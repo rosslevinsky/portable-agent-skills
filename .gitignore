@@ -1,0 +1,13 @@
+# Codex CLI artifacts
+.codex
+
+# Python caches
+__pycache__/
+*.pyc
+
+# OS / editor artifacts
+.DS_Store
+*.swp
+
+# Claude Code per-cwd scheduled-tasks lockfile (runtime state, never commit).
+.claude/scheduled_tasks.lock

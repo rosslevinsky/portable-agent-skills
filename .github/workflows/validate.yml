@@ -1,0 +1,44 @@
+name: Validate Portability
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Validate skill portability
+        run: python scripts/validate_cross_runtime.py skills/
+
+      - name: Run validator fixture tests
+        run: python scripts/validate_cross_runtime.py --test-fixtures tests
+
+      - name: Run installer smoke tests
+        run: bash tests/test_installer.sh
+
+      - name: Check for private/project-specific references
+        run: |
+          if grep -rnE 'prfastack|language_engine|dotfiles|pixi\.toml|new-app\.py|@prfastack' skills/; then
+            echo "ERROR: Private/project-specific references found in skills/"
+            exit 1
+          fi
+
+      - name: Check for private path patterns
+        run: |
+          if grep -rnE 'dotfiles/claude/skills|~/projects' skills/; then
+            echo "ERROR: Private path patterns found in skills/"
+            exit 1
+          fi
