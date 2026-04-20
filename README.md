@@ -11,6 +11,44 @@ AI coding agents benefit from reusable, well-shaped workflows — "write a faili
 
 One install command drops 11 skills into the right places for both runtimes. CI enforces a contract that forbids runtime-specific tool names, requires autonomous fallbacks, and flags private paths before they ship. Edit a skill in a symlinked install and the edit lands back in this repo, ready to commit.
 
+## How to use these skills
+
+The skills in this pack compose into a simple end-to-end workflow. If you only read one section of this README, read this one.
+
+### `/cyw` — check your work, any time, anywhere
+
+`/cyw` runs a structured critical-review → fix → verify loop over whatever you just did. It is the single most useful skill in this pack. Reach for it after *any* non-trivial change — a bug fix, a refactor, a plan, a migration script, a commit message. It does not require a plan or phase structure; it just reviews the recent turn.
+
+**Run it more than once.** The skill already loops internally (up to 3 passes, stopping early when a pass finds zero issues), but in practice a *fresh* `/cyw` invocation — started as a separate call, not another pass inside the same one — often surfaces things the internal loop missed. The reason is not obvious, but the effect is real: treat a second or third fresh `/cyw` as cheap insurance on anything important.
+
+### The standard planning cycle
+
+For work bigger than a one-shot edit, the intended flow is:
+
+```
+/plan-init  →  /plan-phase  →  /plan-run
+```
+
+- **`/plan-init <task>`** — interviews you, explores the codebase, and writes `plans/<slug>/plan.md`: goal, checkable success criteria, constraints, non-goals, affected files. It does *not* break the work into phases.
+- **`/plan-phase <path>`** — reads the plan, proposes a phase structure for your approval, then writes one phase document per phase plus a `phases.md` execution tracker. Each phase is independently committable.
+- **`/plan-run <path>`** — executes incomplete phases in order. Per phase: checks entry criteria, does the work, runs verification, runs `/cyw`, marks the phase done, reviews the diff, commits, pushes. Safe to restart — already-completed phases are skipped.
+
+Insert `/cyw` freely between stages. Common spots: after `/plan-init` (sanity-check the plan before breaking it down), after `/plan-phase` (sanity-check the breakdown before executing), and after `/plan-run` finishes (final sweep). `/plan-run` already calls `/cyw` at the end of each phase, but a fresh invocation at the end of the whole plan often finds more.
+
+### Variants
+
+- **`/plan-duel <task>`** — swap in for `/plan-init` if you have both Claude and Codex subscriptions. Claude and Codex each write a plan, then iteratively critique and refine against each other until a judge scores them as converged (or ≥10 rounds). Produces a winning `plan.md` you can hand to `/plan-phase` as usual. Requires the `codex` CLI on `PATH`.
+- **`/plan-and-do <task>`** — lightweight single-pass alternative for small jobs (≤~8 checklist items, one commit). Interviews, plans briefly, executes, runs `/cyw`, commits. If scope grows during execution, it will tell you to switch to the full `/plan-init` cycle.
+
+### Quick decision guide
+
+| Situation | Start with |
+|---|---|
+| Just finished any change and want a sanity check | `/cyw` (and don't hesitate to run it again) |
+| Small, self-contained task, one commit | `/plan-and-do` |
+| Non-trivial feature or refactor | `/plan-init` → `/plan-phase` → `/plan-run` |
+| Same, but you want Claude + Codex to sharpen the plan | `/plan-duel` → `/plan-phase` → `/plan-run` |
+
 ## Skill Inventory
 
 | Skill | Description | Classification |
