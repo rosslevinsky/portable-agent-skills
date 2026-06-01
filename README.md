@@ -108,7 +108,8 @@ supports the same operations via PowerShell switches:
 .\install.ps1 -Help      # usage
 ```
 
-If script execution is blocked by policy, either bypass it for this one run:
+If script execution is blocked by policy, either bypass it for this one run
+(use `powershell` for Windows PowerShell 5.1, or `pwsh` for PowerShell 7+):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install.ps1
@@ -135,6 +136,56 @@ CLAUDE_SKILLS_DIR=/path/to/claude/skills CODEX_SKILLS_DIR=/path/to/codex/skills 
 
 The same `CLAUDE_SKILLS_DIR` / `CODEX_SKILLS_DIR` environment variables are
 honored by `install.ps1` on Windows.
+
+## Manual installation (if the installer fails)
+
+The installers are only a convenience. A skill is just a directory containing a
+`SKILL.md` (a few skills carry extra files alongside it), and both runtimes load
+a skill simply by finding its directory in the right place. So if `install.sh`
+or `install.ps1` won't run, you can install by hand — just **copy each skill
+directory** from this repo's `skills/` into the runtime's skills directory.
+
+Target directories:
+
+| Runtime | macOS / Linux | Windows |
+|---|---|---|
+| Claude Code | `~/.claude/skills/` | `%USERPROFILE%\.claude\skills\` |
+| Codex CLI | `~/.codex/skills/` (or `$CODEX_HOME/skills/`) | `%USERPROFILE%\.codex\skills\` |
+
+The result you are aiming for is one directory per skill, e.g.
+`~/.claude/skills/commit/SKILL.md`, `~/.claude/skills/cyw/SKILL.md`, and so on.
+
+**macOS / Linux** — copy every skill into both runtimes:
+
+```bash
+mkdir -p ~/.claude/skills ~/.codex/skills
+cp -R skills/* ~/.claude/skills/
+cp -R skills/* ~/.codex/skills/
+```
+
+**Windows (PowerShell)**:
+
+```powershell
+New-Item -ItemType Directory -Force "$HOME\.claude\skills", "$HOME\.codex\skills" | Out-Null
+Copy-Item -Recurse -Force skills\* "$HOME\.claude\skills\"
+Copy-Item -Recurse -Force skills\* "$HOME\.codex\skills\"
+```
+
+**Windows (File Explorer)** — open the repo's `skills` folder, select all the
+skill folders, copy them, then paste into `%USERPROFILE%\.claude\skills` (type
+that path into the address bar; create the `.claude\skills` folders first if
+they don't exist). Repeat for `%USERPROFILE%\.codex\skills`.
+
+Notes:
+
+- **Install only some skills** by copying just the directories you want
+  (e.g. `cp -R skills/cyw skills/commit ~/.claude/skills/`).
+- **Copy whole directories, not just `SKILL.md`** — a couple of skills
+  (e.g. `plan-duel`) ship companion files next to it.
+- A hand-install skips the ownership manifest (`.installed-by-portable-agent-skills`)
+  that the installers write. The skills still work; only `--verify`/`-Verify`
+  and the installer's safe `--uninstall`/`-Uninstall` rely on it. To uninstall a
+  hand-installed skill, just delete its directory from the target.
 
 ## Update
 
