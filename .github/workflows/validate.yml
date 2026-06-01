@@ -48,55 +48,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Exercise both the OS-default Windows PowerShell 5.1 (`powershell`)
-        # and PowerShell 7+ (`pwsh`, preinstalled on the runner).
-        shell: [powershell, pwsh]
-    name: installer-windows (${{ matrix.shell }})
+        # Exercise both the OS-default Windows PowerShell 5.1 (powershell.exe)
+        # and PowerShell 7+ (pwsh, preinstalled on the runner). The matrix value
+        # is the interpreter name; it can't go in `shell:` (matrix context isn't
+        # allowed there), so it is invoked from `run:` instead.
+        interpreter: [powershell, pwsh]
+    name: installer-windows (${{ matrix.interpreter }})
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Pester and PSScriptAnalyzer
-        shell: ${{ matrix.shell }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          # TLS 1.2 is required for PSGallery on Windows PowerShell 5.1.
-          [Net.ServicePointManager]::SecurityProtocol = `
-            [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-          if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
-            Install-PackageProvider -Name NuGet -Force -Scope CurrentUser | Out-Null
-          }
-          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
-          # 5.1 ships Pester 3.4; force a 5.x side-by-side install.
-          Install-Module Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck -Scope CurrentUser
-          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
-
-      - name: Static analysis (PSScriptAnalyzer)
-        shell: ${{ matrix.shell }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Import-Module PSScriptAnalyzer
-          $findings = @()
-          foreach ($f in 'install.ps1', 'tests/install.Tests.ps1') {
-            $findings += Invoke-ScriptAnalyzer -Path $f -Settings ./PSScriptAnalyzerSettings.psd1
-          }
-          if ($findings) {
-            $findings | Format-Table Severity, RuleName, ScriptName, Line, Message -AutoSize -Wrap
-            Write-Error "PSScriptAnalyzer reported $($findings.Count) finding(s)."
-            exit 1
-          }
-          Write-Host 'PSScriptAnalyzer: clean.'
-
-      - name: Run Pester installer tests
-        shell: ${{ matrix.shell }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Import-Module Pester -MinimumVersion 5.0
-          $cfg = New-PesterConfiguration
-          $cfg.Run.Path = 'tests/install.Tests.ps1'
-          $cfg.Run.PassThru = $true
-          $cfg.Output.Verbosity = 'Detailed'
-          $res = Invoke-Pester -Configuration $cfg
-          if ($res.FailedCount -gt 0) {
-            Write-Error "$($res.FailedCount) Pester test(s) failed."
-            exit 1
-          }
+      - name: Run installer checks (analysis + Pester)
+        run: ${{ matrix.interpreter }} -NoProfile -ExecutionPolicy Bypass -File tests/ci-windows.ps1
