@@ -172,9 +172,12 @@ Copy-Item -Recurse -Force skills\* "$HOME\.codex\skills\"
 ```
 
 **Windows (File Explorer)** — open the repo's `skills` folder, select all the
-skill folders, copy them, then paste into `%USERPROFILE%\.claude\skills` (type
-that path into the address bar; create the `.claude\skills` folders first if
-they don't exist). Repeat for `%USERPROFILE%\.codex\skills`.
+skill folders, and copy them. Then paste into `%USERPROFILE%\.claude\skills`:
+paste that path into the address bar and press Enter (the `.claude` folder
+usually already exists, since Claude Code creates it on first run). If the
+`skills` subfolder isn't there yet, the easiest way to create the dot-folders
+is the PowerShell `New-Item` line above — Explorer is awkward about folder names
+that start with a dot. Repeat for `%USERPROFILE%\.codex\skills`.
 
 Notes:
 
