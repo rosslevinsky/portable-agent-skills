@@ -48,6 +48,11 @@ BeforeAll {
     # the test session, and so $LASTEXITCODE reflects the script's real code.
     function Invoke-Installer {
         param([string[]]$Arguments = @(), [string]$ClaudeDir, [string]$CodexDir)
+        # Windows PowerShell 5.1 turns a child process's stderr (captured via
+        # 2>&1) into a terminating NativeCommandError when ErrorActionPreference
+        # is 'Stop'. The installer writes its refusal message to stderr, so relax
+        # the preference here to capture that text instead of throwing.
+        $ErrorActionPreference = 'Continue'
         $env:CLAUDE_SKILLS_DIR = $ClaudeDir
         $env:CODEX_SKILLS_DIR  = $CodexDir
         try {
