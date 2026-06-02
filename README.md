@@ -82,24 +82,126 @@ This copies all skills to `~/.claude/skills/` (Claude Code) and
 `$HOME/.codex/skills/` (Codex CLI's default user skills directory —
 `$CODEX_HOME/skills` if `CODEX_HOME` is set).
 
+### Windows
+
+On native Windows (Claude Code / Codex CLI running outside WSL), use the
+PowerShell installer instead of `install.sh`:
+
+```powershell
+git clone https://github.com/rosslevinsky/portable-agent-skills.git
+cd portable-agent-skills
+.\install.ps1
+```
+
+This copies all skills to `%USERPROFILE%\.claude\skills` (Claude Code) and
+`%USERPROFILE%\.codex\skills` (Codex CLI). `install.ps1` mirrors `install.sh`
+and writes the same ownership manifest, so the two are interchangeable. It
+supports the same operations via PowerShell switches:
+
+```powershell
+.\install.ps1            # install
+.\install.ps1 -Update    # update existing install (idempotent)
+.\install.ps1 -Uninstall # remove only skills installed by this pack
+.\install.ps1 -Verify    # check installed skills against source
+.\install.ps1 -DryRun    # preview without making changes
+.\install.ps1 -Force     # replace existing same-name skills even if unowned
+.\install.ps1 -Help      # usage
+```
+
+If script execution is blocked by policy, either bypass it for this one run
+(use `powershell` for Windows PowerShell 5.1, or `pwsh` for PowerShell 7+):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+or allow local scripts for your user once: `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
+
+`install.ps1` is **copy-only** — it intentionally has no `-Link` mode. The
+editable symlink dev workflow (below) relies on Windows symlink privileges and
+is supported via `install.sh --link` under **WSL** or **Git Bash**. Two notes
+for those routes:
+
+- **WSL** installs into your Linux home (`~/.claude/skills`), so it only feeds a
+  Claude Code/Codex that also runs *inside* WSL — not the native Windows app.
+- **Git Bash** runs `install.sh` in copy mode fine, but `--link` is unreliable
+  there (its `ln` often degrades to a copy). Prefer `install.ps1` for native
+  installs and WSL for symlinked development.
+
 ### Custom install locations
 
 ```bash
 CLAUDE_SKILLS_DIR=/path/to/claude/skills CODEX_SKILLS_DIR=/path/to/codex/skills ./install.sh
 ```
 
+The same `CLAUDE_SKILLS_DIR` / `CODEX_SKILLS_DIR` environment variables are
+honored by `install.ps1` on Windows.
+
+## Manual installation (if the installer fails)
+
+The installers are only a convenience. A skill is just a directory containing a
+`SKILL.md` (a few skills carry extra files alongside it), and both runtimes load
+a skill simply by finding its directory in the right place. So if `install.sh`
+or `install.ps1` won't run, you can install by hand — just **copy each skill
+directory** from this repo's `skills/` into the runtime's skills directory.
+
+Target directories:
+
+| Runtime | macOS / Linux | Windows |
+|---|---|---|
+| Claude Code | `~/.claude/skills/` | `%USERPROFILE%\.claude\skills\` |
+| Codex CLI | `~/.codex/skills/` (or `$CODEX_HOME/skills/`) | `%USERPROFILE%\.codex\skills\` |
+
+The result you are aiming for is one directory per skill, e.g.
+`~/.claude/skills/commit/SKILL.md`, `~/.claude/skills/cyw/SKILL.md`, and so on.
+
+**macOS / Linux** — copy every skill into both runtimes:
+
+```bash
+mkdir -p ~/.claude/skills ~/.codex/skills
+cp -R skills/* ~/.claude/skills/
+cp -R skills/* ~/.codex/skills/
+```
+
+**Windows (PowerShell)**:
+
+```powershell
+New-Item -ItemType Directory -Force "$HOME\.claude\skills", "$HOME\.codex\skills" | Out-Null
+Copy-Item -Recurse -Force skills\* "$HOME\.claude\skills\"
+Copy-Item -Recurse -Force skills\* "$HOME\.codex\skills\"
+```
+
+**Windows (File Explorer)** — open the repo's `skills` folder, select all the
+skill folders, and copy them. Then paste into `%USERPROFILE%\.claude\skills`:
+paste that path into the address bar and press Enter (the `.claude` folder
+usually already exists, since Claude Code creates it on first run). If the
+`skills` subfolder isn't there yet, the easiest way to create the dot-folders
+is the PowerShell `New-Item` line above — Explorer is awkward about folder names
+that start with a dot. Repeat for `%USERPROFILE%\.codex\skills`.
+
+Notes:
+
+- **Install only some skills** by copying just the directories you want
+  (e.g. `cp -R skills/cyw skills/commit ~/.claude/skills/`).
+- **Copy whole directories, not just `SKILL.md`** — a couple of skills
+  (e.g. `plan-duel`) ship companion files next to it.
+- A hand-install skips the ownership manifest (`.installed-by-portable-agent-skills`)
+  that the installers write. The skills still work; only `--verify`/`-Verify`
+  and the installer's safe `--uninstall`/`-Uninstall` rely on it. To uninstall a
+  hand-installed skill, just delete its directory from the target.
+
 ## Update
 
 ```bash
 cd portable-agent-skills
 git pull
-./install.sh --update
+./install.sh --update      # Windows: .\install.ps1 -Update
 ```
 
 ## Uninstall
 
 ```bash
-./install.sh --uninstall
+./install.sh --uninstall   # Windows: .\install.ps1 -Uninstall
 ```
 
 Only removes skills installed by this pack (tracked via an ownership manifest). User-created skills with the same directory names are left untouched.
@@ -174,8 +276,19 @@ Run the portability validator and test suite:
 ```bash
 python scripts/validate_cross_runtime.py skills/          # Check all skills
 python scripts/validate_cross_runtime.py --test-fixtures tests  # Run fixture tests
-bash tests/test_installer.sh                               # Installer smoke tests
+bash tests/test_installer.sh                               # Bash installer smoke tests
 ```
+
+For the Windows PowerShell installer (`install.ps1`), run the Pester suite and
+static analysis (requires the `Pester` 5.x and `PSScriptAnalyzer` modules):
+
+```powershell
+Invoke-Pester tests/install.Tests.ps1
+Invoke-ScriptAnalyzer -Path install.ps1 -Settings ./PSScriptAnalyzerSettings.psd1
+```
+
+CI runs both of these on `windows-latest` under Windows PowerShell 5.1 *and*
+PowerShell 7, in addition to the Bash checks on Linux and macOS.
 
 ## Contributing
 

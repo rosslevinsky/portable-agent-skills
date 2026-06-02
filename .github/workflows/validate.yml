@@ -42,3 +42,20 @@ jobs:
             echo "ERROR: Private path patterns found in skills/"
             exit 1
           fi
+
+  installer-windows:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Exercise both the OS-default Windows PowerShell 5.1 (powershell.exe)
+        # and PowerShell 7+ (pwsh, preinstalled on the runner). The matrix value
+        # is the interpreter name; it can't go in `shell:` (matrix context isn't
+        # allowed there), so it is invoked from `run:` instead.
+        interpreter: [powershell, pwsh]
+    name: installer-windows (${{ matrix.interpreter }})
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run installer checks (analysis + Pester)
+        run: ${{ matrix.interpreter }} -NoProfile -ExecutionPolicy Bypass -File tests/ci-windows.ps1
