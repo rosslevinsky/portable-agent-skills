@@ -29,13 +29,6 @@ jobs:
       - name: Run installer smoke tests
         run: bash tests/test_installer.sh
 
-      - name: Check for private/project-specific references
-        run: |
-          if grep -rnE 'prfastack|language_engine|dotfiles|pixi\.toml|new-app\.py|@prfastack' skills/; then
-            echo "ERROR: Private/project-specific references found in skills/"
-            exit 1
-          fi
-
       - name: Check for private path patterns
         run: |
           if grep -rnE 'dotfiles/claude/skills|~/projects' skills/; then

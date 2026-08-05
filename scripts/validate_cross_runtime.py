@@ -35,17 +35,17 @@ BANNED_PHRASES = [
     "run_in_background",
 ]
 
-# Private paths and project-specific identifiers that must not appear in skills
+# Private paths and project-specific identifiers that must not appear in skills.
+#
+# Every pattern here is private for ANY workspace, not for one in particular. A guard against
+# publishing private names must not itself publish them: this file ships, so a maintainer's
+# own repo names, internal package scopes and scaffolding-script names belong in a local,
+# unpublished list rather than in this list.
 PRIVATE_PATH_PATTERNS = [
     re.compile(r"/home/[^/\s]+"),
     re.compile(r"dotfiles/claude/skills"),
     re.compile(r"~/projects/gh/main"),
-    re.compile(r"\blanguage_engine\b"),
-    re.compile(r"\bprfastack\b"),
     re.compile(r"\brosslevinsky\b"),
-    re.compile(r"\bpixi\.toml\b"),
-    re.compile(r"\bnew-app\.py\b"),
-    re.compile(r"@prfastack"),
 ]
 
 DOC_ARTIFACTS = ["README.md"]
