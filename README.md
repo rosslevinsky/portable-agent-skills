@@ -198,6 +198,35 @@ git pull
 ./install.sh --update      # Windows: .\install.ps1 -Update
 ```
 
+## Installing a previous release
+
+Every release is tagged `vYYYY.MM.MICRO`, and any tagged release stays installable
+indefinitely. Going back is a checkout plus an update — and because `--update` prunes
+skills the checked-out release does not contain, you get that version's skill set
+exactly, rather than a mixture of old and new.
+
+```bash
+git fetch --tags
+git tag --list                 # every release, oldest first
+git checkout v2026.08.0        # or whichever you want back
+./install.sh --update          # Windows: .\install.ps1 -Update
+```
+
+To read an old release without disturbing what you have installed, clone it to a scratch
+directory and point the installer at throwaway targets:
+
+```bash
+git clone --branch v2026.08.0 --depth 1 \
+  https://github.com/rosslevinsky/portable-agent-skills.git /tmp/pas-old
+CLAUDE_SKILLS_DIR=/tmp/pas-claude CODEX_SKILLS_DIR=/tmp/pas-codex \
+  /tmp/pas-old/install.sh
+```
+
+Set both `*_SKILLS_DIR` variables when you do this. Left unset, the installer writes to
+`~/.claude/skills` and `~/.codex/skills` — the live install you were trying not to touch.
+
+The [changelog](CHANGELOG.md) says what changed in each release.
+
 ## Uninstall
 
 ```bash
