@@ -8,12 +8,12 @@ Versions use [Calendar Versioning](https://calver.org/) in the form
 A MICRO bump in the same month indicates a follow-up release; a new month
 starts from `.0` again.
 
-## [2026.08.0] - 2026-08-05
+## [2026.06.0] - 2026-06-01
 
-Three changes reached `main` after the initial release without ever being tagged or
-written up. This entry documents them and gives that state a tag, so it stays
-retrievable — see [Installing a previous
-release](README.md#installing-a-previous-release). Nothing here is new work.
+Windows support. This release shipped at the time and was documented afterwards, so its
+tag was created later than its date — the tag marks the month the release came out, not
+the day it was written up. See [Installing a previous
+release](README.md#installing-a-previous-release) to return to it.
 
 ### Added
 
@@ -27,19 +27,9 @@ release](README.md#installing-a-previous-release). Nothing here is new work.
 - **A how-to-use guide in the README** — `/cyw` as the universal sanity check, the
   planning cycle, and a decision table mapping common situations to a starting skill.
 
-### Changed
-
-- **The validator's private-path check now uses universally private shapes.** The check
-  exists to stop workspace-specific names reaching a published skill, so a pattern that
-  is private to one workspace rather than to any workspace does not belong in a file that
-  ships — publishing the guard would publish the very thing it guards. Those names now
-  live in a local list the validator reads when present and which is never committed.
-  The CI step duplicating the check was removed: the validator already covers it, and a
-  second copy of a rule is a second place for it to drift.
-
 ## [2026.04.0] - 2026-04-16
 
 Initial release.
 
-[2026.08.0]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.08.0
+[2026.06.0]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.06.0
 [2026.04.0]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.04.0

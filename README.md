@@ -208,7 +208,7 @@ exactly, rather than a mixture of old and new.
 ```bash
 git fetch --tags
 git tag --list                 # every release, oldest first
-git checkout v2026.08.0        # or whichever you want back
+git checkout v2026.06.0        # or whichever you want back
 ./install.sh --update          # Windows: .\install.ps1 -Update
 ```
 
@@ -216,7 +216,7 @@ To read an old release without disturbing what you have installed, clone it to a
 directory and point the installer at throwaway targets:
 
 ```bash
-git clone --branch v2026.08.0 --depth 1 \
+git clone --branch v2026.06.0 --depth 1 \
   https://github.com/rosslevinsky/portable-agent-skills.git /tmp/pas-old
 CLAUDE_SKILLS_DIR=/tmp/pas-claude CODEX_SKILLS_DIR=/tmp/pas-codex \
   /tmp/pas-old/install.sh
