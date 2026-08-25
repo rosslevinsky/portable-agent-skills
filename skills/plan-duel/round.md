@@ -1,205 +1,120 @@
 # Plan Duel — Critique Round
 
-Uses: `workdir`, `N`.
+This is round ⟪round⟫ of up to 10. ⟪round_context⟫
 
-The orchestrator reads and parses `judge-round-N.md` after this document
-completes. Do not check exit conditions here — just do the work.
+The two competing plans are labeled A and B with no attribution.
 
----
+## Agent A
 
-## Part A — Cross-critique and update
+Plan A's immutable snapshot from the end of the previous round is ⟪frozen_a⟫ and
+Plan B's is ⟪frozen_b⟫. Work from these frozen snapshots — never from the other
+agent's live, in-progress revision — so both sides refine against identical inputs.
 
-Both agents read plan files directly. Plan A = `plan-a.md` (being improved
-by Agent A), Plan B = `plan-b.md` (being improved by Agent B).
-Run **simultaneously**:
+Read ⟪frozen_a⟫, ⟪frozen_b⟫, and ⟪workdir⟫/problem.md. Then:
 
----
+1. Identify the strongest elements of Plan B (⟪frozen_b⟫) that are missing or
+   weaker in Plan A (⟪frozen_a⟫).
+2. Identify weaknesses or gaps in Plan B that Plan A handles better — preserve
+   these strengths.
+3. Produce a revised Plan A incorporating the best of Plan B while keeping Plan A's
+   own strengths.
+4. List what you deliberately chose NOT to adopt from Plan B and why — be specific;
+   do not silently omit anything.
 
-### Agent A (controller runtime sub-agent)
+Write the complete revised Plan A to ⟪workdir⟫/plan-a.md (overwrite) as a single
+whole-file write, not an incremental patch (to avoid read-verify errors).
+Write rejection notes (item 4) to ⟪workdir⟫/rejections-a-round-⟪round⟫.md.
 
-> **Claude adapter:** Use the Agent tool with subagent_type=general-purpose
-> with the prompt below.
-> **Codex adapter:** Write the prompt below to `{workdir}/controller-prompt-N.txt`,
-> then run: `codex exec --skip-git-repo-check -C "{workdir}" "$(cat "{workdir}/controller-prompt-N.txt")" < /dev/null`
+## Agent B
 
-Resolve all variables before sending: substitute the actual round number for
-every occurrence of `N`, the actual workdir path for `{workdir}`, and resolve
-the round context line — read `{workdir}/judge-round-{N-1}.md` and extract
-the first integer from its `SCORE:` line. If the file is missing or N=1, use
-"This is the first critique round."; otherwise use "The judge scored
-convergence at {score}/10 last round."
+Plan A's immutable snapshot from the end of the previous round is ⟪frozen_a⟫ and
+Plan B's is ⟪frozen_b⟫. Work from these frozen snapshots — never from the other
+agent's live, in-progress revision — so both sides refine against identical inputs.
 
-> You are a senior software architect refining a plan through competitive
-> critique. This is round N of up to 10. {round context line}
->
-> Two competing plans are saved as files in `{workdir}/`:
-> - `plan-a.md` — Plan A (the one you are improving)
-> - `plan-b.md` — Plan B (the reference plan)
-> - `problem.md` — the problem statement
->
-> Read all three files. Then:
-> 1. Identify the strongest elements of Plan B that are missing or weaker
->    in Plan A.
-> 2. Identify weaknesses or gaps in Plan B that Plan A handles better —
->    preserve these strengths.
-> 3. Produce a revised Plan A incorporating the best of Plan B while keeping
->    Plan A's own strengths.
-> 4. List what you deliberately chose NOT to adopt from Plan B and why —
->    be specific; do not silently omit anything.
->
-> Write the complete revised Plan A to `{workdir}/plan-a.md` (overwrite).
-> Write rejection notes (item 4) to `{workdir}/rejections-a-round-N.md`.
+Read ⟪frozen_a⟫, ⟪frozen_b⟫, and ⟪workdir⟫/problem.md. Then:
 
-Verify `plan-a.md` ≥200 bytes. If not — halt: "Agent A update failed at
-round N."
+1. Identify the strongest elements of Plan A (⟪frozen_a⟫) that are missing or weaker
+   in Plan B (⟪frozen_b⟫).
+2. Identify weaknesses or gaps in Plan A that Plan B handles better — preserve these
+   strengths.
+3. Produce a revised Plan B incorporating the best of Plan A while keeping Plan B's
+   own strengths.
+4. List what you deliberately chose NOT to adopt from Plan A and why — be specific;
+   do not silently omit anything.
 
----
+Write the complete revised Plan B to ⟪workdir⟫/plan-b.md (overwrite) as a single
+whole-file write, not an incremental patch (to avoid read-verify errors).
+Write rejection notes (item 4) to ⟪workdir⟫/rejections-b-round-⟪round⟫.md.
 
-### Agent B (participant runtime)
+## Judge
 
-The Agent B prompt mirrors the Agent A prompt above with Plan A and Plan B
-swapped. Resolve all variables the same way: substitute the actual round
-number for every `N`, the actual workdir path for `{workdir}`, and resolve
-the round context line the same way (read prior judge file from disk).
+You are a neutral technical adjudicator with deep expertise in software
+architecture and project planning. You have zero allegiance to either plan. Your
+only goal is accurate, rigorous assessment grounded in technical merit.
 
-Pre-create output files so the participant's file-write tooling does not fail
-on read-verify of nonexistent paths:
+Produce your assessment as your final reply only. Do NOT create, write, or edit any
+file — output the assessment as your response text, nothing else.
 
-```bash
-touch "{workdir}/plan-b.md" "{workdir}/rejections-b-round-N.md"
-```
+Read the revisions just produced this round, from ⟪workdir⟫/:
 
-Write `{workdir}/codex-prompt-N.txt`:
+- ⟪workdir⟫/plan-a.md — Plan A
+- ⟪workdir⟫/plan-b.md — Plan B
+- ⟪workdir⟫/problem.md — the problem statement
+- The rejection files from the last up to 3 rounds (rounds max(1, ⟪round⟫−2)
+  through ⟪round⟫): rejections-a-round-*.md and rejections-b-round-*.md. Skip
+  gracefully if any are missing. Ideas rejected across multiple rounds carry more
+  weight than one-round rejections.
 
-```
-You are a senior software architect refining a plan through competitive
-critique. This is round N of up to 10. {resolved round context line}
+**Part 1 — Convergence score**
 
-Two competing plans are saved as files:
-- {workdir}/plan-a.md — Plan A (the reference plan)
-- {workdir}/plan-b.md — Plan B (the one you are improving)
-- {workdir}/problem.md — the problem statement
+Score on a scale of 0–10:
 
-Read all three files. Then:
-1. Identify the strongest elements of Plan A that are missing or weaker
-   in Plan B.
-2. Identify weaknesses or gaps in Plan A that Plan B handles better —
-   preserve these strengths.
-3. Produce a revised Plan B incorporating the best of Plan A while keeping
-   Plan B's own strengths.
-4. List what you deliberately chose NOT to adopt from Plan A and why —
-   be specific; do not silently omit anything.
+- 0  = fundamentally different approaches or goals
+- 3  = same problem domain, divergent solutions
+- 5  = same high-level approach, meaningful differences in scope or method
+- 7  = broadly aligned, meaningful differences remain in sequencing, risk
+       handling, or implementation detail
+- 8  = no substantive differences — any remaining gaps are pure style or wording
+       with zero technical consequence
+- 10 = identical in all meaningful respects
 
-Write the complete revised Plan B to {workdir}/plan-b.md (overwrite).
-Write rejection notes (item 4) to {workdir}/rejections-b-round-N.md.
+Be skeptical. Plans frequently appear to converge at a surface level while still
+diverging on sequencing, failure handling, rollback strategy, or specific
+implementation choices. If you can articulate any remaining difference that would
+cause a competent engineer to make a different decision, the score is at most 7. Do
+not round up. If in doubt, score lower.
 
-IMPORTANT: When writing or overwriting files, use shell commands
-(e.g. cat > file << 'EOF' ... EOF) rather than patch-based tools,
-to avoid read-verify errors on new or fully-rewritten files.
-```
+**Part 2 — Remaining differences**
 
-Invoke the participant runtime's CLI in non-interactive mode:
+Identify every substantive difference. Ignore formatting, phrasing, trivial
+ordering. For each, state which plan's position is technically stronger and why. Say
+"Equal" if both are valid. Flag any rejection-file entries that appear to be
+mistakes — good ideas discarded that should have been kept.
 
-> **Codex adapter:** `codex exec --skip-git-repo-check -C "{workdir}" "$(cat "{workdir}/codex-prompt-N.txt")" < /dev/null > "{workdir}/codex-round-N-status.md"`
-> **Other runtimes:** Adapt the invocation to the participant's CLI.
+**Part 3 — Preferred plan**
 
-Verify `plan-b.md` ≥200 bytes. If not — halt: "Agent B update failed at
-round N."
+Evaluate on these dimensions in order of importance:
 
----
+1. **Technical soundness** — correct approaches? Wrong assumptions or architectural
+   red flags?
+2. **Completeness** — all aspects addressed, including edge cases?
+3. **Feasibility** — realistic and actionable, or hand-waving hard parts?
+4. **Risk coverage** — failure modes identified and mitigated?
+5. **Clarity** — precise enough to execute without a follow-up conversation?
 
-## Snapshot
+Do not call it a tie. If substantially equivalent, prefer the marginally clearer or
+more complete one.
 
-Copy `plan-a.md` → `plan-a-round-N.md`
-Copy `plan-b.md` → `plan-b-round-N.md`
+Respond with a single JSON object and nothing else — no prose before or after it and
+no markdown fence. It carries exactly these fields:
 
----
-
-## Part B — Judge
-
-Pre-create the judge output file:
-
-```bash
-touch "{workdir}/judge-round-N.md"
-```
-
-Run a judge agent using the controller runtime's most capable model:
-
-> **Claude adapter:** Use the Agent tool with subagent_type=general-purpose,
-> model: opus, with the prompt below.
-> **Codex adapter:** Write the prompt below to `{workdir}/judge-prompt-N.txt`,
-> then run: `codex exec --skip-git-repo-check -C "{workdir}" "$(cat "{workdir}/judge-prompt-N.txt")" < /dev/null`
-> **Other runtimes:** Use the strongest available model for judging.
-
-> You are a neutral technical adjudicator with deep expertise in software
-> architecture and project planning. You have zero allegiance to either plan.
-> Your only goal is accurate, rigorous assessment grounded in technical merit.
->
-> Read from `{workdir}/`:
-> - `plan-a.md` — Plan A
-> - `plan-b.md` — Plan B
-> - `problem.md` — the problem statement
-> - The last 3 rounds of rejection files (or fewer if fewer exist):
->   `rejections-a-round-{max(1,N-2)..N}.md` and
->   `rejections-b-round-{max(1,N-2)..N}.md`.
->   Skip gracefully if any are missing. Ideas rejected across multiple
->   rounds carry more weight than one-round rejections.
->
-> **Part 1 — Convergence score**
->
-> Score on a scale of 0–10:
-> - 0  = fundamentally different approaches or goals
-> - 3  = same problem domain, divergent solutions
-> - 5  = same high-level approach, meaningful differences in scope or method
-> - 7  = broadly aligned, meaningful differences remain in sequencing, risk
->        handling, or implementation detail
-> - 8  = no substantive differences — any remaining gaps are pure style or
->        wording with zero technical consequence
-> - 10 = identical in all meaningful respects
->
-> Be skeptical. Plans frequently appear to converge at a surface level while
-> still diverging on sequencing, failure handling, rollback strategy, or
-> specific implementation choices. If you can articulate any remaining
-> difference that would cause a competent engineer to make a different
-> decision, the score is at most 7. Do not round up. If in doubt, score lower.
->
-> **Part 2 — Remaining differences**
->
-> Identify every substantive difference. Ignore formatting, phrasing, trivial
-> ordering. For each, state which plan's position is technically stronger and
-> why. Say "Equal" if both are valid. Flag any rejection-file entries that
-> appear to be mistakes — good ideas discarded that should have been kept.
->
-> **Part 3 — Preferred plan**
->
-> Evaluate on these dimensions in order of importance:
-> 1. **Technical soundness** — correct approaches? Wrong assumptions or
->    architectural red flags?
-> 2. **Completeness** — all aspects addressed, including edge cases?
-> 3. **Feasibility** — realistic and actionable, or hand-waving hard parts?
-> 4. **Risk coverage** — failure modes identified and mitigated?
-> 5. **Clarity** — precise enough to execute without a follow-up conversation?
->
-> Do not call it a tie. If substantially equivalent, prefer the marginally
-> clearer or more complete one.
->
-> Respond in exactly this format — no other text before or after:
->
-> SCORE: [integer]
->
-> DIFFERENCES:
-> 1. [topic]: Plan A: {approach}. Plan B: {approach}. **Stronger: [A/B/Equal]** — [reason]
-> 2. ...
-> (Write `DIFFERENCES: none` if no substantive differences remain.)
->
-> MISSED REJECTIONS: [list, or `none`]
->
-> PREFERRED: [A or B]
-> [One paragraph: concrete strengths of the winner, concrete weaknesses of
-> the loser. Specific references to both plans required.]
-
-Write the judge's full response to `{workdir}/judge-round-N.md`.
-
-IMPORTANT: When writing or overwriting files, use shell commands
-(e.g. cat > file << 'EOF' ... EOF) rather than patch-based tools,
-to avoid read-verify errors on new or fully-rewritten files.
+- `score` — the integer from Part 1.
+- `differences` — one object per substantive difference from Part 2, each carrying
+  `topic`, `plan_a`, `plan_b`, `stronger` (`"A"`, `"B"`, or `"Equal"`), and `reason`.
+  Use an empty array only if no substantive differences remain.
+- `missed_rejections` — the Part 2 rejection-file mistakes as an array of strings, or
+  an empty array if there are none.
+- `preferred` — `"A"` or `"B"` from Part 3.
+- `justification` — one paragraph defending the choice at the depth you would write it
+  in a review: concrete strengths of the winner, concrete weaknesses of the loser,
+  specific references to both plans required. Do not compress it to a sentence.

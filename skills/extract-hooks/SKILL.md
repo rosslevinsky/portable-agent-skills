@@ -41,7 +41,7 @@ Propose a list of new hook files. For each hook:
 - **Priority:**
   - **High** — duplicated logic across multiple files, or a single file with >100 lines of non-UI logic
   - **Medium** — single file with 30–100 lines of non-UI logic
-  - **Low** — minor state or trivial effects; extraction is optional
+  - **Low** — any non-UI logic below the Medium threshold (under 30 lines), including minor state or trivial effects; extraction is optional
 
 Do not propose a hook that is just a thin wrapper around a single `useState` — only extract when it improves reuse, readability, or separates a real concern. Do not move pure helper functions into hooks; keep them as plain functions.
 
@@ -98,12 +98,20 @@ For each approved hook, in priority order:
 
 ## Phase 5 — Review
 
-When all hooks are implemented:
+When every **approved** hook is implemented — not every candidate. Phase 3 lets the user
+take a subset, or `none`, and a candidate they declined is a decision that was made, not a
+gap to be closed. Review what was built; list what was declined once, without re-arguing it.
+If the answer was `none`, the run ended at Phase 3 and there is nothing here to do.
 
 Run the `cyw` skill to review the work. If the skill is unavailable, do a
 self-check: re-read each modified file, confirm no logic remains inline in
 `.tsx` files, confirm all tests/lint still pass, and list any assumptions or
 risks that could not be verified locally.
+
+**Where no test exercises the logic that moved, report that hook as extracted but
+unverified, and name it.** This skill's promise is that behaviour is preserved, and
+"tests still pass" is not evidence of that when nothing covered the code in the first
+place — a green run over untouched tests reads exactly like a checked one.
 
 ---
 

@@ -1,0 +1,51 @@
+{
+  "title": "diff-review reviewer verdict",
+  "description": "The machine-read summary of one independent diff review. The reviewer's full narrative reasoning is returned separately and is not replaced by this object.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["findings", "overall", "blocking_count"],
+  "properties": {
+    "findings": {
+      "type": "array",
+      "description": "Every finding, most-severe first. An empty array means nothing substantive was found — say that plainly rather than inventing nits.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["file", "line", "severity", "summary", "failure_scenario"],
+        "properties": {
+          "file": {
+            "type": "string",
+            "description": "Repository-relative path of the file the finding is in."
+          },
+          "line": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "1-indexed line the finding anchors to."
+          },
+          "severity": {
+            "type": "string",
+            "enum": ["blocker", "major", "minor", "nit"],
+            "description": "blocker = wrong in a way that breaks correctness, security, or data integrity, must not merge; major = a real correctness or robustness defect to fix before merge, but not catastrophic; minor = a small correctness or clarity issue safe to defer; nit = style or preference with no correctness impact. A phase gate keys on this, so label accurately."
+          },
+          "summary": {
+            "type": "string",
+            "description": "What is wrong, plus the suggested direction — a direction, never an applied edit."
+          },
+          "failure_scenario": {
+            "type": "string",
+            "description": "The concrete failure this causes: specific inputs or state leading to the wrong output, crash, or exposure. If the concern is uncertain, say so and state what would confirm it."
+          }
+        }
+      }
+    },
+    "overall": {
+      "type": "string",
+      "description": "The verdict in prose: whether the change is correct as written, and what the reader should do about it."
+    },
+    "blocking_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "How many findings are severity blocker or major — the count a phase gate acts on. It must equal the number of such entries in `findings`; the supervisor recomputes it and reports any disagreement."
+    }
+  }
+}

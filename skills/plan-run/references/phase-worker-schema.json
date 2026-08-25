@@ -1,0 +1,100 @@
+{
+  "title": "plan-run phase-worker result",
+  "description": "The structured result a phase worker returns to the orchestrator. Exactly one of the two shapes is valid, selected by `outcome.result`: DONE carries the completion evidence, BLOCKED carries the unresolved decision. The two are mutually exclusive and the schema enforces that \u2014 a DONE cannot carry a `question`, and a BLOCKED cannot claim `verification`.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "outcome"
+  ],
+  "properties": {
+    "outcome": {
+      "description": "The phase result. Choose the branch matching what actually happened; never half-finish a phase.",
+      "anyOf": [
+        {
+          "title": "DONE",
+          "description": "The phase's work is complete and left uncommitted.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "result",
+            "summary",
+            "changed_surface",
+            "verification",
+            "deviations"
+          ],
+          "properties": {
+            "result": {
+              "type": "string",
+              "enum": [
+                "DONE"
+              ],
+              "description": "The phase's work is complete and left uncommitted."
+            },
+            "summary": {
+              "type": "string",
+              "minLength": 1,
+              "description": "One or two sentences on what changed."
+            },
+            "changed_surface": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The files and sections touched, for the phase document's Evidence record."
+            },
+            "verification": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The exact verification commands run and their outcomes, including the scoped tests and the lint/type-check over the changed surface."
+            },
+            "deviations": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Doc-vs-reality corrections made to the phase document, or the string \"none\"."
+            }
+          }
+        },
+        {
+          "title": "BLOCKED",
+          "description": "A genuine decision could not be resolved from the three on-disk inputs. No partial work to rely on.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "result",
+            "changed_surface",
+            "question",
+            "options",
+            "recommendation"
+          ],
+          "properties": {
+            "result": {
+              "type": "string",
+              "enum": [
+                "BLOCKED"
+              ],
+              "description": "A genuine decision could not be resolved from the three on-disk inputs."
+            },
+            "changed_surface": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The files this attempt touched and did not revert, so the orchestrator can scope a cleanup to them (`git restore -- <paths>`; delete only files you created) instead of a blanket reset that would discard unrelated uncommitted work. Use \"none\" when you reverted your own edits or made none \u2014 which is preferred, since you know exactly what you touched."
+            },
+            "question": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The single decision that cannot be resolved from plan.md, execution.md, and the phase document."
+            },
+            "options": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The viable choices, briefly."
+            },
+            "recommendation": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The worker's best option and why \u2014 an orchestrator running autonomously will take it and record it as an assumption."
+            }
+          }
+        }
+      ]
+    }
+  }
+}

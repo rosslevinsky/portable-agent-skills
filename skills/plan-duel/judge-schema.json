@@ -1,0 +1,63 @@
+{
+  "title": "plan-duel judge verdict",
+  "description": "The judge's per-round assessment of the two competing plans. One object, no prose around it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["score", "differences", "missed_rejections", "preferred", "justification"],
+  "properties": {
+    "score": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10,
+      "description": "Convergence score, 0 to 10 inclusive. 0 = fundamentally different approaches or goals; 3 = same problem domain, divergent solutions; 5 = same high-level approach, meaningful differences in scope or method; 7 = broadly aligned, meaningful differences remain in sequencing, risk handling, or implementation detail; 8 = no substantive differences, any remaining gaps are pure style or wording with zero technical consequence; 10 = identical in all meaningful respects. If you can articulate any remaining difference that would cause a competent engineer to make a different decision, the score is at most 7. Do not round up."
+    },
+    "differences": {
+      "type": "array",
+      "description": "Every substantive difference between the two plans, one entry each. Ignore formatting, phrasing, and trivial ordering. Empty array only when no substantive differences remain.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["topic", "plan_a", "plan_b", "stronger", "reason"],
+        "properties": {
+          "topic": {
+            "type": "string",
+            "description": "Short label for what this difference is about, e.g. 'Rollback strategy' or 'Test sequencing'."
+          },
+          "plan_a": {
+            "type": "string",
+            "description": "Plan A's concrete position on this topic, stated specifically enough to be checked against the plan."
+          },
+          "plan_b": {
+            "type": "string",
+            "description": "Plan B's concrete position on this topic, stated specifically enough to be checked against the plan."
+          },
+          "stronger": {
+            "type": "string",
+            "enum": ["A", "B", "Equal"],
+            "description": "Which plan's position is technically stronger on this topic. 'Equal' only when both are genuinely valid."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why that position is stronger — the concrete technical consequence of choosing the weaker one, not a restatement of the positions."
+          }
+        }
+      }
+    },
+    "missed_rejections": {
+      "type": "array",
+      "description": "Entries in the rejection files that look like mistakes: good ideas discarded that should have been kept. Each entry names the idea, which side rejected it, and why the rejection was wrong. Empty array when there are none. Ideas rejected across multiple rounds carry more weight than one-round rejections.",
+      "items": {
+        "type": "string"
+      }
+    },
+    "preferred": {
+      "type": "string",
+      "enum": ["A", "B"],
+      "description": "The stronger plan overall, judged on technical soundness, then completeness, then feasibility, then risk coverage, then clarity. Never a tie: if the plans are substantially equivalent, prefer the marginally clearer or more complete one."
+    },
+    "justification": {
+      "type": "string",
+      "description": "One paragraph of full prose defending the choice: the concrete strengths of the winner and the concrete weaknesses of the loser, with specific references to both plans by section or claim. This is the text a human reads to understand the verdict, so argue it at the depth you would in a written review — do not compress it into a sentence or a list of labels."
+    }
+  }
+}

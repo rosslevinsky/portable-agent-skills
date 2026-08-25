@@ -4,9 +4,30 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Runnable on demand, on any branch. A feature-branch push runs nothing here, so the only
+  # way to exercise a change on Windows used to be opening a pull request — and Windows is
+  # the one platform none of this project's authors develop on, so that is exactly the
+  # platform whose feedback should be cheapest to get.
+  workflow_dispatch:
+
+# Read-only token for the whole workflow. Nothing here writes to the repository — it
+# checks out, installs Python and runs checks — so the write access the default
+# GITHUB_TOKEN carries is permission this workflow never uses. Declared at the top level
+# so a new job inherits the restriction instead of having to remember it.
+#
+# The actions below stay on moving major tags rather than SHA pins, deliberately. Both
+# are first-party GitHub actions, and with a read-only token the most a compromised
+# release could reach is read access to content that is published anyway. Pinning would
+# also mean editing this file on every action bump, for no gain a read-only token can use.
+permissions:
+  contents: read
 
 jobs:
   validate:
+    # A generous ceiling, not a tight fit: this job runs in about 2.5 minutes, and the
+    # number is here to stop a hung step burning the 6-hour default, not to police a
+    # slow runner.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -26,29 +47,95 @@ jobs:
       - name: Run validator fixture tests
         run: python scripts/validate_cross_runtime.py --test-fixtures tests
 
-      - name: Run installer smoke tests
-        run: bash tests/test_installer.sh
+      - name: Run engine unit tests (plan-duel + diff-review supervisor)
+        run: python -m unittest discover -s tests -p 'test_*.py'
 
-      - name: Check for private path patterns
+      # Same suite under a NON-UTF-8 default text encoding. The shipped schemas and
+      # prompts contain em dashes, so any file read that forgets encoding="utf-8"
+      # silently mis-decodes on Windows (cp1252) — a class of bug that otherwise only
+      # surfaces in the 6-minute windows-latest job. ASCII here is stricter than
+      # cp1252, so this catches it in seconds. Linux only: it is a source-encoding
+      # check, not an OS check, and one runner proves it.
+      #
+      # The validator runs here too, not only the unittest suite. It was omitted
+      # originally, and that omission hid twelve bare `read_text()` calls and a bare
+      # `write_text()` in it for as long as they existed: the windows-latest job runs
+      # the installer tests only, so nothing ever executed the validator under a
+      # non-UTF-8 default. Its own reads are the ones aimed squarely at em-dash-laden
+      # prompt files, which makes it the last thing that should have been left out.
+      #
+      # Tracker checking is deliberately NOT here: it needs a plan directory, which not
+      # every clone of this pack has, and this step must run everywhere. Its rules are
+      # covered regardless — tests/test_plan_tracker.py builds throwaway plan directories
+      # and runs under the unittest step.
+      - name: Run engine unit tests and the validator under a non-UTF-8 locale (Windows-encoding proxy)
+        if: runner.os == 'Linux'
+        env:
+          PYTHONUTF8: "0"
+          LC_ALL: C
+          LANG: C
         run: |
-          if grep -rnE 'dotfiles/claude/skills|~/projects' skills/; then
-            echo "ERROR: Private path patterns found in skills/"
-            exit 1
-          fi
+          python -m unittest discover -s tests -p 'test_*.py'
+          python scripts/validate_cross_runtime.py skills/
+          python scripts/validate_cross_runtime.py --test-fixtures tests
 
-  installer-windows:
+  windows:
     runs-on: windows-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # Exercise both the OS-default Windows PowerShell 5.1 (powershell.exe)
-        # and PowerShell 7+ (pwsh, preinstalled on the runner). The matrix value
-        # is the interpreter name; it can't go in `shell:` (matrix context isn't
-        # allowed there), so it is invoked from `run:` instead.
-        interpreter: [powershell, pwsh]
-    name: installer-windows (${{ matrix.interpreter }})
+    timeout-minutes: 30
+    # ONE job, not a two-interpreter matrix. The matrix existed because the installer
+    # was written twice -- once in bash, once in PowerShell -- and PowerShell 5.1 and 7
+    # are different enough that both had to be exercised. With one Python installer there
+    # is no PowerShell left to test, so what remains is the real Windows coverage the
+    # Python suites give: .cmd/.bat quoting, PATHEXT, UTF-8 against the console code
+    # page, CRLF, and paths with spaces.
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run installer checks (analysis + Pester)
-        run: ${{ matrix.interpreter }} -NoProfile -ExecutionPolicy Bypass -File tests/ci-windows.ps1
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # FAIL FAST. This job is the critical path — twelve minutes against four for Linux
+      # and macOS, which run alongside it — so what matters is not running LESS but failing
+      # SOONER. These four suites carry nearly all the Windows-specific behaviour (path
+      # separators and case, `PATHEXT` and `.cmd` resolution, the console code page against
+      # UTF-8, CRLF, file locking during replace, and which `os` calls take a file
+      # descriptor) and they are a small fraction of the suite's runtime, so a Windows-only
+      # break surfaces in under a minute instead of after the full discover.
+      #
+      # `test_review_runner` is deliberately NOT here despite being Windows-relevant: it is
+      # 50 of those 111 seconds on its own, which would turn a fast check back into a slow
+      # one. It runs in the full discover below, as does everything else. Nothing is
+      # skipped; only the order in which a failure surfaces changes.
+      - name: Windows-sensitive suites first
+        run: >
+          python -m unittest
+          tests.test_install_py
+          tests.test_encoding_hygiene
+          tests.test_skill_traversal
+          tests.test_plan_duel_engine
+
+      - name: Run the test suites on Windows
+        run: python -m unittest discover -s tests -p "test_*.py"
+
+      # The validator runs HERE too, not only on Linux and macOS. Its path handling, its
+      # traversal and its encoding are the parts most likely to differ on Windows, and a
+      # rule that is only ever exercised on POSIX is a rule whose Windows behaviour nobody
+      # has seen.
+      - name: Validate portability on Windows
+        run: python scripts/validate_cross_runtime.py skills/
+
+      # The fixture corpus runs here too. A negative fixture proven able to fail only on
+      # POSIX is a rule whose Windows behaviour nobody has seen, which is the same argument
+      # as the step above applied to the half that was exempt from it. It needs the symlink
+      # cases guarded — symlink
+      # creation needs elevation here, so adding the step would have ERRORED rather than
+      # passed. Those cases were the tracker check's, and they left with it for
+      # `tests/test_plan_tracker.py`, where they are guarded. Measured before this step was
+      # added: with symlink creation forced to raise OSError 1314, the corpus reports zero
+      # errors. A negative fixture that has only ever been proven able to fail on POSIX is
+      # a rule whose Windows behaviour nobody has seen — the same argument as the line
+      # above, applied to the half that was exempt from it.
+      - name: Run validator fixture tests on Windows
+        run: python scripts/validate_cross_runtime.py --test-fixtures tests

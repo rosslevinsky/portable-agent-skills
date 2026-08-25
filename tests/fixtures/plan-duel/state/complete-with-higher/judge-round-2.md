@@ -1,0 +1,3 @@
+SCORE: 7
+
+PREFERRED: A

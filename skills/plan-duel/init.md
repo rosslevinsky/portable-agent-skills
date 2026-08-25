@@ -1,79 +1,74 @@
 # Plan Duel — Round 0: Initial Plans
 
-Uses: `workdir`, `plan_init_skill_path`.
+Perform the task described below and write only its output file.
 
-Both agents write their plan files directly. Run **simultaneously**:
+Two competing plans are being generated for the same problem, labeled A and B with
+no attribution. Each is produced independently from the problem statement in
+⟪workdir⟫/problem.md.
 
----
+## Agent A
 
-## Agent A (controller runtime)
+Follow the plan methodology below to produce a plan for the problem in
+⟪workdir⟫/problem.md. You are operating autonomously — there is no user to
+interview, so make reasonable assumptions wherever a planner would normally ask,
+and note each assumption in the plan where it applies.
 
-Spawn a sub-agent to generate Plan A. The controller runtime runs this
-sub-agent using its native orchestration mechanism:
+Write the complete plan document to ⟪workdir⟫/plan-a.md.
 
-> **Claude adapter:** Use the Agent tool with subagent_type=general-purpose
-> with the prompt below.
-> **Codex adapter:** Write the prompt below to `{workdir}/controller-prompt-0.txt`,
-> then run: `codex exec --skip-git-repo-check -C "{workdir}" "$(cat "{workdir}/controller-prompt-0.txt")" < /dev/null`
+## Agent B
 
-Prompt for the sub-agent:
+Follow the plan methodology below to produce a plan for the problem in
+⟪workdir⟫/problem.md. You are operating autonomously — there is no user to
+interview, so make reasonable assumptions wherever a planner would normally ask,
+and note each assumption in the plan where it applies.
 
-> Read the plan-init skill from `{plan_init_skill_path}` and follow
-> its methodology to produce a plan for the problem in `{workdir}/problem.md`.
-> You are operating autonomously — there is no user to interview, so make
-> reasonable assumptions where plan-init would normally ask questions, and note
-> each assumption in the plan.
->
-> Write the complete plan document to `{workdir}/plan-a.md`.
+Write the complete plan document to ⟪workdir⟫/plan-b.md.
 
----
+## Plan methodology (condensed v2)
 
-## Agent B (participant runtime)
+_Provenance: condensed from the plan-init skill's content model — a fix to
+either side lands in its mirror._
 
-Pre-create output files so the participant's file-write tooling does not fail
-on read-verify of nonexistent paths:
+Produce one structured plan document that a later work-breakdown step can split
+into executable phases. Work only from ⟪workdir⟫/problem.md plus whatever the
+problem statement itself references. Explore that material before writing:
+identify what must change, what must keep working, and which patterns already
+exist. Do not interview anyone and do not register the plan in any index — write
+only the plan file.
 
-```bash
-touch "{workdir}/plan-b.md"
-```
+The document carries these sections, in this order:
 
-Write `{workdir}/codex-prompt-0.txt`:
+1. **Title** — `# Plan: <human-readable title>`.
+2. **Goal** — one to three sentences: what is being built or changed and why,
+   with a concrete desired end state.
+3. **Success Criteria** — a checklist (`- [ ]`) of observable, testable
+   conditions that prove the work is done. Each item is falsifiable: a specific
+   test command, a specific behavior to verify, or a specific check to run. If
+   the work involves a web UI, include a visual-verification criterion (the
+   target flow verified across viewports, with screenshots inspected — not
+   merely produced).
+4. **Technical Constraints** — what the implementation must respect: existing
+   patterns and conventions to follow, dependencies or APIs that cannot change,
+   performance or compatibility requirements, anything that would block a merge
+   if violated.
+5. **Non-Goals** — what the plan explicitly does NOT address, even if related.
+   At least one entry.
+6. **Assumptions** — anything the plan rests on that was not given in the problem
+   statement, and what would change if it turned out to be wrong. Include this
+   section only when there is something to record; omit it entirely otherwise.
+7. **Affected Areas** — real file paths, grouped as: **Will change** (files
+   edited or created), **Must stay consistent** (callers/consumers that must
+   keep working), and **Tests** (test files needing new or changed coverage;
+   prefer TDD — the failing test is written before the implementation that
+   makes it pass).
 
-```
-Read the plan-init skill from {plan_init_skill_path}
-and follow its methodology to produce a plan for the problem in {workdir}/problem.md.
-You are operating autonomously — no user to interview. Make reasonable assumptions
-where plan-init would normally ask questions, and note each assumption in the plan.
+Keep the plan breakdown-unaware: no phases and no grouping — work
+breakdown happens later, outside the duel. Do not add version-marker rows
+(Format/Suite) yourself; the duel engine stamps the winning plan with the v2
+markers when the duel completes.
 
-Write the complete plan document to {workdir}/plan-b.md.
+## Writing files
 
-IMPORTANT: When writing or overwriting files, use shell commands
-(e.g. cat > file << 'EOF' ... EOF) rather than patch-based tools,
-to avoid read-verify errors on new or fully-rewritten files.
-```
-
-Invoke the participant runtime's CLI in non-interactive mode:
-
-> **Codex adapter:** `codex exec --skip-git-repo-check -C "{workdir}" "$(cat "{workdir}/codex-prompt-0.txt")" < /dev/null > "{workdir}/codex-round-0-status.md"`
-> **Other runtimes:** Adapt the invocation to the participant's CLI.
-
----
-
-## Validate and snapshot
-
-**Agent A:** If `plan-a.md` is missing or under 200 bytes — halt: "Agent A
-plan generation failed at round 0."
-
-**Agent B:** If `plan-b.md` is missing or under 200 bytes:
-- Fallback: scan workdir for any `.md` file other than `problem.md`,
-  `plan-a.md`, and `codex-round-0-status.md`, written in the last 5 minutes,
-  ≥200 bytes.
-  If found, copy to `plan-b.md` and log:
-  `Fallback: used {filename} as plan-b.md.`
-- If still not found — halt: "Agent B plan generation failed at round 0."
-
-Copy `plan-a.md` → `plan-a-round-0.md`
-Copy `plan-b.md` → `plan-b-round-0.md`
-
-Print: `Round 0 complete — initial plans written | A: NNNN words, B: NNNN words`
-(word counts via `wc -w < "{workdir}/plan-a.md"` and `wc -w < "{workdir}/plan-b.md"`).
+When writing or overwriting a file, write its complete contents in a single
+whole-file write rather than applying incremental patches, to avoid read-verify
+errors on newly created or fully-rewritten files.

@@ -74,9 +74,8 @@ Note what's available — do not reinvent what already exists.
 
 **Rules:**
 - Write tests before any implementation
-- Tests must import the not-yet-existing module/function/component — this is intentional
-- Run tests; confirm failure is "module not found" or "cannot find module" or
-  "attribute does not exist" — not a logic error or syntax error in the test itself
+- Tests must exercise behaviour that does not exist yet — this is intentional
+- Run tests; confirm the failure is caused by that absent behaviour, not by a broken test
 - If tests pass immediately, the feature already exists — stop and report that to the user
 
 Write the tests in the appropriate location following the project's existing conventions
@@ -84,11 +83,22 @@ for test file placement and naming.
 
 **After writing tests — run them and confirm RED:**
 
-Show the failure output. If it says `ImportError`, `ModuleNotFoundError`, or
-`Cannot find module`, that's the expected red state. Proceed to Phase 3.
+Show the failure output. A correct red takes either shape:
 
-If it fails for any other reason (syntax error, wrong assertion, etc.), fix the test
-first — the test must be correct before the implementation begins.
+- **Something that does not exist yet** — the name, the attribute, or the *signature*
+  you are calling has nothing behind it: `ImportError`, `ModuleNotFoundError`,
+  `Cannot find module`, `AttributeError`, a `TypeError` naming an argument the function
+  does not accept yet, or a `NotImplementedError` raised by a stub. These are the common
+  shapes, not a closed set: what makes a red correct is that the *behaviour* is absent,
+  not which exception carries the news. Adding a parameter to an existing function reds
+  as a `TypeError`, and that is a legitimate red — not a broken test to be repaired.
+- **New behaviour on an API that already exists** — a **failing assertion**: the call
+  runs and returns the old answer. This is the usual red when extending existing code,
+  and it is a valid red, not a broken test.
+
+Either one means proceed to Phase 3. If it fails for any other reason (syntax error,
+wrong import path, fixture or setup error), fix the test first — the test must be
+correct before the implementation begins.
 
 ---
 
