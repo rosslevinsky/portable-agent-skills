@@ -1,244 +1,241 @@
 ---
 name: plan-phase
 description: >
-  Work breakdown structure: reads a plan document and breaks it into ordered
-  phases. Proposes the phase structure to the user for approval, then creates
-  a phase document (with checklist) for each phase and writes a new phases.md
-  execution tracker alongside the plan. The original plan document is never
-  modified. Use when the user invokes /plan-phase, or says "break this down into
-  phases", "create the phase documents", "do the work breakdown", "WBS this plan".
-  Argument: path to a plan.md file (e.g. plans/auth-refactor/plan.md).
-  If no argument, scan plans/ for plan.md files and ask which one.
+  Work breakdown for a plan — the current planning suite. Reads a `Format: v2`
+  plan.md, proposes an ordered phase list (noting in prose which phases are
+  independent and which reconciles them), then writes one phase document per phase
+  plus the checkbox execution.md tracker (never phases.md). UI
+  phases get a spec item and a visual-verify gate box; every phase carries a compact
+  evidence record. Use when the user invokes /plan-phase, or says "break this plan into
+  phases", "WBS the plan", "create the execution.md tracker".
 ---
 
-# Work Breakdown Structure
+# Work Breakdown Structure (v2)
 
 ## Overview
 
-Read a plan document, analyze the scope, propose a phase structure for approval,
-then produce phase documents and a `phases.md` execution tracker. The original
-plan document is left untouched — it is a stable reference.
+Read a `Format: v2` plan document, propose an ordered **phase list** for approval, then
+produce v2 phase documents and an **`execution.md`** tracker. The original plan is
+never modified.
 
-Each phase must be independently committable — it should leave the codebase in a
-working state. Phases flow forward: earlier phases unblock later ones, never the reverse.
+Two things distinguish this from `/plan-phase-v1`:
 
----
+1. **The phase document is the durable state; the tracker is a derived index.** Every
+   item of Work, every Test and every Gate box in a phase document is a checkbox ticked as
+   the work proceeds, and `execution.md` holds one checkbox per phase, ticked when that phase's
+   gate passes. There are no status values and no scheduling keys anywhere: two levels of
+   record, the child authoritative, is what makes a crash at any point recoverable.
+   Phases that are genuinely independent are noted in **prose** above the list; that is
+   advisory and is not parsed.
+2. **A distinct tracker filename — `execution.md`, never `phases.md`.** With `plan.md`'s
+   `Format: v2` marker this is the entire v1↔v2 non-collision mechanism: v2 skills act
+   only on `Format: v2` plans and read/write `execution.md`; the v1 skills only ever
+   touch `phases.md`.
 
-## Step 1 — Locate the plan
-
-If the user provided a path argument, use it. Otherwise:
-- Search for plan files matching `plans/**/plan.md`
-- If exactly one exists, use it
-- If multiple exist, list them and ask the user which one to break down.
-  If operating autonomously, choose the only incomplete plan; if all are
-  incomplete, choose the most recently modified one and note the assumption.
-- If none exist, tell the user to run `/plan-init <task>` first, or provide any
-  markdown file containing a goal and scope description
-
-Read the plan document in full.
-
-### Handling non-plan-init input
-
-If the file was not produced by `/plan-init`, look for equivalent content:
-
-| Expected section | Acceptable equivalents |
-|---|---|
-| Goal | Objective, Summary, Overview, Problem Statement |
-| Success Criteria | Acceptance Criteria, Definition of Done, Tests |
-| Affected Areas | Scope, Files, Components, Modules |
-| Technical Constraints | Constraints, Requirements, Technical Notes |
-
-If a section is missing entirely, note what couldn't be found and either:
-- Ask the user to clarify (if the gap is material — e.g. no goal at all)
-- Make a reasonable inference and proceed, noting the assumption
-
-Do not refuse to proceed just because the format differs from plan-init output.
+Each phase is independently committable and sized for review cost. Every phase it emits carries a
+per-phase gate whose independent-review axis is a **cross-model** `diff-review` when a second
+runtime is installed (Codex reviewing Claude's code or the reverse — see Step 5), giving at review
+time the same different-model scrutiny `/plan-duel` gives at plan time. The document
+contract (phase-document shape and tracker structure) is defined in
+`references/v2-templates.md` — emit against it exactly. Where the pack's tracker check is
+present in the repository you are working in, `scripts/check_plan_tracker.py` machine-checks
+what you emit; it is not installed with the skills, so in another project it will not be
+there and the templates are the whole contract.
 
 ---
 
-## Step 2 — Explore for breakdown context
+## Step 1 — Locate the plan and confirm it is v2
 
-Based on the plan's affected areas (or equivalent scope section), explore the codebase:
-- Read the key files that will change
-- Identify natural seams: what can be done independently, what has dependencies
-- Look at existing test files to understand what tests currently exist vs. need to be written
-- Note any migration concerns (DB schema, API contracts, translations, etc.)
+If the user provided a path argument, use it. Otherwise search for `plans/**/plan.md`;
+if exactly one exists use it, else list them and ask which to break down (autonomously:
+choose the only `Format: v2` plan, or the most recently modified one, and note the
+assumption). Read the plan in full.
 
-**Verify every assumption against the actual codebase before designing phases.**
-Do not assume a file exists or a path is correct — check it. If the plan's Affected
-Areas list contains paths that don't exist or have moved, note the discrepancy.
+**Confirm the `Format: v2` marker** — the `| Format | v2 |` row in the Status table.
+If it is absent, this is a v1 plan: do **not** proceed. Tell the user to run
+`/plan-phase-v1` instead (which writes `phases.md`). If operating autonomously, stop and
+report: "plan is not `Format: v2` — refusing to avoid a v1/v2 tracker collision."
 
-Use this exploration to inform phase granularity. Phases should be:
-- Small enough to commit independently (1–6 hours of focused work)
-- Large enough to be meaningful (not a single line change unless it's a critical gate)
-- Ordered so each builds on the last without breaking anything
-
----
-
-## Step 3 — Design the phases (internal)
-
-Think through the full sequence before presenting anything to the user. Consider:
-
-1. **Foundation first** — schema changes, new models, interface definitions before their consumers
-2. **Tests are mandatory, not optional** — every phase that introduces new behaviour must include
-   tests for that behaviour. For API endpoints, business logic, and utilities: prefer TDD
-   (failing test written before implementation). For UI and wiring code: tests written
-   alongside. No phase is complete without its tests passing.
-3. **Backend before frontend** (usually) — or at least the API contract before the UI
-4. **Risky changes isolated** — put anything with blast radius in its own phase
-5. **Final phase = verification gate** — last phase runs all success criteria from the plan
-
-Target 3–8 phases. Too few means each phase is too risky; too many means overhead.
-
-For each phase determine:
-- A short human-readable name (title case, e.g. "Add Schema Migration")
-- A kebab-case filename slug (e.g. `add-schema-migration`)
-- A one-sentence goal
-- Entry criteria: what must be true before this phase can start
-- A rough list of tasks (3–8 bullet points — specific but not yet fully detailed)
-- Exit criteria: the formal definition of done for this phase (separate from the task checklist)
-- The verification command(s) to run at the end
+**Output directory:** phase documents and `execution.md` are always written into the
+**same directory as the plan file you just read** — every `plans/<slug>/` path below names
+that directory, whatever it turns out to be. Discovery above accepts a plan anywhere, so
+when the plan lives outside `plans/` (say `docs/proposal.md`) the phase documents and
+`execution.md` go beside it, in `docs/`, never into an invented `plans/<slug>/`. That is
+where `/plan-run` looks: it reads `execution.md` from the plan's own directory, so a
+tracker written anywhere else is a tracker nothing will ever find.
 
 ---
 
-## Step 4 — Present proposed phases and ask for approval
+## Step 2 — Explore for breakdown context and shared surfaces
 
-**Before writing any files**, show the user the proposed breakdown in a single message:
+Explore the plan's affected areas in the codebase (read the key files, find natural
+seams, note existing tests and migration concerns), verifying every path against
+reality. In addition, so you can say honestly which phases are independent, identify:
 
-```
-Here's the proposed breakdown for "<plan title>" — N phases:
+- The **affected-file set** each prospective phase would touch.
+- **Shared surfaces** — coupling that hides behind disjoint file lists: shared
+  APIs/contracts, schema/migrations, generated files, lockfiles, global/theme CSS,
+  shared test fixtures, and shared test-env state.
 
-Phase 1: <Name>
-  Goal: <one sentence>
-  Entry: <what must be true before this phase starts>
-  Tasks: <3–5 bullet points of what this phase covers>
-  Verify: <test command>
-  Exit: <formal done criteria>
+---
 
-Phase 2: <Name>
-  ...
+## Step 3 — Design the phase list (internal)
 
-Does this breakdown look right? A few things you can tell me:
-- Add, remove, or merge phases
-- Move tasks between phases
-- Change the scope of any phase
-- Adjust the order
+Design the phases first (foundation before consumers; tests mandatory per phase;
+risky changes isolated; a final verification-gate phase). **Every phase that introduces
+new behaviour is test-first:** for logic, API endpoints, and utilities the failing test
+is written before the implementation (TDD); for UI and wiring, tests are written
+alongside — no phase is complete until its tests pass. This ordering flows into each
+emitted phase doc's Tests section (the template's test-first note is load-bearing —
+keep it). Then decide which, if any, are genuinely **independent**.
 
-Reply "looks good" to proceed, or describe any changes.
-```
+**Independent phases are rare, and that is correct.** Almost every phase executed so far
+has been a single sequential unit. Note independence when it is real; do not reach for it
+to signal that work is parallelisable in principle. The test:
 
-Wait for the user's response. If they request changes, revise the breakdown
-and re-present it. Repeat until they confirm. Do not create any files until
-the user approves the structure.
+- Phases are independent only if their affected-file sets are **disjoint** *and* none of
+  them shares a surface with another. **Disjoint files is a filter, not proof of
+  independence** — any shared surface means run them in order, because isolating writers
+  covers *files* and cannot reconcile shared non-file state like a DB, ports, or caches.
+- Where phases are independent, **say so in prose above the phase list**, and name the
+  phase that **reconciles** them. That phase's own document carries the reconciliation:
+  its Work brings the work together and its Verification runs the full suite. Nothing
+  about this is a key in the tracker.
+- A phase that changes the **build / dependency-resolution / CI topology** can't be
+  verified in the dev environment alone (resolution and hoisting differ from CI); make
+  **"the CI round for the commit this phase ends at is green"** one of its Gate boxes —
+  naming the repository and ref it runs in — and keep it an ordinary sequential phase.
 
-If operating autonomously (no user available), proceed with the internally
-designed phase breakdown and note the assumption that it was not user-reviewed.
+Size each phase so its diff is cheap to review — reviewability is a first-class
+constraint. Target 3–8 phases.
+
+---
+
+## Step 4 — Propose the breakdown and get approval
+
+**Before writing any files**, present the proposed phase list in one message: the
+ordered phases; which (if any) are independent of one another and why (disjoint files,
+no shared surface); which shared surfaces forced sequencing; and which phase reconciles
+each independent set. Invite the user to add, remove, merge, re-order, or re-scope
+phases, or to make an independent set strictly sequential.
+
+Wait for approval; revise and re-present until confirmed. If operating autonomously
+(no user available), proceed with the proposed graph and note that it was not
+user-reviewed.
 
 ---
 
 ## Step 5 — Write phase documents
 
-For each approved phase N, create `plans/<slug>/phase-<NN>-<name>.md`
-(zero-padded number, e.g. `phase-01-add-schema-migration.md`).
+**Before writing anything into `plans/<slug>/`, check whether that plan directory already
+holds an execution tracker *or any* `phase-*.md`.** This check belongs here, ahead of the
+first write — not beside the tracker write in Step 6 — because Step 5 recreates every phase
+document. A guard that only protects `execution.md` still lets a literal execution destroy a
+finished plan's phase documents and their evidence before it stops. If
+`plans/<slug>/execution.md` exists, **or the directory holds any `phase-*.md`**, do not
+overwrite anything. Three cases, all destructive to get wrong:
 
-Each phase document uses this structure:
+- **It is a checkbox tracker** — the plan is live and possibly mid-run; its unticked
+  boxes are exactly where the run resumes. Overwriting resets that progress. Ask the user
+  whether to re-plan or resume; autonomously, stop and report rather than discarding
+  execution state.
+- **It is a superseded `- phase:` tracker** — the directory is the finished record of a run
+  executed under an older shape. Writing fresh documents over it destroys that record.
+  Leave it alone; start a new plan directory instead.
+- **`phase-*.md` documents with no tracker beside them at all** — an earlier run of this
+  skill stopped between Step 5 and Step 6. This is the case a tracker-only guard waves
+  straight through, and the one where the damage is worst: with no tracker there is nothing
+  to resume from, so nothing looks wrong until the evidence records are already overwritten.
+  Stop and ask; do not assume an unfinished directory is a scratch one.
 
-~~~markdown
-# Phase <N>: <Human-Readable Name>
+For each approved phase N, create `plans/<slug>/phase-<NN>-<name>.md` from the **phase
+document template** in `references/v2-templates.md`. Fill:
 
-_Status: pending_
-
-## Goal
-
-<One sentence: what this phase accomplishes and why it matters.>
-
-## Entry Criteria
-
-Before starting this phase, confirm:
-- [ ] <Prior phase committed, pushed to origin, and verified, or "This is the first phase">
-- [ ] <Any specific precondition — e.g. "migration X applied", "API shape agreed">
-
-## Tasks
-
-- [ ] <Specific task: what file, what change, what outcome>
-- [ ] <Another specific task>
-- [ ] <...>
-
-## Tests
-
-_For logic, API endpoints, and utilities: write failing tests before implementation (TDD).
-For UI and wiring: write tests alongside the code._
-
-- [ ] `<path/to/test_file>` — <what behaviour it covers>
-- [ ] <additional test file if needed>
-
-## Verification
-
-Run these after completing all tasks:
-
-```bash
-<test command 1>
-<test command 2 if needed>
-```
-
-Also verify manually:
-- <Specific thing to check that tests won't catch>
-
-## Exit Criteria
-
-This phase is complete only when ALL of the following are true:
-- [ ] Every task above is checked off
-- [ ] All tests listed in the Tests section are written and passing
-- [ ] No previously passing tests have regressed
-- [ ] All verification commands pass with no failures
-- [ ] Run the `cyw` skill (or equivalent manual review) — finds zero issues
-- [ ] <Any additional condition specific to this phase>
-- [ ] phases.md phase checkbox updated to `[x]`
-
-## Commit
-
-```
-<suggested commit message — imperative, under 72 chars>
-```
-~~~
-
-Use real file paths from the codebase. Tasks should be specific enough that another
-engineer could follow them without re-reading the plan. Follow all conventions
-defined in the project's `CLAUDE.md` / `AGENTS.md` (whichever exists).
+- **Goal / Work / Tests / Verification / Gate / Evidence**, using real codebase paths.
+  **Verification commands are scoped to the phase's changed surface** — the full suite
+  appears only in a reconciling phase or a final verification-gate phase, never in an
+  ordinary phase. Include the phase's cheap per-surface static checks (linter check-only,
+  and a scoped type-check where the project has one); defer only genuinely
+  environment-bound checks to CI.
+- **Emit only the boxes that apply.** The Gate section always carries the two review boxes —
+  author review completed, independent review with no open blocker/major — and those two are
+  ticked with a reason even when the phase produced no reviewable diff. A **UI** phase also
+  gets a spec item under Work and a visual-verification box (run the `web-verify` skill;
+  where unavailable, its bundled manual checklist across the mandatory viewports). A phase
+  whose verification needs the **CI/prod environment shape** also gets a CI box naming the
+  repository and ref — that is the whole mechanism, and it needs no tracker state. A phase
+  with neither gets neither: an inapplicable box is one nobody can tick, and `plan-run`
+  reads any open box as unfinished work.
+- **Never emit a box that restates another, or one that cannot be true.** No "every task
+  above is checked off", no universal "the previous phase is done" (the tracker's order
+  already says it), and never "this phase's box is ticked in `execution.md`" — `plan-run`
+  reads the document to decide that, so as a criterion it is circular.
+- **Every box is ticked as it becomes true, never in a batch at the end.** Say so explicitly
+  in any phase whose Work includes an irreversible action (creating a tag, a release, a PR),
+  and write that item so its outcome is *checkable*: on resume, `plan-run` looks for the
+  outcome before repeating the action.
 
 ---
 
-## Step 6 — Write phases.md
+## Step 6 — Write the `execution.md` tracker
 
-Create `plans/<slug>/phases.md` — the execution tracker. Do not modify plan.md.
+Create `plans/<slug>/execution.md` (never `phases.md`) from the **tracker template** in
+`references/v2-templates.md`: one checkbox per phase, in execution order, each linking its
+phase document. It carries **no** format marker, no status values and no scheduling keys.
+It must satisfy the validator's rules:
 
-~~~markdown
-# Phases: <human-readable title>
+- every column-0 checkbox line is the exact canonical form —
+  `- [ ] [<Name>](./phase-<NN>-<slug>.md)`, or the same with `- [x] `, where `<NN>` is at
+  least two digits and `<slug>` is kebab-case;
+- each link resolves to an existing regular file in the same plan directory — not a
+  symlink — and no phase is listed twice;
+- every `phase-*.md` entry in that directory appears in the list exactly once;
+- there is **at least one checkbox** — zero is a hard error, never "all phases complete";
+- no code fence or HTML comment appears anywhere in the file. They are banned rather than
+  parsed: either can hide a whole region from the checker while a reader sees it plainly.
 
-_Execution tracker for [`plan.md`](./plan.md)_
+Which phases are independent, and which phase reconciles them, goes in **prose above the
+list**. It is advisory and is not parsed. Do not use a `###` sub-heading for it — a blank
+line does not end a `###` section, so the reconciling phase would read as another member.
 
-## Status
+**Put every checkbox under the one `## Phases` heading.** Neither the checker nor `plan-run`
+parses that heading — both read every column-0 checkbox in the file, in order — so a box
+placed under some other heading is executed anyway, in list position, which is unlikely to
+be what its author meant.
 
-| Field | Value |
-|---|---|
-| Phase | Phase 1 of N — <Phase 1 Name> |
-| State | Ready to execute |
-| Blocker | None |
-| Last updated | <date> |
+The orchestrator owns this file; phases never write it.
 
-## Phases
+**Machine-check the tracker before finishing.** If the pack's tracker check is present in
+this repo (you are working inside portable-agent-skills), run it against the file you
+just wrote and fix every reported issue before continuing:
 
-- [ ] [Phase 1: <Name>](./phase-01-<name>.md)
-- [ ] [Phase 2: <Name>](./phase-02-<name>.md)
-- [ ] ...
-~~~
+```bash
+# native Windows: py -3 instead of python3
+python3 scripts/check_plan_tracker.py plans/<slug>/execution.md
+```
+
+**One of its findings has a destructive wrong fix.** `'<name>' is in this directory but no
+checkbox links it` names a `phase-*.md` the tracker does not reference. Fix it by **adding
+the checkbox**, in that phase's right position. Never delete the document to silence the
+check: if you did not write it this run it belongs to a plan you have not read, and deleting
+it discards that plan's evidence record. If you cannot place it confidently, stop and ask.
+
+If the tracker check is not present (the usual case when running inside another
+project), re-read the tracker against the rules above and confirm each by hand — the emitted tracker
+must satisfy the same contract either way.
 
 ---
 
 ## Step 7 — Report to the user
 
-Print a summary:
-- Location of `phases.md` and number of phase files created
-- One-line description of each phase
-- Total checklist items across all phases
-- Next step: "Run `/plan-run plans/<slug>/plan.md` to execute all phases."
+Print a summary: the location of `execution.md` and the phase files; a one-line
+description of each phase (and which, if any, are independent of one another); the
+total checklist items; and the next step: "Run `/plan-run <the plan file you read>` to
+execute the phases." Name its real path — a literal `plans/<slug>/plan.md` points the
+runner at a file that does not exist whenever the plan came from anywhere else.
+
+## References
+
+- `references/v2-templates.md` — the v2 phase-document template (Goal / Work / Tests /
+  Verification / Gate / Evidence, and what is deliberately not in it) and the `execution.md`
+  checkbox tracker template.

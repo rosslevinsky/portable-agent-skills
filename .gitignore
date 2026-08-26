@@ -11,3 +11,62 @@ __pycache__/
 
 # Claude Code per-cwd scheduled-tasks lockfile (runtime state, never commit).
 .claude/scheduled_tasks.lock
+
+# Agent worktrees. Claude Code checks a branch out here when a task runs in isolation, so
+# the directory holds whole extra copies of this repository — transient tool state, exactly
+# like __pycache__, and never something to commit.
+#
+# It is ignored because whole-tree checks were reading it and could not be trusted while it
+# existed. `git ls-files --others --exclude-standard` reports each nested checkout as a
+# single directory entry, which a caller expecting file paths then tries to open and dies
+# on with IsADirectoryError. The privacy sweep walked into them and reported hundreds of
+# violations out of those checkouts' own fixtures — a guard nobody can read is off.
+# (The sweep also now skips untracked files outright; this rule is what keeps them out of
+# a listing in the first place, and the two are not substitutes.)
+.claude/worktrees/
+
+# Claude Code's per-user local settings, written automatically beside the tracked
+# settings.json and filled with absolute home-directory paths and per-machine permission
+# grants. Every contributor to this repository is an agent user, so this is the likeliest
+# accidental commit here — and its contents are precisely what the validator's privacy
+# sweep exists to keep out of a published tree. Only the local override is ignored.
+.claude/settings.local.json
+
+# Playwright / web-verify + demo-video artifacts (heavy; reference by path/CI-URL,
+# never commit — see web-verify and the v2 planning workflow).
+#
+# Scoped to the output directories on purpose. A bare `*.webm` / `*.vtt` / `*.srt` glob
+# is exactly what skills/demo-video/SKILL.md warns against: a repo-wide media glob
+# silently untracks legitimately committed video or
+# caption assets elsewhere in the tree. Every artifact those skills produce already
+# lands in one of the directories below, so nothing needs the broader form. Keep any
+# new rule scoped to a directory.
+test-results/
+playwright-report/
+trace.zip
+*-trace.zip
+web-verify-frames/
+demo-video-output/
+demo-video-frames/
+
+# plan-run per-phase progress logs for a delegated phase (ephemeral observation only —
+# never committed; see the Delegation section of skills/plan-run/SKILL.md).
+plans/**/progress/
+
+# Saved runtime transcripts. They must outlive a session, so they cannot simply be written
+# to a temporary directory — but they are megabytes of one runtime's raw stream, they embed
+# absolute temporary paths, and they are evidence rather than source.
+plans/**/runs/
+
+# Your own private identifiers — repo names, internal package scopes, scaffolding-script
+# names — that the validator should flag if they appear in a skill. Never commit this: the
+# whole point of the file is to hold names that must not be published, so a copy that ships
+# leaks exactly what it exists to catch.
+#
+# This rule protects a file you CREATE. It does not untrack one already committed: git
+# applies .gitignore to untracked paths only. That asymmetry is deliberate — a project that
+# already tracks such a file goes on tracking it, while the copy you write in your own clone
+# stays invisible to git. Verified in both directions before this line was written.
+#
+# Start from scripts/private-identifiers.txt.example.
+scripts/private-identifiers.txt

@@ -1,0 +1,27 @@
+# Line endings are this repository's decision, not the clone's.
+#
+# Git for Windows writes `core.autocrlf=true` at install time — the option worded
+# "Checkout Windows-style, commit Unix-style line endings" — so a Windows clone gets CRLF
+# for anything git reads as text unless something here says otherwise. Measured on this
+# repository: `git -c core.autocrlf=true clone` produces 161 CRLF pairs in
+# `extract-frames.sh`, and both ways of running it die.
+#
+#     ./extract-frames.sh        env: 'bash\r': No such file or directory      exit 127
+#     bash extract-frames.sh     $'\r': command not found
+#                                set: pipefail: invalid option name            exit 2
+#
+# `web-verify/SKILL.md` tells the user to run that file. It is the only shell script the
+# pack ships — every other shell script was removed on Windows-portability grounds.
+*.sh text eol=lf
+
+# Nothing else is pinned, and that is a decision rather than an oversight. Every other
+# tracked file is `.md`, `.py`, `.json`, `.txt`, `.yml` or `.toml`, and all of them read
+# CRLF without complaint: Python's tokenizer, `json.load`, and every `read_text()` in this
+# tree open in text mode, where universal newlines turn `\r\n` into `\n` before any caller
+# sees it. A blanket `* text=auto eol=lf` would be safe today — measured: no tracked file
+# is binary and none deliberately carries a carriage return — but it would be a rule
+# written for a hazard nobody has, and this project has been paying for those.
+#
+# The one place line endings did matter off this list was the installer's manifest, which
+# `write_manifest` now writes with `newline="\n"`. That belongs in the code: the file is
+# generated on a user's machine and never passes through a checkout.

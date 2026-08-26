@@ -1,0 +1,5 @@
+# Code owners for portable-agent-skills
+#
+# Every PR that changes any file requires an approving review from @rosslevinsky
+# (enforced via branch protection: "Require review from Code Owners" on main).
+* @rosslevinsky

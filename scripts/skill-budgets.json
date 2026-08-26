@@ -1,0 +1,15 @@
+{
+  "clarify": 499,
+  "commit": 1764,
+  "cyw": 642,
+  "demo-video": 1745,
+  "diff-review": 3225,
+  "extract-hooks": 871,
+  "plan-duel": 4830,
+  "plan-init": 2397,
+  "plan-phase": 3230,
+  "plan-run": 8529,
+  "security-review-codebase": 4448,
+  "tdd": 970,
+  "web-verify": 1914
+}

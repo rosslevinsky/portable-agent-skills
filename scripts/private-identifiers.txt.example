@@ -1,0 +1,37 @@
+# Your own private identifiers — copy this file to `private-identifiers.txt` and edit.
+#
+# WHAT THIS IS FOR
+# The validator refuses to let private names leak into a skill file. Some of those names are
+# private for everybody — a home directory, a personal path — and those are built in. The rest
+# are private to YOU: your company's repo names, an internal package scope, the name of a
+# scaffolding script nobody outside your team has heard of. Those cannot be built in, because
+# this validator ships. Put them here instead.
+#
+# WHY A SEPARATE FILE
+# A guard against publishing private names must not publish them itself. Anything written
+# directly into the validator would travel with it to every clone — which is the disclosure the
+# check exists to prevent. This file is gitignored, so your copy stays on your machine.
+#
+# It is optional. No file is the normal case and the validator simply carries on with its
+# built-in patterns.
+#
+# FORMAT
+#   - One Python regular expression per line.
+#   - Blank lines and lines starting with '#' are ignored.
+#   - A line that will not compile is a hard error, never a silent skip: a guard that quietly
+#     drops a pattern is worse than no guard, because you believe you are covered.
+#
+# \b means "word boundary" — it stops `acme` from also matching `acmesoft`. Escape dots
+# (`\.`), since an unescaped `.` matches any character.
+#
+# EXAMPLES — delete these and add your own.
+#
+# \bacme_internal\b        a private repository name
+# @acme                    an internal npm scope
+# \bdeploy-prod\.sh\b      an internal script name
+# \bacme\.corp\b           an internal hostname
+#
+# CHECK IT WORKS
+#   python3 scripts/validate_cross_runtime.py skills/
+# Add one of your names to a skill file, run that, and confirm it fails. A check you have
+# never seen fail is a check you have not tested.

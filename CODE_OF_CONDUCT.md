@@ -36,7 +36,7 @@ This Code of Conduct applies within all community spaces, and also applies when 
 
 ## Enforcement
 
-Instances of abusive, harassing, or otherwise unacceptable behavior may be reported to the community leaders responsible for enforcement at https://github.com/rosslevinsky/portable-agent-skills/security/advisories/new (via GitHub's private vulnerability reporting). All complaints will be reviewed and investigated promptly and fairly.
+Instances of abusive, harassing, or otherwise unacceptable behavior may be reported to the community leaders responsible for enforcement at https://github.com/rosslevinsky/portable-agent-skills/security/advisories/new. That is GitHub's private vulnerability reporting form, used here because it is the only private channel this repository has — a conduct report is not a security vulnerability, and you are not misusing it by sending one. All complaints will be reviewed and investigated promptly and fairly.
 
 All community leaders are obligated to respect the privacy and security of the reporter of any incident.
 

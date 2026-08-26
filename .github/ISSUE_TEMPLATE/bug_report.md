@@ -31,7 +31,7 @@ Minimal command line or skill text that triggers the issue:
 
 - OS and version (e.g. macOS 14.4, Ubuntu 22.04):
 - Shell (bash/zsh, version):
-- Python version (`python --version`):
+- Python version (`python3 --version`; native Windows: `py -3 --version`):
 - Runtime (Claude Code / Codex CLI, version if known):
 - This repo version (tag or commit): 
 

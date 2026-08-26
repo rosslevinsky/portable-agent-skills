@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 If you believe you've found a security issue in Portable Agent Skills — for
-example, a bug in `install.sh` that could be abused to overwrite user files
+example, a bug in `install.py` that could be abused to overwrite user files
 outside the configured skills directory, or a validator bypass that lets
 unsafe skill content slip through CI — please report it **privately** via
 GitHub Security Advisories:
@@ -22,19 +22,49 @@ exploitation easier before a fix can ship.
 
 This repository contains:
 
-- Markdown workflow documents (`SKILL.md`) — no runtime code, no network
-  calls, no credentials handling.
-- A Bash installer (`install.sh`) that writes into user-configurable skill
-  directories.
-- A Python validator (`scripts/validate_cross_runtime.py`) that reads
-  skill files and tests fixtures.
+- Markdown workflow documents (`SKILL.md`) and their `references/` —
+  instructions, not runtime code; no credentials handling.
+- One stdlib-only Python installer (`install.py`) that copies skill
+  directories into user-configurable skill directories. It replaced the bash
+  and PowerShell installers in `v2026.08.0`; earlier tags still ship those,
+  so a report against `install.sh` or `install.ps1` is about a released tag
+  rather than current `main`. The pack can also be installed by an
+  [Agent Plugins](https://agent-plugins.org) 1.0.0 client reading
+  `plugin.json`, which does not run `install.py` at all.
+- Two stdlib-only Python programs that read paths you give them.
+  `scripts/validate_cross_runtime.py` walks a skill tree and **refuses** any
+  entry that resolves somewhere other than where it sits, rather than
+  following it. `scripts/check_plan_tracker.py` reads an `execution.md`
+  tracker and resolves the phase documents it links, requiring each to be a
+  regular file in that same plan directory.
+- Two stdlib-only Python programs that make no network calls and handle no
+  credentials, but do launch another CLI as a child process:
+  `skills/plan-duel/plan_duel.py` (the duel engine) and
+  `skills/diff-review/review_runner.py` (the reviewer supervisor).
+- One bash script, `skills/web-verify/references/extract-frames.sh`, which
+  invokes `ffmpeg` over a video path you supply and writes into an output
+  directory you supply.
+- The project's own test suites and CI, which are published rather than kept
+  back: twelve Python suites under `tests/`, two stub CLIs under
+  `tests/fixtures/plan-duel/` that stand in for a real runtime, and
+  `.github/workflows/validate.yml`. They are not part of an install and a
+  user never runs them, but they are executable code in the published tree
+  and reports against them are in scope.
 
 Relevant concerns include:
 
 - **Installer**: path traversal, symlink attacks on the install target,
   accidental overwrite of user data.
-- **Validator**: crafted fixture files that cause uncontrolled recursion,
-  resource exhaustion, or false negatives on banned phrases.
+- **Validator and tracker checker**: crafted files that cause uncontrolled
+  recursion, resource exhaustion, or false negatives on banned phrases; a
+  link that escapes the refusal above and pulls an external tree into the
+  scan.
+- **Subprocess supervisors**: the argv handed to a spawned CLI, the sandbox and
+  approval flags it is pinned to, and whether a hostile or malformed reply from
+  that child can be made to escape its declared permissions.
+- **Shell script**: an unquoted path or a hostile filename reaching
+  `extract-frames.sh`'s `ffmpeg` invocation, or output written outside the
+  directory it was given.
 - **Skill content**: prompt-injection vectors embedded in a skill file
   that could mislead an agent into harmful actions.
 

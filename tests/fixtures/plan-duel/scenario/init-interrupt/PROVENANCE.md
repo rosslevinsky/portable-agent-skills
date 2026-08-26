@@ -1,0 +1,5 @@
+# Provenance
+
+Encodes the artifact contract of the superseded v1 duel workflow — the behavioural golden these fixtures hold the engine to. That contract is not a tag you have to fetch: it is spelled out in the skill's own `SKILL.md`, `round.md` and `summary.md`, which ship beside this file. These are **synthetic** fixtures, not a recorded v1 run: plan bodies are deterministic filler (>=200 bytes, with a `# ` title), and judge `SCORE:`/`PREFERRED:` values are hand-chosen to drive one specific v1 exit path. The engine snapshots/renames/scores exactly as v1's SKILL.md + round.md + summary.md specify; the integration test asserts that contract.
+
+Scenario: **init-interrupt** (resume). The workdir has a stale `plan-a.md` and round-0 prompt/progress files but NO completed round (no plan-a/b-round-N pair). v1 full-resets (deletes plan-*/prompt/progress artifacts, keeping problem.md and unrelated files), prints `Init incomplete — restarting from round 0.`, re-runs round 0, then converges at round 3. Continuation inputs live in `inputs/`.
