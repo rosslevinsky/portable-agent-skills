@@ -534,8 +534,14 @@ python3 -m unittest discover -s tests -p 'test_*.py'        # Every Python suite
 
 Those three commands are the whole gate, and CI runs all three on **Ubuntu, macOS and
 Windows** — one job each. Windows is where a path-separator or text-encoding mistake
-actually surfaces, so it runs the same set rather than a subset. There is no PowerShell
-suite and no static-analysis step, because there is no PowerShell.
+actually surfaces, so it runs the same set rather than a subset. Nothing on any command
+path is PowerShell, so there is no PowerShell suite.
+
+**One skill does ship PowerShell, and nothing statically checks it.**
+`security-review-codebase/references/hierarchical-mode.md` carries a Windows PowerShell 5.1
+block that picks a report directory outside the audited repository. It is instructions an
+agent runs, not a file CI executes, so the three commands above do not reach it. Read it
+directly if you are reviewing what this pack runs on Windows.
 
 There is a fourth command, and it is a tool rather than a gate:
 

@@ -8,6 +8,32 @@ Versions use [Calendar Versioning](https://calver.org/) in the form
 A MICRO bump in the same month indicates a follow-up release; a new month
 starts from `.0` again.
 
+## [2026.09.0]
+
+### Security
+
+- `security-review-codebase`'s deep mode told a Codex-driven reader to dispatch each
+  component review as a shell string with the prompt in double quotes. The prompt carries
+  the attack-surface document, which is built from the repository under audit, so a `$(…)`
+  or a backtick in that content would have run on the auditor's machine before the
+  read-only sandbox existed. The adapter note now shows an argv list with the prompt as one
+  element, and says why.
+
+### Fixed
+
+- The same adapter note left standard input open. `codex exec` reads stdin even when the
+  prompt is already in argv, so a scripted deep review blocked before it reached the model,
+  with no output to diagnose the hang by. The note now says to close it.
+- `security-review-codebase`'s deep-mode reference promised that running the component
+  reviews sequentially "keeps full coverage" and loses only parallelism. The skill's own
+  classification says otherwise: on a very large codebase one accumulating context can
+  thin the later reviews. The reference now says what the classification says, in both
+  places it had made the claim.
+- `README.md` said the pack contains no PowerShell. `security-review-codebase` ships a
+  Windows PowerShell 5.1 block that picks a report directory outside the audited tree.
+  The sentence now says what is true: no command path is PowerShell, one skill ships some,
+  and nothing statically checks it.
+
 ## [2026.08.0] - 2026-08-25
 
 Sixteen skills, up from eleven. The planning workflow is rebuilt around a checkbox tracker
@@ -209,6 +235,7 @@ release](README.md#installing-a-previous-release) to return to it.
 
 Initial release.
 
+[2026.09.0]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.0
 [2026.08.0]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.08.0
 [2026.06.0]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.06.0
 [2026.04.0]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.04.0
