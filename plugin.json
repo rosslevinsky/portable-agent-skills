@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "portable-agent-skills",
-  "version": "2026.08.0",
+  "version": "2026.09.0",
   "description": "Agent workflow skills that behave the same in Claude Code and Codex CLI, with a portability contract enforced in CI.",
   "license": "Apache-2.0",
   "homepage": "https://github.com/rosslevinsky/portable-agent-skills#readme",

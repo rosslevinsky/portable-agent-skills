@@ -8,8 +8,11 @@ sub-reviews → cross-component analysis → synthesis, producing a persistent a
 
 Run the per-component reviews as **parallel sub-agents where the runtime supports concurrent
 work units; otherwise review each component sequentially in this context**. Sequential
-execution keeps full coverage — it loses only parallelism and fresh-context-per-component
-hygiene.
+execution reviews every component — no component is skipped — but on a **very large**
+codebase a single accumulating context can thin the thoroughness of later components'
+reviews. That is a coverage risk, not only a speed and hygiene loss, and it is why `SKILL.md`
+classifies this skill Degraded rather than Full. Treat the persisted
+`03-<component-slug>.md` files as the record, and on a large tree prefer the sub-agent path.
 
 ## Output directory setup
 
@@ -190,8 +193,9 @@ component's files against the categories, write its findings to
 in-context agent cannot purge its own context between components, so treat those persisted
 `03-<component-slug>.md` files — not your working memory — as the source of truth for
 Phases 4 and 5 rather than assuming each component's context stays isolated. This is the
-portable path — it keeps full coverage and only forgoes the
-wall-clock win of parallelism.
+portable path. Every component is still reviewed, but on a very large codebase one
+accumulating context can thin the later reviews — the coverage risk `SKILL.md`'s
+classification names — so it forgoes more than the wall-clock win of parallelism.
 
 **Parallel accelerator (where sub-agents exist).** Instead of the loop, dispatch one sub-agent
 per component concurrently, each with the inputs above; as each returns, write its
@@ -201,11 +205,21 @@ per component concurrently, each with the inputs above; as each returns, write i
 > per component, all in the same response). Run them as foreground agents so you receive all
 > results before Phase 4. Do not use `run_in_background: true`.
 
-> **Codex adapter:** Dispatch each component review as `codex exec -s read-only -c
-> approval_policy="never" --skip-git-repo-check -C <dir> "<prompt>"`. The read-only sandbox is
-> what keeps the no-files promise; asking a reviewer not to write does not. Where a runtime
-> cannot bound a reader that way, the orchestrator writes every file and the reader returns
-> text only.
+> **Codex adapter:** Dispatch each component review as an **argv list**, with the prompt as
+> one element — `["codex", "exec", "-s", "read-only", "-c", "approval_policy=never",
+> "--skip-git-repo-check", "-C", "<dir>", "<prompt>"]`, **with stdin closed** — `codex exec`
+> reads stdin even when the prompt is already in argv, so a scripted call that leaves it open
+> blocks before it reaches the model, with no output to diagnose the hang by. **Never build
+> the command as a shell string with the prompt interpolated into quotes.** The prompt carries the attack-surface
+> document, which is derived from the repository under audit; inside a double-quoted shell
+> argument, `$(…)`, a backtick or a stray quote in that content becomes execution on the
+> auditor's machine. This is the repository you already assume is hostile. The same rule the
+> portability contract sets for bundled helpers — argv list, never a shell string — applies
+> here, and applies hardest in this skill.
+>
+> The read-only sandbox is what keeps the no-files promise; asking a reviewer not to write
+> does not. Where a runtime cannot bound a reader that way, the orchestrator writes every
+> file and the reader returns text only.
 
 When every component checkbox in `02-plan.md` is `[x]`, proceed to Phase 4.
 
