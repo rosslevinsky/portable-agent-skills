@@ -34,7 +34,7 @@ starts from `.0` again.
   The sentence now says what is true: no command path is PowerShell, one skill ships some,
   and nothing statically checks it.
 
-## [2026.08.0] - 2026-08-25
+## [2026.08.0] - 2026-08-26
 
 Sixteen skills, up from eleven. The planning workflow is rebuilt around a checkbox tracker
 and a second, independent code review at every phase, with the previous generation kept
