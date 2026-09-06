@@ -185,6 +185,28 @@ Run every command listed in the phase's Verification section. If any command fai
 3. Re-run until all verification commands pass
 4. Do not proceed until verification is clean
 
+A command that outruns one foreground call runs under the runtime's background-execution
+facility where that facility reports the exit; otherwise launch it once and, in a later call,
+poll for a marker it writes. Never poll a command-line pattern (`pgrep -f`, `pkill -f`,
+`ps | grep`): the shell running your poll holds the command text in its own argv, so the
+pattern matches the poller and the loop never exits. Put the command in a file, so nothing
+re-expands it, and launch it in its own process group (`set -m`) and, where `setsid`
+exists, its own session, under `nohup`, so a runtime that kills a timed-out call's group
+does not kill the work, with `bash -eo pipefail`, so a
+sequence stops at its first failing step and a pipe does not hide one (one command per
+line: errexit exempts `a` in `a && b`); have it append a marker
+that carries its exit status, bound the poll, and read the work's outcome from that marker
+— a non-zero exit from the poll itself is the poll dying, not the verification failing:
+
+```bash
+# the command itself is in /abs/path/work.sh, written with your file tool, one command per line
+rm -f /abs/path/work.log; set -m; S=$(command -v setsid || true)
+$S nohup bash -c 'set +e; bash -eo pipefail /abs/path/work.sh; printf "\nWORK-EXIT rc=%s\n" "$?"' \
+  > /abs/path/work.log 2>&1 < /dev/null &
+# later call
+for i in $(seq 1 240); do grep -q '^WORK-EXIT rc=' /abs/path/work.log 2>/dev/null && break; sleep 15; done
+```
+
 ### 3f — Check your work
 
 Run the `cyw` skill now. This performs a structured review of everything changed

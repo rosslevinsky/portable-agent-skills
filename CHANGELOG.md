@@ -8,6 +8,23 @@ Versions use [Calendar Versioning](https://calver.org/) in the form
 A MICRO bump in the same month indicates a follow-up release; a new month
 starts from `.0` again.
 
+## [2026.09.2] - 2026-09-06
+
+### Changed
+
+- `plan-run` now says how to wait for a command that outruns a single call, in the
+  Satisfy step and in the phase-worker contract; `plan-run-v1` says the same in its
+  verification step. A wait built on a process-name match (`pgrep -f`, `pkill -f`,
+  `ps | grep`) never finishes under an agent harness, because the pattern sits in the
+  polling shell's own argv and matches itself — a finished suite left the loop spinning
+  and, once killed, was reported as a failure. The skills now say: use the runtime's
+  background facility where it reports the exit; otherwise launch once, have the command
+  append a marker carrying its exit status, and poll for that marker from a later call,
+  bounded. A worker returns no `DONE` before the work has reported its exit, and reads the
+  work's outcome from that exit or the marker rather than from the poll's own exit. And
+  never add a trailing `&` inside a call already run through the runtime's background
+  facility: the call is reported finished while the work runs on unobserved.
+
 ## [2026.09.1] - 2026-09-06
 
 ### Changed
@@ -257,6 +274,7 @@ release](README.md#installing-a-previous-release) to return to it.
 
 Initial release.
 
+[2026.09.2]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.2
 [2026.09.1]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.1
 [2026.09.0]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.0
 [2026.08.0]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.08.0
