@@ -308,6 +308,51 @@ clean — a failure is a blocker even if your change did not cause it (fix it, o
 through the blocking protocol if it is demonstrably pre-existing and out of scope). Tick each
 box in **Tests** as its test is written and passing.
 
+**Waiting for a long command.** A command that outruns one foreground call runs under the
+runtime's background-execution facility where that facility reports the exit. Where it does
+not, launch the command once and, in a **later call**, poll for an artifact it writes. Never
+poll a command-line pattern (`pgrep -f`, `pkill -f`, `ps | grep`): the shell running your
+poll holds the command text in its own argv, so the pattern matches the poller and the loop
+never exits. Have the command append a marker carrying its exit status, so the marker is the
+outcome and not just the end:
+
+```bash
+# Launch call, detached so the work outlives it. Literal paths: shell state does not survive.
+# The command itself is in /abs/path/work.sh, written with your file tool, one command per line.
+rm -f /abs/path/work.log; set -m; S=$(command -v setsid || true)
+$S nohup bash -c 'set +e; bash -eo pipefail /abs/path/work.sh; printf "\nWORK-EXIT rc=%s\n" "$?"' \
+  > /abs/path/work.log 2>&1 < /dev/null &
+# A later call. Bounded — a poll that can spin forever is the orphan this rule prevents.
+for i in $(seq 1 240); do grep -q '^WORK-EXIT rc=' /abs/path/work.log 2>/dev/null && break; sleep 15; done
+```
+
+The marker cannot match the poller because `grep` reads a file, not the process table;
+removing the old log first stops a previous run's marker matching. `set -m` gives the
+background job its own process group, `nohup` ignores the hangup, and `setsid` puts it in
+its own session where the command exists (Linux; macOS ships none). A runtime that kills a
+timed-out call's process group cannot reach the work on any host; one that kills the whole
+session cannot reach it only where `setsid` ran — which is one more reason the runtime's own
+background facility comes first. The command lives in a file so nothing re-expands it:
+a `$(…)` in a quoted command string would run in the launching shell, not the work's. The
+outer `bash -c` starts with `set +e`, so `$?` is captured whatever errexit the launching
+environment exports; `bash -eo pipefail` runs the file so a sequence stops at its first
+failing step and a failed producer in a pipe (`npm test | tee`) is not hidden by its
+consumer, and a missing file is a non-zero marker rather than a silent non-start. One
+command per line in that file: errexit exempts `a` in `a && b`, so a failed test on a
+chained line lets the next line report success. `printf`'s leading newline
+lands the marker on its own line after output with no trailing newline. Where you also need to know the work is still alive, write its
+PID to a file at launch and poll `kill -0` on it — a PID cannot match a pattern, and it
+tells you liveness only, never the outcome: the marker still carries that. (PowerShell:
+`Select-String -Quiet` and `Get-Process -Id`; the rule is the marker, not the syntax.)
+
+Two things the marker's absence means. **A non-zero exit from the poll is the poll dying or
+timing out, not the work failing** — the work's outcome is the `rc=` in the marker, and a
+killed watcher's exit reads exactly like a failed suite. And **no result is reported before
+the work has reported its exit** — the runtime's, where its facility reports one, or the
+marker's where you polled: a phase reported complete with its log part-way is not complete.
+Never add a trailing `&` inside a call already run in the background — the outer shell
+returns at once, the call is reported finished, and the work runs on unobserved.
+
 **Testing discipline (red → green, self-sufficient).** For every item that adds new behaviour:
 
 - **Order.** Logic, APIs and utilities: write the failing test **first**; UI and wiring: tests

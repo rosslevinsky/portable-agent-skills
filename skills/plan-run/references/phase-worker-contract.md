@@ -46,6 +46,13 @@ doc-vs-reality corrections. Writing the record yourself puts two authors on one 
 the orchestrator's copy lands second regardless; it also has to add what you cannot know —
 the independent review, which runs after you return.
 
+**Your result comes after the work, never during it.** A command that outruns one call is
+waited on as Satisfy's "Waiting for a long command" says — the runtime's background facility
+where it reports the exit, else a marker the command writes carrying its exit status, never
+a process-name match — and `DONE` is not returned before that exit is reported. The reported
+exit, or the marker's `rc=`, is the work's outcome; a PID captured at launch tells you only
+that the work is alive, and the poll's own exit tells you nothing about it.
+
 ## The result
 
 Your final message **is** the result — data for the orchestrator, not prose for a human: one
