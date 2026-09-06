@@ -14,8 +14,9 @@ conversation does. (The **procedure** is `../SKILL.md`, which you read alongside
 3. Your own phase document — its Work, Tests, Verification commands and Gate boxes. Its
    **Evidence record you report, and do not write**; see "What you do".
 
-A fourth may be passed: an append-only **progress file** to add one line to per meaningful
-step. Nothing reads it for decisions; omitting it changes nothing.
+A fourth is passed: an append-only **progress file**. Add one line per meaningful step,
+prefixed `[+MM:SS]` from your start. Nothing reads it for decisions; if the write fails,
+continue.
 
 Everything durable is on disk. If you feel you are missing context, you are missing a file
 to read, not a memory.

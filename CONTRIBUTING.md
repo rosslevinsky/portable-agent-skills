@@ -193,10 +193,17 @@ python3 -m unittest discover -s tests -p 'test_*.py'              # Every Python
 ```
 
 All three must pass before a PR is eligible to merge. CI runs exactly these on **Ubuntu,
-macOS and Windows** — one job each. There is no PowerShell driver, because there is no
-PowerShell. A fixture that creates a symlink needs a platform guard, since creating one
+macOS and Windows** — one job each. No command path is PowerShell, so there is no PowerShell
+driver — though one skill ships a PowerShell 5.1 block that nothing statically checks; see
+`README.md`'s Validation section. A fixture that creates a symlink needs a platform guard, since creating one
 needs elevation on Windows; those cases live in `tests/test_plan_tracker.py` behind a
 symlink probe rather than in the corpus.
+
+**A change to the release machinery is reviewed on its own pull request.** `scripts/promote_*`
+and `scripts/release_driver.py` get the same independent review a skill change gets, on the
+PR that changes them. A release does not re-review them: it reviews the projected diff, and
+the tool that produced that diff earned its trust on the PR that changed it, not on the one
+that ran it.
 
 **Two programs are not in that list and should not be added to it.**
 
