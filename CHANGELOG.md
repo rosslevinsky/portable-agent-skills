@@ -8,6 +8,28 @@ Versions use [Calendar Versioning](https://calver.org/) in the form
 A MICRO bump in the same month indicates a follow-up release; a new month
 starts from `.0` again.
 
+## [2026.09.1] - 2026-09-05
+
+### Changed
+
+- `plan-run` always writes a per-phase progress file now, rather than offering to. A
+  delegated phase worker's output is invisible until it returns, so a long phase looked the
+  same as a hung one; the worker now appends one timestamped line per step — `[+MM:SS]`
+  from the phase's start, as `plan-duel`'s log already does — and the orchestrator appends
+  the worker's exit status and elapsed time when it returns, so the log ends with an
+  outcome even when the worker could not write its own last line. Nothing on the
+  correctness path reads it and a failed write is ignored, so the run's result is unchanged
+  whether or not anyone watches. The review sub-agent is no longer handed the file: it runs
+  read-only and could never write it.
+- `CONTRIBUTING.md` states that a change to the release machinery is reviewed on its own
+  pull request, not at release time.
+
+### Fixed
+
+- `CONTRIBUTING.md` said the pack contains no PowerShell — the same sentence corrected in
+  `README.md` in `2026.09.0`, in a third place. `security-review-codebase` ships a Windows
+  PowerShell 5.1 block; the sentence now says so and points at `README.md`'s account.
+
 ## [2026.09.0]
 
 ### Security
@@ -235,6 +257,7 @@ release](README.md#installing-a-previous-release) to return to it.
 
 Initial release.
 
+[2026.09.1]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.1
 [2026.09.0]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.0
 [2026.08.0]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.08.0
 [2026.06.0]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.06.0

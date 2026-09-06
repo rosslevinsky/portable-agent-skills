@@ -104,14 +104,18 @@ decision, settled by the isolation bound above and by nothing else — collapse 
 > before it reaches the model — a hang with no output to diagnose it by. Close stdin
 > however the shell spells it (`< /dev/null`; `$null |` in PowerShell).
 
-> **Optional — live progress (non-blocking).** A worker's tool output is buffered and opaque
-> until it returns, so a long phase can look stalled. You may create a per-phase append-only
-> progress file — `plans/<slug>/progress/phase-<id>.log` — and hand its path to the worker
-> (and to your own review sub-agent) asking for one line per meaningful step (`work item 3
-> done`, `verification green`, …). Gitignore that directory so the throwaway log never
-> lands in a commit. Nothing on the correctness path reads it, so the run completes
-> identically whether or not anyone watches. **Claude adapter:** tail it with the Monitor
-> tool, narrating each new line. **Any runtime:** `tail -f` it in another pane.
+> **Live progress (non-blocking).** A worker's tool output is buffered and opaque until it
+> returns, so a long phase can look stalled. Create a per-phase append-only progress file —
+> `plans/<slug>/progress/phase-<id>.log` — and hand its path to the worker, asking for one
+> timestamped line per meaningful step: `[+MM:SS] work item 3 done`, elapsed from the phase's
+> start, the convention `plan-duel`'s log uses. When the worker returns, append one line
+> yourself — its exit status and elapsed time — so the log ends with an outcome even when
+> the worker could not write its own last line. Gitignore that directory so the throwaway
+> log never lands in a commit. Nothing on the correctness path reads it, so the run
+> completes identically whether or not anyone watches; a failed write is ignored. The review
+> sub-agent is not handed one — it runs read-only and cannot write it, and `diff-review`'s
+> supervisor already streams its output. **Claude adapter:** tail it with the Monitor tool,
+> narrating each new line. **Any runtime:** `tail -f` it in another pane.
 
 One invariant holds whoever runs the work, and with the never-delegated three above it is why
 delegation changes speed but not outcome: within each phase the order is **author
