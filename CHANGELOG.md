@@ -9,6 +9,7 @@ A MICRO bump in the same month indicates a follow-up release; a new month
 starts from `.0` again.
 
 ## [2026.09.1] - 2026-09-06
+
 ### Changed
 
 - `plan-run` always writes a per-phase progress file now, rather than offering to. A
@@ -30,6 +31,7 @@ starts from `.0` again.
   PowerShell 5.1 block; the sentence now says so and points at `README.md`'s account.
 
 ## [2026.09.0] - 2026-09-05
+
 ### Security
 
 - `security-review-codebase`'s deep mode told a Codex-driven reader to dispatch each
