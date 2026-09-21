@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Skills are Markdown that a model obeys. Changing one changes behaviour, and most of the
+Skills are Markdown that a model obeys. Changing one changes behavior, and most of the
 guards here fail in ways that do not explain themselves.
 
 ## Before you finish, run all three

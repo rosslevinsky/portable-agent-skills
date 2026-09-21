@@ -37,7 +37,7 @@ inapplicable box is indistinguishable, to a resumed run, from work that never ha
 
 _Logic, APIs and utilities: write the failing test first. UI and wiring: alongside._
 
-- [ ] `<path/to/test_file>` — <behaviour it covers>
+- [ ] `<path/to/test_file>` — <behavior it covers>
 
 ## Verification
 

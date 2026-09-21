@@ -1,0 +1,90 @@
+{
+  "title": "review-panel reader result",
+  "description": "What one blind reader (or coverage auditor) returns for its unit. Every finding is a location, the consequence a person experiences, a concrete failure, a PROPOSED severity, a direction, how big the fix is and the source at the cited lines, plus a proposed reproduction where one can be run. A reader cannot say whether a finding is established or what evidence establishes it: those fields do not exist here because the verification stage produces them, and a reader able to fill them would pre-claim the status a stranger exists to assign.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["finding_count", "findings", "summary"],
+  "properties": {
+    "finding_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "How many entries `findings` holds, stated before the array so that it can be checked against what follows it. A result whose array is shorter than this number is a lost answer and fails the whole unit, rather than being read as a shorter list of findings. Count what you are about to write, not what you remember finding."
+    },
+    "findings": {
+      "type": "array",
+      "description": "Every distinct defect found, most-severe first, one entry per defect even when several share a root cause. An empty array means nothing was found in the assigned files; say so in `summary` rather than inventing nits.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["file", "line_start", "line_end", "severity", "consequence", "failure", "direction", "fix_size", "quote", "reproduction"],
+        "properties": {
+          "file": {
+            "type": "string",
+            "description": "Snapshot-relative path of the file the finding is in, forward-slashed."
+          },
+          "line_start": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "1-indexed first line the finding anchors to."
+          },
+          "line_end": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "1-indexed last line the finding anchors to; equal to `line_start` for a one-line finding."
+          },
+          "severity": {
+            "type": "string",
+            "enum": ["blocker", "major", "minor", "nit"],
+            "description": "PROPOSED. blocker = wrong in a way that breaks correctness, security, or data integrity; major = a real correctness or robustness defect, not catastrophic; minor = a small correctness or clarity issue safe to defer; nit = style or preference with no correctness impact. A verifier may revise it with a stated rationale."
+          },
+          "consequence": {
+            "type": "string",
+            "description": "Plain language, one sentence: what a person using this software experiences when this goes wrong — the data they lose, the run that stops, the answer they are given that is not true. Not what the code does; the mechanism belongs in `failure`. It is written to be a heading somebody reads first, so lead with the plain words and put any identifier after them."
+          },
+          "failure": {
+            "type": "string",
+            "description": "The concrete failure mechanism: the input, state or host that makes the code do the wrong thing, and what wrong looks like. Not a worry — a mechanism. If uncertain, say so and state what would confirm it."
+          },
+          "direction": {
+            "type": "string",
+            "description": "The suggested direction for a fix — a direction, never an applied edit."
+          },
+          "fix_size": {
+            "type": "string",
+            "enum": ["1 line", "small", "medium", "large"],
+            "description": "How much code the fix in `direction` touches, so cheap wins can be ordered ahead of expensive ones. `1 line` = one line changed; `small` = a few lines inside one function; `medium` = one function or one file restructured; `large` = more than one file, or a change to an interface other code calls. Judge the fix you are proposing, not the size of the defect."
+          },
+          "quote": {
+            "type": "string",
+            "description": "The source exactly as it reads at the cited lines, copied and never paraphrased. It is collected so that a wrong line range is detectable at all: the same range can be read out of the snapshot and compared with what you say is there, and a quote that is not there says the range is wrong. Copy every line of a short range, and at the very least the first and the last line of a long one, each on its own line and in the order they appear. That is the rule the check applies, exactly: every line you quote must appear in the cited range in the order you give them, and the range's own first and last lines must be among them. Leave out the middle of a long range and the quotation still stands; leave out either end and the range is reported as wrong, because the ends are what a range is."
+          },
+          "reproduction": {
+            "type": ["object", "null"],
+            "additionalProperties": false,
+            "required": ["argv", "cwd", "expect"],
+            "description": "A proposed way to show the failure by running something in the snapshot, or null where the claim cannot be run — a documentary contradiction, a latent branch no input reaches from here. Never invented: a verifier runs it, and a reproduction that does not show the failure counts against the finding.",
+            "properties": {
+              "argv": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "The command as an argument vector, first element the program."
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Working directory relative to the snapshot root; `.` for the root."
+              },
+              "expect": {
+                "type": "string",
+                "description": "What the run shows when the finding is real: the exit status, the output, or the file it leaves behind."
+              }
+            }
+          }
+        }
+      }
+    },
+    "summary": {
+      "type": "string",
+      "description": "One paragraph on what was read and what was found — or that nothing was, and why the reader is confident of that."
+    }
+  }
+}

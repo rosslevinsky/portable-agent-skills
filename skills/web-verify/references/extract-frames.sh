@@ -100,6 +100,11 @@ if [ ! -f "$INPUT" ]; then
   exit 1
 fi
 
+# A leading `-` makes every command below read the output path as an option — `mkdir`,
+# `find`, ffmpeg. One `./` in front of it, once, beats remembering a `--` at five call
+# sites and forgetting it at the sixth.
+case "$OUTDIR" in -*) OUTDIR="./$OUTDIR" ;; esac
+
 mkdir -p "$OUTDIR"
 
 # Each run gets its own subdirectory, and every path below is scoped to it. Writing
@@ -115,15 +120,25 @@ if ! mkdir "$RUNDIR"; then
   exit 1
 fi
 
+# ffmpeg's image2 muxer reads `%` ANYWHERE in the output path as a format specifier, not
+# only in the basename, so a directory named `100%-done` sends the frames somewhere else or
+# fails outright. `%%` is the muxer's literal percent: the path is escaped once here and
+# only the escaped form is ever handed to ffmpeg. The directory keeps its real name.
+RUNDIR_FMT="$(printf '%s' "$RUNDIR" | sed 's/%/%%/g')"
+
 # Primary pass: emit a frame at each scene change above the threshold.
 # -vsync vfr keeps only the selected frames; showinfo logs their timestamps
 # (it emits at info level, so this pass runs at -loglevel info to surface them).
 # -y so a run can never stop on an overwrite prompt. ffmpeg does not prompt for an
 # image2 sequence, so this changes nothing today; it states the requirement instead
-# of leaving it to a behaviour someone has to know.
-if ! ffmpeg -y -hide_banner -loglevel info -i "$INPUT" \
+# of leaving it to a behavior someone has to know.
+# `-nostdin` AND the redirect, which are not the same promise: the flag asks ffmpeg not to
+# read stdin, the redirect means it cannot. Called inside a caller's `while read` loop,
+# ffmpeg otherwise swallows the rest of that input — and a stray `q` in it stops extraction
+# early while this script still reports success.
+if ! ffmpeg -nostdin -y -hide_banner -loglevel info -i "$INPUT" \
   -vf "select='gt(scene,${THRESHOLD})',showinfo" \
-  -vsync vfr "$RUNDIR/change-%04d.png"; then
+  -vsync vfr "$RUNDIR_FMT/change-%04d.png" < /dev/null; then
   # Name the run directory on the way out. ffmpeg may already have written frames
   # before it failed, and those are partial and must not be mistaken for a result —
   # a caller cannot delete or inspect what it was never told the path of, and with
@@ -138,8 +153,8 @@ count="$(find "$RUNDIR" -maxdepth 1 -name 'change-*.png' | wc -l | tr -d ' ')"
 # also sample one frame per second so nothing important is missed.
 if [ "$count" -lt 2 ]; then
   echo "only $count change-point frame(s); adding a 1 fps sample as fallback." >&2
-  if ! ffmpeg -y -hide_banner -loglevel warning -i "$INPUT" \
-    -vf "fps=1" "$RUNDIR/sample-%04d.png"; then
+  if ! ffmpeg -nostdin -y -hide_banner -loglevel warning -i "$INPUT" \
+    -vf "fps=1" "$RUNDIR_FMT/sample-%04d.png" < /dev/null; then
     echo "ffmpeg failed extracting fallback frames from: $INPUT (partial output: $RUNDIR)" >&2
     exit 3
   fi

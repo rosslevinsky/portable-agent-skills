@@ -35,10 +35,11 @@ Two properties are non-negotiable:
 
 - **Diff-first, fresh context.** Review the diff as an outsider would, without the
   implementation conversation coloring judgment.
-- **No tree edits — enforced, not requested.** The reviewer *reports*; it never fixes. On rung 1
-  this is a hard read-only bound via per-instance flags (Codex `-s read-only -c approval_policy="never"`;
-  Claude `--permission-mode plan`) that block the model's own edit and shell paths — not merely a
-  prompt asking it not to. (Those flags do **not** constrain user-configured hooks, plugins, or MCP
+- **No tree edits — bounded by flags, not merely requested.** The reviewer *reports*; it never fixes. On rung 1
+  this is a bound set by per-instance flags, not merely a prompt asking it not to: Codex
+  `-s read-only -c approval_policy="never"` rejects writes from the shell and the edit tool, and
+  Claude `--permission-mode plan` blocks its edit tools, though a shell command it runs can still
+  write. (Those flags do **not** constrain user-configured hooks, plugins, or MCP
   servers, which run outside the sandbox; for an airtight boundary, run the reviewer under an
   OS-level read-only mount or with customizations disabled.) Findings go back to the author/gate.
 
@@ -150,16 +151,24 @@ all, and a reviewer that returns a good narrative without a parseable object is 
 findings as prose. Never require the object.
 
 `findings[]` is the authority and `blocking_count` is derived from it, so when the two
-disagree the supervisor **recomputes the count** from the severities, writes the corrected
-value, and says so in `verdict_reason` — publishing a known-wrong number with only a warning
-attached would leave the trap armed for any gate that reads the count without reading the
-note.
+disagree the supervisor **corrects the count** and says so in `verdict_reason` — publishing a
+known-wrong number with only a warning attached would leave the trap armed for any gate that
+reads the count without reading the note. It corrects it **only as far as the findings
+support**: a positive claim is **never lowered to 0**, and an unrecognised severity floors it
+at 1, because 0 is what a gate reads as clean and an off-enum spelling would otherwise erase
+a real finding. The number can therefore be higher than the entries listed — gate on
+`findings[]`.
 
 The heartbeat is only honest if the output flows **unbuffered end to end**: the reviewer runs in a
 **per-event-flushed streaming mode** (the adapters pass `--json` / `--output-format stream-json
 --include-partial-messages`), the supervisor reads it in raw chunks (`os.read`) and flushes each
 chunk to the display log as it arrives — so the heartbeat ticks per chunk, not only on newline. Without the CLI's streaming mode, output block-buffers into the pipe and
 a working review can look silent — so the streaming flag is not optional on rung 1.
+
+**Every path in the two lines below is absolute** — `--cwd`, `--display`, `--findings`,
+`--verdict-json`. With `--cwd` set the supervisor refuses a relative output path, since it
+and the reviewer would resolve it against different directories, and this skill reads that
+refusal as grounds to fall back.
 
 > **Claude adapter (Claude is running this review):** rung 2 — run the review as an independent
 > sub-agent (Agent tool, subagent_type general-purpose). Rung 1 — launch Codex through the supervisor,
@@ -172,9 +181,9 @@ a working review can look silent — so the streaming flag is not optional on ru
 > **Codex adapter (Codex is running this review):** rung 2 — use the native `/review`, or a fresh
 > `codex exec --skip-git-repo-check -s read-only -c approval_policy="never" -C <dir> "<review prompt>"`
 > reviewer over the diff. **Both flags, on the fallback rung too** — `-s read-only` bounds the
-> shell and the approval policy bounds the built-in edit tool, and a reviewer that can write
-> is not a review. Rung 1 — launch Claude through the supervisor, **read-only-enforced**
-> (`--permission-mode plan` blocks every edit path), returning its **full transcript**:
+> shell and the approval policy bounds the built-in edit tool, and a reviewer whose edit tools are
+> unbounded is not a review. Rung 1 — launch Claude through the supervisor with its **edit tools blocked**
+> (`--permission-mode plan`; a shell command it runs can still write), returning its **full transcript**:
 > `<python> <skill-dir>/review_runner.py --idle 900 --deadline 1800 --cwd <dir> --display <cap> --findings <f> --result-mode stream-transcript --schema <skill-dir>/review-schema.json --verdict-json <v> -- claude -p "<review prompt>" --add-dir <dir> --permission-mode plan --json-schema ⟪schema_json⟫ --output-format stream-json --include-partial-messages --verbose`.
 > **Controller vs author / probe:** rung 1 wants a reviewer whose **model differs from the diff's
 > author**. If you — the runtime running this skill — already differ from the author, review directly:
@@ -204,7 +213,7 @@ preference:
    Redirect the status to a file, then poll until it holds *parseable JSON* (a shell
    redirect creates the file empty at launch, so existence alone is not completion).
    Bound the loop, and check the supervisor is still alive, since a supervisor that is
-   signalled before it can write leaves the file empty forever.
+   signaled before it can write leaves the file empty forever.
 
 **Never wait with a command-line pattern match** (`pgrep -f`, `pkill -f`, `ps | grep`).
 Those match full command lines, and an agent harness typically runs each shell command as
@@ -271,6 +280,9 @@ object in the prompt and fall back to reading the prose list if it does not arri
 
 The single, bounded **rung-1 cross-runtime pass** above is a normal part of this skill and runs
 by default when another runtime is available. What stays **separate and user-triggered** is a
-*heavier* review — a multi-pass, multi-agent, or cloud-based audit (e.g. an "ultra" / deep
-review): **recommend** that when the change warrants deeper scrutiny, but do not launch it
-automatically from this skill.
+*heavier* review — the whole-tree, blind, multi-agent sweep the `review-panel` skill runs, or
+a cloud-based deep audit: **recommend** that when the change warrants deeper scrutiny, but do
+not launch it automatically from this skill. Where the `review-panel` skill is not installed,
+the recommendation still stands as a sentence to the user — the tree wants a whole-tree
+sweep and this diff-first pass is not one — and this review is never widened to stand in
+for it.

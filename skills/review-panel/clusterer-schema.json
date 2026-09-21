@@ -1,0 +1,38 @@
+{
+  "title": "review-panel clustering result",
+  "description": "How one area's verified candidates group into defects. Each cluster is the same root cause at the same site, however differently its members worded it; a candidate that shares nothing but a nearby line belongs in its own cluster. This stage groups and nothing else: it judges no claim right or wrong, revises no severity, and cannot remove a candidate from the run. Every candidate the payload lists appears in exactly one cluster here, and a reply that drops one, repeats one, or names one the payload never listed is refused whole — showing a duplicate costs a reader a minute, and merging two real defects into one deletes the second from the report with nobody the wiser.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["clusters", "summary"],
+  "properties": {
+    "clusters": {
+      "type": "array",
+      "description": "One entry per defect, in any order. A candidate that matches no other is a cluster of one, and that is the normal case rather than a failure to merge. Together the entries partition the payload's candidate list exactly.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["members", "consequence", "split_reason"],
+        "properties": {
+          "members": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "The candidate ids in this cluster, as the payload spells them, e.g. `cand-007`. Never empty, never repeated within a cluster or across clusters, and never an id the payload does not list."
+          },
+          "consequence": {
+            "type": "string",
+            "description": "Plain language, ONE SHORT SENTENCE — aim for 12 words and never exceed 20: what a person using this software experiences when this defect goes wrong. It becomes the heading somebody reads first and a cell in a table they scan, so it has to fit on one line: a 138-character heading is a paragraph and stops the index being scannable. Lead with the plain words, put any identifier after them, and leave the mechanism to `what_goes_wrong` — that field is where the detail belongs. Where the members worded it differently, write the one sentence that covers what they agree on rather than picking a favourite.",
+            "maxLength": 120
+          },
+          "split_reason": {
+            "type": ["string", "null"],
+            "description": "Why this cluster is not merged with another at the same file and overlapping lines, or null where neither applies. One sentence naming what differs — the root cause, the direction of the mistake, the caller each affects. A guard that is both too weak and too strong is two defects at one location, and each half says here what makes it its own. Required too whenever you split because you could not tell, wherever the lines fall: splitting under doubt is the answer this stage prefers, and a reader needs to know where you did it. Null only when neither applies."
+          }
+        }
+      }
+    },
+    "summary": {
+      "type": "string",
+      "description": "One paragraph for a person reading the report: how many defects the candidates came to, which merges were the interesting ones, and anything you were unsure about. Say plainly where you split because you could not tell, so a reader knows where to look twice."
+    }
+  }
+}

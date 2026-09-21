@@ -1,0 +1,176 @@
+{
+  "title": "review-panel coverage verifier result",
+  "description": "What one coverage verifier returns for its batch: exactly one verdict per candidate it was handed, by candidate id. A coverage gap says a branch distinguishes an input and no test constructs it, so the statuses are its own three and not the defect set — `reproduced` and `confirmed_by_reading` would be answers to a question about whether the code is wrong, which is not what was asked. `gap_refuted` names the test that covers the input; a refutation without one is refused by the engine. `gap_confirmed` names the test that should be red before the gap is closed. `unresolved` names which of four things would settle it, and is reported as such and never absorbed. A severity revision cannot exist without its rationale. Nothing here addresses a reader, a slot or a lens: the verifier answers per candidate, and there is no rebuttal round.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "verdicts",
+    "summary"
+  ],
+  "properties": {
+    "verdicts": {
+      "type": "array",
+      "description": "One entry per candidate in the payload, in any order; every candidate exactly once.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "candidate",
+          "status",
+          "evidence",
+          "rationale",
+          "revision",
+          "test_first",
+          "unresolved_reason",
+          "covered_by",
+          "needs_files"
+        ],
+        "properties": {
+          "candidate": {
+            "type": "string",
+            "description": "The candidate id as the payload gives it, e.g. `cand-007`."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "gap_confirmed",
+              "gap_refuted",
+              "unresolved"
+            ],
+            "description": "gap_confirmed = the branch is where the candidate says it is and no test in scope constructs the input; gap_refuted = a test in scope does construct it, and `covered_by` names that test; unresolved = the snapshot could not settle it. Whether the code at that branch is CORRECT is not the question a coverage gap asks, so there is no status for it: a guarded branch with no test is still a gap."
+          },
+          "evidence": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": false,
+            "required": [
+              "argv",
+              "cwd",
+              "exit_status",
+              "output",
+              "truncated",
+              "run_kind",
+              "shows"
+            ],
+            "description": "What was run, where, what it produced, and which kind of run it was — present where you ran a test to settle the question, null where you read. A coverage gap can be settled by reading, so evidence is never required.",
+            "properties": {
+              "argv": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "The command as an argument vector, first element the program."
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Working directory relative to the root of the disposable copy; `.` for the root."
+              },
+              "exit_status": {
+                "type": "integer",
+                "description": "The process exit status, or the launcher's when the program could not start."
+              },
+              "output": {
+                "type": "string",
+                "description": "Captured stdout and stderr, bounded to the size the brief states; the tail is kept when cut."
+              },
+              "truncated": {
+                "type": "boolean",
+                "description": "Whether `output` was cut to the bound."
+              },
+              "run_kind": {
+                "type": "string",
+                "enum": [
+                  "executed",
+                  "documentary"
+                ],
+                "description": "What this run did. `executed` = the command ran the code under review and the output is what that code did. `documentary` = the command inspected the tree without running that code — a search for a string, a listing, a checksum — and the output shows what is written rather than what happens. Both are legitimate evidence and the status is judged the same way; they are counted and labelled apart, because a report that calls a text search a reproduction promises a reader a run that never happened."
+              },
+              "shows": {
+                "type": "string",
+                "minLength": 1,
+                "description": "One sentence saying what this run establishes, in your own words -- \"Shows that no caller of getCollection exists in the reviewed set\". The command and its output do not say why you ran them, and the same broad run attached to several defects has no single reason a reader can infer. Write the reason, not a restatement of the command.",
+                "pattern": "\\S"
+              }
+            }
+          },
+          "rationale": {
+            "type": "string",
+            "description": "Why this status: the branch and the input for a confirmed gap, the test and the case in it for a refuted one, what was tried and what stopped it for unresolved."
+          },
+          "test_first": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The test that should be RED before this gap is closed and green after it: where it belongs, the input or state it constructs, and what it asserts. Required for `gap_confirmed`, which is a test somebody is about to write. `null` for `gap_refuted`, which has a test already; for `unresolved`, give one where you already know what it would be and `null` where you do not."
+          },
+          "unresolved_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "needs_a_run",
+              "needs_a_file_outside_the_scope",
+              "needs_a_product_decision",
+              "blocked_by_the_environment",
+              null
+            ],
+            "description": "Which of four things would settle this, required for `unresolved` and `null` for every other status. `needs_a_run` = only running something can decide it, and no run was made or could be built here. `needs_a_file_outside_the_scope` = the answer is in a caller, a configuration file or a dependency this review does not cover; name it in the rationale AND in `needs_files`. `needs_a_product_decision` = the code plainly does what it does, and whether that is wrong is the owner's call, not a reader's. `blocked_by_the_environment` = a run was attempted and the host stopped it — a missing program, a copy that could not be written, a command that would not finish. That last one is kept apart from the rest on purpose: an environment failure is not an open question about the code."
+          },
+          "revision": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": false,
+            "required": [
+              "severity",
+              "rationale"
+            ],
+            "description": "A revised severity with its reason, or null to leave the auditor's severity as it stands. The report renders the revision beside the proposal; the engine never infers one. A `gap_refuted` verdict carries none.",
+            "properties": {
+              "severity": {
+                "type": "string",
+                "enum": [
+                  "blocker",
+                  "major",
+                  "minor",
+                  "nit"
+                ],
+                "description": "The same four levels the reader proposes in."
+              },
+              "rationale": {
+                "type": "string",
+                "description": "Why the proposed level is wrong and this one is right."
+              }
+            }
+          },
+          "covered_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The test that already constructs the input: its path, and which case in it sends that input. Required for `gap_refuted` and the only thing that can refute a gap — a refutation naming no test is an opinion about the code. `null` for every other status."
+          },
+          "needs_files": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The files that would settle this claim, by path, when `unresolved_reason` is `needs_a_file_outside_the_scope` — the caller, configuration file or dependency this review does not cover. Name them here as well as in the rationale: the rationale is prose and nothing can add prose up, and the report counts how many open claims each file would settle so that widening the next job's scope is a decision with a number against it. Paths are relative and are by definition outside the reviewed set, so they are not checked against the snapshot. Empty or absent for every other reason, and for every status other than `unresolved`."
+          }
+        }
+      }
+    },
+    "summary": {
+      "type": "string",
+      "description": "One paragraph on what was checked, how many gaps stood, and anything the batch as a whole shows."
+    }
+  }
+}

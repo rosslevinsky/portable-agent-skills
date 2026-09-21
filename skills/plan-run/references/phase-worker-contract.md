@@ -114,4 +114,4 @@ nothing substantive is treated as `BLOCKED` and re-dispatched rather than commit
 a `BLOCKED` whose `question` **or `recommendation`** says nothing substantive — an autonomous
 orchestrator acts on that recommendation, so an empty one is not a decision it can take. The
 schema guarantees only that the fields are present and non-empty, only on the CLI path;
-whether they are *meaningful* stays the orchestrator's judgement in both modes.
+whether they are *meaningful* stays the orchestrator's judgment in both modes.

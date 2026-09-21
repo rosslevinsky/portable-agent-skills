@@ -22,7 +22,10 @@ reader learned what this directory contains by running it instead of reading thi
 | `test_plan_duel_engine.py` | Deterministic unit tests for the stdlib-only plan-duel engine (Phase 1) |
 | `test_plan_tracker.py` | The plan tracker check: one isolated case per rule of `execution.md`, ported out of the validator's fixture harness so the rules run on Windows |
 | `test_plugin_manifest.py` | `plugin.json` against Agent Plugins 1.0.0: the canonical `$schema`, the name's character rules, and — the one with teeth — that its `version` equals the CHANGELOG's, so the pack cannot advertise a version it is not |
+| `test_review_panel_driver.py` | The stdlib-only review-panel driver, `review_panel_run.py`: ownership, one active attempt per unit, one terminal publication, replay-stable budgets, extraction and completion — driven against a stub worker it writes itself |
+| `test_review_panel_engine.py` | Deterministic unit tests for the stdlib-only review-panel engine, `review_panel.py`; reads `fixtures/review-panel/` |
 | `test_review_runner.py` | Unit tests for the stdlib-only diff-review supervisor, ``review_runner.py`` |
+| `test_shard_tests.py` | That splitting the suite across CI runners loses no test — total and disjoint, over the real discovery |
 | `test_shipped_schemas.py` | Contract tests for the structured-output schemas the skills ship |
 | `test_skill_budgets.py` | A recorded word budget per skill, held equal to what that skill measures — a ceiling against growth and a floor against slack |
 | `test_skill_content.py` | Assertions about what the shipped skill text tells a runtime to *do* |
@@ -52,7 +55,7 @@ All suites must pass before a PR is eligible to merge.
 ## `test_install_py.py`
 
 Runs `install.py` against temporary directories — it **never** touches a real
-`~/.claude` or `~/.agents`. Organised around the promises the installer makes rather
+`~/.claude` or `~/.agents`. Organized around the promises the installer makes rather
 than its functions.
 
 | Group | What it confirms |
@@ -68,7 +71,7 @@ than its functions.
 | Both runtimes | The defaults name one directory per runtime, each with its own manifest |
 | Three gaps the old suite named | A manifest line cannot reach outside the target; a retired skill is pruned from disk, not only from the manifest; an unowned skill is not replaced without `--force` |
 
-The last group exists because those three behaviours were covered by the bash suite,
+The last group exists because those three behaviors were covered by the bash suite,
 dropped by the first draft of `install.py`, and found by **reading** the suite being
 deleted rather than deleting it. All three were reproduced before they were fixed.
 
@@ -80,7 +83,7 @@ implementation and confirming the right test noticed.
 
 Each markdown file in this directory is a deliberately-shaped input
 designed to fire (or not fire) a single check in the validator. The
-`--test-fixtures` mode reads them and confirms each behaves as labelled —
+`--test-fixtures` mode reads them and confirms each behaves as labeled —
 it's a test-the-linter harness.
 
 Paired positive / negative fixtures:
@@ -166,12 +169,12 @@ exercised separately, so neither can mask the other).
 - The `.md` fixtures are the cheap way to add a new validator rule: write
   one failing file, register it in `run_test_fixtures()`, done.
 - The `test_*.py` suites cover everything a document cannot state: install
-  behaviour end-to-end (file modes, manifest writes, the ownership-before-copy
+  behavior end-to-end (file modes, manifest writes, the ownership-before-copy
   ordering) and the engines the skills bundle.
 
-There used to be a third style — a `.sh` suite driving `install.sh`, and a
-Pester suite driving `install.ps1`. Both are gone with the shell installers.
-One Python implementation has no parity to test, which is most of why it is
+There is no third style. A `.sh` suite driving `install.sh` and a Pester suite
+driving `install.ps1` would each need their own parity tests, and one Python
+implementation has no parity to test — which is most of why the installer is
 one implementation.
 
 ## Adding a new fixture

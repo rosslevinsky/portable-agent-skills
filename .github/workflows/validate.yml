@@ -4,10 +4,12 @@ on:
   pull_request:
   push:
     branches: [main]
-  # Runnable on demand, on any branch. A feature-branch push runs nothing here, so the only
-  # way to exercise a change on Windows used to be opening a pull request — and Windows is
-  # the one platform none of this project's authors develop on, so that is exactly the
-  # platform whose feedback should be cheapest to get.
+  # Runnable on demand, on any branch. A feature-branch push runs nothing here, so without
+  # this a change reaches Windows only by opening a pull request — and Windows is the one
+  # platform none of this project's authors develop on, so that is exactly the platform
+  # whose feedback should be cheapest to get. It is also how a commit already on `main` gets a
+  # run at all when `tested` would otherwise skip one, since that job asks nothing on a manual
+  # run and every test job therefore goes ahead.
   workflow_dispatch:
 
 # Read-only token for the whole workflow. Nothing here writes to the repository — it
@@ -22,17 +24,299 @@ on:
 permissions:
   contents: read
 
+# One run per branch at a time. A second push while the first is still going makes the
+# first one's answer worthless — it is about code nobody will merge — and cancelling the
+# stale run is what stops paying for that twice. It is also what makes a quick follow-up
+# push cheap instead of something to avoid.
+#
+# `main` is the exception. A push to main is a merge that has already happened, so its run
+# is the record of whether what shipped is green, and a second merge landing on top of it
+# must not erase the first one's answer.
+#
+# **`cancel-in-progress: false` does not buy that on its own, which is why main gets a group
+# per COMMIT.** The flag governs the RUNNING run; it says nothing about a queued one, and the
+# rule for those is that a newly queued run cancels whatever was already pending in its group.
+# So with one group for the whole branch, three merges in quick succession leave the middle
+# one cancelled — no suite, no gate, on a tree that has shipped — and it is the direct push
+# and the bypass merge, the trees nothing else has proved, that can least afford it. Putting
+# the sha in the group means main runs never share one, so none of them can queue behind or
+# displace another; the flag stays false there as a statement of intent, over a group that can
+# only ever hold one run.
+#
+# Everywhere else the group stays per-ref and cancelling is the point: a second push while the
+# first is still going makes the first one's answer worthless — it is about code nobody will
+# merge — and cancelling the stale run is what stops paying for that twice. It is also what
+# makes a quick follow-up push cheap instead of something to avoid. A pull request's ref is
+# never `refs/heads/main`, so it keeps that behavior untouched.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || 'ref' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
-  validate:
-    # A generous ceiling, not a tight fit: this job runs in about 2.5 minutes, and the
-    # number is here to stop a hung step burning the 6-hour default, not to police a
-    # slow runner.
-    timeout-minutes: 20
+  # Has this exact tree already been proved green? A push to `main` is a merge that has just
+  # happened, and the pull request behind it tested the same bytes minutes earlier: the commit
+  # is new, the TREE is not. Nothing below needs running again for it, and this job is what
+  # establishes that cheaply enough to be worth asking — one checkout and two API reads.
+  #
+  # **Identical tree, and a green run at it.** Tree equality alone is not the claim: a tree
+  # equal to some commit nobody ever tested proves nothing. So each candidate commit has to
+  # carry both — the same tree as this one, and a SUCCESSFUL run of this very workflow, which
+  # means its `gate` was green because a run is successful only when every job in it was.
+  #
+  # **A green run at a candidate is not by itself a green run of that candidate's TREE**, and
+  # the difference is the whole reason for the receipt. A `pull_request` run checks out the
+  # synthetic MERGE of head and base — the checkout takes no `ref`, which is what selects
+  # that — so what it proves is the tree it assembled, not the head's. Those coincide while
+  # base sits still under the branch, and base does not have to: retargeting a pull request
+  # fires `edited`, which is not one of the three default activity types, so no new run
+  # happens and the run against the OLD base goes on standing. Move a branch from a
+  # development base onto `main` and the merge can land a tree equal to the head while the
+  # only run that ever passed tested that head on top of something else entirely.
+  #
+  # A commit sha cannot express any of that, so the proving run states it: `suite` uploads an
+  # artifact named for the tree it checked out, and the check below asks that run for the name
+  # spelling THIS tree. Same tree, green run, and the run's own word that it is the tree it
+  # had.
+  #
+  # Two candidates, which between them cover every way a pull request reaches `main`:
+  # a merge commit's second parent, and the head of the pull request this commit closed. The
+  # second is what makes a SQUASH merge work — a squash lands one parent and a new tree-equal
+  # commit, so there is no second parent to look at — and the first is what reads a merge
+  # commit, whose own tree is the one being asked about. One job, both shapes, and no
+  # assumption about which of the two this tree merges with: a fork choosing either is covered,
+  # and so is a tree that changes its mind.
+  #
+  # **Every failure answers "not proved".** An API that will not reply, a candidate that
+  # cannot be read, a tree that does not match: each falls through to running the suite. The
+  # expensive mistake is skipping a suite that had something to say, so nothing here concludes
+  # "already tested" from an absence.
+  tested:
+    # Pull requests only ever answer "no" — the merge ref's tree can equal the head's tree
+    # while the head is exactly what has not been tested yet — so the question is not even
+    # asked there. Skipped, this job costs no runner and delays nothing: the jobs below depend
+    # on it with `always()`, which is what lets a skipped dependency through.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # The job's own scopes, because a job-level block REPLACES the top-level one rather than
+    # adding to it. Still read-only, and still nothing that writes: the two extra scopes are
+    # what let it read a commit's tree and ask whether a run against it succeeded.
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    outputs:
+      already: ${{ steps.proved.outputs.already }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # This commit and its parents. A merge commit's parents are one generation away, so
+          # two is enough to read the second parent's tree; a depth that came up short would
+          # answer "not proved" and cost a suite run rather than skip one.
+          fetch-depth: 2
+
+      - name: Look for a green run of this tree
+        id: proved
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # This file, by name, so the question is about THIS workflow's history and not about
+          # any other workflow that happens to have run against the same commit.
+          WORKFLOW: validate.yml
+          # Shared with the step in `suite` that writes the receipt. Both spell it from here.
+          RECEIPT: tested-tree
+        run: |
+          tree=$(git rev-parse "HEAD^{tree}")
+          echo "this tree: $tree"
+          # The merged branch's tip, where there is one, and the head of the pull request this
+          # commit closed. Either may be empty; both being empty is the direct-push case.
+          second=$(git rev-parse --verify --quiet "HEAD^2" || true)
+          head=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
+                   --jq '.[].head.sha' 2>/dev/null || true)
+          for candidate in $second $head; do
+            candidate_tree=$(gh api "repos/$GITHUB_REPOSITORY/commits/$candidate" \
+                               --jq '.commit.tree.sha' 2>/dev/null) || continue
+            if [ "$candidate_tree" != "$tree" ]; then
+              echo "$candidate: different tree ($candidate_tree)"
+              continue
+            fi
+            run=$(gh api \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/$WORKFLOW/runs?head_sha=$candidate&status=success&per_page=1" \
+              --jq '.workflow_runs[0].id // empty' 2>/dev/null) || continue
+            if [ -z "$run" ]; then
+              echo "$candidate: same tree, no green run of $WORKFLOW"
+              continue
+            fi
+            # THE RECEIPT, and the reason a green run at the candidate is not enough on its
+            # own. On a `pull_request` event the checkout below takes no `ref`, so the run
+            # tests the SYNTHETIC MERGE of head and base — not the head. A run green at this
+            # candidate therefore proves the tree it assembled that day, which is the
+            # candidate's own tree only while base has not moved under it.
+            #
+            # And base moves without re-running anything: retargeting a pull request fires
+            # `edited`, which is not one of the three default activity types, so the green run
+            # against the OLD base still stands. Reparent a branch from a development base
+            # onto `main` and the merge can land a tree equal to the head while the only run
+            # that ever passed tested the head plus whatever that base carried.
+            #
+            # So the run has to say which tree it actually checked out. `suite` writes that as
+            # an artifact named for the tree, and this asks for the one naming THIS tree. No
+            # receipt, an API that will not answer, a run from before receipts existed: every
+            # one of them falls through to running the suite, which is the safe direction.
+            if gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$run/artifacts" \
+                 --jq '.artifacts[].name' 2>/dev/null | grep -qxF "$RECEIPT-$tree"; then
+              echo "already=true" >> "$GITHUB_OUTPUT"
+              echo "$candidate: run $run checked out this exact tree and was green" \
+                | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "$candidate: green run $run carries no $RECEIPT-$tree receipt"
+          done
+          echo "already=false" >> "$GITHUB_OUTPUT"
+          echo "no commit with this tree has a green run; the suite runs" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+  suite:
+    # Skipped where the tree above was already proved green, and run whenever it was not.
+    # `always()` is what lets a pull request through: `tested` is skipped there, and without it
+    # a skipped dependency skips this job too — every test job silently not running, and a gate
+    # that then has nothing to assert over.
+    needs: tested
+    if: always() && needs.tested.outputs.already != 'true'
+    # SHARDED on every platform, because the wall clock of this workflow is one
+    # `unittest discover` and almost nothing else. The only way to make one machine's part
+    # of it shorter is to stop handing that machine the whole suite.
+    #
+    # Split by test CLASS rather than by module: one module is well over half the suite's
+    # runtime, so a split by module could never be faster than that module alone.
+    #
+    # FOUR shards, and the number is measured rather than preferred. No class is more than
+    # 5% of the suite's runtime, so there is no floor to hit until about twenty; what stops
+    # it at four is that shards are handed out round-robin over sorted class names, which is
+    # blind to how long a class takes. That blindness costs about a tenth against a perfect
+    # split at four widths and swings far wider at twelve. Going further would mean checking
+    # in a table of per-class timings, and the sharder's whole virtue is that a test file
+    # added tomorrow lands on a shard without anybody editing anything.
+    #
+    # `tests/test_shard_tests.py` is what makes this safe to rely on. A test that lands on
+    # no shard does not fail; it is never run, and the job is green because of it. That file
+    # asserts the split is total and disjoint over the REAL discovery, at five widths — and
+    # asserts the matrix below and the `--total` handed to the runner are the same number,
+    # because raising one and missing the other loses a shard's worth of tests in silence.
+    #
+    # **Three platforms on every event, and the saving on a merge is `tested` above.** Where a
+    # tree is already proved, this job does not run at all — the whole matrix, not a cheaper
+    # slice of it — so there is nothing left for a narrower platform list here to save.
+    #
+    # A push that gets PAST `tested` is a tree nothing has proved: a direct push, or a merge
+    # that bypassed the up-to-date requirement, which an owner-bypassable protection permits.
+    # That is the least tested code ever to reach this job, so it gets the widest matrix rather
+    # than the cheapest. Such pushes are rare, so covering them in full costs almost nothing —
+    # and the alternative is aiming the thinnest coverage at the riskiest case.
+    #
+    # One platform list, read the same way on every event, is also one fewer conditional whose
+    # truth somebody has to keep checking.
+    #
+    # **This file ships byte-identical to the public repository.** Nothing in it names a
+    # repository or reads a branch-protection setting, so it is correct in a tree whose
+    # protection this repository does not control, and a fork inherits a rule that is true for
+    # it. A squash merge is covered because `tested` looks up the pull request's head as well as
+    # a merge commit's second parent.
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        shard: [1, 2, 3, 4]
     runs-on: ${{ matrix.os }}
+    # A generous ceiling, not a tight fit: a shard runs in two or three minutes, and the
+    # number is here to stop a hung step burning the 6-hour default, not to police a slow
+    # runner.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      # The receipt `tested` reads: the tree THIS run checked out, named as an artifact so a
+      # later run can ask for it by name rather than infer it from a commit sha. On a pull
+      # request that tree is the synthetic merge and not the head, which is exactly the
+      # distinction a sha cannot express.
+      #
+      # One matrix cell writes it. Every cell checks out the same tree, and `upload-artifact`
+      # refuses a name already uploaded in the same run. The file goes to the RUNNER TEMP
+      # directory, never into the checkout: an untracked file in the work tree is something
+      # this suite's own inventory tests can see.
+      #
+      # It runs before the tests rather than after, and the run's SUCCESS is what makes it
+      # mean anything — a receipt on a run that went red proves nothing, because `tested`
+      # asks only about runs that succeeded.
+      - name: Record the tree this run checked out
+        id: receipt
+        if: matrix.os == 'ubuntu-latest' && matrix.shard == 1
+        shell: bash
+        run: |
+          t=$(git rev-parse "HEAD^{tree}")
+          echo "$t" > "$RUNNER_TEMP/tested-tree.txt"
+          echo "name=tested-tree-$t" >> "$GITHUB_OUTPUT"
+          echo "receipt: tested-tree-$t" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: steps.receipt.outputs.name != ''
+        with:
+          name: ${{ steps.receipt.outputs.name }}
+          path: ${{ runner.temp }}/tested-tree.txt
+          # Days, not the 90-day default: the only reader is a merge minutes later.
+          retention-days: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # On the first shard only, and BEFORE the suite. The validator takes two seconds, so
+      # running it first costs nothing and a broken skill file says so before any shard has
+      # finished loading its tests. Running it on all four would answer the same question
+      # four times on the same bytes.
+      #
+      # It runs on every platform rather than on Linux alone. Its path handling, its
+      # traversal and its encoding are the parts most likely to differ on Windows, and a
+      # rule only ever exercised on POSIX is a rule whose Windows behavior nobody has seen.
+      - name: Validate skill portability
+        if: matrix.shard == 1
+        run: python scripts/validate_cross_runtime.py skills/
+
+      # The fixture corpus runs on every platform for the same reason: a negative fixture
+      # proven able to fail only on POSIX is a rule whose Windows behavior nobody has seen.
+      # Its symlink cases are guarded, which is what lets this step run on Windows at all —
+      # creating a symlink there needs elevation, so an unguarded case would ERROR rather
+      # than pass. Those cases live in tests/test_plan_tracker.py, where the guard is.
+      - name: Run validator fixture tests
+        if: matrix.shard == 1
+        run: python scripts/validate_cross_runtime.py --test-fixtures tests
+
+      - name: Run this shard of the test suite
+        run: python scripts/shard_tests.py --index ${{ matrix.shard }} --total 4
+
+  non-utf8:
+    # Skipped and run on the same terms as the suite above, and for the same reason: it is the
+    # same tests over the same bytes.
+    needs: tested
+    if: always() && needs.tested.outputs.already != 'true'
+    # The same suite under a NON-UTF-8 default text encoding. The shipped schemas and
+    # prompts contain em dashes, so any file read that forgets encoding="utf-8" silently
+    # mis-decodes on Windows (cp1252). ASCII here is stricter than cp1252, so it catches
+    # that class of bug on the cheapest runner there is.
+    #
+    # Linux only: it is a source-encoding check, not an OS check, and one runner proves it.
+    # Sharded like the suite above, because it IS the suite above — run twice over the same
+    # tests is exactly the shape that has to be split rather than queued.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHONUTF8: "0"
+      LC_ALL: C
+      LANG: C
     steps:
       - uses: actions/checkout@v4
 
@@ -41,101 +325,66 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Validate skill portability
-        run: python scripts/validate_cross_runtime.py skills/
-
-      - name: Run validator fixture tests
-        run: python scripts/validate_cross_runtime.py --test-fixtures tests
-
-      - name: Run engine unit tests (plan-duel + diff-review supervisor)
-        run: python -m unittest discover -s tests -p 'test_*.py'
-
-      # Same suite under a NON-UTF-8 default text encoding. The shipped schemas and
-      # prompts contain em dashes, so any file read that forgets encoding="utf-8"
-      # silently mis-decodes on Windows (cp1252) — a class of bug that otherwise only
-      # surfaces in the 6-minute windows-latest job. ASCII here is stricter than
-      # cp1252, so this catches it in seconds. Linux only: it is a source-encoding
-      # check, not an OS check, and one runner proves it.
-      #
-      # The validator runs here too, not only the unittest suite. It was omitted
-      # originally, and that omission hid twelve bare `read_text()` calls and a bare
-      # `write_text()` in it for as long as they existed: the windows-latest job runs
-      # the installer tests only, so nothing ever executed the validator under a
-      # non-UTF-8 default. Its own reads are the ones aimed squarely at em-dash-laden
-      # prompt files, which makes it the last thing that should have been left out.
+      # The validator runs under the non-UTF-8 default too, not only the unittest suite.
+      # Its own reads are the ones aimed squarely at em-dash-laden prompt files, which makes
+      # it the last thing that should be left out: while it was, twelve bare `read_text()`
+      # calls and a bare `write_text()` sat in it unnoticed, because nothing else ever ran
+      # it without a UTF-8 default.
       #
       # Tracker checking is deliberately NOT here: it needs a plan directory, which not
       # every clone of this pack has, and this step must run everywhere. Its rules are
       # covered regardless — tests/test_plan_tracker.py builds throwaway plan directories
-      # and runs under the unittest step.
-      - name: Run engine unit tests and the validator under a non-UTF-8 locale (Windows-encoding proxy)
-        if: runner.os == 'Linux'
-        env:
-          PYTHONUTF8: "0"
-          LC_ALL: C
-          LANG: C
-        run: |
-          python -m unittest discover -s tests -p 'test_*.py'
-          python scripts/validate_cross_runtime.py skills/
-          python scripts/validate_cross_runtime.py --test-fixtures tests
-
-  windows:
-    runs-on: windows-latest
-    timeout-minutes: 30
-    # ONE job, not a two-interpreter matrix. The matrix existed because the installer
-    # was written twice -- once in bash, once in PowerShell -- and PowerShell 5.1 and 7
-    # are different enough that both had to be exercised. With one Python installer there
-    # is no PowerShell left to test, so what remains is the real Windows coverage the
-    # Python suites give: .cmd/.bat quoting, PATHEXT, UTF-8 against the console code
-    # page, CRLF, and paths with spaces.
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      # FAIL FAST. This job is the critical path — twelve minutes against four for Linux
-      # and macOS, which run alongside it — so what matters is not running LESS but failing
-      # SOONER. These four suites carry nearly all the Windows-specific behaviour (path
-      # separators and case, `PATHEXT` and `.cmd` resolution, the console code page against
-      # UTF-8, CRLF, file locking during replace, and which `os` calls take a file
-      # descriptor) and they are a small fraction of the suite's runtime, so a Windows-only
-      # break surfaces in under a minute instead of after the full discover.
-      #
-      # `test_review_runner` is deliberately NOT here despite being Windows-relevant: it is
-      # 50 of those 111 seconds on its own, which would turn a fast check back into a slow
-      # one. It runs in the full discover below, as does everything else. Nothing is
-      # skipped; only the order in which a failure surfaces changes.
-      - name: Windows-sensitive suites first
-        run: >
-          python -m unittest
-          tests.test_install_py
-          tests.test_encoding_hygiene
-          tests.test_skill_traversal
-          tests.test_plan_duel_engine
-
-      - name: Run the test suites on Windows
-        run: python -m unittest discover -s tests -p "test_*.py"
-
-      # The validator runs HERE too, not only on Linux and macOS. Its path handling, its
-      # traversal and its encoding are the parts most likely to differ on Windows, and a
-      # rule that is only ever exercised on POSIX is a rule whose Windows behaviour nobody
-      # has seen.
-      - name: Validate portability on Windows
+      # and runs under the suite step below.
+      - name: Validate skill portability under a non-UTF-8 locale
+        if: matrix.shard == 1
         run: python scripts/validate_cross_runtime.py skills/
 
-      # The fixture corpus runs here too. A negative fixture proven able to fail only on
-      # POSIX is a rule whose Windows behaviour nobody has seen, which is the same argument
-      # as the step above applied to the half that was exempt from it. It needs the symlink
-      # cases guarded — symlink
-      # creation needs elevation here, so adding the step would have ERRORED rather than
-      # passed. Those cases were the tracker check's, and they left with it for
-      # `tests/test_plan_tracker.py`, where they are guarded. Measured before this step was
-      # added: with symlink creation forced to raise OSError 1314, the corpus reports zero
-      # errors. A negative fixture that has only ever been proven able to fail on POSIX is
-      # a rule whose Windows behaviour nobody has seen — the same argument as the line
-      # above, applied to the half that was exempt from it.
-      - name: Run validator fixture tests on Windows
+      - name: Run validator fixture tests under a non-UTF-8 locale
+        if: matrix.shard == 1
         run: python scripts/validate_cross_runtime.py --test-fixtures tests
+
+      - name: Run this shard of the test suite under a non-UTF-8 locale
+        run: python scripts/shard_tests.py --index ${{ matrix.shard }} --total 4
+
+  gate:
+    # ONE check for the branch ruleset to require, standing for every job above it.
+    #
+    # The ruleset could name each of them instead, and that list goes stale in silence in
+    # both directions. A platform or a shard removed leaves a required context nothing will
+    # ever report, and a required check that never reports blocks every merge — including
+    # the one that would fix it. A shard ADDED is simply not required, so the thing most
+    # likely to be new is the thing least likely to be gating. Naming this job instead means
+    # the matrix can change without anybody editing the ruleset, which is the same reason
+    # `shard_tests.py` hands out shards by discovery rather than by a checked-in list.
+    #
+    # `if: always()` is what makes it a gate rather than a decoration. Without it a failed
+    # or cancelled dependency SKIPS this job, and a skipped required check reports nothing
+    # at all — so the ruleset waits forever on a run that already finished, which reads as a
+    # hung merge rather than a failed one. With it, the job runs and asserts the results it
+    # was given.
+    # `tested` is among these because its answer decides what a SKIP means here, and a gate
+    # that could not tell a deliberate skip from a lost job would be the wrong gate.
+    needs: [tested, suite, non-utf8]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every job green, or skipped because this tree was already green
+        run: |
+          echo "tested=${{ needs.tested.outputs.already }} suite=${{ needs.suite.result }}" \
+               "non-utf8=${{ needs['non-utf8'].result }}"
+          # **A skip counts as green ONLY where this workflow chose it.** With the tree already
+          # proved by the run behind the merge, `skipped` is the expected result and `success`
+          # would mean the skip did not happen. Every other skip — a cancelled dependency, a
+          # job that never started, a `tested` step that failed outright — says nothing about
+          # the code, and a gate a ruleset requires must not pass on it. So the expected result
+          # is computed first and then BOTH jobs are held to exactly it, rather than each being
+          # allowed to be either thing.
+          want=success
+          if [ "${{ needs.tested.outputs.already }}" = "true" ]; then
+            want=skipped
+            echo "the pull request behind this merge proved this tree; the suite was skipped" \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+          [ "${{ needs.suite.result }}" = "$want" ] || exit 1
+          [ "${{ needs['non-utf8'].result }}" = "$want" ] || exit 1

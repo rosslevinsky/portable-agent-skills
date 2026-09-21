@@ -8,7 +8,7 @@ moved — a paragraph living in both places costs the context it was supposed to
 a second copy to keep in step.
 
 So: every ledger paragraph must appear in no `SKILL.md`, in no `references/*.md`, and in no
-other ledger. Comparison is on whitespace-normalised text, because relocating a paragraph
+other ledger. Comparison is on whitespace-normalized text, because relocating a paragraph
 re-wraps it and a line-by-line check would miss every real duplicate.
 
 Deliberately NOT checked here: private paths and hardcoded attribution. `validate_skills()`
@@ -34,7 +34,7 @@ MIN_WORDS = 15
 
 # Per-line decoration that repeats down a block: shell/Markdown comment markers and
 # blockquote markers. Relocated rationale often LIVED as `# ` comment lines inside a bash
-# fence, and whitespace-only normalisation leaves those prefixes interleaved through the
+# fence, and whitespace-only normalization leaves those prefixes interleaved through the
 # text — so the same prose re-added in that shape would not substring-match the plain
 # paragraph in the ledger, and this guard would pass while the duplication was back.
 _LINE_MARKER = re.compile(r"^[ \t]*(?:[>#]+[ \t]?)+", re.MULTILINE)
@@ -45,7 +45,7 @@ def _normalise(text: str) -> str:
 
 
 def _paragraphs(path: Path) -> list[str]:
-    """Blank-line-separated blocks worth comparing, whitespace-normalised."""
+    """Blank-line-separated blocks worth comparing, whitespace-normalized."""
     out = []
     for block in re.split(r"\n\s*\n", path.read_text(encoding="utf-8")):
         block = block.strip()
@@ -114,9 +114,10 @@ def duplication_offences(skills_dir: Path, root: Path | None = None) -> list[str
 def ledgers() -> list[Path]:
     """The ledger is the file named ``DECISIONS.md`` AT a skill root -- the validator's rule.
 
-    ``LEDGER_FILENAME`` and ``iter_skill_roots`` are both imported rather than restated: the
-    ledger used to be recognised by basename in one place and by nothing in another, so a
-    ``references/DECISIONS.md`` was budgeted while the root one was not.
+    ``LEDGER_FILENAME`` and ``iter_skill_roots`` are both imported rather than restated. A
+    second spelling of the rule drifts from the first: recognize the ledger by basename here
+    and by position there, and a ``references/DECISIONS.md`` is budgeted while the root one
+    is not.
     """
     return sorted(
         skill_md.parent / vcr.LEDGER_FILENAME
@@ -208,8 +209,8 @@ class DecisionsLedgerTests(unittest.TestCase):
         shared = " ".join(f"word{i}" for i in range(MIN_WORDS + 5))
         self.assertIn(_normalise(shared), _normalise(f"preamble\n{shared}\ntail"))
         self.assertNotIn(_normalise(shared), _normalise("something else entirely"))
-        # And the re-wrap case the normalisation exists for: same prose, different line
-        # breaks, must still be recognised as the same paragraph.
+        # And the re-wrap case the normalization exists for: same prose, different line
+        # breaks, must still be recognized as the same paragraph.
         rewrapped = shared.replace(" ", "\n  ", 3)
         self.assertEqual(_normalise(rewrapped), _normalise(shared))
 
@@ -221,10 +222,10 @@ class DecisionsLedgerTests(unittest.TestCase):
         beside it has no guard at all.
 
         **This catches copy-paste only, and that is the whole claim.** The comparison is a
-        substring test on normalised text, so the same rule restated in different words is
+        substring test on normalized text, so the same rule restated in different words is
         invisible to it — which is exactly the shape the duplication found by hand had.
         Detecting *that* is out of scope: a redundancy detector produces candidates, and
-        deciding which copy is the home is a judgement a check cannot make.
+        deciding which copy is the home is a judgment a check cannot make.
         """
         offences = duplication_offences(SKILLS, REPO_ROOT)
         self.assertEqual(
@@ -238,7 +239,7 @@ class DecisionsLedgerTests(unittest.TestCase):
         """The guard above has never fired on this tree, so prove it is able to.
 
         Driving :func:`duplication_offences` over a fixture tree rather than asserting on
-        substring behaviour: a companion that only checked ``in`` would stay green if a
+        substring behavior: a companion that only checked ``in`` would stay green if a
         glob stopped matching, and the guard would then pass vacuously beside it.
         """
         shared = " ".join(f"word{i}" for i in range(MIN_WORDS + 5))
@@ -281,7 +282,7 @@ class DecisionsLedgerTests(unittest.TestCase):
         """Regression: the shape the relocated rationale actually had.
 
         `plan-run`'s defeated-alternatives commentary lived as `# ` lines inside a bash
-        fence. With whitespace-only normalisation those prefixes stayed interleaved through
+        fence. With whitespace-only normalization those prefixes stayed interleaved through
         the text, so the same prose re-added in that shape did not substring-match the plain
         paragraph in the ledger and this guard passed while the duplication was back.
         """

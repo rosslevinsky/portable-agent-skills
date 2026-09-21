@@ -34,7 +34,7 @@ Two things distinguish this from `/plan-phase-v1`:
 
 Each phase is independently committable and sized for review cost. Every phase it emits carries a
 per-phase gate whose independent-review axis is a **cross-model** `diff-review` when a second
-runtime is installed (Codex reviewing Claude's code or the reverse — see Step 5), giving at review
+runtime is installed (Codex reviewing Claude's code or the reverse — `plan-run` runs it), giving at review
 time the same different-model scrutiny `/plan-duel` gives at plan time. The document
 contract (phase-document shape and tracker structure) is defined in
 `references/v2-templates.md` — emit against it exactly. Where the pack's tracker check is
@@ -83,7 +83,7 @@ reality. In addition, so you can say honestly which phases are independent, iden
 
 Design the phases first (foundation before consumers; tests mandatory per phase;
 risky changes isolated; a final verification-gate phase). **Every phase that introduces
-new behaviour is test-first:** for logic, API endpoints, and utilities the failing test
+new behavior is test-first:** for logic, API endpoints, and utilities the failing test
 is written before the implementation (TDD); for UI and wiring, tests are written
 alongside — no phase is complete until its tests pass. This ordering flows into each
 emitted phase doc's Tests section (the template's test-first note is load-bearing —

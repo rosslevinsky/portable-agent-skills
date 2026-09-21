@@ -78,7 +78,7 @@ does not directly compare two already-written `plan.md` files as separate inputs
   Python is installed: it is a Microsoft Store alias that opens a download page instead of
   running anything. Probed first, it "succeeds", and the engine then never launches.
   **Bare `python` is deliberately not in that list.** Where it is Python 2, `plan_duel.py`
-  dies *parsing* `from __future__ import annotations` — before any line of it runs — so the
+  dies *parsing* its first non-ASCII character — before any line of it runs — so the
   engine's own version guard never fires and the user gets a raw `SyntaxError` instead of
   the message above. A probe that can only produce the wrong error is worse than one fewer
   candidate.
@@ -133,8 +133,8 @@ does not directly compare two already-written `plan.md` files as separate inputs
      the CLI spawned goes with it. On Windows the process **tree** is ended via
      `taskkill /F /T`, which is best effort: a descendant re-parented by a shim that has
      already exited can survive, and the engine stops waiting on it rather than hanging.
-   - **On Windows, prefer a participant CLI that is not a `.cmd`/`.bat` shim**, or run the
-     duel under WSL or Git-Bash. Windows runs a shim through the shell, which reinterprets
+   - **On Windows, use CLIs that are not `.cmd`/`.bat` shims**, or run the duel under
+     WSL; preflight refuses a shim. Windows runs a shim through the shell, which reinterprets
      `%VAR%` and `&` in arguments — and the arguments here are whole prompts.
    - **For live progress, pass an explicit `--workdir <path>`** (so you know where
      `<workdir>/progress.log` will land) and run the engine in the **background** using

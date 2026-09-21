@@ -45,7 +45,7 @@
     "blocking_count": {
       "type": "integer",
       "minimum": 0,
-      "description": "How many findings are severity blocker or major — the count a phase gate acts on. It must equal the number of such entries in `findings`; the supervisor recomputes it and reports any disagreement."
+      "description": "How many findings are severity blocker or major — the count a phase gate acts on. The supervisor corrects it from `findings` and reports any disagreement, but never downward to 0 and never below 1 where a severity is unrecognised — so it can exceed the entries listed. Gate on `findings`."
     }
   }
 }

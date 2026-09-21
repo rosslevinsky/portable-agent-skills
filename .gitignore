@@ -70,3 +70,9 @@ plans/**/runs/
 #
 # Start from scripts/private-identifiers.txt.example.
 scripts/private-identifiers.txt
+
+# A dated review note left at the root by a session, for a human to read later. Ignored
+# because `--manifest-closure` counts every path git reports as untracked-but-not-ignored,
+# so a note left here turns the gate red until somebody classifies a file nobody ships.
+# Anchored to the root, so it cannot swallow anything nested.
+/OPEN-PROBLEMS-*.md

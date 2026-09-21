@@ -137,7 +137,7 @@ stated plus anything implied by the scope. At least one entry required.
 consistent. Use actual paths from the codebase. Group by:
 - "Will change" — files that get edited or created
 - "Must stay consistent" — callers/consumers that must still work
-- "Tests" — test files that need new or changed tests. For new behaviour, prefer
+- "Tests" — test files that need new or changed tests. For new behavior, prefer
   TDD: the failing test is written before the implementation that makes it pass.
 
 ---
@@ -214,7 +214,7 @@ omit this section entirely when the user answered the interview.)_
 - `path/to/shared/thing` — reason
 
 **Tests** _(TDD preferred: write failing tests before the implementation that makes them pass)_**:**
-- `path/to/test_file.py` — what behaviour it covers
+- `path/to/test_file.py` — what behavior it covers
 
 ---
 

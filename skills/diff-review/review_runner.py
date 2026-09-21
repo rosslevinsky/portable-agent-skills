@@ -26,9 +26,17 @@ newline. A silent window is therefore a genuine stall, not buffering.
 Stdlib only. The reviewer command is passed as argv DATA after ``--``; no branded CLI name
 is baked in here, and ``cmd[0]`` is resolved with ``shutil.which`` so Windows ``.cmd``
 shims work. Every SUPERVISED run prints exactly one JSON ``{"status": ...}`` line to stdout
-— including when the supervisor is itself signalled — while ``--help`` is an ordinary
+— including when the supervisor is itself signaled — while ``--help`` is an ordinary
 argparse path. The status is ``ok`` | ``idle_timeout`` | ``deadline`` | ``error``, with a
 ``reason`` on every non-``ok``, and exit 0 only on a clean review.
+
+**Two flags are opt-in, and that is the whole of their contract.** ``--status-detail`` adds
+``terminal_detail`` and ``terminal_detail_source`` to the status line, and
+``--max-capture-bytes`` bounds what is retained;
+a caller that passes neither sees exactly the bytes it has always seen, key for key. They
+are opt-in rather than always-on because adding a field to the status line is a change
+every existing caller would have to absorb, and the reason for wanting them — telling a
+provider outage apart from a bad answer — belongs to one caller.
 
 Known limitation — native Windows batch shims: if ``shutil.which`` resolves the reviewer to
 a ``.cmd``/``.bat``, Windows runs it through the shell, which reinterprets ``%VAR%`` / ``&``
@@ -43,6 +51,7 @@ import math
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -54,7 +63,10 @@ def _emit(status, **extra):
     """Print the one-line JSON status contract; return the process exit code."""
     payload = {"status": status}
     payload.update(extra)
-    print(json.dumps(payload))
+    # FLUSHED, because stdout is block-buffered whenever it is a pipe — which is how every
+    # caller runs this — and any path that ends in `os._exit` skips the buffer entirely. The
+    # one line this program contracts to print was lost that way.
+    print(json.dumps(payload), flush=True)
     return 0 if status == "ok" else 1
 
 
@@ -229,8 +241,31 @@ def _reconcile_blocking_count(verdict):
             unknown.append("<missing>" if raw is None else str(raw))
 
     claimed = verdict.get("blocking_count")
-    if not isinstance(claimed, int) or isinstance(claimed, bool):
+    # A whole number the model spelled as 2.0 or "2" is a claim, not an absence. Read as an
+    # absence it fell past the positive-claim floor below, and a verdict saying two blockers
+    # over an empty findings list was published as 0 — what a gate reads as clean.
+    if isinstance(claimed, bool):
         claimed = None
+    elif isinstance(claimed, float):
+        claimed = int(claimed) if claimed.is_integer() else None
+    elif isinstance(claimed, str):
+        # `int()` decides, never `isdigit()`. "++2" survives an lstrip of the signs, "\u00b2"
+        # IS a digit to Python, and a 5000-digit string is refused by the interpreter's own
+        # limit — each raised ValueError out of a review that had ALREADY SUCCEEDED, from
+        # outside every handler here, and the finished work was reported as a crash.
+        try:
+            claimed = int(claimed.strip())
+        except ValueError:
+            claimed = None
+    elif not isinstance(claimed, int):
+        claimed = None
+
+    # Written back HERE, before any path can return. The published verdict promises an
+    # integer and the equal-claim return below touches nothing — so a verdict claiming "1"
+    # beside one blocking finding agreed with itself and went out as a string, which a gate
+    # comparing numbers cannot read.
+    if claimed is not None:
+        verdict["blocking_count"] = claimed
 
     if unknown:
         # Cannot derive the count, so it must not be ZERO.
@@ -301,7 +336,7 @@ def _same_path(first, second):
     than ``os.path.normcase``: normcase is the identity on POSIX, and macOS is POSIX with a
     case-insensitive volume by default. The cost on a case-sensitive filesystem is refusing
     an invocation naming two files differing only in case — a clear message rather than a
-    deletion, and one behaviour on every platform.
+    deletion, and one behavior on every platform.
     """
     resolved_first, resolved_second = os.path.realpath(first), os.path.realpath(second)
     return (resolved_first == resolved_second
@@ -335,13 +370,19 @@ def _terminate(proc):
     for hard in (False, True):
         try:
             if os.name == "posix":
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL if hard else signal.SIGTERM)
+                # The GROUP id is the child's pid — start_new_session made it the leader —
+                # and never `os.getpgid`, which raises once `wait()` below has reaped that
+                # leader. It did, on the SIGTERM rung, and the SIGKILL rung then never ran
+                # while a descendant still held the inherited pipes.
+                os.killpg(proc.pid, signal.SIGKILL if hard else signal.SIGTERM)
             else:
                 if proc.poll() is not None:
                     return
                 proc.kill() if hard else proc.terminate()
         except (ProcessLookupError, PermissionError, OSError):
-            return
+            # This rung could not signal; the next one still tries, since a group with no
+            # leader can still hold members.
+            pass
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
@@ -383,12 +424,36 @@ def _capture_result(line, state, lock):
         return
     try:
         event = json.loads(stripped)
-    except ValueError:
+    except (ValueError, RecursionError):
+        # RecursionError beside ValueError, as in _scan_verdict: the decoder recurses once
+        # per nesting level, and it raised straight past a ValueError-only guard and killed
+        # this reader thread, so every later event — the terminal one included — was lost.
         return
     if not isinstance(event, dict) or event.get("type") != "result":
         return
     with lock:
-        state["last_result"] = event
+        cap = state.get("capture_cap")
+        if cap and len(stripped.encode("utf-8", "replace")) > cap:
+            # **This mode's result event is the reply, so the cap has to reach it too.**
+            # The event is the whole of what this mode publishes: `--findings` is written
+            # from its `result` payload and nothing else is kept. An event that arrived on
+            # one complete line is already past the pending-line bound — that one measures
+            # what has no end yet — so without this it is held whole, and the reviewer's
+            # entire output sits in this process's memory, four hundred attempts at a time,
+            # while the flag that asked for a bound reports nothing dropped.
+            #
+            # Bounded by the same rule as the assistant text: the payload's TAIL is what is
+            # kept, because the closing object a caller extracts the answer from is its last
+            # non-whitespace content and a head would never hold one.
+            bounded, dropped = _bounded_result(event, cap)
+            # Set rather than added: only the last result event is retained, so what the
+            # notice names is what was cut from THAT one. A running total would describe an
+            # event this program is no longer holding.
+            state["capture_dropped"] = dropped
+            state["capture_truncated"] = True
+            state["last_result"] = bounded
+        else:
+            state["last_result"] = event
 
 
 def _valid_verdict(event):
@@ -419,17 +484,218 @@ def _event_text(event):
     if not isinstance(event, dict):
         return None
     if event.get("type") == "item.completed":  # Codex --json
-        item = event.get("item") or {}
+        # isinstance, not `or {}`: a truthy non-object — a string, a list — passes that guard
+        # and raises AttributeError on the next line, which kills the reader thread.
+        item = event.get("item")
+        if not isinstance(item, dict):
+            return None
         if item.get("type") == "agent_message" and isinstance(item.get("text"), str):
             return item["text"]
         return None
     if event.get("type") == "assistant":  # Claude stream-json
         if event.get("parent_tool_use_id"):  # forwarded sub-agent text, not the main reviewer
             return None
-        parts = [b.get("text") for b in ((event.get("message") or {}).get("content") or [])
+        message = event.get("message")
+        if not isinstance(message, dict):
+            return None
+        parts = [b.get("text") for b in (message.get("content") or [])
                  if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)]
         return "".join(parts) or None
     return None
+
+
+# --- the two opt-in bounds ----------------------------------------------------
+# How much of the terminal event's error text `terminal_detail` may carry. A status line is
+# read by a program, not scrolled by a person, and an unbounded field puts a whole failing
+# payload into it.
+TERMINAL_DETAIL_MAX_BYTES = 2000
+
+# What the retained tail says about what is no longer in front of it. PREPENDED, never
+# appended: a reply's closing object is its last non-whitespace content, and anything after
+# it means there is no closing object at all — so a marker on the end would break every
+# capped reply that was otherwise intact.
+TRUNCATION_NOTICE = ("[review_runner] {dropped} byte(s) of earlier output were dropped to "
+                     "stay within --max-capture-bytes; what follows is the retained tail "
+                     "and is NOT the whole review")
+
+
+def _bounded(text, limit):
+    """``text`` cut to ``limit`` bytes of UTF-8, with an ellipsis where anything was cut."""
+    raw = text.encode("utf-8", "replace")
+    if len(raw) <= limit:
+        return text
+    # "ignore" rather than "replace": the cut lands wherever the byte count runs out, and a
+    # half character at the end is a fragment nobody reads. The ellipsis is what says
+    # something was dropped.
+    return raw[:limit].decode("utf-8", "ignore") + "…"
+
+
+def _terminal_detail_parts(event, limit=TERMINAL_DETAIL_MAX_BYTES):
+    """The terminal event's own error text, and **which rule produced it**.
+
+    ``(text, source)``, where ``source`` is ``"message"``, ``"error"`` or ``"event-type"``
+    and both are ``None`` where the event carries nothing at all. One function rather than
+    two, because a second walk of the same event would be a second contract to keep in step
+    with this one.
+
+    **The third rule's text is a name, not an explanation, and the source is how a caller
+    tells them apart.** A failure whose event is ``{"type": "turn.failed"}`` explained
+    itself nowhere — its reason went to stderr, if anywhere — and a caller that reads
+    ``"turn.failed"`` as the failure's own account of itself can never see that. It then
+    classifies an outage as an ordinary bad answer, every time, and whatever it does about
+    repeated unexplained failures never fires.
+    """
+    if not isinstance(event, dict):
+        return None, None
+    text, source = None, None
+    message = event.get("message")
+    if isinstance(message, str) and message.strip():
+        text, source = message, "message"
+    else:
+        error = event.get("error")
+        if isinstance(error, dict):
+            nested = error.get("message")
+            if isinstance(nested, str) and nested.strip():
+                text, source = nested, "error"
+        elif isinstance(error, str) and error.strip():
+            text, source = error, "error"
+    if text is None:
+        kind = event.get("type")
+        if isinstance(kind, str) and kind.strip():
+            text, source = kind, "event-type"
+    if text is None:
+        return None, None
+    return _bounded(text.strip(), limit), source
+
+
+def _terminal_detail(event, limit=TERMINAL_DETAIL_MAX_BYTES):
+    """The terminal event's own error text, or ``None`` where the event carries none.
+
+    **The extraction contract is stated rather than guessed at**, because a caller
+    classifying a failure by this text needs to know what it is reading: the top-level
+    ``message``, then a nested error's message, then the event type alone. Nothing reaches
+    further — a scan for "the most error-looking string in the event" would hand a caller a
+    field that means something different on each runtime, and a classification built on it
+    would be wrong in a way nobody could see.
+
+    The third rule is why a failure that produced a terminal event always has *some* detail:
+    a caller can then read an ABSENT detail as "this failure explained itself nowhere",
+    which is a different thing from a failure it can classify. Which rule answered is
+    reported beside the text — see :func:`_terminal_detail_parts`.
+    """
+    return _terminal_detail_parts(event, limit)[0]
+
+
+def _reduced_event(event, cap):
+    """What is kept of a terminal event larger than the cap: its head, and nothing else.
+
+    The head is what ``terminal_detail`` is extracted from, so the reason the run failed
+    survives. Everything else — a ``structured_output`` object among it — does not, which is
+    the point of a cap: the verdict then falls back to the scan of the reviewer's own text
+    rather than being read out of a payload this program refused to hold.
+    """
+    text, source = _terminal_detail_parts(event, min(cap, TERMINAL_DETAIL_MAX_BYTES))
+    kept = {"type": event.get("type")}
+    # **Only real error text becomes a message.** The last extraction rule answers with the
+    # event's own type, and writing that into `message` would make what is kept claim the
+    # failure explained itself — a claim the original event never made, and one a caller
+    # classifying failures then cannot see through.
+    if source in ("message", "error"):
+        kept["message"] = text
+    for key in ("subtype", "is_error"):
+        if key in event:
+            kept[key] = event[key]
+    return kept
+
+
+def _bounded_result(event, cap):
+    """What is kept of a ``result`` event larger than the cap, and how many bytes went.
+
+    ``(event, dropped)``. The fields that decide the outcome survive by
+    :func:`_reduced_event` — the type, the success flags, and the error text
+    ``terminal_detail`` is read from — and the payload keeps its **tail**, since the answer
+    a caller extracts is the last object in it.
+
+    Everything else the runtime put on the event is gone, ``structured_output`` included,
+    which is the same trade :func:`_reduced_event` makes and for the same reason: a cap that
+    kept a field because it was useful would not be a cap. The verdict then falls back to
+    the scan of the text that was kept.
+    """
+    kept = _reduced_event(event, cap)
+    payload = event.get("result")
+    dropped = 0
+    if isinstance(payload, str):
+        raw = payload.encode("utf-8", "replace")
+        if len(raw) > cap:
+            dropped = len(raw) - cap
+            # "ignore", so the kept tail is never LONGER than what was cut from it — the
+            # same reason the transcript bound gives.
+            payload = raw[dropped:].decode("utf-8", "ignore")
+        kept["result"] = payload
+    return kept, dropped
+
+
+def _noticed(text, state):
+    """``text`` with the truncation notice in front of it where anything was dropped.
+
+    One function for every publication a cap can shorten, so a reader is never told a review
+    is whole by the file that is missing the most. Called with the lock held.
+    """
+    if text and state.get("capture_truncated"):
+        return TRUNCATION_NOTICE.format(dropped=state.get("capture_dropped", 0)) + "\n\n" + text
+    return text
+
+
+def _bound_transcript(state):
+    """Keep the retained assistant text inside the cap, dropping from the FRONT.
+
+    From the front is the whole rule. The worker contract puts the answer at the END of a
+    transcript, so dropping the tail silently turns a complete reply into one that stops
+    mid-sentence and no caller can tell the two apart. Dropping the front loses context and
+    keeps the answer, and the notice prepended to what is left says so.
+
+    Called with the lock held.
+    """
+    cap = state.get("capture_cap")
+    if not cap:
+        return
+    parts = state["transcript"]
+    while parts and state.get("transcript_bytes", 0) > cap:
+        before = state["transcript_bytes"]
+        raw = parts[0].encode("utf-8", "replace")
+        over = before - cap
+        if len(raw) <= over:
+            parts.pop(0)
+            state["transcript_bytes"] -= len(raw)
+            state["capture_dropped"] = state.get("capture_dropped", 0) + len(raw)
+            continue
+        # "ignore", so the kept tail is never LONGER than what was cut from it: a partial
+        # character at the front is a fragment nobody reads, while rendering it as U+FFFD
+        # can take more bytes than the cut removed.
+        kept = raw[over:].decode("utf-8", "ignore")
+        parts[0] = kept
+        state["transcript_bytes"] -= (len(raw) - len(kept.encode("utf-8", "replace")))
+        state["capture_dropped"] = state.get("capture_dropped", 0) + over
+        # **A pass that removed nothing ends the loop.** This runs on a reader thread, so a
+        # loop that cannot make progress is not a slow supervisor — it is one that never
+        # reports at all, and the caller then waits out a deadline for an attempt that
+        # finished. Being a few bytes over a cap is the smaller of the two by a long way.
+        if state["transcript_bytes"] >= before:
+            break
+    if state.get("capture_dropped"):
+        state["capture_truncated"] = True
+
+
+def _retained_transcript(state):
+    """The transcript as it will be published, with the truncation notice where one is due.
+
+    One function for both publications — the successful review's findings and a failed run's
+    preserved partial — because a notice on one and not the other is a reader being told the
+    review is whole by the file that is missing the most.
+
+    Called with the lock held.
+    """
+    return _noticed("\n\n".join(state["transcript"]).strip(), state)
 
 
 def _capture_terminal(line, state, lock):
@@ -444,7 +710,7 @@ def _capture_terminal(line, state, lock):
         return
     try:
         event = json.loads(stripped)
-    except ValueError:
+    except (ValueError, RecursionError):
         return
     if not isinstance(event, dict):
         return
@@ -459,10 +725,18 @@ def _capture_terminal(line, state, lock):
     if verdict is not None:
         with lock:
             state["terminal"] = verdict
-            # Keep the event itself, not just its ok/failed verdict: a runtime that
-            # honors an inline schema flag returns the validated object on THIS event
-            # (``structured_output``) while its assistant text stays prose.
-            state["terminal_event"] = event
+            cap = state.get("capture_cap")
+            if cap and len(stripped.encode("utf-8", "replace")) > cap:
+                # Over the cap: its head is kept for `terminal_detail` and the transcript is
+                # marked truncated, because a caller told nothing about this would read a
+                # reply assembled from a stream this program declined to hold whole.
+                state["terminal_event"] = _reduced_event(event, cap)
+                state["capture_truncated"] = True
+            else:
+                # Keep the event itself, not just its ok/failed verdict: a runtime that
+                # honors an inline schema flag returns the validated object on THIS event
+                # (``structured_output``) while its assistant text stays prose.
+                state["terminal_event"] = event
 
 
 def _capture_transcript(line, state, lock):
@@ -472,12 +746,16 @@ def _capture_transcript(line, state, lock):
         return
     try:
         event = json.loads(stripped)
-    except ValueError:
+    except (ValueError, RecursionError):
         return
     text = _event_text(event)
     if text:
         with lock:
             state["transcript"].append(text)
+            if state.get("capture_cap"):
+                state["transcript_bytes"] = (state.get("transcript_bytes", 0)
+                                             + len(text.encode("utf-8", "replace")))
+                _bound_transcript(state)
 
 
 def _consume_jsonl(line, mode, state, lock):
@@ -519,6 +797,9 @@ def _drain_stderr(stream, write_display, state, lock, done):
             try:
                 data = os.read(fd, 65536)
             except OSError:
+                # Tolerated only because nothing derives a fact from stderr: it reaches the
+                # display log and nothing else, the liveness clock is stamped by the stdout
+                # reader too, and no outcome is decided from what arrived here.
                 break
             if not data:
                 break
@@ -532,7 +813,125 @@ def _drain_stderr(stream, write_display, state, lock, done):
         done.set()
 
 
-def run(args):
+def _same_directory(first, second):
+    """True when both names reach the same directory, asked by identity where the OS can say.
+
+    `os.path.samefile` compares device and inode — file id on Windows — so a junction, a
+    symlink and a differently cased spelling of one directory all answer true, while two
+    directories that merely look alike on a case-sensitive filesystem answer false.
+
+    NOT `_same_path`, which folds case unconditionally. That conservatism is right for output
+    paths, where a false match costs a refusal the caller can read; here a false match costs
+    the installed reviewer — the search rejects it and the review drops to a same-model rung
+    over a program that was there all along.
+    """
+    try:
+        return os.path.samefile(first, second)
+    except (OSError, ValueError):
+        pass
+    return (os.path.normcase(os.path.realpath(first))
+            == os.path.normcase(os.path.realpath(second)))
+
+
+def _which_outside_cwd(program, search_path):
+    """Resolve `program` along `search_path`, never accepting a copy in the current directory.
+
+    `shutil.which` cannot answer this: on Windows it searches the current directory first
+    whatever path it is handed, so asking it a second time returns the same checkout copy.
+    Entries are tried in order with the platform's executable extensions, and an entry that
+    IS the current directory is skipped — the tree under review must never supply the
+    program sent to read it.
+    """
+    cwd = os.getcwd()
+    exts = [""]
+    if os.name == "nt":
+        # PATHEXT is ";"-separated on Windows whatever `os.pathsep` reads as here, and it
+        # applies to a name that ALREADY carries an extension: `reviewer.v2` resolves to
+        # `reviewer.v2.cmd`, exactly as the platform's own lookup does. Only a name already
+        # ending in one of these extensions is taken as final.
+        pathext = [e for e in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";") if e]
+        suffix = os.path.splitext(program)[1]
+        if not (suffix and any(suffix.lower() == e.lower() for e in pathext)):
+            exts = pathext + [""]
+    for entry in search_path.split(os.pathsep):
+        if not entry:
+            continue
+        try:
+            # IDENTITY, not spelling. `C:\\WORK\\repo` and a junction both name the current
+            # directory while comparing unequal as text, and accepting one of those entries
+            # runs the checkout's own copy — the single thing this search exists to prevent.
+            if _same_directory(entry, cwd):
+                continue
+        except (OSError, ValueError):
+            continue
+        for ext in exts:
+            candidate = os.path.join(entry, program + ext)
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+    return None
+
+
+def _open_display(path):
+    """Open the display log for appending, or return None when the path cannot be one.
+
+    Plain `open()` is wrong here for two reasons that are the same reason: it WAITS. Opening
+    a FIFO blocks until a reader arrives, and once one goes away a full pipe blocks every
+    write — so a supervisor told to log somewhere unusual stops dead, printing no status
+    line and running neither the idle timer nor the deadline. That is precisely what the
+    skill promises watching the log cannot do to a review.
+
+    O_NONBLOCK makes both the open and the writes fail instead of waiting, and the handle is
+    kept only while `fstat` reports a regular file. O_BINARY keeps Windows from translating
+    newlines underneath the text layer, which would translate them again. The caller treats
+    every display step as best-effort, so failing here costs the log and nothing else.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    flags |= getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return None
+        return open(fd, "a", encoding="utf-8", closefd=True)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+        raise
+
+
+def _payload_complete(mode, state, lock):
+    """Whether the reviewer's own end-of-stream marker is already in hand.
+
+    A descendant holding the inherited stdout keeps the reader from EOF, and Windows has no
+    process group to reap it with. Where the terminal event — or, in result-event mode, the
+    result itself — has arrived, the stream ended and only the pipe is still open: a review
+    that finished, reported as an error because a helper outlived it. External-file mode
+    answers False, since its payload is the file and nothing in the stream speaks for it.
+    """
+    with lock:
+        if mode == "stream-transcript":
+            return state["terminal"] is not None
+        if mode == "stream-json-result-event":
+            return state["last_result"] is not None
+    return False
+
+
+class _Refused(Exception):
+    """A request this supervisor will not start, carrying the reason as its message."""
+
+
+def _preflight(args):
+    """Check the request, resolve the reviewer program, prepare the output directories.
+
+    Every answer here is reached BEFORE anything is created and before any signal handler is
+    armed, and that is what lets a refusal be an exception: there is nothing to clean up, and
+    nothing in here has to know how a status line is printed. `run` turns a `_Refused` into
+    the one line it prints.
+
+    Returns the reviewer command with `cmd[0]` resolved to an absolute path, and the reason
+    the verdict file is unavailable — None when it is available, since a verdict that cannot
+    be written is reported rather than fatal.
+    """
     # THE OUTPUT PATHS MUST NOT ALREADY EXIST. That one rule is the whole ownership model.
     # A path that did not exist when the run started and exists now was brought into being
     # by THIS run, so it is the only thing the supervisor may ever remove — no git, no exit
@@ -547,7 +946,7 @@ def run(args):
             ((args.findings, "--findings"), (args.verdict_json, "--verdict-json"),
              (args.display, "--display")), 2):
         if first and second and _same_path(first, second):
-            return _emit("error", reason=(
+            raise _Refused((
                 f"{first_flag} and {second_flag} name the same path, so they would "
                 f"overwrite each other and whichever landed last would be read as both. "
                 f"Give them separate paths"
@@ -564,7 +963,7 @@ def run(args):
                            (args.verdict_json, "--verdict-json"),
                            (args.display, "--display")):
             if path and not os.path.isabs(path):
-                return _emit("error", reason=(
+                raise _Refused((
                     f"{flag} is relative ({path}) and --cwd is set, so the supervisor and "
                     f"the reviewer would resolve it against different directories. Pass "
                     f"an absolute path"
@@ -583,7 +982,7 @@ def run(args):
     for path, flag in ((args.findings, "--findings"),
                        (args.verdict_json, "--verdict-json")):
         if path and os.path.lexists(path):
-            return _emit("error", reason=(
+            raise _Refused((
                 f"{flag} names {path}, which already exists. This supervisor writes only "
                 f"files it creates and removes only those, so it will not take over a "
                 f"path it did not make — whether that is source, someone else's output, "
@@ -593,15 +992,21 @@ def run(args):
 
     for name, val in (("--idle", args.idle), ("--deadline", args.deadline)):
         if not math.isfinite(val) or val <= 0:
-            return _emit("error", reason=f"{name} must be a finite positive number")
+            raise _Refused(f"{name} must be a finite positive number")
+
+    # A cap of zero or less bounds everything to nothing, which is a run that can only ever
+    # report an overflow. Refused here rather than acted on, so the caller learns it asked
+    # for something that cannot succeed instead of reading a review that failed.
+    if args.max_capture_bytes is not None and args.max_capture_bytes <= 0:
+        raise _Refused("--max-capture-bytes must be a positive number of bytes")
 
     cmd = args.cmd[1:] if args.cmd and args.cmd[0] == "--" else list(args.cmd)
     if not cmd:
-        return _emit("error", reason="no reviewer command given")
+        raise _Refused("no reviewer command given")
 
     cmd, schema_error = _substitute_schema(cmd, args.schema)
     if schema_error is not None:
-        return _emit("error", reason=schema_error)
+        raise _Refused(schema_error)
 
     # PATH only — never the current directory. On Windows `shutil.which` searches CWD first,
     # mirroring cmd.exe, and this supervisor's whole job is to review a checkout it does not
@@ -618,7 +1023,7 @@ def run(args):
         # Refused rather than resolved against `--cwd`: that directory is the checkout under
         # review. A caller naming a program by path can name it absolutely.
         if args.cwd and not os.path.isabs(cmd[0]):
-            return _emit("error", reason=(
+            raise _Refused((
                 f"reviewer program {cmd[0]!r} is a relative path and --cwd was given, "
                 f"so it names one file to check and another to run. Pass an absolute "
                 f"path, or a bare program name to be found on PATH"
@@ -627,13 +1032,17 @@ def run(args):
     else:
         search_path = os.environ.get("PATH", os.defpath)
         exe = shutil.which(cmd[0], path=search_path)
-        if exe is not None and os.path.dirname(os.path.abspath(exe)) == os.getcwd():
-            # Reached only when CWD is genuinely on PATH; treat it as not found rather
-            # than silently running the checkout's copy.
+        if exe is not None and _same_directory(os.path.dirname(os.path.abspath(exe)),
+                                               os.getcwd()):
             if os.getcwd() not in search_path.split(os.pathsep):
-                exe = None
+                # The checkout's own copy, found because Windows searches the current
+                # directory before PATH and not because anyone put it there. Search the REST
+                # of PATH rather than reporting the program missing: refusing here dropped
+                # the review to a same-model rung over a reviewer that was installed all
+                # along. The copy in the tree is still never run.
+                exe = _which_outside_cwd(cmd[0], search_path)
     if exe is None:
-        return _emit("error", reason=f"reviewer CLI not found on PATH: {cmd[0]}")
+        raise _Refused(f"reviewer CLI not found on PATH: {cmd[0]}")
     # ABSOLUTE, so the child execs the exact file that was just checked. Without this a
     # relative PATH entry leaves `Popen` to redo the resolution under whatever directory it
     # runs in. The check and the exec have to name one file, on both platforms.
@@ -644,65 +1053,133 @@ def run(args):
         if args.findings:
             Path(args.findings).parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        return _emit("error", reason=f"setup failed: {exc}")
+        raise _Refused(f"setup failed: {exc}")
 
-    popen_kw = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    stdin=subprocess.DEVNULL,  # a reviewer that probes stdin gets EOF, never hangs
-                    bufsize=0, cwd=args.cwd or None)
-    if os.name == "posix":
-        popen_kw["start_new_session"] = True  # own process group, for a clean group kill
-    # Claimed HERE, after every other refusal and immediately before the child can write.
-    # "Creates nothing when it refuses" is the promise, so the claim has to be the last thing
-    # that happens before it stops being able to keep it — claiming earlier leaves empty files
-    # behind on every refusal path, and the next attempt is rejected for a collision this
-    # program caused.
-    #
-    # OWNERSHIP IS TAKEN, NOT OBSERVED. An existence check followed by writes by name is
-    # check-then-act: between the two, anything may put a symlink at that path. An existence
-    # check can say "nothing was here a moment ago"; it cannot say "this is mine".
-    # `O_CREAT | O_EXCL` says both in one syscall, and POSIX requires it to fail on a symlink.
-    #
-    # The handle is closed immediately rather than held: in external-file mode the reviewer
-    # writes this path itself, often by rename.
-    owned: list[Path] = []
-    for path, flag in ((args.findings, "--findings"),
-                       (args.verdict_json, "--verdict-json")):
-        if not path:
-            continue
+    # The verdict's directory is NOT essential, so it is made here rather than at the write:
+    # the claim below opens the path with O_CREAT, which fails with ENOENT on a missing
+    # parent and refused the WHOLE review over an output that is additive by contract. A
+    # directory that cannot be made drops the verdict with a reason instead.
+    verdict_unavailable = None
+    if args.verdict_json:
         try:
-            os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
-        except FileExistsError:
-            for created in owned:  # leave nothing behind from a refused start
-                with contextlib.suppress(OSError):
-                    created.unlink()
-            return _emit("error", reason=(
-                f"{flag} names {path}, which already exists. This supervisor writes only "
-                f"files it creates and removes only those, so it will not take over a "
-                f"path it did not make — whether that is source, someone else's output, "
-                f"or a previous review. Delete it yourself if it is stale, or name a "
-                f"path that does not exist"
-            ))
+            Path(args.verdict_json).parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            for created in owned:
-                with contextlib.suppress(OSError):
-                    created.unlink()
-            return _emit("error", reason=f"{flag} ({path}) could not be created: {exc}")
-        owned.append(Path(path))
+            verdict_unavailable = f"could not create the verdict directory: {exc}"
+    return cmd, verdict_unavailable
 
-    # Arm the signal handlers BEFORE spawning. A signal delivered between Popen returning
-    # and the handlers being installed would otherwise break both contracts at once: no
-    # JSON status printed, and the just-created child left ORPHANED — start_new_session
-    # detaches its signal fate from ours (which is what makes the group kill clean), so
-    # nothing reaps it and neither the idle timer nor the deadline governs it any more.
-    # The handler reads the child out of a mutable holder, so it is correct both before
-    # the child exists and after.
-    signal_state = {"proc": None, "reported": False}
 
-    def _on_signal(signum, _frame):
-        if signal_state["reported"]:
+class _Interrupts:
+    """Cancellation: the handlers, the files this run created, and the one status line.
+
+    Everything about being interrupted is here — what to terminate, what to remove, and the
+    rule that EXACTLY ONE JSON status line is printed however the run ends. That rule was
+    broken three times while it was spread across `run`: once printing nothing at all, once
+    able to print twice, and once marking itself reported before the line was out. It is one
+    object so that there is one place to get it right.
+    """
+
+    def __init__(self):
+        self.proc = None             # the child, once there is one worth terminating
+        self.owned = []              # every path THIS run created, and the only ones it removes
+        self.payload = None          # the decided status, once its print is imminent
+        self.reported = False        # the line is out; a handler must add nothing to it
+        self.claiming = False        # mid-claim: record a signal, do not act on it
+        self.spawning = False        # mid-spawn: likewise
+        self.interrupted = None      # what a window recorded, for its owner to finish
+        self.standing_aside = False  # the ONE-SHOT allowance while a status prints
+        self._previous = []
+
+    def arm(self):
+        """Install the handlers, before anything exists that an interrupt would strand.
+
+        A signal delivered before this is installed breaks both contracts at once: no JSON
+        status printed, and — once there is a child — a reviewer left ORPHANED, since
+        `start_new_session` has detached its signal fate from ours, so nothing reaps it and
+        neither the idle clock nor the deadline governs it any more.
+        """
+        for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None)):
+            if sig is not None:
+                try:
+                    self._previous.append((sig, signal.signal(sig, self._on_signal)))
+                except (ValueError, OSError):
+                    pass  # not the main thread, or the platform disallows it — best effort
+
+    def restore(self):
+        """Put back whatever was installed before `arm`."""
+        for sig, previous in self._previous:
+            try:
+                signal.signal(sig, previous)
+            except (ValueError, OSError):
+                pass
+
+    def claimed(self, path):
+        """Record a path this run created, which is what makes removing it legitimate."""
+        self.owned.append(Path(path))
+
+    def release(self):
+        """Remove what this run created, and only that.
+
+        Every path recorded here was verified ABSENT at startup, so whatever stands there now
+        was made by this run: there is nothing to decide. It is also what keeps
+        refuse-if-it-exists from being a trap, since residue from a failed run would otherwise
+        refuse the next attempt.
+        """
+        for created in self.owned:
+            with contextlib.suppress(OSError):
+                created.unlink()
+
+    def report(self, status, **extra):
+        """Print the one status line with the handler standing aside, then disarm.
+
+        EVERY exit after `arm` goes through here. Storing the payload first is what tells
+        `_on_signal` the print is imminent, so it steps aside rather than exiting silently;
+        marking the run reported before the line was actually out told the handler the
+        opposite, and a signal in that window ended a finished review in silence. `finally`,
+        so a print that RAISES — a closed stdout — still leaves the caller's handlers as it
+        found them.
+        """
+        self.payload = dict(status=status, **extra)
+        try:
+            return _emit(status, **extra)
+        finally:
+            self.reported = True
+            self.restore()
+
+    def deferred(self, child):
+        """Finish what `_on_signal` recorded, now that the record it needed is complete."""
+        name = (signal.Signals(self.interrupted).name if hasattr(signal, "Signals")
+                else self.interrupted)
+        if child is not None:
+            _terminate(child)
+            _reap_group(child)
+        self.release()
+        return self.report("error", reason=f"supervisor interrupted by {name}",
+                           exit_code=child.poll() if child is not None else None)
+
+    def _on_signal(self, signum, _frame):
+        if self.reported:
             os._exit(1)  # status already emitted; never append a second one
-        signal_state["reported"] = True
-        child = signal_state["proc"]
+        if self.payload is not None:
+            # The run has decided its status and the print is the next thing that happens.
+            # Let it: exiting here ends a COMPLETED review with no status line at all, and
+            # printing the payload from here races that print and emits a second one.
+            #
+            # ONCE. Standing aside costs the microseconds a print takes — unless the print
+            # cannot finish, as it cannot into a stdout nobody is draining, and then this
+            # would make the supervisor unkillable. A caller that signals twice means it.
+            if not self.standing_aside:
+                self.standing_aside = True
+                return
+            os._exit(1)
+        if self.claiming or self.spawning:
+            # Mid-claim, or mid-spawn: in both, this handler would act on a record that is one
+            # statement out of date — a file created but not yet recorded, a child that exists
+            # but is not yet held here. Record the signal and return; the check after each of
+            # those windows acts on it with the record complete.
+            self.interrupted = signum
+            return
+        self.reported = True
+        child = self.proc
         if child is not None:
             _terminate(child)
             # ...and then whatever the group still holds. `_terminate` returns immediately
@@ -712,15 +1189,11 @@ def run(args):
             # normal exit path already calls it and the signal path did not.
             _reap_group(child)
         name = signal.Signals(signum).name if hasattr(signal, "Signals") else signum
-        # The same cleanup a failed review does, because an interrupted review IS a failed
-        # one and leaves the same residue. Removing the up-front invalidation made "refuse
-        # if it exists" the guard — which means anything this run leaves behind blocks the
-        # retry. SIGTERM during an external-file review left the reviewer's findings file in
-        # place and the legitimate rerun was refused as "already exists".
-        #
-        # `os.unlink` is a single syscall and safe here: the handler is already committed to
-        # `os._exit`, so a failure to remove leaves the operator a file they can delete.
-        for path in owned:
+        # The same cleanup a failed review does, because an interrupted review IS a failed one
+        # and leaves the same residue. `os.unlink` is a single syscall and safe here: this
+        # handler is already committed to `os._exit`, so a failure to remove leaves the
+        # operator a file they can delete.
+        for path in self.owned:
             try:
                 os.unlink(path)
             except OSError:
@@ -732,66 +1205,102 @@ def run(args):
         }), flush=True)
         os._exit(1)  # must not fall through into the normal reporting path
 
-    previous_handlers = []
-    for _sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None)):
-        if _sig is not None:
+
+class _Stream:
+    """The reviewer's output while it runs: two reader threads, the record they fill in, and
+    the display log they tee to.
+
+    ONE object because these are one mechanism, not a sequence of steps. The heartbeat the
+    idle clock reads is stamped by the stdout reader on every chunk; the record the outcome is
+    decided from is filled in by that same thread; and the display handle may be closed only
+    once BOTH readers have finished with it. Handing those seven things between separate
+    functions would describe them as independent, which is exactly what they are not.
+    """
+
+    def __init__(self, proc, args):
+        self.proc = proc
+        self.mode = args.result_mode
+        # `capture_cap` lives in the shared record rather than being threaded through
+        # `_consume_jsonl`: the capture functions are the only things that need it, they
+        # already take this dict, and a caller that never passes the flag leaves it None and
+        # reaches not one line of the bounding code. Every new key is read with `.get`, so a
+        # record built without them — as a caller testing one step builds one — still works.
+        self.cap = args.max_capture_bytes or None
+        self.state = {"last_activity": time.monotonic(), "last_result": None,
+                      "transcript": [], "terminal": None, "terminal_event": None,
+                      "capture_cap": self.cap, "transcript_bytes": 0,
+                      "capture_dropped": 0, "capture_truncated": False,
+                      "capture_overflow": None, "display_bytes": 0,
+                      "read_error": None}
+        self.lock = threading.Lock()
+        self.done = threading.Event()
+        self.err_done = threading.Event()
+        self.started = None
+        # Constructed only AFTER a successful launch, so a failed launch leaves no unmatched
+        # "start" marker in the log, and every display step here is best-effort.
+        self.display_fh = None
+        if args.display:
             try:
-                previous_handlers.append((_sig, signal.signal(_sig, _on_signal)))
-            except (ValueError, OSError):
-                pass  # not the main thread, or the platform disallows it — best effort
+                Path(args.display).parent.mkdir(parents=True, exist_ok=True)
+                self.display_fh = _open_display(args.display)  # append: never truncate a shared log
+            except OSError:
+                self.display_fh = None  # display is best-effort; never abort a review for it
 
-    def _restore_handlers():
-        for _s, _p in previous_handlers:
-            try:
-                signal.signal(_s, _p)
-            except (ValueError, OSError):
-                pass
+    def write_display(self, text, bounded=True):
+        """Tee ``text`` to the display log, inside the capture cap where one is set.
 
-    try:
-        proc = subprocess.Popen(cmd, **popen_kw)
-    except (FileNotFoundError, OSError) as exc:
-        signal_state["reported"] = True
-        _restore_handlers()
-        # Release the claimed outputs, exactly as a refused CLAIM already does. Taking
-        # ownership and then failing to launch left two empty files behind — and the next
-        # attempt refuses a path it did not create, so a retry failed for a reason that had
-        # nothing to do with the retry. A bad `--cwd` is enough to reach this. Only files
-        # THIS call created are removed, which is the same rule the refusal states.
-        for created in owned:
-            with contextlib.suppress(OSError):
-                created.unlink()
-        return _emit("error", reason=f"launch failed: {exc}")
-    signal_state["proc"] = proc
+        ``bounded=False`` is this program's OWN markers — the start line and the end line
+        carrying the status. The end marker is the display log's only completion signal and
+        callers are told to treat it as one, so a cap that swallowed it would turn a
+        finished review into a log that reads as a hang. What a cap is for is the reviewer's
+        output, which is the part nobody can bound in advance.
 
-
-    # Open the display log only AFTER a successful launch (so a failed launch leaves no
-    # unmatched "start" marker), and treat every display step as best-effort.
-    display_fh = None
-    if args.display:
-        try:
-            Path(args.display).parent.mkdir(parents=True, exist_ok=True)
-            display_fh = open(args.display, "a", encoding="utf-8")  # append: never truncate a shared log
-        except OSError:
-            display_fh = None  # display is best-effort; never abort a review for it
-
-    def write_display(text):
-        if display_fh is None:
+        Two threads reach this — the stdout reader and the stderr drainer — so the running
+        total is taken under the lock. Without it the cap is a race and the two threads
+        overshoot it by whatever they happened to be holding.
+        """
+        if self.display_fh is None or not text:
             return
+        if bounded and self.cap is not None:
+            size = len(text.encode("utf-8", "replace"))
+            with self.lock:
+                written = self.state.get("display_bytes", 0)
+                if written >= self.cap:
+                    return
+                self.state["display_bytes"] = written + size
+                room = self.cap - written
+            if size > room:
+                text = (text.encode("utf-8", "replace")[:room].decode("utf-8", "ignore")
+                        + f"\n[review_runner] display log capped at {self.cap} bytes; the "
+                          f"rest of the reviewer's output is not logged\n")
         try:
-            display_fh.write(text)
-            display_fh.flush()
+            self.display_fh.write(text)
+            self.display_fh.flush()
         except OSError:
             pass
 
-    write_display("[review_runner] start\n")
+    def start(self):
+        """Start both readers, and the two clocks `watch` and the status line measure against.
 
-    state = {"last_activity": time.monotonic(), "last_result": None, "transcript": [],
-             "terminal": None, "terminal_event": None}
-    lock = threading.Lock()
-    done = threading.Event()
-    fd = proc.stdout.fileno()
+        BOTH clocks start here rather than at construction. Opening the display log is I/O of
+        unknown duration — a network path, a large append — and counting it as silence from
+        the child would spend the first idle window before the child could speak into it, so a
+        slow log alone could end a healthy review with `idle_timeout`.
+        """
+        self.write_display("[review_runner] start\n", bounded=False)
+        self.state["last_activity"] = time.monotonic()
+        threading.Thread(target=self._read_stdout, daemon=True).start()
+        threading.Thread(target=_drain_stderr,
+                         args=(self.proc.stderr, self.write_display, self.state, self.lock,
+                               self.err_done), daemon=True).start()
+        self.started = time.monotonic()
 
-    def reader():
+    def elapsed(self):
+        """Seconds since the readers started, which is what the status line reports."""
+        return 0.0 if self.started is None else time.monotonic() - self.started
+
+    def _read_stdout(self):
+        fd = self.proc.stdout.fileno()
         buf = b""
         # One decoder ACROSS chunks, because a read boundary falls wherever the bytes
         # happened to arrive — mid-character as readily as anywhere else. Decoding each
@@ -800,24 +1309,56 @@ def run(args):
         # Only the DISPLAY path needs this — the JSONL path accumulates raw bytes and
         # decodes whole lines, so a split inside a line never reaches it.
         display_decoder = _display_decoder()
+        # A line this program could not hold whole is the one failure a cap must not hide.
+        # Once it is set, reading CONTINUES — a reader that walked away would leave the child
+        # blocked on a full pipe with nobody to notice — but nothing more is accumulated and
+        # nothing more is parsed, because a transcript assembled out of the rest would be
+        # shorter than the reviewer's own output with nothing to say so.
+        overflowed = False
         try:
             while True:
                 try:
                     data = os.read(fd, 65536)
-                except OSError:
+                except OSError as exc:
+                    # A FAILED READ IS NOT END OF STREAM. Breaking out silently sets `done`
+                    # below on the way past, so the run is reported as drained and whatever
+                    # arrived before the fault is published as the reviewer's whole answer —
+                    # a review cut short by the machine, reported as one that finished.
+                    # Recorded here and refused by `watch` and `_route_outcome`, which is
+                    # where the two states can still be told apart.
+                    with self.lock:
+                        self.state["read_error"] = (
+                            f"reading the reviewer's output failed: {exc}")
                     break
                 if not data:
                     break
-                with lock:
-                    state["last_activity"] = time.monotonic()  # heartbeat per CHUNK, not per line
-                write_display(display_decoder.decode(data))
-                if args.result_mode in ("stream-json-result-event", "stream-transcript"):
-                    buf += data
-                    while b"\n" in buf:
-                        raw, buf = buf.split(b"\n", 1)
-                        _consume_jsonl(raw.decode("utf-8", "replace"), args.result_mode, state, lock)
-            if args.result_mode in ("stream-json-result-event", "stream-transcript") and buf.strip():
-                _consume_jsonl(buf.decode("utf-8", "replace"), args.result_mode, state, lock)
+                with self.lock:
+                    self.state["last_activity"] = time.monotonic()  # heartbeat per CHUNK, not per line
+                self.write_display(display_decoder.decode(data))
+                if overflowed or self.mode not in ("stream-json-result-event",
+                                                   "stream-transcript"):
+                    continue
+                buf += data
+                while b"\n" in buf:
+                    raw, buf = buf.split(b"\n", 1)
+                    _consume_jsonl(raw.decode("utf-8", "replace"), self.mode,
+                                   self.state, self.lock)
+                # Measured on what is still PENDING, which is what "cannot be reframed"
+                # means: a line that arrived whole has been reframed already, and the
+                # transcript and terminal-event bounds are what hold it from there. A line
+                # that keeps growing with no end to it is the one this cannot do, and
+                # dropping part of it would leave a JSON document that parses as something
+                # its author did not write.
+                if self.cap is not None and len(buf) > self.cap:
+                    overflowed = True
+                    buf = b""
+                    with self.lock:
+                        self.state["capture_overflow"] = (
+                            f"one output line exceeded --max-capture-bytes ({self.cap}) "
+                            f"before it ended, so it cannot be reframed")
+            if (not overflowed and buf.strip()
+                    and self.mode in ("stream-json-result-event", "stream-transcript")):
+                _consume_jsonl(buf.decode("utf-8", "replace"), self.mode, self.state, self.lock)
         finally:
             # Flush whatever the decoder is still holding, on EVERY exit path. A child
             # killed mid-character leaves an incomplete sequence, and the decoder holds it
@@ -825,79 +1366,214 @@ def run(args):
             # from the log with nothing to say anything was lost.
             tail = display_decoder.decode(b"", final=True)
             if tail:
-                write_display(tail)
-            done.set()
+                self.write_display(tail)
+            self.done.set()
 
-    thread = threading.Thread(target=reader, daemon=True)
-    thread.start()
+    def watch(self, idle, deadline):
+        """Poll until the reviewer exits or one of the two clocks runs out.
 
-    err_done = threading.Event()
-    err_thread = threading.Thread(
-        target=_drain_stderr,
-        args=(proc.stderr, write_display, state, lock, err_done), daemon=True)
-    err_thread.start()
+        Silence is measured from the last chunk that arrived, the deadline from the start, and
+        neither is derived from the other: a reviewer that talks forever resets the first and
+        never touches the second.
+        """
+        status, reason = "ok", None
+        while self.proc.poll() is None:
+            now = time.monotonic()
+            with self.lock:
+                silent = now - self.state["last_activity"]
+                overflow = self.state.get("capture_overflow")
+                read_failed = self.state.get("read_error")
+            if read_failed and not _payload_complete(self.mode, self.state, self.lock):
+                # The reader is gone, so nothing will stamp the heartbeat again and the idle
+                # clock below would charge the child for silence that is this program's.
+                # Ended here under the fault's own name: a storage or pipe failure is never
+                # the reviewer's answer. Excused once the reviewer's own end-of-stream marker
+                # is in hand, because then the stream is over and only the pipe is still open.
+                status, reason = "error", read_failed
+                _terminate(self.proc)
+                break
+            if overflow:
+                # Ended here rather than left to finish: the rest of this run's output
+                # cannot be parsed, so every second of it is spent against a result that
+                # will be refused anyway. `_route_outcome` asks the same question for a
+                # child that had already exited by the time the reader noticed.
+                status, reason = "error", f"capture overflow: {overflow}"
+                _terminate(self.proc)
+                break
+            if now - self.started >= deadline:
+                status, reason = "deadline", f"no completion within {deadline:.0f}s"
+                _terminate(self.proc)
+                break
+            if silent >= idle:
+                status, reason = "idle_timeout", f"no output for {idle:.0f}s"
+                _terminate(self.proc)
+                break
+            time.sleep(0.5)
+        return status, reason
 
-    start = time.monotonic()
-    status, reason = "ok", None
-    while proc.poll() is None:
-        now = time.monotonic()
-        with lock:
-            idle = now - state["last_activity"]
-        if now - start >= args.deadline:
-            status, reason = "deadline", f"no completion within {args.deadline:.0f}s"
-            _terminate(proc)
-            break
-        if idle >= args.idle:
-            status, reason = "idle_timeout", f"no output for {args.idle:.0f}s"
-            _terminate(proc)
-            break
-        time.sleep(0.5)
+    def settle(self, status):
+        """Wait for both readers, close what is safe to close, mark the log.
 
-    # Split what used to be one 30s wait. A reader that has not hit EOF a few seconds after
-    # the child exited is not slow — it is blocked on a descendant still holding the pipe —
-    # so reap the group and give it the rest of the budget. Same 30s ceiling, but a completed
-    # review no longer loses its tail.
-    drained = done.wait(timeout=5)
-    if not drained:
-        _reap_group(proc)
-        drained = done.wait(timeout=25)
-    exit_code = proc.poll()
-    err_drained = err_done.wait(timeout=5)
-    if drained:
-        # Only close the shared pipe once the reader has finished — no close-under-reader.
-        try:
-            proc.stdout.close()
-        except OSError:
-            pass
-    if err_drained:
-        try:
-            proc.stderr.close()
-        except OSError:
-            pass
-    if display_fh:
-        # ALWAYS write the end marker, drained or not. It is the display log's only
-        # completion signal and callers are told to treat it as one, so making it conditional
-        # conflates three different states. `drained` is reported rather than implied.
-        write_display(
-            f"[review_runner] end status={status} exit={exit_code} drained={drained}\n"
-        )
-        # CLOSING, however, stays behind the drain guard. An undrained reader is still live
-        # and a descendant holding the inherited pipe can wake it at any moment; closing the
-        # handle underneath it turns that write into an uncaught ValueError and drops the
-        # rest of the stream. Writing is best-effort and safe; closing is not.
-        #
-        # BOTH drains, not just stdout's — separate waits, separate threads, the SAME handle.
-        # A reviewer that exits cleanly but leaves a helper holding the inherited stderr gives
-        # drained=True with err_drained=False, and the close then lands under a live
-        # _drain_stderr whose next write raises. The thread traceback prints AHEAD of the JSON
-        # status line, so a caller capturing with 2>&1 reads a finished review as a hang.
-        if drained and err_drained:
+        Returns whether stdout drained, and the reviewer's exit code.
+        """
+        # Two waits rather than one 30s wait. A reader that has not hit EOF a few seconds after
+        # the child exited is not slow — it is blocked on a descendant still holding the pipe —
+        # so reap the group and give it the rest of the budget. Same 30s ceiling, and a single
+        # wait spends all of it before reaping, which costs a completed review its tail.
+        drained = self.done.wait(timeout=5)
+        if not drained:
+            _reap_group(self.proc)
+            drained = self.done.wait(timeout=25)
+        exit_code = self.proc.poll()
+        err_drained = self.err_done.wait(timeout=5)
+        if drained and not err_drained:
+            # stdout reached EOF, so the reviewer itself is gone, and something still holds
+            # stderr: the survivor _reap_group exists for, reached through the other pipe. The
+            # stdout path above already does this; left alone here it kept running under an ok
+            # status, still spending, and the display log is closed under its live writer.
+            _reap_group(self.proc)
+            err_drained = self.err_done.wait(timeout=25)
+        if drained:
+            # Only close the shared pipe once the reader has finished — no close-under-reader.
             try:
-                display_fh.close()
+                self.proc.stdout.close()
             except OSError:
                 pass
+        if err_drained:
+            try:
+                self.proc.stderr.close()
+            except OSError:
+                pass
+        if self.display_fh:
+            # ALWAYS write the end marker, drained or not. It is the display log's only
+            # completion signal and callers are told to treat it as one, so making it conditional
+            # conflates three different states. `drained` is reported rather than implied.
+            self.write_display(
+                f"[review_runner] end status={status} exit={exit_code} drained={drained}\n",
+                bounded=False,
+            )
+            # CLOSING, however, stays behind the drain guard. An undrained reader is still live
+            # and a descendant holding the inherited pipe can wake it at any moment; closing the
+            # handle underneath it turns that write into an uncaught ValueError and drops the
+            # rest of the stream. Writing is best-effort and safe; closing is not.
+            #
+            # BOTH drains, not just stdout's — separate waits, separate threads, the SAME handle.
+            # A reviewer that exits cleanly but leaves a helper holding the inherited stderr gives
+            # drained=True with err_drained=False, and the close then lands under a live
+            # _drain_stderr whose next write raises. The thread traceback prints AHEAD of the JSON
+            # status line, so a caller capturing with 2>&1 reads a finished review as a hang.
+            if drained and err_drained:
+                try:
+                    self.display_fh.close()
+                except OSError:
+                    pass
+        return drained, exit_code
 
+
+PARTIAL_SUFFIX = ".partial"
+PARTIAL_ALTERNATES = 8
+
+
+def _preserve_partial(findings_path, transcript, reason):
+    """Keep a failed run's reviewer text beside ``--findings``; return its path or None.
+
+    NOT the findings path. That path means "a review completed" — it is written only on
+    success and reported only on success, so a caller may test the file rather than the
+    status line and still be right. A truncated review written there is worse than none: a
+    reviewer that reached three of twelve files and said "nothing wrong in what I read"
+    reads as a clean review of all twelve. The text is still worth keeping, because a
+    cross-model review that dies on a usage limit is expensive to lose and the display log
+    is not on the correctness path.
+
+    It is claimed with ``O_EXCL`` and **never** ``O_TRUNC``, and it is NOT recorded in
+    ``owned`` — recording it would have ``release()`` delete the one file this whole function
+    exists to leave behind, and the cleanup on failure is exactly what it opts out of.
+
+    Claiming exclusively means it cannot write to a path that already holds something, so a
+    second failed run in a directory holding the first one's remains takes the next free name
+    — ``.partial.1``, ``.partial.2`` — rather than either overwriting or giving up. Both runs
+    keep their text, which is the property this function is for. Writing in place would not:
+    ``O_TRUNC`` on an existing ``.partial`` destroys the earlier failure's transcript, and on
+    a hard link it destroys the file at the other end. ``O_EXCL`` also means a FIFO left at
+    the path returns ``EEXIST`` at once instead of blocking the open until a reader arrives —
+    a hang with nothing left to time it out, since this runs after the deadline loop has ended.
+
+    The ``lstat`` refusal stays in front of the claim even though ``O_EXCL`` would reject a
+    symlink on its own. It is what makes a link at the path report "not preserved" rather
+    than quietly writing the text one name along: a link somebody else placed is a reason to
+    stop, not a name collision to step around.
+
+    Never fatal, never able to change the outcome. A run that failed and could not keep its
+    text has still failed, and for the same reason.
+    """
+    base = str(findings_path) + PARTIAL_SUFFIX
+    banner = (f"[review_runner] INCOMPLETE REVIEW — the run failed: {reason}\n"
+              f"[review_runner] This is what the reviewer had produced when it stopped. It "
+              f"is NOT a completed review and must not be read as one.\n\n")
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        # `lstat`, not `Path.is_symlink()`, which answers False for everything it cannot
+        # stat: a path whose kind is unknown would be written through the very link this
+        # refuses to follow, on the platforms with no O_NOFOLLOW to catch it. ENOENT is the
+        # only "not a link" this accepts; any other error leaves the text unpreserved, which
+        # is the half of a best-effort that costs nothing but the text.
+        try:
+            mode = os.lstat(base).st_mode
+        except FileNotFoundError:
+            mode = 0
+        if stat.S_ISLNK(mode):
+            return None
+        # Bounded, because a directory holding this many dead partials is a symptom and
+        # walking it forever would be a second one. Giving up loses only the text.
+        for candidate in (base, *(f"{base}.{n}" for n in range(1, PARTIAL_ALTERNATES + 1))):
+            try:
+                fd = os.open(candidate, flags, 0o600)
+            except FileExistsError:
+                continue     # a file, a FIFO, a symlink or a directory -- none of them ours
+            try:
+                os.write(fd, (banner + transcript + "\n").encode("utf-8", errors="replace"))
+            finally:
+                os.close(fd)
+            return candidate
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _read_verdict_file(path, size, cap):
+    """The verdict file external-file mode produced, read inside the cap where one is set.
+
+    **The file is the reviewer's own and is not this program's to shorten**, so nothing here
+    rewrites it: it stays on disk exactly as the reviewer left it, and a caller reading it
+    reads all of it. What a cap bounds is what this process HOLDS — a findings file of any
+    size otherwise arrives whole in memory, four hundred supervisors at a time, which is the
+    thing ``--max-capture-bytes`` exists to stop.
+
+    The TAIL is what is read, because the only use of this text is the scan for the verdict
+    object, and a closing object is a document's last content. And the run is NOT reported
+    truncated for it: `capture_truncated` tells a caller that what was published is shorter
+    than what the reviewer produced, and here the published answer is the untouched file.
+    """
+    if cap and size > cap:
+        with open(path, "rb") as fh:
+            fh.seek(size - cap)
+            return fh.read().decode("utf-8", "replace")
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
+def _route_outcome(args, status, reason, drained, exit_code, state, lock):
+    """Decide the outcome from what actually arrived, and write it to ``--findings``.
+
+    The three result modes disagree about what counts as the review — a final result event,
+    the whole transcript, or a file the reviewer wrote itself — and this is the only step that
+    knows the difference. Returns the status, its reason, and the text that landed in
+    ``--findings``, which is what a verdict is then extracted from.
+
+    A status that arrived here already failed (an idle timeout, a deadline) is carried through
+    untouched: this step only ever decides the outcome of a run that got as far as finishing.
+    """
     findings_text = None  # what actually landed in --findings, for verdict extraction
+    partial = None        # a failed run's reviewer text, kept under its own name
     # Every write below is REVIEWER-DERIVED text, and every one takes `errors="replace"` for
     # the same reason the reads on this path do. JSON permits an unpaired `\ud800` escape and
     # Python's decoder produces the lone surrogate faithfully, so it reaches here intact. A
@@ -907,7 +1583,21 @@ def run(args):
     # says must never be made. U+FFFD in one word does not compare to that.
     try:
         if status == "ok":
-            if not drained:
+            with lock:
+                overflow = state.get("capture_overflow")
+                read_failed = state.get("read_error")
+            if read_failed and not _payload_complete(args.result_mode, state, lock):
+                # Asked before `drained`, which a failed read satisfies too — the reader sets
+                # its done flag on every exit path — so an unreported read fault arrives here
+                # looking exactly like a stream that ended.
+                status, reason = "error", read_failed
+            elif overflow:
+                # Asked here as well as in the watch loop: a child that had already exited
+                # when the reader hit the oversized line never reaches that loop again, and
+                # the run would otherwise be reported ok over a stream this program stopped
+                # parsing part-way.
+                status, reason = "error", f"capture overflow: {overflow}"
+            elif not drained and not _payload_complete(args.result_mode, state, lock):
                 status, reason = "error", "reader did not drain child output"
             elif exit_code not in (0, None):
                 status, reason = "error", f"reviewer exited {exit_code}"
@@ -918,12 +1608,17 @@ def run(args):
                 if payload is None:
                     status, reason = "error", "no successful terminal result event"
                 else:
+                    # The notice goes in front of what is published, never on the end: this
+                    # payload IS the reply, and anything after its closing object means the
+                    # reply has no closing object at all.
+                    with lock:
+                        payload = _noticed(payload, state)
                     Path(args.findings).write_text(
                         payload, encoding="utf-8", errors="replace")
                     findings_text = payload
             elif args.result_mode == "stream-transcript":
                 with lock:
-                    transcript = "\n\n".join(state["transcript"]).strip()
+                    transcript = _retained_transcript(state)
                     terminal = state["terminal"]
                 if terminal != "ok":
                     status, reason = "error", "no successful terminal event — review incomplete or failed"
@@ -940,23 +1635,48 @@ def run(args):
                     findings_text = transcript
             else:  # external-file: require a fresh, non-empty verdict file
                 fp = Path(args.findings)
-                if not fp.exists() or fp.stat().st_size == 0:
+                try:
+                    size = fp.stat().st_size
+                except FileNotFoundError:
+                    # The only error that means the reviewer wrote nothing. `exists()`
+                    # answers False for a path it cannot stat as well, and charging a
+                    # storage fault to the reviewer as "no verdict" is how a caller counting
+                    # bad answers spends an allowance on a failure that was never its own.
+                    # Anything else falls to the routing failure below, named.
+                    size = 0
+                if size == 0:
                     status, reason = "error", "reviewer wrote no verdict"
                 else:
-                    findings_text = fp.read_text(encoding="utf-8", errors="replace")
+                    findings_text = _read_verdict_file(fp, size,
+                                                       args.max_capture_bytes or None)
     except (OSError, ValueError) as exc:
         # ValueError alongside OSError: `UnicodeEncodeError` and `UnicodeDecodeError` are
         # ValueErrors. The `errors="replace"` above should mean nothing here can raise one,
         # but a decoding surprise landing in the module-level `except BaseException` is what
         # turned a completed review into `status: error` once already.
         status, reason = "error", f"routing failed: {exc}"
+    # Whatever went wrong, the reviewer's own words are the expensive part. Kept for every
+    # transcript-mode failure, not just a failed terminal event: an idle timeout and a
+    # deadline arrive here already failed and carry the same half-written review.
+    if status != "ok" and args.result_mode == "stream-transcript" and args.findings:
+        with lock:
+            transcript = _retained_transcript(state)
+        if transcript:
+            partial = _preserve_partial(args.findings, transcript, reason)
+    return status, reason, findings_text, partial
 
-    # Structured verdict — strictly additive and NEVER fatal. Enforcement exists only
-    # on the rung that has a CLI schema flag; the in-harness sub-agent rung has none,
-    # so a review that produced a good narrative but no parseable object is still a
-    # successful review. Report the miss instead of failing it.
-    verdict_path, verdict_reason = None, None
-    if args.verdict_json and status == "ok":
+
+def _publish_verdict(args, status, verdict_unavailable, findings_text, state, lock):
+    """Extract the structured verdict and write it BESIDE the findings, never instead.
+
+    Strictly additive and NEVER fatal. Enforcement exists only on the rung that has a CLI
+    schema flag; the in-harness sub-agent rung has none, so a review that produced a good
+    narrative but no parseable object is still a successful review, and the miss is reported
+    rather than failing it. Returns the path written — None when nothing was — and the reason
+    there is no verdict, which the caller reports as ``verdict_reason``.
+    """
+    verdict_path, verdict_reason = None, verdict_unavailable
+    if args.verdict_json and status == "ok" and verdict_unavailable is None:
         with lock:
             terminal_event = state["terminal_event"] or state["last_result"]
         verdict = _extract_verdict(findings_text, terminal_event)
@@ -975,19 +1695,168 @@ def run(args):
             # is belt to that fix's braces — `json.dumps` escapes a surrogate to ASCII, so
             # it cannot currently raise — but this write is REPORTED, never fatal, and it
             # must stay that way for every failure rather than for one kind of failure.
-            except (OSError, ValueError) as exc:
+            # RecursionError beside the rest, for the same reason: `json.dumps` recurses
+            # once per nesting level when it indents, and the decoder accepts objects deeper
+            # than the encoder writes. This write is REPORTED, never fatal, and that has to
+            # hold for every way it can fail rather than for the ones already seen.
+            except (OSError, ValueError, RecursionError) as exc:
                 verdict_reason = f"could not write the verdict file: {exc}"
+    return verdict_path, verdict_reason
+
+
+def run(args):
+    try:
+        cmd, verdict_unavailable = _preflight(args)
+    except _Refused as refusal:
+        # Nothing has been created and no handler is armed yet, so a refusal is only ever
+        # this one line.
+        return _emit("error", reason=str(refusal))
+
+    popen_kw = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    stdin=subprocess.DEVNULL,  # a reviewer that probes stdin gets EOF, never hangs
+                    bufsize=0, cwd=args.cwd or None)
+    if os.name == "posix":
+        popen_kw["start_new_session"] = True  # own process group, for a clean group kill
+    # Armed BEFORE anything is claimed, which is earlier than the child needs and exactly
+    # where the outputs need it: the claim below creates files, and a signal landing between
+    # creating one and recording it left it on disk to refuse the retry.
+    guard = _Interrupts()
+    guard.arm()
+
+    # Claimed HERE, after every other refusal and immediately before the child can write.
+    # "Creates nothing when it refuses" is the promise, so the claim has to be the last thing
+    # that happens before it stops being able to keep it — claiming earlier leaves empty files
+    # behind on every refusal path, and the next attempt is rejected for a collision this
+    # program caused.
+    #
+    # OWNERSHIP IS TAKEN, NOT OBSERVED. An existence check followed by writes by name is
+    # check-then-act: between the two, anything may put a symlink at that path. An existence
+    # check can say "nothing was here a moment ago"; it cannot say "this is mine".
+    # `O_CREAT | O_EXCL` says both in one syscall, and POSIX requires it to fail on a symlink.
+    #
+    # The handle is closed immediately rather than held: in external-file mode the reviewer
+    # writes this path itself, often by rename.
+    # RECORDED across the claim rather than blocked: creating the file and recording it in
+    # `owned` is one action written as two statements, and a handler firing in between exits
+    # without removing a file it cannot see, leaving residue that refuses the retry. A signal
+    # mask would close that window on POSIX and do nothing whatever on Windows, where the
+    # handler runs just the same — and a mask that ever spanned the spawn would be inherited
+    # by the reviewer.
+    guard.claiming = True
+    for path, flag in ((args.findings, "--findings"),
+                       (None if verdict_unavailable else args.verdict_json, "--verdict-json")):
+        if not path:
+            continue
+        try:
+            os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+        except FileExistsError:
+            guard.release()
+            # Cleaned up BEFORE reporting: a signal recorded during this refusal finds
+            # nothing left to remove either way.
+            guard.claiming = False
+            return guard.report("error", reason=(
+                f"{flag} names {path}, which already exists. This supervisor writes only "
+                f"files it creates and removes only those, so it will not take over a "
+                f"path it did not make — whether that is source, someone else's output, "
+                f"or a previous review. Delete it yourself if it is stale, or name a "
+                f"path that does not exist"
+            ))
+        except OSError as exc:
+            guard.release()
+            guard.claiming = False
+            return guard.report("error", reason=f"{flag} ({path}) could not be created: {exc}")
+        guard.claimed(path)
+    guard.claiming = False
+    if guard.interrupted is not None:
+        return guard.deferred(None)
+
+    # The spawn window is closed by RECORDING a signal, never by blocking one. Blocking here
+    # looked right and was not: the child inherits the mask across fork and exec, so the
+    # reviewer would start unable to handle the termination this supervisor later sends it,
+    # and every cancellation would wait out the grace period and land as SIGKILL. Instead
+    # the handler notes the signal while the child is invisible and returns, and the few
+    # lines after the spawn do what it would have done.
+    guard.spawning = True
+    try:
+        proc = subprocess.Popen(cmd, **popen_kw)
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        # ValueError as well: a NUL byte anywhere in the argv raises it rather than OSError,
+        # and escaping here skipped the release of the claimed files and reported a crash
+        # instead of a launch that failed.
+        guard.spawning = False
+        # Release the claimed outputs, exactly as a refused CLAIM already does. Taking
+        # ownership and then failing to launch left two empty files behind — and the next
+        # attempt refuses a path it did not create, so a retry failed for a reason that had
+        # nothing to do with the retry. A bad `--cwd` is enough to reach this. Only files
+        # THIS call created are removed, which is the same rule the refusal states.
+        guard.release()
+        return guard.report("error", reason=f"launch failed: {exc}")
+    guard.proc = proc
+    guard.spawning = False
+    if guard.interrupted is not None:
+        # A signal arrived while the child was invisible to the handler, which recorded it
+        # and returned. There is something to terminate now.
+        return guard.deferred(proc)
+
+
+    stream = _Stream(proc, args)
+    stream.start()
+    status, reason = stream.watch(args.idle, args.deadline)
+    drained, exit_code = stream.settle(status)
+
+    status, reason, findings_text, partial_findings = _route_outcome(
+        args, status, reason, drained, exit_code, stream.state, stream.lock)
+
+    verdict_path, verdict_reason = _publish_verdict(
+        args, status, verdict_unavailable, findings_text, stream.state, stream.lock)
 
     # The claim created this path empty to hold it. If no verdict was written into it, remove
     # it — "no verdict" has always meant "no verdict file", and a caller that tests for the
-    # file would otherwise read an empty one as a verdict that exists.
-    if args.verdict_json and verdict_path is None:
+    # file would otherwise read an empty one as a verdict that exists. Only where this run
+    # CLAIMED it, though: a verdict whose directory could not be prepared is never claimed, and
+    # deleting that path anyway removes a file this program did not create, which is the one
+    # thing it promises never to do. Another writer can reach it while the review runs.
+    if args.verdict_json and verdict_path is None and Path(args.verdict_json) in guard.owned:
         with contextlib.suppress(OSError):
             Path(args.verdict_json).unlink()
 
     extra = {}
     if args.verdict_json:
         extra = {"verdict": verdict_path, "verdict_reason": verdict_reason}
+    # Reported only when one was written, so a run that kept nothing has the status line it
+    # has always had. `findings` stays null on a failure: the two are different claims, and
+    # a caller keying on `findings` must never see this path.
+    if partial_findings:
+        extra["partial_findings"] = partial_findings
+
+    # **The two opt-in keys appear only for a caller that asked for them**, which is what
+    # makes those flags additive. `partial_findings` is not one of them: it appears on any
+    # failed transcript-mode run that kept text, flags or no flags, and a caller reading the
+    # status line as a fixed set of keys should expect it there.
+    #
+    # `terminal_detail` is null where the failure explained itself NOWHERE — no terminal
+    # event at all, which is what a reviewer writing its error to stderr leaves behind. That
+    # is a distinct answer from a detail this program chose not to read, and a caller
+    # classifying failures depends on being able to tell them apart.
+    if args.status_detail:
+        with stream.lock:
+            event = stream.state.get("terminal_event") or stream.state.get("last_result")
+        # Both keys, because the text alone cannot be classified. An event that carried no
+        # error text at all is reported by NAME, and a caller reading that name as the
+        # failure's account of itself cannot tell an outage from a bad answer — the source
+        # says which of the three rules answered, so "turn.failed" is readable as the
+        # failure explaining nothing rather than as an explanation.
+        detail, source = _terminal_detail_parts(
+            event, min(TERMINAL_DETAIL_MAX_BYTES, args.max_capture_bytes)
+            if args.max_capture_bytes else TERMINAL_DETAIL_MAX_BYTES)
+        extra["terminal_detail"] = detail
+        extra["terminal_detail_source"] = source
+    if args.max_capture_bytes:
+        # Whether anything was dropped, said in the status line rather than left for the
+        # caller to find by reading the transcript for a marker. A caller deciding what a
+        # reply's absence means needs the answer as data.
+        with stream.lock:
+            extra["capture_truncated"] = bool(stream.state.get("capture_truncated"))
 
     # A review that did not succeed leaves the workspace as it found it. `owned` is the only
     # deletion this program performs, and every path in it was verified ABSENT at startup —
@@ -996,25 +1865,20 @@ def run(args):
     # It is also what keeps the refuse-if-it-exists rule from being a trap: without it a
     # failed review would leave files behind that block the next attempt.
     if status != "ok":
-        for path in owned:
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
-            except OSError:
-                pass  # best-effort: the status line below is the report that matters
+        guard.release()
 
     # Disarm before reporting. The child is already dead or drained, so the handlers have
     # nothing left to protect — and a signal arriving between here and process exit would
     # otherwise fire one and append a SECOND status line to a run that has already reported.
     # The `reported` flag alone would not close that window.
-    signal_state["reported"] = True
-    _restore_handlers()
-
-    return _emit(status, reason=reason, exit_code=exit_code,
-                 elapsed_s=round(time.monotonic() - start, 1),
-                 findings=args.findings if status == "ok" else None,
-                 **extra)
+    # Stored BEFORE the disarm, so the window between deciding and printing is covered by
+    # the handler rather than by luck: a signal there ended a finished review with an
+    # interruption error and no status of its own.
+    payload = dict(status=status, reason=reason, exit_code=exit_code,
+                   elapsed_s=round(stream.elapsed(), 1),
+                   findings=args.findings if status == "ok" else None, **extra)
+    return guard.report(status, **{key: value for key, value in payload.items()
+                              if key != "status"})
 
 
 def main(argv=None):
@@ -1062,6 +1926,21 @@ def main(argv=None):
                     help="external-file: the child writes --findings itself; "
                          "stream-json-result-event: extract the final JSONL result event; "
                          "stream-transcript: concatenate all of the reviewer's message text")
+    ap.add_argument("--status-detail", action="store_true",
+                    help="add terminal_detail to the status line: the terminal event's own "
+                         "error text — its top-level message, then a nested error's "
+                         "message, then the event type alone — bounded, and null where the "
+                         "failure explained itself nowhere. terminal_detail_source is added "
+                         "beside it, naming which of those three answered, so an event name "
+                         "is not read as an explanation. Opt-in: without it the status line "
+                         "is exactly what it has always been")
+    ap.add_argument("--max-capture-bytes", type=int, default=None,
+                    help="cap each retained representation separately: the pending raw "
+                         "line, the decoded reviewer text, the retained terminal event and "
+                         "the display log. Reviewer text over the cap is dropped from the "
+                         "FRONT with a notice prepended, and a line too large to reframe "
+                         "ends the run rather than shortening the transcript in silence. "
+                         "Opt-in: without it nothing is bounded and nothing is counted")
     ap.add_argument("cmd", nargs=argparse.REMAINDER, help="-- <reviewer argv ...>")
     try:
         args = ap.parse_args(argv)

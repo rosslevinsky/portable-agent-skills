@@ -26,9 +26,56 @@ a tracker it did not write.
 from __future__ import annotations
 
 import argparse
+import fnmatch
+import os
 import re
+import stat as stat_module
 import sys
 from pathlib import Path
+
+
+def _mode_or_absent(path: Path, *, follow: bool = True) -> int | None:
+    """``path``'s ``st_mode``, or ``None`` when nothing can be at that name.
+
+    **A read has three outcomes and the existence predicates report two.** Which errors
+    they fold into False is not "the file is not there": ``Path.exists()`` and its siblings
+    answer False for ``ELOOP`` and ``EBADF`` as readily as for ``ENOENT``, so a symlink
+    loop — a name the filesystem cannot resolve at all — reads as a name with nothing at
+    it. ``os.path.exists()`` is broader still and swallows every ``OSError``, and the set
+    each of them folds has changed between interpreter versions, so the answer to "is this
+    unreadable file there" depends on which Python is running.
+
+    This fixes the set: absent is ``ENOENT`` and ``ENOTDIR`` (a parent component is not a
+    directory), the two that really do mean nothing can be at this name. ``ENAMETOOLONG``
+    is not one of them: it says the path could not be RESOLVED, which establishes nothing
+    about what stands at the name — a long alias for a real file answers it too, so reading
+    it as absence drops a file that is right there. Every other ``OSError`` propagates, on
+    every version.
+
+    ``follow=False`` inspects the link itself, for callers asking whether a name IS a link.
+    """
+    try:
+        return (os.stat if follow else os.lstat)(path).st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+
+
+def _is_file(path: Path) -> bool:
+    """Is ``path`` a regular file? Absent answers False; unreadable raises."""
+    mode = _mode_or_absent(path)
+    return mode is not None and stat_module.S_ISREG(mode)
+
+
+def _is_dir(path: Path) -> bool:
+    """Is ``path`` a directory? Absent answers False; unreadable raises."""
+    mode = _mode_or_absent(path)
+    return mode is not None and stat_module.S_ISDIR(mode)
+
+
+def _is_symlink(path: Path) -> bool:
+    """Is ``path`` itself a symlink? Absent answers False; unreadable raises."""
+    mode = _mode_or_absent(path, follow=False)
+    return mode is not None and stat_module.S_ISLNK(mode)
 
 
 # The phase document is the durable state — every task, test and exit criterion is a box
@@ -54,6 +101,24 @@ TRACKER_LEGACY_SLUG = re.compile(_TRACKER_SLUG)
 # Banned rather than parsed: a fence or an HTML comment can hide a whole region of the
 # file, and no real tracker has ever contained one.
 TRACKER_BANNED = ("```", "~~~", "<!--", "-->")
+
+
+def _every_legacy_entry_is_a_phase_document(names: list[str], plan_dir: Path) -> bool:
+    """Is every superseded ``- phase:`` entry a real phase document in ``plan_dir``?
+
+    Retiring a tracker skips every other rule on it, so an entry that could not be examined
+    answers False: a read that failed grants no license to stop checking.
+    """
+    for name in names:
+        if not TRACKER_LEGACY_SLUG.fullmatch(name):
+            return False
+        document = plan_dir / f"{name}.md"
+        try:
+            if _is_symlink(document) or not _is_file(document):
+                return False
+        except OSError:
+            return False
+    return True
 
 
 def check_tracker(filepath: Path) -> tuple[list[str], list[str]]:
@@ -84,9 +149,7 @@ def check_tracker(filepath: Path) -> tuple[list[str], list[str]]:
              if line[:1] in ("-", "*", "+") and line[1:3] == " ["]
     legacy = [m.group(1) for line in lines if (m := TRACKER_LEGACY_LINE.match(line))]
     if (legacy and not boxed and not errors
-            and all(TRACKER_LEGACY_SLUG.fullmatch(name)
-                    and not (filepath.parent / f"{name}.md").is_symlink()
-                    and (filepath.parent / f"{name}.md").is_file() for name in legacy)):
+            and _every_legacy_entry_is_a_phase_document(legacy, filepath.parent)):
         return ([], [f"{at}: legacy tracker ({len(legacy)} superseded '- phase:' entries)"
                      f" — not checked"])
     if legacy and boxed:
@@ -108,7 +171,18 @@ def check_tracker(filepath: Path) -> tuple[list[str], list[str]]:
             continue
         phases[target] = idx
         linked = filepath.parent / target
-        if linked.is_symlink() or not linked.is_file():
+        # A link this cannot examine is reported as that, not as "not a regular file".
+        # Both are errors, so nothing is waved through either way, and the difference is
+        # what the operator does next: a slug the grammar admits can be longer than one
+        # path component may be, and "not a regular file here" would send them looking for
+        # a file whose name the filesystem cannot even hold.
+        try:
+            examined_wrong = _is_symlink(linked) or not _is_file(linked)
+        except OSError as exc:
+            errors.append(f"{at}:{idx}: '{target}' could not be examined ({exc}), so "
+                          f"whether this phase document is here and executable is unknown")
+            continue
+        if examined_wrong:
             errors.append(f"{at}:{idx}: '{target}' is not a regular file here; a link "
                           f"resolving elsewhere, or nowhere, cannot be executed")
 
@@ -118,7 +192,27 @@ def check_tracker(filepath: Path) -> tuple[list[str], list[str]]:
                       f"finalise a plan whose work never ran")
     # Every `phase-*.md` ENTRY, whatever kind it is: filtering to regular files here let an
     # unlisted symlink or directory — a phase that would never be executed — pass unnoticed.
-    for name in sorted({p.name for p in filepath.parent.glob("phase-*.md")} - set(phases)):
+    # Listed rather than globbed, and an unlistable directory is an ERROR. `Path.glob`
+    # swallows the OSError from a directory it cannot read and returns nothing, which this
+    # rule would read as "every phase document is linked" — the one answer that makes a
+    # silently unexecuted phase invisible, which is what the rule is for.
+    #
+    # Matched with `fnmatch` and compared through `normcase`, which are the PLATFORM's own
+    # case rule and the one the filesystem will apply when `plan-run` opens these names.
+    # Windows opens `Phase-02-B.MD` by the link `./phase-02-b.md`, so a case-sensitive
+    # comparison here both misses an unlisted phase that is really there and invents an
+    # unlisted one for a phase that is properly linked. On POSIX `normcase` is the identity
+    # and nothing changes.
+    try:
+        on_disk = {name for name in os.listdir(filepath.parent)
+                   if fnmatch.fnmatch(name, "phase-*.md")}
+    except OSError as exc:
+        errors.append(f"{at}: this plan directory could not be listed ({exc}), so no check "
+                      f"was made that every phase-*.md is linked by a checkbox")
+        return (errors, [])
+    linked_names = {os.path.normcase(target) for target in phases}
+    for name in sorted(name for name in on_disk
+                       if os.path.normcase(name) not in linked_names):
         errors.append(f"{at}: '{name}' is in this directory but no checkbox links it; a "
                       f"phase missing from the tracker is never executed")
     return (errors, [])
@@ -134,9 +228,25 @@ def run_tracker_check(target: Path) -> int:
     An explicit file path is checked whatever it is called, which is how ``plan-phase``
     verifies a tracker it has just written.
     """
-    if target.is_dir():
-        files = sorted(target.rglob("execution.md"))
-    elif target.is_file():
+    if _is_dir(target):
+        # `os.walk`, not `rglob`. A directory the scan cannot list is skipped by `rglob`
+        # in silence, so a tracker inside it is never checked and the run still prints
+        # "validation passed" — a skipped file the operator cannot see, which the notice
+        # printing below exists to prevent one line at a time.
+        files = []
+        problems: list[OSError] = []
+        # Compared through `normcase` for the same reason the phase listing is: on Windows
+        # `Execution.md` IS the tracker `plan-run` opens, and a scan that walks past it
+        # prints "validation passed" over a plan nothing checked.
+        for parent, _dirnames, filenames in os.walk(target, onerror=problems.append):
+            files.extend(Path(parent) / name for name in filenames
+                         if os.path.normcase(name) == "execution.md")
+        if problems:
+            print(f"Cannot scan {target}: {problems[0]}; some trackers may not have been "
+                  f"checked")
+            return 1
+        files = sorted(files)
+    elif _is_file(target):
         files = [target]
     else:
         print(f"Path not found: {target}")
