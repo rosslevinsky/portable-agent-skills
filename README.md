@@ -7,9 +7,9 @@ A collection of portable, cross-runtime agent skills for [Claude Code](https://d
 
 ## What is this?
 
-AI coding agents benefit from reusable, well-shaped workflows — "write a failing test first, then implement," "audit this codebase for security issues," "break a large task into committable phases." This repository packages those workflows as plain-markdown `SKILL.md` files that both **Claude Code** (Anthropic) and **Codex CLI** (OpenAI) can invoke, with equivalent behaviour enforced by an automated portability contract.
+AI coding agents benefit from reusable, well-shaped workflows — "write a failing test first, then implement," "audit this codebase for security issues," "break a large task into committable phases." This repository packages those workflows as plain-markdown `SKILL.md` files that both **Claude Code** (Anthropic) and **Codex CLI** (OpenAI) can invoke, with equivalent behavior enforced by an automated portability contract.
 
-One install command drops 16 skills into the right places for both runtimes. CI enforces a contract that forbids runtime-specific tool names, requires a fallback wherever a skill leans on a companion skill, and flags private paths before they ship. Installs are copies, never links — so an edit an agent makes to its own instructions gets read here before it ships back out.
+One install command drops 17 skills into the right places for both runtimes. CI enforces a contract that forbids runtime-specific tool names, requires a fallback wherever a skill leans on a companion skill, and flags private paths before they ship. Installs are copies, never links — so an edit an agent makes to its own instructions gets read here before it ships back out.
 
 ## How to use these skills
 
@@ -134,6 +134,48 @@ It degrades gracefully and works in either direction (Claude-driven or Codex-dri
 Either way, only **blocker/major** findings gate a commit; style nits are recorded as non-blocking
 follow-ups. Turn the cross-model rung off for a run with `/plan-run --no-cross-review`.
 
+**Five skills here could all be called "a review", and they are not interchangeable.**
+[`REVIEWS.md`](REVIEWS.md) sets them side by side: who reads the work, how much that reader
+knows, whether a second model is involved at all, and — the part most people never ask —
+who gets to challenge a finding once somebody raises it. Read it if you are choosing between
+them, or want to know what a given review is actually worth.
+
+### `/review-panel` — many readers who cannot see each other, and nobody checks their own work
+
+The heaviest correctness review in the pack, and the one to reach for when being wrong would
+be expensive. You name a set of files and state what you are worried about. Everything else
+follows from two rules that no other skill here applies.
+
+**Nobody reads alone, and no reader sees another.** The files are split into areas, and every
+area is read by **two agents at once**, each given a different angle to read for and neither
+able to see the other's work or even the other's instructions. Two independent readings of the
+same code find different things; two readings that can see each other converge on the same
+things.
+
+**Nobody checks their own finding.** Every finding goes to an agent that did **not** raise it,
+which settles the claim by *running* it in a separate copy of the tree rather than by arguing
+about it, and reports the command, the exit status and the output. A claim nothing can run is
+judged by reading the code instead, and says which of the two it was; a run that only searched
+the source is labelled as that rather than as a run of your code. With both runtimes installed,
+that challenger is the other model.
+
+One round asks a different question — **which shapes of input none of your tests construct** —
+and what it finds is reported as a test to write rather than as a defect, because a missing
+test is not a failure and a report that files it as one buries it among the dismissals.
+
+Those two rules buy something nothing else in the pack offers: **it proves it read everything
+you gave it.** Every file is accounted for, and the run fails and names the path if anything
+was left unassigned. Every other review here is bounded by something — a diff, a set of
+components chosen by judgment — and none of them can tell you what they missed.
+
+It reports and never edits your tree. It needs Python 3.10+ for its bundled engine, and it is
+not a cheap run: two readers per area, plus a check for every finding. Use it before publishing
+something, not at every commit.
+
+It does not replace the two reviews above it. `/diff-review` is anchored to a change set and
+`/security-review-codebase` sweeps a whole tree for vulnerabilities; this one reads whatever
+you point it at, for whatever problem you state.
+
 ### The rest of the pack
 
 Every skill here can be invoked on its own, whether or not you use the planning cycle. Six of
@@ -141,7 +183,7 @@ them have not been described yet:
 
 - **`/tdd <feature>`** — red/green/refactor, enforced. It writes the failing tests first and
   **confirms they actually fail** before writing any implementation, then implements the
-  minimum that passes, then cleans up. Reach for it where getting the behaviour right matters
+  minimum that passes, then cleans up. Reach for it where getting the behavior right matters
   more than getting it quickly.
 - **`/commit`** — stages the paths your change actually touched (named, never a `git add -A`
   sweep of the tree), reviews that diff, and writes the message from what it read. It stops at
@@ -166,7 +208,7 @@ them have not been described yet:
   and a storyboard you assemble from stills of your own — not screenshots it took for you. It
   writes subtitles, not speech; narration audio is out of scope.
 - **`/extract-hooks`** — audits `.tsx` files, finds the logic that is not layout, and moves it
-  into `use*.ts` custom hooks without changing behaviour. React and TypeScript only.
+  into `use*.ts` custom hooks without changing behavior. React and TypeScript only.
 
 ### Quick decision guide
 
@@ -176,7 +218,7 @@ them have not been described yet:
 | Non-trivial feature or refactor, UI work, or anything wanting visual verification + independent review | `/plan-init` → `/plan-phase` → `/plan-run` |
 | Same, but you want Claude + Codex to sharpen the plan | `/plan-duel` → `/plan-phase` → `/plan-run` |
 | Continuing a plan already broken down into `phases.md` (the superseded v1 layout) | `/plan-run-v1` |
-| Getting the behaviour right matters more than getting it quickly | `/tdd` |
+| Getting the behavior right matters more than getting it quickly | `/tdd` |
 | Ready to record what you just did | `/commit` |
 | You want the whole codebase checked for exploitable vulnerabilities | `/security-review-codebase` |
 | Changed UI and want to see that it really renders | `/web-verify` |
@@ -184,6 +226,8 @@ them have not been described yet:
 | A `.tsx` file has too much logic tangled into its layout | `/extract-hooks` |
 | Something you were just told didn't land | `/clarify` |
 | You want a diff reviewed by someone other than whoever wrote it | `/diff-review` |
+| You want a whole file set read for defects by several agents who cannot see each other, with every finding checked by one who did not raise it | `/review-panel` |
+| You are not sure which of the review skills you want | read [`REVIEWS.md`](REVIEWS.md) |
 
 ## Skill Inventory
 
@@ -205,6 +249,7 @@ them have not been described yet:
 | `demo-video` | Guided-tour walkthrough video (Playwright → video → subtitles) | Degraded |
 | `plan-duel` | Iterative plan refinement between two agents, driven by a bundled stdlib-only Python engine (needs Python 3.10+ and **both** runtimes' CLIs on `PATH`) | Degraded |
 | `security-review-codebase` | Full-codebase security audit — single-pass by default, optional hierarchical deep mode | Degraded |
+| `review-panel` | Blind multi-agent correctness sweep of a file set: bounded areas, readers who see nothing of each other, every finding verified by a stranger; reports, never edits. Needs a host that can run two workers at once and refuses one that cannot | Runtime-limited |
 
 **Classifications:**
 - **Full** — Works in both runtimes with equivalent outcomes
@@ -444,7 +489,7 @@ reinstall**:
 python3 install.py
 ```
 
-Installing 16 skills is a copy of about 40,000 words — fast enough to be the inner loop.
+Installing 17 skills is a copy of about 55,000 words — fast enough to be the inner loop.
 
 The install is a copy, never a link, for two reasons. A link is POSIX-only and unreliable
 under Git Bash, and on Windows a directory junction is invisible to the ordinary link test

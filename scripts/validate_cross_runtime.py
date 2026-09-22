@@ -47,6 +47,7 @@ import json
 import os
 import posixpath
 import re
+import stat as stat_module
 import subprocess
 import sys
 import tempfile
@@ -95,14 +96,72 @@ PRIVATE_PATH_PATTERNS = [
 EXTRA_PRIVATE_IDENTIFIERS = Path(__file__).resolve().parent / "private-identifiers.txt"
 
 
+def _mode_or_absent(path: Path, *, follow: bool = True) -> int | None:
+    """``path``'s ``st_mode``, or ``None`` when nothing can be at that name.
+
+    **A read has three outcomes and the existence predicates report two.** Which errors
+    they fold into False is not "the file is not there": ``Path.exists()`` and its siblings
+    answer False for ``ELOOP`` and ``EBADF`` as readily as for ``ENOENT``, so a symlink
+    loop — a name the filesystem cannot resolve at all — reads as a name with nothing at
+    it. ``os.path.exists()`` is broader still and swallows every ``OSError``, and the set
+    each of them folds has changed between interpreter versions, so the answer to "is this
+    unreadable file there" depends on which Python is running.
+
+    This fixes the set: absent is ``ENOENT`` and ``ENOTDIR`` (a parent component is not a
+    directory), the two that really do mean nothing can be at this name. ``ENAMETOOLONG``
+    is not one of them: it says the path could not be RESOLVED, which establishes nothing
+    about what stands at the name — a long alias for a real file answers it too, so reading
+    it as absence drops a file that is right there. Every other ``OSError`` propagates, on
+    every version.
+
+    ``follow=False`` inspects the link itself, for callers asking whether a name IS a link.
+    """
+    try:
+        return (os.stat if follow else os.lstat)(path).st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+
+
+def _present(path: Path) -> bool:
+    """Is anything at ``path``? Absent answers False; unreadable raises.
+
+    Follows the link, like the ``Path.exists()`` each caller used before it: a dangling
+    link is a name with nothing at it, and a looping one is a name that cannot be resolved.
+    """
+    return _mode_or_absent(path) is not None
+
+
+def _is_file(path: Path) -> bool:
+    """Is ``path`` a regular file? Absent answers False; unreadable raises."""
+    mode = _mode_or_absent(path)
+    return mode is not None and stat_module.S_ISREG(mode)
+
+
+def _is_dir(path: Path) -> bool:
+    """Is ``path`` a directory? Absent answers False; unreadable raises."""
+    mode = _mode_or_absent(path)
+    return mode is not None and stat_module.S_ISDIR(mode)
+
+
+def _is_symlink(path: Path) -> bool:
+    """Is ``path`` itself a symlink? Absent answers False; unreadable raises."""
+    mode = _mode_or_absent(path, follow=False)
+    return mode is not None and stat_module.S_ISLNK(mode)
+
+
 def _load_extra_private_patterns(path: Path) -> list[re.Pattern]:
     """Compile the workspace's own private identifiers, if it declared any.
 
     A missing file is the normal case and returns nothing. A malformed line raises:
     a private-name guard that silently drops a pattern it could not compile is worse
     than no guard, because the operator believes they are covered.
+
+    An UNREADABLE file raises for the same reason, which is why the test is
+    :func:`_is_file` and not ``path.is_file()``. That predicate folds ``ELOOP`` into
+    "not there", so a link the filesystem cannot resolve would empty the whole list and
+    every private name in the tree would sweep clean — the guard off, with nothing said.
     """
-    if not path.is_file():
+    if not _is_file(path):
         return []
     out = []
     for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
@@ -294,6 +353,7 @@ CLASSIFICATION_REQUIRED_SKILLS = {
     "demo-video",
     "diff-review",
     "plan-duel",
+    "review-panel",
     "security-review-codebase",
     "web-verify",
 }
@@ -309,6 +369,7 @@ AGENT_DISPATCH_SKILLS = {
     "plan-run",
     "plan-duel",
     "diff-review",
+    "review-panel",
     "security-review-codebase",
 }
 # **The curated set above is the rule. This marker is a safety net, not a detector.**
@@ -317,7 +378,7 @@ AGENT_DISPATCH_SKILLS = {
 #
 # Deliberately not widened to `spawn … agent`, `delegate … agent`, `parallel agents`. Those
 # read as ordinary prose in skills that dispatch nothing, so they would fire on description
-# rather than behaviour — and a rule that fires on description is one authors phrase around.
+# rather than behavior — and a rule that fires on description is one authors phrase around.
 AGENT_DISPATCH_MARKERS = [
     re.compile(r"\bsub-?agents?\b", re.IGNORECASE),
 ]
@@ -436,7 +497,7 @@ def _walk_tree(root: Path):
 
     **:func:`os.walk`, deliberately, rather than ``Path.rglob("*")``**, for two reasons:
 
-    * **Symlinked directories.** ``rglob``'s non-descent is incidental behaviour, and 3.13
+    * **Symlinked directories.** ``rglob``'s non-descent is incidental behavior, and 3.13
       changed the surface around it. A file *inside* a symlinked directory is not itself a
       symlink, so a per-entry ``is_symlink()`` filter lets every one through if the walk
       descends. Locked twice — ``followlinks=False`` and the explicit ``dirnames`` prune —
@@ -461,7 +522,9 @@ def _walk_tree(root: Path):
             f"  {root}: this directory is a link, so it was not walked — validating a link "
             f"validates whatever it resolves to, which is not what ships"
         )
-    if not root.is_dir():
+    # `_is_dir`, not `root.is_dir()`: that predicate folds an unresolvable name into "not
+    # a directory", and an empty walk validates clean over every file the tree holds.
+    if not _is_dir(root):
         return
 
     problems: list[OSError] = []
@@ -487,7 +550,11 @@ def _walk_tree(root: Path):
             relative = entry.relative_to(root)
             if BUILD_RESIDUE_DIRS.intersection(relative.parts):
                 continue
-            yield entry, relative, entry.suffix.lower(), entry.is_symlink()
+            # `_is_symlink`, so an entry whose `lstat` fails is not quietly filed as an
+            # ordinary file: the symlink branch of every caller scans a link's TARGET, and
+            # the file branch opens the file, so a misfiling sends the entry down a path
+            # that reads nothing and reports nothing.
+            yield entry, relative, entry.suffix.lower(), _is_symlink(entry)
 
     if problems:
         raise UnreadableTree(
@@ -495,6 +562,32 @@ def _walk_tree(root: Path):
             f"only partially scanned and the result below covers less than it claims: "
             f"{problems[0]}"
         )
+
+
+def _candidate_skill_roots(skills_dir: Path, suffix: str = ""):
+    """Every ``<skills_dir>/*<suffix>/SKILL.md``, in name order, link or not.
+
+    **Not ``Path.glob``.** ``glob`` swallows the :class:`OSError` from a directory it
+    cannot list, so one unreadable directory under ``skills/`` drops its skill out of the
+    listing and the run validates the other fifteen and reports success. Which skills exist
+    is the premise of every rule below; a premise that is quietly short is how a gate stops
+    firing without anyone's check going red. ``os.listdir`` raises instead.
+
+    An absent ``skills_dir`` yields nothing — the caller reports "no skills discovered".
+    """
+    if not _is_dir(skills_dir):
+        return
+    for entry in sorted(os.listdir(skills_dir)):
+        if suffix and not entry.endswith(suffix):
+            continue
+        skill_md = skills_dir / entry / "SKILL.md"
+        # The LINK test comes first, and that order is the whole reason a dangling or
+        # looping SKILL.md still reaches `symlinked_skill_roots` to be reported: `_is_file`
+        # resolves the name and raises on a loop, while `_is_symlink` inspects the link
+        # itself. `iter_skill_roots` refuses every link anyway, and a refusal nobody prints
+        # is indistinguishable from a skill that passed.
+        if _is_symlink(skill_md) or _is_file(skill_md):
+            yield skill_md
 
 
 def iter_skill_roots(skills_dir: Path, suffix: str = ""):
@@ -509,8 +602,8 @@ def iter_skill_roots(skills_dir: Path, suffix: str = ""):
     Refusal here is silent by design and reported by :func:`symlinked_skill_roots`, which
     walks the same predicate.
     """
-    for skill_md in sorted(skills_dir.glob(f"*{suffix}/SKILL.md")):
-        if skill_md.parent.is_symlink() or skill_md.is_symlink():
+    for skill_md in _candidate_skill_roots(skills_dir, suffix):
+        if _is_symlink(skill_md.parent) or _is_symlink(skill_md):
             continue
         yield skill_md
 
@@ -521,8 +614,8 @@ def symlinked_skill_roots(skills_dir: Path):
     Same predicate, deliberately. A skill silently skipped is indistinguishable from a skill
     that passed -- the failure mode this whole phase exists to remove.
     """
-    for skill_md in sorted(skills_dir.glob("*/SKILL.md")):
-        if skill_md.parent.is_symlink() or skill_md.is_symlink():
+    for skill_md in _candidate_skill_roots(skills_dir):
+        if _is_symlink(skill_md.parent) or _is_symlink(skill_md):
             yield skill_md.parent
 
 
@@ -600,7 +693,7 @@ def discover_skill_artifacts(skills_dir: Path) -> list[str]:
     companion files that must be packaged.
     """
     artifacts: list[str] = []
-    if not skills_dir.is_dir():
+    if not _is_dir(skills_dir):
         return artifacts
     for skill_md in iter_skill_roots(skills_dir):
         skill_name = skill_md.parent.name
@@ -640,7 +733,7 @@ def discover_skill_artifacts(skills_dir: Path) -> list[str]:
         # named because it is not found by suffix — and the per-artifact rule loop in
         # validate_skills dispatches on .py / .md only, so a .json artifact is gated by the
         # tree-wide check_shipped_json sweep instead.
-        if (skill_md.parent / PLAN_DUEL_SCHEMA).is_file():
+        if _is_file(skill_md.parent / PLAN_DUEL_SCHEMA):
             artifacts.append(f"{skill_name}/{PLAN_DUEL_SCHEMA}")
     return artifacts
 
@@ -780,7 +873,7 @@ def prose_lines(content: str) -> list[str]:
 def discover_degraded_or_limited(skills_dir: Path) -> list[str]:
     """Discover SKILL.md files whose _Classification: line contains Degraded or Runtime-limited."""
     flagged: set[str] = set()
-    if not skills_dir.is_dir():
+    if not _is_dir(skills_dir):
         return []
     for skill_md in iter_skill_roots(skills_dir):
         skill_name = skill_md.parent.name
@@ -788,7 +881,11 @@ def discover_degraded_or_limited(skills_dir: Path) -> list[str]:
             flagged.add(f"{skill_name}/SKILL.md")
         try:
             content = skill_md.read_text(encoding="utf-8")
-        except OSError:
+        except FileNotFoundError:
+            # Deleted between the listing and here. Every OTHER read error propagates:
+            # this function decides which skills the classification rule runs over, so
+            # swallowing one would drop a skill out of that rule with nothing said, and
+            # the run would report a clean pass it never made.
             continue
         for stripped in prose_lines(content):
             if stripped.startswith(CLASSIFICATION_DECL_PREFIX):
@@ -807,7 +904,7 @@ def discover_agent_dispatchers(skills_dir: Path) -> list[str]:
     covers dispatchers that shell out to subprocess participants without the word.
     """
     flagged: set[str] = set()
-    if not skills_dir.is_dir():
+    if not _is_dir(skills_dir):
         return []
     for skill_md in iter_skill_roots(skills_dir):
         skill_name = skill_md.parent.name
@@ -816,7 +913,10 @@ def discover_agent_dispatchers(skills_dir: Path) -> list[str]:
             continue
         try:
             content = skill_md.read_text(encoding="utf-8")
-        except OSError:
+        except FileNotFoundError:
+            # As in `discover_degraded_or_limited`: absent is a skip, unreadable is not.
+            # An unreadable SKILL.md swallowed here silently exempts that skill from the
+            # `_Progress:` rule.
             continue
         if any(marker.search(content) for marker in AGENT_DISPATCH_MARKERS):
             flagged.add(f"{skill_name}/SKILL.md")
@@ -1120,8 +1220,8 @@ def _escaping_relative_paths(line: str, depth: int):
             if resolved != ".." and not resolved.startswith("../"):
                 continue
             # Say how far out it goes, not merely that it does. `../..` written under
-            # `references/` is not visibly an escape until someone counts the levels, and the
-            # reason the old rule was wrong here is that counting is easy to get wrong by eye.
+            # `references/` is not visibly an escape until someone counts the levels, and
+            # counting them by eye is easy to get wrong.
             levels = len([s for s in resolved.split("/") if s == ".."])
             yield candidate, (
                 f"resolves {levels} level{'s' if levels > 1 else ''} above the skill "
@@ -1202,7 +1302,7 @@ def check_bundled_refs_resolve(filepath: Path, skill_root: Path) -> list[str]:
                 continue
             # Written from the SKILL ROOT wherever it appears, including from inside
             # `references/` itself -- that is the convention every skill already uses.
-            if not (skill_root / token).exists():
+            if not _present(skill_root / token):
                 errors.append(
                     f"  {filepath}:{i}: '{token}' does not exist in this skill — a "
                     f"runtime told to read it has nothing to read, and the instruction "
@@ -1248,7 +1348,7 @@ def check_independence_ladder(filepath: Path) -> list[str]:
     satisfiable — on a host that cannot reach it.
 
     **Narrow on purpose.** The vocabulary is the phrasings the pack already uses; a rule that
-    tried to recognise every way an author might describe delegation would fire on correct
+    tried to recognize every way an author might describe delegation would fire on correct
     prose.
     """
     errors = []
@@ -1720,9 +1820,10 @@ def check_classification(filepath: Path) -> list[str]:
     The value is checked only for being non-empty: this runs over whatever pack it is
     pointed at, and a skill may carry a classification this file has no business vetoing.
     """
-    # Lossy, because a single non-UTF-8 byte used to raise UnicodeDecodeError out of here
-    # and abort the entire validation run — not an OSError, so the catch below never saw it.
-    # A file this cannot decode cleanly is one to REPORT on, not one to die on.
+    # Lossy on purpose. A strict read raises UnicodeDecodeError on a single non-UTF-8
+    # byte, which aborts the entire validation run — and it is not an OSError, so the
+    # catch below would never see it. A file this cannot decode cleanly is one to REPORT
+    # on, not one to die on.
     # check_shipped_files_decode asks that question once, up front; these two readers stay
     # lossy so a file that IS reported as undecodable is still scanned rather than skipped.
     try:
@@ -1757,9 +1858,10 @@ def check_progress_declaration(filepath: Path) -> list[str]:
     design and read by nothing, so runtime emission is unverifiable. See PORTABILITY.md
     "Progress Reporting".
     """
-    # Lossy, because a single non-UTF-8 byte used to raise UnicodeDecodeError out of here
-    # and abort the entire validation run — not an OSError, so the catch below never saw it.
-    # A file this cannot decode cleanly is one to REPORT on, not one to die on.
+    # Lossy on purpose. A strict read raises UnicodeDecodeError on a single non-UTF-8
+    # byte, which aborts the entire validation run — and it is not an OSError, so the
+    # catch below would never see it. A file this cannot decode cleanly is one to REPORT
+    # on, not one to die on.
     # check_shipped_files_decode asks that question once, up front; these two readers stay
     # lossy so a file that IS reported as undecodable is still scanned rather than skipped.
     try:
@@ -1860,6 +1962,19 @@ def check_engine_portability(filepath: Path) -> list[str]:
 REQUIRED_COMPANIONS = {
     "plan-duel": [*PLAN_DUEL_COMPANIONS, PLAN_DUEL_ENGINE, PLAN_DUEL_SCHEMA],
     "diff-review": ["review_runner.py", "review-schema.json"],
+    "review-panel": [
+        "review_panel.py",
+        # The driver: the one program SKILL.md tells the user to run. Listed for the same
+        # reason as the engine -- a packaging change that dropped it would leave a skill
+        # whose documented command does not exist, and nothing else here would notice.
+        "review_panel_run.py",
+        "reader-schema.json",
+        "verifier-schema.json",
+        "references/reader.md",
+        "references/coverage-auditor.md",
+        "references/verifier.md",
+        "references/report-format.md",
+    ],
     "plan-run": [
         "references/phase-worker-contract.md",
         "references/phase-worker-schema.json",
@@ -1965,11 +2080,15 @@ def check_companion_files(skills_dir: Path) -> list[str]:
     errors = []
     for skill_name, companions in sorted(REQUIRED_COMPANIONS.items()):
         skill_dir = skills_dir / skill_name
-        if not (skill_dir / "SKILL.md").exists():
+        # `_present`, not `.exists()`. A SKILL.md whose name cannot be resolved would read
+        # as "this skill is not in the tree" and its whole companion list would go
+        # unchecked — the packaging rule silently off for exactly the skill something is
+        # wrong with.
+        if not _present(skill_dir / "SKILL.md"):
             continue
         for companion in companions:
             companion_path = skill_dir / companion
-            if not companion_path.exists():
+            if not _present(companion_path):
                 errors.append(
                     f"  {companion_path}: missing {skill_name} companion file "
                     f"'{companion}' (required when SKILL.md is present)"
@@ -1986,7 +2105,7 @@ def check_shipped_json(skills_dir: Path) -> list[str]:
     schema is always an object.
     """
     errors: list[str] = []
-    if not skills_dir.is_dir():
+    if not _is_dir(skills_dir):
         return errors
     # The shared walk, not `rglob("*.json")` plus a private `__pycache__` test. That test was
     # one of the three separate residue filters this phase collapsed, and the glob folded no
@@ -2027,7 +2146,7 @@ def check_portability_md(repo_root: Path) -> list[str]:
     portability = repo_root / "PORTABILITY.md"
     errors = []
 
-    if not portability.exists():
+    if not _present(portability):
         return ["  PORTABILITY.md not found in repository root"]
 
     content = portability.read_text(encoding="utf-8")
@@ -2121,13 +2240,33 @@ def declared_classification(skill_md: Path) -> str:
     """
     try:
         content = skill_md.read_text(encoding="utf-8")
-    except OSError:
+    except FileNotFoundError:
+        # Absence of the FILE defaults the same way absence of the LINE does. An
+        # unreadable one does not: "Full" is the most permissive answer this function can
+        # give, and handing it back for a file nobody could open would let the README
+        # inventory agree with a classification that was never read.
         return "Full"
     for line in prose_lines(content):
         if line.startswith(CLASSIFICATION_DECL_PREFIX):
             value = line[len(CLASSIFICATION_DECL_PREFIX):].strip().strip("_*").strip()
             # The first word is the classification; everything after it is the explanation
             # every real declaration carries ("Degraded — assertions run in any runtime …").
+            # **Except that one of the two names carries a hyphen of its own.** Splitting on
+            # punctuation alone answers "Runtime" for "Runtime-limited", which matches no
+            # row in the README inventory and no marker in this file, so a skill declaring
+            # it would fail the cross-check with a value nobody wrote. The known names are
+            # tried first, longest first, so a hyphen inside one is read as part of it
+            # rather than as the dash before the explanation.
+            #
+            # **The name must END where the value's own separator is, not merely at a word
+            # boundary.** A word boundary sits between "Degraded" and the slash of
+            # "Degraded/Experimental", which would answer "Degraded" for a classification
+            # this file deliberately does not veto — `check_classification` takes any
+            # non-empty value — and report a mismatch against a README row that agrees with
+            # the skill. Only the separators the fallback below treats as one count.
+            for known in sorted(CLASSIFICATION_REQUIRED_MARKERS, key=len, reverse=True):
+                if re.match(rf"{re.escape(known)}(?:[\s—–-]|$)", value, re.IGNORECASE):
+                    return known
             return re.split(r"[\s—–-]", value, 1)[0].strip() or "Full"
     return "Full"
 
@@ -2186,7 +2325,9 @@ def check_v1_description_disjointness(skills_dir: Path) -> list[str]:
             )
 
         counterpart = skills_dir / v1_name[: -len(V1_SUFFIX)] / "SKILL.md"
-        if not counterpart.exists():
+        # A counterpart whose name cannot be resolved is not a counterpart that is absent,
+        # and skipping on it turns the disjointness rule off for the one pair at issue.
+        if not _present(counterpart):
             continue
         counterpart_opening = _opening_sentence(
             _parse_frontmatter(counterpart).get("description", "")
@@ -2241,9 +2382,9 @@ HYGIENE_SKIP_ROOTS = frozenset({"plans", "node_modules", ".venv"})
 def tracked_paths(root: Path) -> frozenset[str] | None:
     """Repo-relative paths git tracks under ``root``, or ``None`` when git cannot answer.
 
-    **Used to SUBTRACT noise, never to enumerate.** The walk remains the single answer to
+    **This subtracts noise; it never enumerates.** The walk remains the single answer to
     "which files exist"; this only removes files that are not part of the project. With no
-    git, nothing is subtracted and the behaviour is unchanged.
+    git, nothing is subtracted and the behavior is unchanged.
 
     It has to be optional, because **this validator ships** and a user runs it against an
     installed pack that is nobody's git repository. Branching the *scope* on git would give
@@ -2334,7 +2475,7 @@ def iter_hygiene_targets(root: Path):
         # the relaxation covered both installers, the CI workflow and the whole test corpus;
         # and while the symlink branch kept an older rule the file branch had dropped, an
         # identical target was caught under skills/ and missed at the root. A rule with two
-        # implementations has two behaviours.
+        # implementations has two behaviors.
         patterns = (DOC_PRIVATE_PATH_PATTERNS if rel in OWNER_NAMING_FILES
                     else PRIVATE_PATH_PATTERNS)
         yield filepath, rel, patterns, is_symlink
@@ -2388,7 +2529,15 @@ def sweep_content_hygiene(root: Path) -> list[str]:
                         f"private/project-specific reference '{pattern.pattern}'"
                     )
             continue
-        if not filepath.is_file():
+        # Reported, never skipped — the same rule the symlink branch above states. The
+        # walk already listed this entry, so "not a regular file" here means a device, a
+        # socket or a stat that failed, and a file this sweep could not look at must not
+        # leave the sweep saying there is no private path in it.
+        if not _is_file(filepath):
+            errors.append(
+                f"  {filepath}: the walk listed this entry but it is not a regular file, "
+                f"so it was NOT scanned for private paths"
+            )
             continue
         errors.extend(check_private_paths(filepath, patterns))
         errors.extend(check_hardcoded_attribution(filepath))
@@ -2577,7 +2726,13 @@ def _rejected_for(label: str, findings: list[str], because: str) -> list[str]:
 
 
 def run_test_fixtures(fixtures_dir: Path) -> list[str]:
-    """Validate test fixtures produce expected results."""
+    """Validate test fixtures produce expected results.
+
+    The ``if f.exists()`` below each fixture name is plain ``Path.exists`` on purpose and
+    tolerating its two-valued answer authorizes nothing: every one of them has an ``else``
+    that appends "Fixture not found", so a fixture this harness cannot stat fails the run
+    instead of being waved past. The message names the wrong cause; the exit code does not.
+    """
     errors = []
 
     # Test: file with banned phrases should fail
@@ -2610,10 +2765,10 @@ def run_test_fixtures(fixtures_dir: Path) -> list[str]:
     # so a skill missing from CLASSIFICATION_REQUIRED_SKILLS goes unchecked the moment
     # someone deletes its `_Classification:` line.
     #
-    # The five names are written out rather than read from the constant: a loop over the set
+    # The six names are written out rather than read from the constant: a loop over the set
     # would shrink with it. Each case runs through to a real ERROR, not just to discovery.
-    for skill_name in ("demo-video", "diff-review", "plan-duel", "security-review-codebase",
-                       "web-verify"):
+    for skill_name in ("demo-video", "diff-review", "plan-duel", "review-panel",
+                       "security-review-codebase", "web-verify"):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_skills = Path(tmpdir)
             skill_dir = tmp_skills / skill_name
@@ -2690,8 +2845,8 @@ def run_test_fixtures(fixtures_dir: Path) -> list[str]:
 
     # Test: an undecodable shipped file is REPORTED by name, not raised out of the run.
     #
-    # One 0x97 in any SKILL.md used to abort everything with a UnicodeDecodeError from
-    # pathlib — the offending path nowhere in the traceback, no finding of any kind
+    # A strict read of one 0x97 in any SKILL.md aborts everything with a UnicodeDecodeError
+    # from pathlib — the offending path nowhere in the traceback, no finding of any kind
     # printed, the private-path sweep and the budget ratchet never reached.
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_skills = Path(tmpdir) / "skills"
@@ -2857,10 +3012,10 @@ def run_test_fixtures(fixtures_dir: Path) -> list[str]:
     # Test: stale runtime capability claims should fail
     f = fixtures_dir / "test_validate_stale_runtime_claim.md"
     if f.exists():
-        # Per PATTERN, not per file. One line used to trip patterns 1 and 2 together while
-        # pattern 3 had no line at all, so a pattern that stopped matching left the fixture
-        # still rejecting and the loss invisible. Asserting each pattern's own reported
-        # string makes the fixture's coverage equal to the rule's.
+        # Per PATTERN, not per file. One line can trip patterns 1 and 2 together while
+        # pattern 3 has no line at all, and the fixture then keeps rejecting after a
+        # pattern stops matching, so the loss is invisible. Asserting each pattern's own
+        # reported string makes the fixture's coverage equal to the rule's.
         stale_findings = check_stale_runtime_claims(f)
         for pattern in STALE_RUNTIME_CLAIM_PATTERNS:
             errors += _rejected_for("test_validate_stale_runtime_claim.md",

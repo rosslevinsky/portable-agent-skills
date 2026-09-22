@@ -25,11 +25,27 @@ obvious. Below is the shape to follow — adapt selectors and steps to the actua
 // Launch with slow motion and video recording enabled via the project's config
 // (e.g. use: { launchOptions: { slowMo: 600 }, video: 'on' }).
 
+// Subtitle timing comes from this array — see subtitles.md. `t0` is the video's zero
+// point, and it is set INSIDE the test, where the page exists: Playwright starts recording
+// at page creation, so a module-level `Date.now()` runs before the recording and carries
+// the whole launch offset into every caption.
+let t0;
+const steps = [];
+
 async function step(page, caption, action) {
-  // record caption + start time for subtitle derivation (see subtitles.md)
+  const start = Date.now() - t0;
   await action(page);
   await page.waitForTimeout(PAUSE_MS); // long enough to read
+  steps.push({ caption, start, duration: Date.now() - t0 - start });
 }
+
+// The FIRST hook to receive the page. Recording starts when the page is created, so any
+// hook or fixture that uses it before this one is video time the captions would miss — and
+// setting `t0` in the test body puts every such hook on the wrong side of zero.
+test.beforeEach(async ({ page }) => {
+  t0 = Date.now();
+  steps.length = 0;   // one array per recording
+});
 
 test('guided tour', async ({ page }) => {
   await step(page, 'Open the settings page', async p => {

@@ -109,7 +109,7 @@ self-check: re-read each modified file, confirm no logic remains inline in
 risks that could not be verified locally.
 
 **Where no test exercises the logic that moved, report that hook as extracted but
-unverified, and name it.** This skill's promise is that behaviour is preserved, and
+unverified, and name it.** This skill's promise is that behavior is preserved, and
 "tests still pass" is not evidence of that when nothing covered the code in the first
 place — a green run over untouched tests reads exactly like a checked one.
 

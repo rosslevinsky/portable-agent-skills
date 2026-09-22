@@ -12,7 +12,7 @@ by path or CI URL only — never inline screenshots, videos, traces, or reports.
 ~~~markdown
 # As-Built Spec and Drift Report — <plan title>
 
-_Assembled by /plan-run on <date>. Source of intent: [`plan.md`](./plan.md);
+_Assembled by /plan-run on <date>. Source of intent: [`<plan file>`](./<plan file>);
 execution record: [`execution.md`](./execution.md)._
 
 ## What was built

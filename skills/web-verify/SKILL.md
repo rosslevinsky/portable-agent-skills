@@ -76,8 +76,9 @@ artifact. Prefer full-page screenshots at each asserted state.
 
 Optionally, for richer change-point evidence, record a video of the flow and
 extract frames at visual change points with ffmpeg — this is a heavier, optional
-layer. Use the template in `references/extract-frames.sh`; if ffmpeg is not
-installed, skip frame extraction and rely on screenshots.
+layer. Use the template in `references/extract-frames.sh` — a Bash
+script, so it needs Bash as well as ffmpeg. Missing either, skip frame extraction and rely
+on screenshots.
 
 ## Step 4 — Inspect the captures (do not skip)
 

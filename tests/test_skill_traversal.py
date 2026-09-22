@@ -32,6 +32,7 @@ this defect regenerated at whichever site the last fix had not touched.
 """
 import ast
 import contextlib
+import errno
 import io
 import os
 import sys
@@ -80,7 +81,7 @@ def _skill(root: Path) -> Path:
 
 
 def _discovered_paths(skills_dir: Path) -> set[str]:
-    """Normalise discovery output to a set of skill-relative path strings."""
+    """Normalize discovery output to a set of skill-relative path strings."""
     out = set()
     for entry in discover_skill_artifacts(skills_dir):
         text = entry if isinstance(entry, str) else str(entry)
@@ -337,12 +338,13 @@ DIRECT_FILESYSTEM_WALKERS = {
     "_walk_tree":
         "THE primitive. os.walk, one place, with the residue prune, the case fold, the "
         "symlink refusal and the OSError that rglob swallows.",
-    "iter_skill_roots":
+    "_candidate_skill_roots":
         "'Which skills exist' -- a different question from 'which files belong to one', "
-        "and the glob is over skill roots, not over a skill's contents.",
-    "symlinked_skill_roots":
-        "The reporting twin of iter_skill_roots. Same predicate on purpose: a refusal one "
-        "function makes and another does not mention is how the refusal went silent.",
+        "and the listing is over skill roots, not over a skill's contents. One level of "
+        "os.listdir, which raises where glob would have returned a short list: a skill "
+        "that drops out of this listing is a skill every rule below silently passes. "
+        "iter_skill_roots and symlinked_skill_roots both read it, so the question has "
+        "one implementation and the refusal one predicate.",
 }
 
 
@@ -766,6 +768,227 @@ class RelativePathsAreResolvedNotCounted(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn("absolute path", errors[0])
         self.assertNotIn("levels above", errors[0])
+
+
+# A symlink that points at itself. `os.stat` answers ELOOP — the filesystem cannot resolve
+# the name at all — and `Path.exists()` / `.is_file()` fold that into False, the same answer
+# they give for a name with nothing at it. It is the one unreadable state a test can create
+# on any platform without elevation and without depending on who is running it: `chmod 0o000`
+# does not stop root and does not stop Windows.
+def _unresolvable(path: Path) -> Path:
+    """Make ``path`` a self-referential symlink and return it."""
+    path.symlink_to(path.name)
+    return path
+
+
+CAN_SYMLINK = True
+try:
+    with tempfile.TemporaryDirectory() as _probe:
+        _loop = Path(_probe) / "loop"
+        _unresolvable(_loop)
+        CAN_SYMLINK = not _loop.exists() and _loop.is_symlink()
+except (OSError, NotImplementedError):  # pragma: no cover - platform dependent
+    CAN_SYMLINK = False
+
+NEEDS_UNRESOLVABLE = unittest.skipUnless(
+    CAN_SYMLINK, "this platform/user cannot create an unresolvable symlink")
+
+
+@NEEDS_UNRESOLVABLE
+class AnUnreadableFileIsNotAnAbsentOne(unittest.TestCase):
+    """The existence predicates fold ELOOP into False, and this file is a GATE.
+
+    A check that reads that False as "not there" does not fail — it silently passes, and
+    the run prints "All validations passed" over a file it never opened. Each case below
+    drives one validator entry point at a name the filesystem cannot resolve and asserts
+    the validator says so rather than answering as if the name were free.
+
+    The ENOENT half is asserted alongside, because narrowing what counts as absent is only
+    a fix if genuinely absent still means absent.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    def _skill_dir(self, name="demo") -> Path:
+        skill = self.root / "skills" / name
+        skill.mkdir(parents=True)
+        return skill
+
+    def test_an_unresolvable_private_identifier_list_does_not_empty_the_guard(self):
+        """Returning [] there switches the private-name sweep off for the whole run."""
+        listing = _unresolvable(self.root / "private-identifiers.txt")
+        with self.assertRaises(OSError):
+            vcr._load_extra_private_patterns(listing)
+
+    def test_an_absent_private_identifier_list_is_still_the_ordinary_case(self):
+        self.assertEqual(
+            vcr._load_extra_private_patterns(self.root / "nowhere.txt"), [])
+
+    def test_a_skill_root_that_cannot_be_resolved_is_reported_not_dropped(self):
+        """One skill short is a run that validates the rest and reports success."""
+        _unresolvable(self._skill_dir() / "SKILL.md")
+        roots = list(vcr.iter_skill_roots(self.root / "skills"))
+        refused = [p.name for p in vcr.symlinked_skill_roots(self.root / "skills")]
+        self.assertEqual(roots, [], "a link is never validated as a skill")
+        self.assertEqual(refused, ["demo"],
+                         "and the refusal must be reported, or it is a silent skip")
+
+    def test_the_whole_run_reports_the_refusal_rather_than_passing(self):
+        _unresolvable(self._skill_dir() / "SKILL.md")
+        errors = vcr.validate_skills(self.root / "skills", self.root)
+        self.assertTrue(any("symlink" in e for e in errors), errors)
+
+    def test_an_unreadable_skill_is_not_reported_as_a_full_classification(self):
+        """"Full" is the most permissive answer, and it must be read, never assumed."""
+        skill = self._skill_dir()
+        real_read = Path.read_text
+
+        def denying_read(self_, *a, **k):
+            if self_.name == "SKILL.md":
+                raise PermissionError(13, "Permission denied", str(self_))
+            return real_read(self_, *a, **k)
+
+        (skill / "SKILL.md").write_text(FRONTMATTER, encoding="utf-8")
+        with unittest.mock.patch.object(Path, "read_text", denying_read):
+            with self.assertRaises(PermissionError):
+                vcr.declared_classification(skill / "SKILL.md")
+
+    def test_an_absent_skill_still_defaults_to_full(self):
+        """The ENOENT half of the same function, so the fix narrows rather than breaks."""
+        self.assertEqual(
+            vcr.declared_classification(self.root / "nowhere" / "SKILL.md"), "Full")
+
+    def test_the_two_word_classification_is_read_whole(self):
+        """`Runtime-limited` is one of the two names this file requires a declaration for,
+        and the dash inside it is not the dash before the explanation. Read as one word it
+        answered `Runtime`, which matches no row in the README inventory and no marker
+        here — so the first skill to declare it would fail the cross-check for a reason
+        pointing nowhere near the truth."""
+        skill = self._skill_dir()
+        cases = (
+            ("Runtime-limited — it needs two workers.", "Runtime-limited"),
+            ("Degraded — one runtime loses parallelism.", "Degraded"),
+            ("Runtime-limited", "Runtime-limited"),
+            # A value this file has no business vetoing: `check_classification` accepts any
+            # non-empty one, and the README is compared against whatever it says. Matching
+            # a known name up to any boundary would answer "Degraded" here and report a
+            # mismatch against a README row that says exactly what the skill says.
+            ("Degraded/Experimental — a custom pack's own word.", "Degraded/Experimental"),
+        )
+        for declared, expected in cases:
+            with self.subTest(declared=declared):
+                (skill / "SKILL.md").write_text(
+                    f"{FRONTMATTER}\n_Classification: {declared}_\n", encoding="utf-8")
+                self.assertEqual(vcr.declared_classification(skill / "SKILL.md"), expected)
+
+    def test_an_unreadable_skill_is_not_silently_exempt_from_the_progress_rule(self):
+        skill = self._skill_dir()
+        (skill / "SKILL.md").write_text(FRONTMATTER, encoding="utf-8")
+        real_read = Path.read_text
+
+        def denying_read(self_, *a, **k):
+            if self_.name == "SKILL.md":
+                raise PermissionError(13, "Permission denied", str(self_))
+            return real_read(self_, *a, **k)
+
+        with unittest.mock.patch.object(Path, "read_text", denying_read):
+            with self.assertRaises(PermissionError):
+                vcr.discover_agent_dispatchers(self.root / "skills")
+            with self.assertRaises(PermissionError):
+                vcr.discover_degraded_or_limited(self.root / "skills")
+
+    def test_a_companion_check_is_not_skipped_for_a_skill_it_cannot_resolve(self):
+        """Skipping there turns the packaging rule off for the skill something is wrong with."""
+        skills = self.root / "skills"
+        (skills / "plan-duel").mkdir(parents=True)
+        _unresolvable(skills / "plan-duel" / "SKILL.md")
+        with self.assertRaises(OSError):
+            vcr.check_companion_files(skills)
+
+    def test_a_skill_that_is_simply_absent_is_still_skipped(self):
+        """The ENOENT half: `check_companion_files` runs over a partial pack on purpose."""
+        (self.root / "skills").mkdir()
+        self.assertEqual(vcr.check_companion_files(self.root / "skills"), [])
+
+    def test_a_reference_that_cannot_be_resolved_is_not_reported_as_missing(self):
+        """"Does not exist in this skill" is a claim, and an ELOOP has not earned it."""
+        skill = self._skill_dir()
+        (skill / "references").mkdir()
+        _unresolvable(skill / "references" / "guide.md")
+        doc = skill / "SKILL.md"
+        doc.write_text("See `references/guide.md` for details.\n", encoding="utf-8")
+        with self.assertRaises(OSError):
+            vcr.check_bundled_refs_resolve(doc, skill)
+
+    def test_a_reference_that_is_absent_is_still_reported_as_missing(self):
+        skill = self._skill_dir()
+        doc = skill / "SKILL.md"
+        doc.write_text("See `references/nowhere.md` for details.\n", encoding="utf-8")
+        findings = vcr.check_bundled_refs_resolve(doc, skill)
+        self.assertTrue(any("does not exist" in f for f in findings), findings)
+
+    def test_the_run_reports_an_unreadable_path_instead_of_passing(self):
+        """The end-to-end claim: a failing exit, the path NAMED, never "passed".
+
+        A regression guard on the top-level contract rather than a demonstration of any
+        one handler: `check_shipped_files_decode` runs before discovery and already reports
+        an unreadable shipped file, so this stays green if a single downstream handler is
+        widened again. What it pins is that no arrangement of those handlers can produce
+        "All validations passed" or a traceback over a file nothing could open.
+        """
+        skill = self._skill_dir()
+        (skill / "SKILL.md").write_text(FRONTMATTER, encoding="utf-8")
+        real_read = Path.read_text
+
+        def denying_read(self_, *a, **k):
+            if self_.name == "SKILL.md":
+                raise PermissionError(13, "Permission denied", str(self_))
+            return real_read(self_, *a, **k)
+
+        argv = ["validate_cross_runtime.py", str(self.root / "skills")]
+        with unittest.mock.patch.object(Path, "read_text", denying_read), \
+                unittest.mock.patch.object(sys, "argv", argv), \
+                unittest.mock.patch.object(vcr, "__file__", str(VALIDATOR)):
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                with self.assertRaises(SystemExit) as exit_info:
+                    vcr.main()
+        self.assertEqual(exit_info.exception.code, 1)
+        self.assertNotIn("All validations passed", buffer.getvalue())
+        self.assertNotIn("Traceback", buffer.getvalue())
+        self.assertIn("SKILL.md", buffer.getvalue())
+
+
+class ANameTooLongToResolveIsNotAnAbsentName(unittest.TestCase):
+    """``ENAMETOOLONG`` says the path could not be RESOLVED, which establishes nothing about
+    what stands at the name — a long alias answers it for a file that is really there.
+
+    This validator is a GATE, so a name it reads as free is a name it does not check. The
+    errno is injected rather than built from a 300-character name: which errno a platform
+    reports for one of those is its own business, and this asks what the helper does with the
+    errno. The genuinely absent half is asserted beside it, because narrowing what counts as
+    absent is a fix only while absent still means absent.
+    """
+
+    def test_it_propagates(self):
+        too_long = OSError(errno.ENAMETOOLONG, "File name too long")
+        with unittest.mock.patch.object(os, "stat", side_effect=too_long):
+            with self.assertRaises(OSError) as raised:
+                vcr._mode_or_absent(Path("some-name"))
+        self.assertEqual(raised.exception.errno, errno.ENAMETOOLONG)
+
+    def test_the_link_inspection_propagates_it_too(self):
+        too_long = OSError(errno.ENAMETOOLONG, "File name too long")
+        with unittest.mock.patch.object(os, "lstat", side_effect=too_long):
+            with self.assertRaises(OSError):
+                vcr._mode_or_absent(Path("some-name"), follow=False)
+
+    def test_a_genuinely_absent_name_is_still_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(vcr._mode_or_absent(Path(tmp) / "nothing"))
 
 
 if __name__ == "__main__":

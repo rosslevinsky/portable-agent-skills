@@ -11,12 +11,15 @@ derived from THIS file. Timing margins are generous so the suite stays determini
 
 import ast
 import contextlib
+import errno
 import io
 import json
 import os
 import re
 import shutil
 import subprocess
+import signal
+import threading
 import sys
 import tempfile
 import time
@@ -46,6 +49,21 @@ def _run(*args):
     return json.loads(buf.getvalue().strip().splitlines()[-1])
 
 
+def _parsed(*argv):
+    """Build an args namespace through the REAL parser, the way a caller reaches it.
+
+    Hand-rolling a namespace would drift from the parser's own defaults, and the defaults
+    are part of what the pre-flight is asked about.
+    """
+    captured = []
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        with unittest.mock.patch.object(review_runner, "run",
+                                        lambda a: captured.append(a) or 0):
+            review_runner.main(list(argv))
+    assert captured, "main never reached run"
+    return captured[0]
+
+
 class ExternalFileMode(unittest.TestCase):
     def test_clean_verdict_ok(self):
         with tempfile.TemporaryDirectory() as d:
@@ -65,8 +83,8 @@ class ExternalFileMode(unittest.TestCase):
             self.assertEqual(res["status"], "error")
 
     def test_stale_file_is_error(self):
-        # A pre-existing findings file is refused BEFORE launch (it used to be deleted),
-        # so stale content can never be passed off as a fresh verdict. The file is left
+        # A pre-existing findings file is refused BEFORE launch rather than deleted, so
+        # stale content can never be passed off as a fresh verdict. The file is left
         # exactly where it was — this supervisor removes only what it created.
         with tempfile.TemporaryDirectory() as d:
             f = Path(d) / "findings.txt"
@@ -225,6 +243,100 @@ class StreamTranscript(unittest.TestCase):
             res = _run("--idle", "5", "--deadline", "10", "--findings", f,
                        "--result-mode", "stream-transcript", "--", PY, "-c", child)
             self.assertEqual(res["status"], "error")
+
+
+class PartialTranscriptIsPreserved(unittest.TestCase):
+    """A failed run keeps the reviewer's text, at a path that is NOT the findings file.
+
+    `--findings` means "a review completed": it is written only on success and its path is
+    reported only on success, so a caller may test the file instead of the status and still
+    be right. Writing a truncated review there would make a review that got through three of
+    twelve files look like a clean review of all twelve. The text is still worth keeping — a
+    long cross-model review that dies on a usage limit is expensive to lose — so it goes
+    beside the findings file under its own name, and the status line names it under its own
+    key.
+    """
+
+    CHILD = (r'import json; '
+             r'print(json.dumps({"type":"item.completed","item":'
+             r'{"type":"agent_message","text":"partial output"}})); '
+             r'print(json.dumps({"type":"turn.failed"}))')
+
+    def _failed_run(self, d):
+        f = str(Path(d) / "findings.txt")
+        res = _run("--idle", "5", "--deadline", "10", "--findings", f,
+                   "--result-mode", "stream-transcript", "--", PY, "-c", self.CHILD)
+        return f, res
+
+    def test_the_findings_file_is_still_absent_and_unreported(self):
+        with tempfile.TemporaryDirectory() as d:
+            f, res = self._failed_run(d)
+            self.assertEqual(res["status"], "error")
+            self.assertIsNone(res["findings"],
+                              "a failed run named a findings file, which means a review")
+            self.assertFalse(Path(f).exists(),
+                             "the findings file survived a failed run; a caller that tests "
+                             "for it reads a truncated review as a complete one")
+
+    def test_the_text_is_kept_beside_it_and_named_in_the_status(self):
+        with tempfile.TemporaryDirectory() as d:
+            f, res = self._failed_run(d)
+            kept = res.get("partial_findings")
+            self.assertIsNotNone(kept, f"the reviewer's text was discarded: {res}")
+            self.assertNotEqual(kept, f, "the partial went to the findings path itself")
+            self.assertIn("partial output", Path(kept).read_text(encoding="utf-8"))
+
+    def test_the_kept_file_says_it_is_not_a_review(self):
+        with tempfile.TemporaryDirectory() as d:
+            _, res = self._failed_run(d)
+            head = Path(res["partial_findings"]).read_text(encoding="utf-8").splitlines()[0]
+            self.assertIn("INCOMPLETE", head,
+                          f"nothing at the top marks this as a failed run: {head!r}")
+
+    def test_a_successful_run_keeps_nothing_extra(self):
+        """Anti-vacuity: a guard that fired on every run would satisfy the three above."""
+        with tempfile.TemporaryDirectory() as d:
+            f = str(Path(d) / "findings.txt")
+            child = (r'import json; '
+                     r'print(json.dumps({"type":"item.completed","item":'
+                     r'{"type":"agent_message","text":"a real review"}})); '
+                     r'print(json.dumps({"type":"turn.completed"}))')
+            res = _run("--idle", "5", "--deadline", "10", "--findings", f,
+                       "--result-mode", "stream-transcript", "--", PY, "-c", child)
+            self.assertEqual(res["status"], "ok")
+            self.assertIsNone(res.get("partial_findings"))
+            self.assertEqual(list(Path(d).iterdir()), [Path(f)],
+                             "a successful run left a partial file beside its findings")
+
+    def test_nothing_is_written_when_the_reviewer_produced_no_text(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = str(Path(d) / "findings.txt")
+            child = r'import json; print(json.dumps({"type":"turn.failed"}))'
+            res = _run("--idle", "5", "--deadline", "10", "--findings", f,
+                       "--result-mode", "stream-transcript", "--", PY, "-c", child)
+            self.assertEqual(res["status"], "error")
+            self.assertIsNone(res.get("partial_findings"))
+            self.assertEqual(list(Path(d).iterdir()), [],
+                             "an empty partial file was written for a silent reviewer")
+
+    @unittest.skipUnless(hasattr(os, "symlink"), "no symlinks on this host")
+    def test_a_symlink_at_the_partial_path_is_never_written_through(self):
+        """The claim on `--findings` refuses a planted symlink; this path cannot claim, so
+        it refuses to write instead. Preserving text is never worth following a link
+        somebody else placed."""
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / "elsewhere.txt"
+            target.write_text("untouched", encoding="utf-8")
+            f = str(Path(d) / "findings.txt")
+            try:
+                os.symlink(target, Path(f + ".partial"))
+            except (OSError, NotImplementedError):
+                self.skipTest("this host does not permit creating a symlink")
+            res = _run("--idle", "5", "--deadline", "10", "--findings", f,
+                       "--result-mode", "stream-transcript", "--", PY, "-c", self.CHILD)
+            self.assertEqual(res["status"], "error")
+            self.assertIsNone(res.get("partial_findings"))
+            self.assertEqual(target.read_text(encoding="utf-8"), "untouched")
 
 
 class Bounds(unittest.TestCase):
@@ -597,8 +709,8 @@ class VerdictExtraction(unittest.TestCase):
             self.assertIn("NOT in it", res["verdict_reason"])
 
     def test_the_off_enum_note_never_claims_more_than_the_number_it_published(self):
-        """Two unknowns, floor 1: the old sentence said "2 ... each was counted" and
-        published 1. Asserted on the reconciler directly — the floor only lands below
+        """Two unknowns, floor 1: a sentence reading "2 ... each was counted" beside a
+        published 1 claims more than the number it published. Asserted on the reconciler directly — the floor only lands below
         the number of unknowns when the claim and the real count are both under it."""
         verdict = {
             "findings": [
@@ -729,8 +841,8 @@ class VerdictExtraction(unittest.TestCase):
     def test_a_grandchild_holding_the_pipe_does_not_cost_the_review(self):
         # The reviewer exits CLEANLY and leaves a helper holding the inherited stdout pipe,
         # so the reader never sees EOF. _terminate cannot help — it returns early when the
-        # child is already gone, which is this case exactly — so the supervisor used to wait
-        # out the whole 30s drain and report the review with its tail missing.
+        # child is already gone, which is this case exactly — so a supervisor that only
+        # waits spends the whole 30s drain and reports the review with its tail missing.
         verdict = json.dumps({"findings": [], "overall": "fine", "blocking_count": 0})
         child = (
             "import json,subprocess,sys\n"
@@ -791,7 +903,7 @@ class VerdictExtraction(unittest.TestCase):
             self.assertEqual(json.loads(v.read_text())["overall"], "STALE")
 
     def test_the_refusal_precedes_every_other_check(self):
-        """`--idle 0` used to return above the invalidation loop; ordering still matters.
+        """`--idle 0` returning above the invalidation loop is the ordering this pins.
 
         The collision refusal has to come first for the same reason the `unlink` did: a
         check that returns earlier would let a run report on a path it never owned.
@@ -932,7 +1044,7 @@ class VerdictExtraction(unittest.TestCase):
 
 
 class ReviewerTextThatCannotBeEncoded(unittest.TestCase):
-    """One unpaired surrogate used to discard a COMPLETED cross-model review.
+    """One unpaired surrogate is enough to discard a COMPLETED cross-model review.
 
     JSON permits a lone ``\\ud800`` escape and Python's decoder produces the lone surrogate
     faithfully, so it reaches the transcript intact. `write_text` then raises
@@ -1185,8 +1297,9 @@ class DisplayDecoderChunks(unittest.TestCase):
         self.assertNotEqual(independent, self._feed(*chunks))
 
 
-def reader_wiring(source: str, func: str = "run") -> dict:
-    """What ``run()`` does with the display decoder and the chunks it reads, by DATA FLOW.
+def reader_wiring(source: str, func: str = "_read_stdout") -> dict:
+    """What the stdout reader does with the display decoder and the chunks it reads, by
+    DATA FLOW.
 
     Nothing here is spelled as a name. The decoder is whatever ``_display_decoder()`` was
     assigned to; the chunk is whatever ``os.read(...)`` was assigned to. Rename either and
@@ -1291,7 +1404,7 @@ def reader_wiring(source: str, func: str = "run") -> dict:
 
 
 class DisplayDecoderWiring(unittest.TestCase):
-    """`reader()` must actually USE it. Every test above passes if it decodes chunks itself.
+    """`_Stream._read_stdout` must actually USE it. Every test above passes if it decodes chunks itself.
 
     Source assertions, in the shape `tests/test_skill_budgets.py` already uses for the
     budget check: the end-to-end pair below exercises the real path but depends on thread
@@ -1300,12 +1413,12 @@ class DisplayDecoderWiring(unittest.TestCase):
 
     def setUp(self):
         self.source = _RUNNER.read_text(encoding="utf-8")
-        self.wiring = reader_wiring(self.source)
+        self.wiring = reader_wiring(self.source, func="_read_stdout")
 
     def test_the_decoder_is_built_once_and_never_inside_the_read_loop(self):
         self.assertEqual(
             self.wiring["builds"], 1,
-            "run() must build exactly one display decoder: none means the reader went "
+            "the reader must build exactly one display decoder: none means it went "
             "back to decoding each chunk on its own, and more than one means a chunk is "
             "being decoded against a fresh decoder, which is the same bug spelled twice.")
         self.assertFalse(
@@ -1383,7 +1496,7 @@ class DisplayDecoderWiring(unittest.TestCase):
         must change *nothing*, and under the name-comparison version it changed everything.
         """
         src = _RUNNER.read_text(encoding="utf-8")
-        feed = "write_display(display_decoder.decode(data))"
+        feed = "self.write_display(display_decoder.decode(data))"
         self.assertIn(feed, src, "the mutation base moved; update these cases")
         indent = " " * 16
 
@@ -1412,7 +1525,8 @@ class DisplayDecoderWiring(unittest.TestCase):
 
         with self.subTest("an alias of the chunk still counts as feeding it"):
             m = reader_wiring(src.replace(
-                feed, f"same = data\n{indent}write_display(display_decoder.decode(same))"))
+                feed,
+                f"same = data\n{indent}self.write_display(display_decoder.decode(same))"))
             self.assertTrue(m["fed"])
 
         with self.subTest("a decoder rebuilt per chunk"):
@@ -1422,7 +1536,8 @@ class DisplayDecoderWiring(unittest.TestCase):
             self.assertTrue(m["built_in_loop"])
 
         with self.subTest("the chunk decoded on its own"):
-            m = reader_wiring(src.replace(feed, 'write_display(data.decode("utf-8", "replace"))'))
+            m = reader_wiring(src.replace(
+                feed, 'self.write_display(data.decode("utf-8", "replace"))'))
             self.assertTrue(m["chunk_decoded"])
             self.assertFalse(m["fed"])
 
@@ -1724,8 +1839,8 @@ class ItOwnsOnlyWhatItCreates(unittest.TestCase):
     def test_no_git_call_is_made_at_all(self):
         """The point of the restructure, asserted rather than described.
 
-        The old model spawned git on every invocation to decide whether it was allowed
-        to delete. Nothing here asks anything about a repository.
+        Spawning git on every invocation to decide whether deleting is allowed is what
+        this replaces. Nothing here asks anything about a repository.
         """
         spawned = []
         real_run = subprocess.run
@@ -1894,7 +2009,7 @@ class OwnershipIsTakenNotObserved(unittest.TestCase):
 
         Between the two, anything may put a symlink or a hardlink at the path and the
         later write follows it. POSIX requires O_CREAT|O_EXCL to fail on a symlink, which
-        is exactly the case the old check was reaching for and could not enforce.
+        is exactly the case a check made before the write cannot enforce.
         """
         source = inspect.getsource(review_runner.run)
         self.assertIn("O_EXCL", source,
@@ -1922,12 +2037,12 @@ class OwnershipIsTakenNotObserved(unittest.TestCase):
     def test_an_interrupted_run_removes_what_it_created(self):
         """Otherwise the retry is refused for a collision this program caused.
 
-        The signal handler exits through os._exit and used to skip the cleanup, so
-        removing the up-front invalidation made every interruption block the rerun.
+        The signal handler exits through os._exit, which skips anything registered to run
+        at exit, so without cleanup here every interruption blocks the rerun.
         """
-        source = inspect.getsource(review_runner.run)
-        handler = source.split("def _on_signal(", 1)[1].split("os._exit(1)  # must not", 1)[0]
-        self.assertIn("os.unlink", handler,
+        handler = inspect.getsource(review_runner._Interrupts._on_signal)
+        before_exit = handler.split("os._exit(1)  # must not", 1)[0]
+        self.assertIn("os.unlink", before_exit,
                       "the signal path exits without removing what the run created")
 
 
@@ -1969,6 +2084,1660 @@ class AFailedLaunchReleasesWhatItClaimed(unittest.TestCase):
             again = self._run(findings, verdict, d / "still-not-a-directory")
             self.assertNotIn("already exists", again.stdout + again.stderr,
                              "the retry was refused over residue from the first attempt")
+
+
+class MalformedStreamLinesDoNotKillTheReader(unittest.TestCase):
+    """A line the decoder cannot handle is skipped, never raised. The reader thread dying
+    loses every later event, so a partial transcript goes out as the review."""
+
+    DEEP = "[" * 100000 + "]" * 100000
+
+    def test_a_deeply_nested_line_is_skipped_in_every_capture(self):
+        state = {"last_result": None, "transcript": [], "terminal": None, "terminal_event": None}
+        lock = threading.Lock()
+        for mode in ("stream-json-result-event", "stream-transcript"):
+            with self.subTest(mode=mode):
+                review_runner._consume_jsonl(self.DEEP, mode, state, lock)
+        self.assertIsNone(state["last_result"])
+        self.assertEqual(state["transcript"], [])
+        self.assertIsNone(state["terminal"])
+        # Anti-vacuity: an ordinary terminal line after it still registers.
+        review_runner._consume_jsonl(json.dumps({"type": "turn.completed"}),
+                                     "stream-transcript", state, lock)
+        self.assertEqual(state["terminal"], "ok")
+
+    def test_an_event_whose_item_or_message_is_not_an_object_is_skipped(self):
+        for event in ({"type": "item.completed", "item": "agent_message"},
+                      {"type": "item.completed", "item": [1, 2]},
+                      {"type": "assistant", "message": ["text"]},
+                      {"type": "assistant", "message": "text"}):
+            with self.subTest(event=event):
+                self.assertIsNone(review_runner._event_text(event))
+        self.assertEqual(review_runner._event_text(
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "hello"}}), "hello")
+
+
+class ABlockingCountTheModelWroteAsAnotherType(unittest.TestCase):
+    """`blocking_count` is what a gate reads. A claim spelled 2.0 or "2" is still a claim,
+    and dropping it publishes zero for a review that said otherwise."""
+
+    def reconcile(self, claimed):
+        verdict = {"findings": [], "overall": "clean", "blocking_count": claimed}
+        note = review_runner._reconcile_blocking_count(verdict)
+        return verdict["blocking_count"], note
+
+    def test_a_positive_claim_in_another_type_is_not_published_as_clean(self):
+        for claimed in (2.0, "2", " 2 "):
+            with self.subTest(claimed=claimed):
+                count, note = self.reconcile(claimed)
+                self.assertEqual(count, 1)
+                self.assertIsNotNone(note)
+
+    def test_a_claim_that_is_no_whole_number_is_still_no_claim(self):
+        for claimed in (2.5, "two", True, None):
+            with self.subTest(claimed=claimed):
+                self.assertEqual(self.reconcile(claimed)[0], 0)
+
+
+class TheKillLadderReachesTheGroupAfterTheLeaderIsReaped(unittest.TestCase):
+    """`os.getpgid` is unusable once `wait()` has reaped the leader, and the group is what
+    holds the inherited pipes: the SIGKILL rung never left the ground."""
+
+    class _Proc:
+        pid = 4321
+
+        def __init__(self):
+            self.polls = [None, None]
+
+        def poll(self):
+            return self.polls.pop(0) if self.polls else 0
+
+        def wait(self, timeout=None):
+            return 0
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+    @unittest.skipUnless(hasattr(os, "killpg"), "no process groups on this platform")
+    def test_both_rungs_signal_the_group_by_the_child_pid(self):
+        sent = []
+
+        def killpg(pgid, sig):
+            sent.append((pgid, sig))
+
+        def getpgid(pid):
+            raise ProcessLookupError(3, "No such process")
+
+        with unittest.mock.patch.object(review_runner.os, "name", "posix"), \
+             unittest.mock.patch.object(review_runner.os, "killpg", killpg), \
+             unittest.mock.patch.object(review_runner.os, "getpgid", getpgid):
+            review_runner._terminate(self._Proc())
+        self.assertEqual([sig for _pgid, sig in sent], [signal.SIGTERM, signal.SIGKILL])
+        self.assertEqual({pgid for pgid, _sig in sent}, {4321})
+
+
+def _run_lines(func="run"):
+    """Line numbers, within one function, of the calls and assignments whose ORDER is the
+    guarantee. Asserted on the source because these windows are microseconds wide: a test
+    that delivered a signal into one would be a race, and a green run would prove nothing.
+    """
+    tree = ast.parse(_RUNNER.read_text(encoding="utf-8"), filename=str(_RUNNER))
+    found = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == func]
+    assert len(found) == 1, f"expected one `def {func}`, found {len(found)}"
+    fn = found[0]
+    out = {"signal.signal": [], "os.open": [], "subprocess.Popen": [],
+           "guard.arm": [], "guard.claiming": [], "guard.report": []}
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Call):
+            called = node.func
+            if isinstance(called, ast.Attribute) and isinstance(called.value, ast.Name):
+                out.setdefault(f"{called.value.id}.{called.attr}", []).append(node.lineno)
+            elif isinstance(called, ast.Name):
+                out.setdefault(called.id, []).append(node.lineno)
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if (isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name)
+                        and target.value.id == "signal_state"
+                        and isinstance(target.slice, ast.Constant)):
+                    out.setdefault(f"signal_state[{target.slice.value}]", []).append(node.lineno)
+                if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
+                    out.setdefault(f"{target.value.id}.{target.attr}", []).append(node.lineno)
+
+    def outside_nested(node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.FunctionDef):
+                continue  # a nested def is not run's own flow
+            yield child
+            yield from outside_nested(child)
+
+    out["_emit in run itself"] = [
+        n.lineno for n in outside_nested(fn)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "_emit"]
+    return out
+
+
+class TheSupervisorIsInterruptibleAtEveryStep(unittest.TestCase):
+    """Three windows where a signal, or the lack of a handler, cost more than the run."""
+
+    def test_the_handlers_are_armed_before_the_outputs_are_claimed(self):
+        lines = _run_lines()
+        self.assertTrue(lines["guard.arm"] and lines["os.open"])
+        self.assertLess(min(lines["guard.arm"]), min(lines["os.open"]),
+                        "a signal between the claim and the arming leaves the claimed files "
+                        "behind, and the retry is refused for a collision this run caused")
+
+    def test_the_claim_window_is_recorded_rather_than_blocked(self):
+        """A signal mask closes this window on POSIX and does nothing at all on Windows,
+        where the handler runs just the same. Recording covers both."""
+        lines = _run_lines()
+        claiming = lines["guard.claiming"]
+        # Set once before the claim and cleared on every way out of it — the refusals
+        # included, which is why this counts the span and not the statements.
+        self.assertGreaterEqual(len(claiming), 2)
+        self.assertLess(min(claiming), min(lines["os.open"]))
+        self.assertGreater(max(claiming), max(lines["os.open"]))
+        self.assertNotIn("signal.pthread_sigmask", lines,
+                         "a held mask is INHERITED by the child if it ever spans the spawn, "
+                         "and on Windows it is not held at all")
+
+    def test_every_report_after_arming_goes_through_the_one_helper(self):
+        """Storing the payload before printing is what lets the handler stand aside. A
+        `return _emit(...)` that skips it can be cut off with no status line at all."""
+        lines = _run_lines()
+        armed = min(lines["guard.arm"])
+        self.assertEqual([n for n in lines["_emit in run itself"] if n > armed], [],
+                         "an exit after the handlers are armed prints without storing its "
+                         "payload first")
+
+
+class AVerdictPathTheSupervisorCannotPrepare(unittest.TestCase):
+    """The verdict is additive and never fatal — including when its directory is missing."""
+
+    def test_a_verdict_directory_that_cannot_be_made_does_not_refuse_the_review(self):
+        with tempfile.TemporaryDirectory() as d:
+            findings = str(Path(d) / "findings.txt")
+            verdict = str(Path(d) / "no" / "such" / "dir" / "verdict.json")
+            child = (r'import json; print(json.dumps({"type":"item.completed","item":'
+                     r'{"type":"agent_message","text":"the review"}})); '
+                     r'print(json.dumps({"type":"turn.completed"}))')
+            res = _run("--idle", "10", "--deadline", "20", "--findings", findings,
+                       "--verdict-json", verdict, "--result-mode", "stream-transcript",
+                       "--", PY, "-c", child)
+            self.assertEqual(res["status"], "ok", res)
+            self.assertIn("the review", Path(findings).read_text(encoding="utf-8"))
+
+    def test_a_verdict_directory_that_is_a_file_drops_the_verdict_with_a_reason(self):
+        with tempfile.TemporaryDirectory() as d:
+            blocker = Path(d) / "blocker"
+            blocker.write_text("not a directory\n", encoding="utf-8")
+            findings = str(Path(d) / "findings.txt")
+            child = (r'''import json; print(json.dumps({"type":"item.completed","item":'''
+                     r'''{"type":"agent_message","text":"the review"}})); '''
+                     r'''print(json.dumps({"type":"turn.completed"}))''')
+            res = _run("--idle", "10", "--deadline", "20", "--findings", findings,
+                       "--verdict-json", str(blocker / "verdict.json"),
+                       "--result-mode", "stream-transcript", "--", PY, "-c", child)
+            self.assertEqual(res["status"], "ok", res)
+            self.assertIn("verdict directory", res["verdict_reason"] or "")
+
+
+class AVerdictTooDeepToWriteIsReportedNotFatal(unittest.TestCase):
+    """`json.dumps` recurses once per level when it indents; the review is already done."""
+
+    def test_a_verdict_write_that_recurses_is_a_reason_not_an_error(self):
+        real_dumps = json.dumps
+
+        def dumps(obj, *args, **kwargs):
+            if kwargs.get("indent") == 2:  # the verdict write, and nothing else
+                raise RecursionError("maximum recursion depth exceeded")
+            return real_dumps(obj, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as d:
+            findings = str(Path(d) / "findings.txt")
+            verdict = str(Path(d) / "verdict.json")
+            child = (r'import json; print(json.dumps({"type":"item.completed","item":'
+                     r'{"type":"agent_message","text":' + repr(VERDICT) + r'}})); '
+                     r'print(json.dumps({"type":"turn.completed"}))')
+            with unittest.mock.patch.object(review_runner.json, "dumps", dumps):
+                res = _run("--idle", "10", "--deadline", "20", "--findings", findings,
+                           "--verdict-json", verdict, "--result-mode", "stream-transcript",
+                           "--", PY, "-c", child)
+            self.assertEqual(res["status"], "ok", res)
+            self.assertIsNotNone(res["verdict_reason"])
+
+
+class ACliInTheCheckoutDoesNotHideTheRealOne(unittest.TestCase):
+    """Windows searches the current directory first; the copy on PATH is still the one asked for."""
+
+    def test_the_resolver_takes_the_later_entry_and_never_the_current_directory(self):
+        with tempfile.TemporaryDirectory() as d:
+            empty, holding = Path(d) / "empty", Path(d) / "holding"
+            empty.mkdir(); holding.mkdir()
+            program = holding / "reviewer"
+            program.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            program.chmod(0o755)
+            search = os.pathsep.join([str(empty), str(holding)])
+
+            self.assertEqual(review_runner._which_outside_cwd("reviewer", search), str(program))
+            # The same entry, once it IS the current directory: the tree under review does
+            # not get to supply the program sent to read it.
+            with unittest.mock.patch.object(review_runner.os, "getcwd", lambda: str(holding)):
+                self.assertIsNone(review_runner._which_outside_cwd("reviewer", search))
+
+    @unittest.skipUnless(os.name == "posix", "a symlink needs privileges on Windows")
+    def test_an_alias_of_the_current_directory_is_still_the_current_directory(self):
+        """Spelling is not identity. A junction, a symlink or a differently cased Windows
+        path names the same directory, and accepting it runs the checkout's own copy."""
+        with tempfile.TemporaryDirectory() as d:
+            holding = Path(d) / "holding"
+            holding.mkdir()
+            program = holding / "reviewer"
+            program.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            program.chmod(0o755)
+            alias = Path(d) / "alias"
+            os.symlink(holding, alias)
+            with unittest.mock.patch.object(review_runner.os, "getcwd", lambda: str(holding)):
+                self.assertIsNone(review_runner._which_outside_cwd("reviewer", str(alias)))
+
+    def test_pathext_applies_to_a_name_that_already_has_an_extension(self):
+        with tempfile.TemporaryDirectory() as d:
+            holding = Path(d) / "bin"
+            holding.mkdir()
+            # Spelled as PATHEXT spells it. Windows' filesystem is case-insensitive and
+            # this one is not, so the case here is an artifact of where the test runs.
+            shim = holding / "reviewer.v2.CMD"
+            shim.write_text("@echo off\n", encoding="utf-8")
+            shim.chmod(0o755)
+            with unittest.mock.patch.object(review_runner.os, "name", "nt"), \
+                 unittest.mock.patch.dict(os.environ, {"PATHEXT": ".COM;.EXE;.BAT;.CMD"}):
+                found = review_runner._which_outside_cwd("reviewer.v2", str(holding))
+            self.assertEqual(found, str(shim))
+
+    def test_the_rest_of_path_is_searched_when_the_first_hit_is_the_checkout(self):
+        with tempfile.TemporaryDirectory() as d:
+            elsewhere = Path(d) / "bin"
+            elsewhere.mkdir()
+            real = elsewhere / "reviewer"
+            real.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            real.chmod(0o755)
+            planted = Path.cwd() / "reviewer"
+
+            def which_as_windows_does(cmd, mode=os.F_OK | os.X_OK, path=None):
+                entries = (path or "").split(os.pathsep)
+                if os.getcwd() not in entries:  # Windows looks here first, always
+                    return str(planted)
+                return str(real)
+
+            with unittest.mock.patch.object(review_runner.shutil, "which", which_as_windows_does), \
+                 unittest.mock.patch.dict(os.environ, {"PATH": str(elsewhere)}):
+                res = _run("--idle", "5", "--deadline", "10",
+                           "--findings", str(Path(d) / "findings.txt"),
+                           "--result-mode", "external-file", "--", "reviewer")
+            self.assertNotIn("not found on PATH", (res.get("reason") or ""), res)
+
+
+class AHeldPipeIsNotAFailedReview(unittest.TestCase):
+    """A descendant holding stdout keeps the reader from EOF. Where the reviewer's own
+    terminal event already arrived, the stream ended and only the pipe is open — and on
+    Windows there is no process group to reap it with."""
+
+    def test_payload_complete_asks_the_mode_what_it_reads(self):
+        lock = threading.Lock()
+        transcript = {"terminal": "ok", "last_result": None}
+        self.assertTrue(review_runner._payload_complete("stream-transcript", transcript, lock))
+        self.assertFalse(review_runner._payload_complete(
+            "stream-transcript", {"terminal": None, "last_result": None}, lock))
+        self.assertTrue(review_runner._payload_complete(
+            "stream-json-result-event", {"terminal": None, "last_result": {"type": "result"}}, lock))
+        self.assertFalse(review_runner._payload_complete(
+            "external-file", {"terminal": "ok", "last_result": None}, lock))
+
+    @unittest.skipUnless(os.name == "posix", "the child inherits stderr the POSIX way")
+    def test_a_descendant_holding_stderr_is_reaped_rather_than_left_running(self):
+        reaped = []
+        real_reap = review_runner._reap_group
+
+        def counting_reap(proc):
+            reaped.append(proc.pid)
+            return real_reap(proc)
+
+        with tempfile.TemporaryDirectory() as d:
+            helper = Path(d) / "helper.py"
+            helper.write_text("import time\ntime.sleep(15)\n", encoding="utf-8")
+            child = Path(d) / "child.py"
+            child.write_text(
+                "import json, subprocess, sys\n"
+                "print(json.dumps({'type': 'item.completed', 'item': "
+                "{'type': 'agent_message', 'text': 'the review'}}), flush=True)\n"
+                "print(json.dumps({'type': 'turn.completed'}), flush=True)\n"
+                # Inherits stderr only: stdout reaches EOF, stderr stays held.
+                "subprocess.Popen([sys.executable, %r], stdout=subprocess.DEVNULL)\n" % str(helper),
+                encoding="utf-8")
+            with unittest.mock.patch.object(review_runner, "_reap_group", counting_reap):
+                res = _run("--idle", "40", "--deadline", "60",
+                           "--findings", str(Path(d) / "findings.txt"),
+                           "--result-mode", "stream-transcript", "--", PY, str(child))
+            self.assertEqual(res["status"], "ok", res)
+            self.assertTrue(reaped, "the survivor holding stderr was never reaped")
+
+
+class AFifoAsTheDisplayLogCannotStopTheRun(unittest.TestCase):
+    """`--display` is watched, not owned — the one output this supervisor shares and never
+    removes. Opening a FIFO waits for a reader, and a full one blocks every write: either
+    stops a supervised review dead, with no status line and neither timer running, which is
+    the one thing the skill promises watching the log cannot do."""
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "no FIFOs on this platform")
+    def test_the_open_fails_or_declines_rather_than_waiting(self):
+        with tempfile.TemporaryDirectory() as d:
+            fifo = str(Path(d) / "watch.fifo")
+            os.mkfifo(fifo)
+            with self.assertRaises(OSError):  # no reader: ENXIO now, a wait forever before
+                review_runner._open_display(fifo)
+            reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+            try:
+                self.assertIsNone(review_runner._open_display(fifo))
+            finally:
+                os.close(reader)
+
+    def test_a_regular_file_is_still_appended_to(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "display.log"
+            log.write_text("first\n", encoding="utf-8")
+            handle = review_runner._open_display(str(log))
+            self.assertIsNotNone(handle)
+            handle.write("second\n")
+            handle.close()
+            self.assertEqual(log.read_text(encoding="utf-8"), "first\nsecond\n")
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "no FIFOs on this platform")
+    def test_a_review_completes_though_the_display_log_is_a_fifo(self):
+        with tempfile.TemporaryDirectory() as d:
+            fifo = str(Path(d) / "watch.fifo")
+            os.mkfifo(fifo)
+            findings = str(Path(d) / "findings.txt")
+            child = ("import json\n"
+                     'print(json.dumps({"type": "item.completed", "item": '
+                     '{"type": "agent_message", "text": "the review"}}))\n'
+                     'print(json.dumps({"type": "turn.completed"}))')
+            # A SUBPROCESS, because the defect is an unbounded wait: in-process it would
+            # hang the whole suite rather than fail one test.
+            proc = subprocess.run(
+                [PY, str(_RUNNER), "--idle", "10", "--deadline", "20",
+                 "--findings", findings, "--display", fifo,
+                 "--result-mode", "stream-transcript", "--", PY, "-c", child],
+                capture_output=True, text=True, timeout=60)
+            status = json.loads(proc.stdout.strip().splitlines()[-1])
+            self.assertEqual(status["status"], "ok", proc.stdout)
+            self.assertIn("the review", Path(findings).read_text(encoding="utf-8"))
+
+
+def _harness(directory, patch_source):
+    """Write a script that runs the supervisor in-process with one thing replaced.
+
+    A subprocess, because every window under test ends in `os._exit`: run in-process, a red
+    here would take the whole suite down with it rather than fail one test.
+    """
+    path = Path(directory) / "harness.py"
+    path.write_text(
+        "import os, signal, subprocess, sys, time\n"
+        f"sys.path.insert(0, {str(_RUNNER.parent)!r})\n"
+        "import review_runner\n"
+        + patch_source +
+        "raise SystemExit(review_runner.main(sys.argv[1:]))\n",
+        encoding="utf-8")
+    return str(path)
+
+
+_A_REVIEW = ("import json\n"
+             'print(json.dumps({"type": "item.completed", "item": '
+             '{"type": "agent_message", "text": "the review"}}))\n'
+             'print(json.dumps({"type": "turn.completed"}))')
+
+
+class TheReviewerDoesNotInheritThisSupervisorsSignalMask(unittest.TestCase):
+    """Whatever this supervisor blocks for itself, the child inherits across fork and exec.
+    A reviewer that starts with SIGTERM blocked cannot shut down when asked, so every
+    cancellation waits out the grace period and lands as SIGKILL."""
+
+    @unittest.skipUnless(os.path.exists("/proc/self/status"), "needs /proc to read the mask")
+    def test_the_child_starts_with_sigterm_and_sigint_deliverable(self):
+        with tempfile.TemporaryDirectory() as d:
+            findings = str(Path(d) / "findings.txt")
+            child = ("import json\n"
+                     "blocked = 0\n"
+                     "for line in open('/proc/self/status'):\n"
+                     "    if line.startswith('SigBlk:'):\n"
+                     "        blocked = int(line.split()[1], 16)\n"
+                     "text = 'SIGTERM=%s SIGINT=%s' % (bool(blocked >> 14 & 1), "
+                     "bool(blocked >> 1 & 1))\n"
+                     'print(json.dumps({"type": "item.completed", "item": '
+                     '{"type": "agent_message", "text": text}}))\n'
+                     'print(json.dumps({"type": "turn.completed"}))')
+            res = _run("--idle", "10", "--deadline", "20", "--findings", findings,
+                       "--result-mode", "stream-transcript", "--", PY, "-c", child)
+            self.assertEqual(res["status"], "ok", res)
+            self.assertEqual(Path(findings).read_text(encoding="utf-8").strip(),
+                             "SIGTERM=False SIGINT=False")
+
+
+class AnInterruptWhileTheChildIsBeingSpawned(unittest.TestCase):
+    """The window between `Popen` returning and the child being stored. A handler that
+    exits here leaves a reviewer running that nothing can reach: `start_new_session` has
+    already detached its signal fate, and neither timer is over it any more."""
+
+    @unittest.skipUnless(os.name == "posix", "delivers a real SIGTERM")
+    def test_the_reviewer_is_terminated_and_the_claim_released(self):
+        with tempfile.TemporaryDirectory() as d:
+            harness = _harness(d,
+                "real = subprocess.Popen\n"
+                "def popen_then_signal(*a, **kw):\n"
+                "    proc = real(*a, **kw)\n"
+                "    print('CHILD_PID=%d' % proc.pid, file=sys.stderr, flush=True)\n"
+                "    os.kill(os.getpid(), signal.SIGTERM)\n"
+                "    time.sleep(0.05)\n"
+                "    return proc\n"
+                "subprocess.Popen = popen_then_signal\n")
+            findings = str(Path(d) / "findings.txt")
+            proc = subprocess.run(
+                [PY, harness, "--idle", "30", "--deadline", "60", "--findings", findings,
+                 "--result-mode", "stream-transcript",
+                 "--", PY, "-c", "import time; time.sleep(30)"],
+                capture_output=True, text=True, timeout=90)
+            status = json.loads(proc.stdout.strip().splitlines()[-1])
+            self.assertEqual(status["status"], "error", proc.stdout)
+            self.assertIn("interrupted", status["reason"] or "")
+            self.assertFalse(Path(findings).exists(), "the claim survived the interrupt")
+            pid = int(re.search(r"CHILD_PID=(\d+)", proc.stderr).group(1))
+            for _ in range(60):
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    return
+                time.sleep(0.05)
+            os.kill(pid, signal.SIGKILL)
+            self.fail("the reviewer was left running with nothing supervising it")
+
+
+class ASignalAtTheFinishLineStillPrintsTheStatus(unittest.TestCase):
+    """Between deciding the status and printing it. Exiting here prints nothing at all —
+    `os._exit` skips the buffer — and printing from the handler races the real print and
+    emits a second line. Exactly one status line is the contract."""
+
+    @unittest.skipUnless(os.name == "posix", "delivers a real SIGTERM")
+    def test_one_status_line_survives_a_signal_in_the_last_window(self):
+        with tempfile.TemporaryDirectory() as d:
+            harness = _harness(d,
+                "real_emit = review_runner._emit\n"
+                "def emit_after_a_signal(status, **extra):\n"
+                "    os.kill(os.getpid(), signal.SIGTERM)\n"
+                "    time.sleep(0.05)\n"
+                "    return real_emit(status, **extra)\n"
+                "review_runner._emit = emit_after_a_signal\n")
+            findings = str(Path(d) / "findings.txt")
+            proc = subprocess.run(
+                [PY, harness, "--idle", "10", "--deadline", "20", "--findings", findings,
+                 "--result-mode", "stream-transcript", "--", PY, "-c", _A_REVIEW],
+                capture_output=True, text=True, timeout=90)
+            lines = [line for line in proc.stdout.splitlines() if line.startswith('{"status"')]
+            self.assertEqual(len(lines), 1, f"stdout was {proc.stdout!r}")
+            self.assertEqual(json.loads(lines[0])["status"], "ok", proc.stdout)
+
+
+class AVerdictPathTheClaimSkippedIsNotDeleted(unittest.TestCase):
+    """`--verdict-json` whose directory could not be prepared is never claimed, so the
+    ending has no business deleting whatever is at that path by the time it finishes."""
+
+    def test_a_file_another_writer_put_there_survives_the_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            vdir = Path(d) / "vdir"
+            vdir.mkdir()
+            verdict = vdir / "verdict.json"
+            findings = str(Path(d) / "findings.txt")
+            real_mkdir = review_runner.Path.mkdir
+
+            def mkdir_but_not_there(self, *a, **kw):
+                if str(self) == str(vdir):
+                    raise PermissionError(13, "temporarily unavailable")
+                return real_mkdir(self, *a, **kw)
+
+            child = (f"open({str(verdict)!r}, 'w').write('{{}}')\n" + _A_REVIEW)
+            with unittest.mock.patch.object(review_runner.Path, "mkdir", mkdir_but_not_there):
+                res = _run("--idle", "10", "--deadline", "20", "--findings", findings,
+                           "--verdict-json", str(verdict), "--result-mode", "stream-transcript",
+                           "--", PY, "-c", child)
+            self.assertEqual(res["status"], "ok", res)
+            self.assertIn("verdict directory", res["verdict_reason"] or "")
+            self.assertTrue(verdict.exists(),
+                            "a file this run never created was deleted on the way out")
+
+
+class ABlockingCountThatIntCannotRead(unittest.TestCase):
+    """`isdigit()` is not `int()`. Each of these reached `int()` and raised, out of a review
+    that had already succeeded, from outside every handler in the program."""
+
+    def test_strings_int_refuses_are_read_as_no_claim(self):
+        for text in ("++2", "²", "9" * 5000, " ", "2.5"):
+            with self.subTest(text=text):
+                verdict = {"findings": [{"severity": "major"}], "blocking_count": text}
+                review_runner._reconcile_blocking_count(verdict)  # must not raise
+                self.assertEqual(verdict["blocking_count"], 1)
+
+    def test_a_matching_claim_is_published_as_the_integer_it_promises(self):
+        verdict = {"findings": [{"severity": "major"}], "blocking_count": "1"}
+        self.assertIsNone(review_runner._reconcile_blocking_count(verdict))
+        self.assertIsInstance(verdict["blocking_count"], int)
+        self.assertEqual(verdict["blocking_count"], 1)
+
+    def test_a_matching_zero_claim_is_published_as_an_integer_too(self):
+        verdict = {"findings": [], "blocking_count": "0"}
+        self.assertIsNone(review_runner._reconcile_blocking_count(verdict))
+        self.assertIsInstance(verdict["blocking_count"], int)
+
+
+class TheSameDirectoryByIdentityNotBySpelling(unittest.TestCase):
+    """What counts as "the current directory" when excluding it from a PATH search."""
+
+    @unittest.skipUnless(os.name == "posix", "a symlink needs privileges on Windows")
+    def test_an_alias_is_the_same_directory(self):
+        with tempfile.TemporaryDirectory() as d:
+            real = Path(d) / "repo"
+            real.mkdir()
+            alias = Path(d) / "alias"
+            os.symlink(real, alias)
+            self.assertTrue(review_runner._same_directory(str(alias), str(real)))
+
+    def test_two_directories_differing_only_in_case_are_not_the_same(self):
+        with tempfile.TemporaryDirectory() as d:
+            upper = Path(d) / "Repo"
+            upper.mkdir()
+            if (Path(d) / "repo").exists():
+                self.skipTest("case-insensitive filesystem, where these ARE one directory")
+            lower = Path(d) / "repo"
+            lower.mkdir()
+            self.assertFalse(
+                review_runner._same_directory(str(upper), str(lower)),
+                "folding case here excludes a legitimate PATH entry, and the review drops "
+                "to a same-model reviewer over a program that was installed all along")
+
+
+class TheStandAsideAtTheFinishLineIsBounded(unittest.TestCase):
+    """Standing aside so the status can print must not make the supervisor unkillable when
+    the print itself cannot finish — a stdout nobody drains, say."""
+
+    @unittest.skipUnless(os.name == "posix", "delivers real signals")
+    def test_a_second_signal_ends_a_run_whose_print_never_completes(self):
+        with tempfile.TemporaryDirectory() as d:
+            harness = _harness(d,
+                "real_emit = review_runner._emit\n"
+                "def emit_that_stalls(status, **extra):\n"
+                "    os.kill(os.getpid(), signal.SIGTERM)\n"
+                "    time.sleep(0.05)\n"
+                "    os.kill(os.getpid(), signal.SIGTERM)\n"
+                "    time.sleep(5)\n"
+                "    return real_emit(status, **extra)\n"
+                "review_runner._emit = emit_that_stalls\n")
+            findings = str(Path(d) / "findings.txt")
+            proc = subprocess.run(
+                [PY, harness, "--idle", "10", "--deadline", "20", "--findings", findings,
+                 "--result-mode", "stream-transcript", "--", PY, "-c", _A_REVIEW],
+                capture_output=True, text=True, timeout=90)
+            self.assertEqual(proc.returncode, 1, proc.stdout)
+            self.assertNotIn('{"status"', proc.stdout,
+                             "the second signal was ignored as well, so a caller that "
+                             "insists cannot cancel this run at all")
+
+
+class AnInterruptWhileTheOutputsAreBeingClaimed(unittest.TestCase):
+    """The claim creates a file and then records it. A handler that exits in between cannot
+    see what it must remove, and the leftover refuses the retry. Green before the change on
+    POSIX, where a mask covered it; this is what covers Windows, and what guards the
+    replacement everywhere."""
+
+    @unittest.skipUnless(os.name == "posix", "delivers a real SIGTERM")
+    def test_nothing_is_left_behind_and_one_status_line_is_printed(self):
+        with tempfile.TemporaryDirectory() as d:
+            harness = _harness(d,
+                "real_open = os.open\n"
+                "def open_then_signal(path, flags, *a, **kw):\n"
+                "    fd = real_open(path, flags, *a, **kw)\n"
+                "    if flags & os.O_EXCL:\n"
+                "        os.kill(os.getpid(), signal.SIGTERM)\n"
+                "        time.sleep(0.05)\n"
+                "    return fd\n"
+                "os.open = open_then_signal\n")
+            findings = str(Path(d) / "findings.txt")
+            proc = subprocess.run(
+                [PY, harness, "--idle", "10", "--deadline", "20", "--findings", findings,
+                 "--result-mode", "stream-transcript", "--", PY, "-c", _A_REVIEW],
+                capture_output=True, text=True, timeout=90)
+            lines = [line for line in proc.stdout.splitlines() if line.startswith('{"status"')]
+            self.assertEqual(len(lines), 1, f"stdout was {proc.stdout!r}")
+            self.assertIn("interrupted", json.loads(lines[0])["reason"] or "")
+            self.assertFalse(Path(findings).exists(), "the claim survived the interrupt")
+
+
+class ThePreflightAnswersBeforeAnythingExists(unittest.TestCase):
+    """Everything the pre-flight decides is decided before a file is created and before a
+    handler is armed. That is what lets it refuse by raising: there is nothing to clean up,
+    and `run` alone prints the status line."""
+
+    def test_a_clean_request_resolves_the_program_and_makes_the_output_directory(self):
+        with tempfile.TemporaryDirectory() as d:
+            findings = Path(d) / "nested" / "deeper" / "findings.txt"
+            args = _parsed("--idle", "5", "--deadline", "10", "--findings", str(findings),
+                           "--result-mode", "stream-transcript",
+                           "--", PY, "-c", "pass")
+            cmd, verdict_unavailable = review_runner._preflight(args)
+            self.assertEqual(cmd[0], os.path.abspath(PY))
+            self.assertEqual(cmd[1:], ["-c", "pass"])
+            self.assertIsNone(verdict_unavailable)
+            self.assertTrue(findings.parent.is_dir(), "the findings directory is essential")
+
+    def test_each_refusal_raises_with_the_reason_a_caller_would_read(self):
+        with tempfile.TemporaryDirectory() as d:
+            existing = Path(d) / "already.txt"
+            existing.write_text("someone else's\n", encoding="utf-8")
+            one = str(Path(d) / "one.txt")
+            cases = [
+                (("--findings", one, "--verdict-json", one), "name the same path"),
+                (("--cwd", d, "--findings", "relative.txt"), "is relative"),
+                (("--findings", str(existing)), "already exists"),
+                (("--idle", "0", "--findings", one), "finite positive"),
+                (("--findings", one), "no reviewer command given"),
+            ]
+            for extra, expected in cases:
+                with self.subTest(expected=expected):
+                    argv = ["--deadline", "10",
+                            "--result-mode", "stream-transcript", *extra]
+                    if expected != "no reviewer command given":
+                        argv += ["--", PY, "-c", "pass"]
+                    else:
+                        argv += ["--"]
+                    with self.assertRaises(review_runner._Refused) as caught:
+                        review_runner._preflight(_parsed(*argv))
+                    self.assertIn(expected, str(caught.exception))
+
+    def test_a_program_that_is_not_installed_is_refused_by_name(self):
+        with tempfile.TemporaryDirectory() as d:
+            args = _parsed("--idle", "5", "--deadline", "10",
+                           "--findings", str(Path(d) / "findings.txt"),
+                           "--result-mode", "stream-transcript",
+                           "--", "definitely-not-installed-abcxyz")
+            with self.assertRaises(review_runner._Refused) as caught:
+                review_runner._preflight(args)
+            self.assertIn("not found on PATH", str(caught.exception))
+
+    def test_a_verdict_directory_it_cannot_make_is_reported_not_raised(self):
+        with tempfile.TemporaryDirectory() as d:
+            blocker = Path(d) / "blocker"
+            blocker.write_text("not a directory\n", encoding="utf-8")
+            args = _parsed("--idle", "5", "--deadline", "10",
+                           "--findings", str(Path(d) / "findings.txt"),
+                           "--verdict-json", str(blocker / "verdict.json"),
+                           "--result-mode", "stream-transcript",
+                           "--", PY, "-c", "pass")
+            cmd, verdict_unavailable = review_runner._preflight(args)
+            self.assertIsNotNone(cmd)
+            self.assertIn("verdict directory", verdict_unavailable or "")
+
+    def test_a_refusal_creates_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            findings = Path(d) / "nested" / "findings.txt"
+            args = _parsed("--idle", "0", "--deadline", "10", "--findings", str(findings),
+                           "--result-mode", "stream-transcript",
+                           "--", PY, "-c", "pass")
+            with self.assertRaises(review_runner._Refused):
+                review_runner._preflight(args)
+            self.assertFalse(findings.parent.exists(),
+                             "a refused request left a directory behind")
+
+
+def _stream_state(**over):
+    """The reader threads' shared record, as the outcome step finds it."""
+    base = {"last_activity": 0.0, "last_result": None, "transcript": [],
+            "terminal": None, "terminal_event": None}
+    base.update(over)
+    return base
+
+
+class TheOutcomeIsDecidedFromWhatArrived(unittest.TestCase):
+    """`_route_outcome` turns "the child exited" into a status and a findings file. The three
+    result modes disagree about what counts as the review, and this is the only step that
+    knows the difference, and these reach it without a whole supervised run."""
+
+    def _args(self, directory, mode="stream-transcript"):
+        return _parsed("--idle", "5", "--deadline", "10",
+                       "--findings", str(Path(directory) / "findings.txt"),
+                       "--result-mode", mode, "--", PY, "-c", "pass")
+
+    def test_a_complete_transcript_is_written_and_reported_ok(self):
+        with tempfile.TemporaryDirectory() as d:
+            args = self._args(d)
+            status, reason, text, _partial = review_runner._route_outcome(
+                args, "ok", None, True, 0,
+                _stream_state(transcript=["the review"], terminal="ok"), threading.Lock())
+            self.assertEqual((status, reason), ("ok", None))
+            self.assertEqual(text, "the review")
+            self.assertEqual(Path(args.findings).read_text(encoding="utf-8"), "the review\n")
+
+    def test_an_undrained_pipe_is_fatal_only_when_the_terminal_event_never_arrived(self):
+        """The rule DR12 asked for, asked of the step that decides it."""
+        for terminal, expected in (("ok", "ok"), (None, "error")):
+            with self.subTest(terminal=terminal), tempfile.TemporaryDirectory() as d:
+                args = self._args(d)
+                status, reason, _, _partial = review_runner._route_outcome(
+                    args, "ok", None, False, 0,
+                    _stream_state(transcript=["the review"], terminal=terminal),
+                    threading.Lock())
+                self.assertEqual(status, expected, reason)
+                if expected == "error":
+                    self.assertIn("did not drain", reason)
+
+    def test_an_empty_file_in_external_file_mode_is_no_verdict(self):
+        with tempfile.TemporaryDirectory() as d:
+            args = self._args(d, mode="external-file")
+            Path(args.findings).touch()
+            status, reason, text, _partial = review_runner._route_outcome(
+                args, "ok", None, True, 0, _stream_state(), threading.Lock())
+            self.assertEqual(status, "error")
+            self.assertIn("wrote no verdict", reason)
+            self.assertIsNone(text)
+
+    def test_a_findings_path_that_cannot_be_written_is_a_routing_failure(self):
+        with tempfile.TemporaryDirectory() as d:
+            args = self._args(d)
+            Path(args.findings).mkdir()  # a directory standing where the file should go
+            status, reason, _, _partial = review_runner._route_outcome(
+                args, "ok", None, True, 0,
+                _stream_state(transcript=["the review"], terminal="ok"), threading.Lock())
+            self.assertEqual(status, "error")
+            self.assertIn("routing failed", reason)
+
+    def test_a_reviewer_that_exited_badly_keeps_its_own_reason(self):
+        with tempfile.TemporaryDirectory() as d:
+            args = self._args(d)
+            status, reason, _, _partial = review_runner._route_outcome(
+                args, "ok", None, True, 3,
+                _stream_state(transcript=["the review"], terminal="ok"), threading.Lock())
+            self.assertEqual(status, "error")
+            self.assertIn("exited 3", reason)
+
+
+class TheVerdictIsPublishedBesideTheFindings(unittest.TestCase):
+    """Additive and never instead: every way this step can fail is a reason, not a status."""
+
+    def _args(self, directory):
+        return _parsed("--idle", "5", "--deadline", "10",
+                       "--findings", str(Path(directory) / "findings.txt"),
+                       "--verdict-json", str(Path(directory) / "verdict.json"),
+                       "--result-mode", "stream-transcript", "--", PY, "-c", "pass")
+
+    def test_a_verdict_in_the_narrative_is_written_out(self):
+        with tempfile.TemporaryDirectory() as d:
+            args = self._args(d)
+            path, _reason = review_runner._publish_verdict(
+                args, "ok", None, VERDICT, _stream_state(), threading.Lock())
+            self.assertEqual(path, args.verdict_json)
+            written = json.loads(Path(path).read_text(encoding="utf-8"))
+            for key in ("findings", "overall", "blocking_count"):
+                self.assertIn(key, written)
+
+    def test_a_narrative_with_no_verdict_object_is_a_reason(self):
+        with tempfile.TemporaryDirectory() as d:
+            args = self._args(d)
+            path, reason = review_runner._publish_verdict(
+                args, "ok", None, "prose, and no object anywhere in it",
+                _stream_state(), threading.Lock())
+            self.assertIsNone(path)
+            self.assertIn("no verdict object", reason)
+            self.assertFalse(Path(args.verdict_json).exists())
+
+    def test_a_directory_it_could_not_prepare_is_carried_through_untouched(self):
+        with tempfile.TemporaryDirectory() as d:
+            args = self._args(d)
+            already = "could not create the verdict directory: [Errno 13] nope"
+            path, reason = review_runner._publish_verdict(
+                args, "ok", already, VERDICT, _stream_state(), threading.Lock())
+            self.assertIsNone(path)
+            self.assertEqual(reason, already)
+            self.assertFalse(Path(args.verdict_json).exists())
+
+    def test_a_failed_review_publishes_no_verdict(self):
+        with tempfile.TemporaryDirectory() as d:
+            args = self._args(d)
+            path, reason = review_runner._publish_verdict(
+                args, "error", None, VERDICT, _stream_state(), threading.Lock())
+            self.assertIsNone(path)
+            self.assertIsNone(reason)
+            self.assertFalse(Path(args.verdict_json).exists())
+
+
+def _reviewer(script):
+    """A real child, with the pipes and the session the supervisor gives one."""
+    extra = {"start_new_session": True} if os.name == "posix" else {}
+    return subprocess.Popen([PY, "-c", script], stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                            bufsize=0, **extra)
+
+
+class TheStreamWatchesTheReviewerWhileItRuns(unittest.TestCase):
+    """`_Stream` is the reviewer's output while it runs: both reader threads, the record they
+    fill in, and the display log they tee to. The two clocks over it — silence, and total
+    time — are what these ask, without a whole supervised review."""
+
+    def _args(self, directory, display=None, mode="stream-transcript"):
+        argv = ["--idle", "5", "--deadline", "30",
+                "--findings", str(Path(directory) / "findings.txt"),
+                "--result-mode", mode]
+        if display:
+            argv += ["--display", display]
+        return _parsed(*argv, "--", PY, "-c", "pass")
+
+    def test_the_idle_clock_starts_with_the_readers_not_at_construction(self):
+        """Opening the display log is I/O of unknown duration — a network path, a large
+        append. Charged to the child as silence, it spends the first idle window before the
+        child can speak into it, and a slow log then kills a healthy review.
+
+        Asserted on the state rather than by timing a deliberately slow open, which would be
+        a race dressed up as a test.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            proc = _reviewer("import time; time.sleep(5)")
+            self.addCleanup(proc.kill)
+            stream = review_runner._Stream(proc, self._args(d))
+            stream.state["last_activity"] = 0.0  # as if construction were long ago
+            before = time.monotonic()
+            stream.start()
+            self.assertGreaterEqual(
+                stream.state["last_activity"], before,
+                "the idle clock still starts at construction, so display setup is charged "
+                "to the child as silence it never had a chance to break")
+            self.assertAlmostEqual(stream.state["last_activity"], stream.started,
+                                   delta=0.5, msg="the two clocks must start together")
+
+    def test_silence_past_the_idle_window_is_an_idle_timeout(self):
+        with tempfile.TemporaryDirectory() as d:
+            stream = review_runner._Stream(_reviewer("import time; time.sleep(30)"),
+                                           self._args(d))
+            stream.start()
+            status, reason = stream.watch(0.5, 30)
+            drained, exit_code = stream.settle(status)
+            self.assertEqual(status, "idle_timeout", reason)
+            self.assertIn("no output for", reason)
+            self.assertTrue(drained, "the reader never reached EOF after the kill")
+            self.assertIsNotNone(exit_code, "the reviewer was left running")
+
+    def test_a_reviewer_that_never_stops_talking_still_meets_the_deadline(self):
+        """The two clocks are independent: output resets one and never touches the other."""
+        with tempfile.TemporaryDirectory() as d:
+            chatty = ("import time\n"
+                      "while True:\n"
+                      "    print('tick', flush=True)\n"
+                      "    time.sleep(0.05)\n")
+            stream = review_runner._Stream(_reviewer(chatty), self._args(d))
+            stream.start()
+            status, reason = stream.watch(30, 0.6)
+            stream.settle(status)
+            self.assertEqual(status, "deadline", reason)
+            self.assertIn("no completion within", reason)
+
+    def test_what_arrived_is_recorded_and_the_log_brackets_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "display.log"
+            events = ("import json\n"
+                      'print(json.dumps({"type": "item.completed", "item": '
+                      '{"type": "agent_message", "text": "the review"}}), flush=True)\n'
+                      'print(json.dumps({"type": "turn.completed"}), flush=True)\n')
+            stream = review_runner._Stream(_reviewer(events),
+                                           self._args(d, display=str(log)))
+            stream.start()
+            status, reason = stream.watch(10, 30)
+            drained, exit_code = stream.settle(status)
+            self.assertEqual((status, drained, exit_code), ("ok", True, 0), reason)
+            self.assertEqual(stream.state["transcript"], ["the review"])
+            self.assertEqual(stream.state["terminal"], "ok")
+            text = log.read_text(encoding="utf-8")
+            self.assertIn("[review_runner] start", text)
+            self.assertIn("end status=ok exit=0 drained=True", text)
+
+    def test_a_display_log_it_cannot_open_costs_only_the_log(self):
+        with tempfile.TemporaryDirectory() as d:
+            blocker = Path(d) / "blocker"
+            blocker.write_text("not a directory\n", encoding="utf-8")
+            stream = review_runner._Stream(_reviewer("print('hello', flush=True)"),
+                                           self._args(d, display=str(blocker / "log")))
+            self.assertIsNone(stream.display_fh, "a log it cannot open is not a log")
+            stream.start()
+            status, reason = stream.watch(10, 30)
+            drained, _exit_code = stream.settle(status)
+            self.assertEqual(status, "ok", reason)
+            self.assertTrue(drained)
+
+
+class TheInterruptsObjectOwnsTheOneStatusLine(unittest.TestCase):
+    """Cancellation in one place: what to terminate, what to remove, and the rule that exactly
+    one JSON status line is printed however the run ends. That rule broke three times while it
+    was spread across `run` — printing nothing, printing twice, and printing before a handler
+    could know a status existed — so these ask the object for it directly."""
+
+    def _guard(self):
+        guard = review_runner._Interrupts()
+        self.addCleanup(guard.restore)  # never leave the runner holding our handler
+        return guard
+
+    def test_reporting_prints_one_line_then_disarms(self):
+        guard = self._guard()
+        before = signal.getsignal(signal.SIGTERM)
+        guard.arm()
+        self.assertIsNot(signal.getsignal(signal.SIGTERM), before, "arm installed nothing")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = guard.report("ok", reason=None, findings="/tmp/findings.txt")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(buf.getvalue().strip())["status"], "ok")
+        self.assertEqual(len(buf.getvalue().strip().splitlines()), 1)
+        self.assertTrue(guard.reported)
+        self.assertEqual(guard.payload["status"], "ok",
+                         "the payload must be stored before the print, or a signal in that "
+                         "window ends a finished review in silence")
+        self.assertIs(signal.getsignal(signal.SIGTERM), before, "the handlers stayed armed")
+
+    def test_a_print_that_raises_still_restores_the_handlers(self):
+        """An in-process caller must not be left holding a handler that ignores cancellation
+        because stdout happened to be closed."""
+        guard = self._guard()
+        before = signal.getsignal(signal.SIGTERM)
+        guard.arm()
+        with unittest.mock.patch.object(review_runner, "_emit",
+                                        side_effect=BrokenPipeError(32, "closed")):
+            with self.assertRaises(BrokenPipeError):
+                guard.report("ok")
+        self.assertIs(signal.getsignal(signal.SIGTERM), before,
+                      "a raising print left the handlers installed")
+        self.assertTrue(guard.reported)
+
+    def test_release_removes_what_was_claimed_and_nothing_else(self):
+        with tempfile.TemporaryDirectory() as d:
+            mine, theirs = Path(d) / "mine.txt", Path(d) / "theirs.txt"
+            mine.write_text("mine\n", encoding="utf-8")
+            theirs.write_text("someone else's\n", encoding="utf-8")
+            guard = self._guard()
+            guard.claimed(str(mine))
+            guard.claimed(str(Path(d) / "never-created.txt"))  # already gone is not an error
+            guard.release()
+            self.assertFalse(mine.exists())
+            self.assertTrue(theirs.exists(), "it removed a file it never created")
+
+    def test_a_deferred_signal_is_reported_and_the_claims_released(self):
+        with tempfile.TemporaryDirectory() as d:
+            claimed = Path(d) / "findings.txt"
+            claimed.write_text("half a review\n", encoding="utf-8")
+            guard = self._guard()
+            guard.arm()
+            guard.claimed(str(claimed))
+            guard.interrupted = signal.SIGTERM
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = guard.deferred(None)
+            self.assertEqual(code, 1)
+            line = json.loads(buf.getvalue().strip())
+            self.assertEqual(line["status"], "error")
+            self.assertIn("interrupted by SIGTERM", line["reason"])
+            self.assertFalse(claimed.exists(), "an interrupted run left its claim behind")
+
+
+def _transcript_event(text):
+    return json.dumps({"type": "assistant",
+                       "message": {"content": [{"type": "text", "text": text}]}})
+
+
+def _child_printing(*lines):
+    """A reviewer that prints the given JSONL lines and exits."""
+    return "import sys\n" + "".join(
+        f"sys.stdout.write({line!r} + chr(10))\nsys.stdout.flush()\n" for line in lines)
+
+
+class TheStatusLineKeepsItsShapeUnlessAsked(unittest.TestCase):
+    """The compatibility half of the two opt-in flags.
+
+    Both add a key to the one line this program contracts to print, and a caller that reads
+    that line as a fixed record would have to absorb the change. So neither is on by
+    default, and this is the assertion that says so — key for key, not "roughly the same".
+    """
+
+    HISTORICAL = {"status", "reason", "exit_code", "elapsed_s", "findings"}
+
+    def _ok_run(self, directory, *extra):
+        child = _child_printing(_transcript_event('{"verdict": "fine"}'),
+                                json.dumps({"type": "turn.completed"}))
+        return _run("--idle", "10", "--deadline", "20",
+                    "--findings", str(Path(directory) / "findings.txt"),
+                    "--result-mode", "stream-transcript", *extra, "--", PY, "-c", child)
+
+    def test_a_caller_passing_neither_flag_gets_the_keys_it_always_got(self):
+        with tempfile.TemporaryDirectory() as d:
+            line = self._ok_run(d)
+            self.assertEqual(line["status"], "ok", line)
+            self.assertEqual(set(line), self.HISTORICAL,
+                             "the status line grew a key for a caller that asked for none")
+
+    def test_the_verdict_keys_are_still_the_only_other_addition(self):
+        with tempfile.TemporaryDirectory() as d:
+            line = self._ok_run(d, "--verdict-json", str(Path(d) / "verdict.json"))
+            self.assertEqual(set(line), self.HISTORICAL | {"verdict", "verdict_reason"})
+
+    def test_each_flag_adds_exactly_its_own_keys(self):
+        with tempfile.TemporaryDirectory() as d:
+            detail = self._ok_run(d, "--status-detail")
+            self.assertEqual(set(detail),
+                             self.HISTORICAL | {"terminal_detail",
+                                                "terminal_detail_source"})
+        with tempfile.TemporaryDirectory() as d:
+            capped = self._ok_run(d, "--max-capture-bytes", "100000")
+            self.assertEqual(set(capped), self.HISTORICAL | {"capture_truncated"})
+            self.assertFalse(capped["capture_truncated"])
+
+    def test_a_cap_of_zero_is_refused_rather_than_acted_on(self):
+        with tempfile.TemporaryDirectory() as d:
+            line = _run("--idle", "10", "--deadline", "20",
+                        "--findings", str(Path(d) / "findings.txt"),
+                        "--result-mode", "stream-transcript",
+                        "--max-capture-bytes", "0", "--", PY, "-c", "pass")
+            self.assertEqual(line["status"], "error")
+            self.assertIn("--max-capture-bytes", line["reason"])
+
+
+class TheTerminalEventsOwnErrorText(unittest.TestCase):
+    """`--status-detail`, and the contract it extracts by.
+
+    A caller telling a provider outage apart from a bad answer reads this field, so what it
+    holds has to be stated rather than discovered: the top-level message, then a nested
+    error's message, then the event type alone. An absent detail is its own answer — the
+    failure explained itself nowhere — and these hold that apart from the rest.
+    """
+
+    def test_the_top_level_message_wins(self):
+        detail = review_runner._terminal_detail(
+            {"type": "turn.failed", "message": "quota exhausted",
+             "error": {"message": "something else"}})
+        self.assertEqual(detail, "quota exhausted")
+
+    def test_a_nested_errors_message_is_next(self):
+        detail = review_runner._terminal_detail(
+            {"type": "turn.failed", "error": {"message": "rate limit reached"}})
+        self.assertEqual(detail, "rate limit reached")
+
+    def test_the_event_type_alone_is_the_last_resort(self):
+        self.assertEqual(review_runner._terminal_detail({"type": "turn.failed"}),
+                         "turn.failed")
+
+    def test_no_event_at_all_is_null(self):
+        self.assertIsNone(review_runner._terminal_detail(None))
+        self.assertIsNone(review_runner._terminal_detail({}))
+
+    def test_the_detail_is_bounded(self):
+        detail = review_runner._terminal_detail({"type": "x", "message": "e" * 50_000})
+        self.assertLessEqual(len(detail.encode("utf-8")),
+                             review_runner.TERMINAL_DETAIL_MAX_BYTES + 4)
+        self.assertTrue(detail.endswith("…"), "nothing says the text was cut")
+
+    def test_a_failure_that_explained_itself_nowhere_reports_null(self):
+        """The shape an outage takes today: the CLI writes its reason to stderr, which
+        reaches the display log alone, and exits non-zero. A caller must be able to see that
+        the failure named nothing — it is what tells an unclassifiable failure from a
+        classified one."""
+        with tempfile.TemporaryDirectory() as d:
+            child = "import sys; sys.stderr.write('usage limit\\n'); sys.exit(1)"
+            line = _run("--idle", "10", "--deadline", "20",
+                        "--findings", str(Path(d) / "findings.txt"),
+                        "--result-mode", "stream-transcript", "--status-detail",
+                        "--", PY, "-c", child)
+            self.assertEqual(line["status"], "error")
+            self.assertIn("terminal_detail", line)
+            self.assertIsNone(line["terminal_detail"])
+            self.assertIsNone(line["terminal_detail_source"],
+                              "a failure with no terminal event named a rule that answered")
+
+    def test_the_source_names_which_rule_answered(self):
+        """The text alone cannot be classified: the last rule's answer is a NAME, and a
+        caller that reads a name as the failure's account of itself can never see a failure
+        that explained itself nowhere but stderr."""
+        parts = review_runner._terminal_detail_parts
+        self.assertEqual(parts({"type": "turn.failed", "message": "quota exhausted",
+                                "error": {"message": "something else"}}),
+                         ("quota exhausted", "message"))
+        self.assertEqual(parts({"type": "turn.failed", "error": {"message": "rate limit"}}),
+                         ("rate limit", "error"))
+        self.assertEqual(parts({"type": "turn.failed"}), ("turn.failed", "event-type"))
+        self.assertEqual(parts({}), (None, None))
+        self.assertEqual(parts(None), (None, None))
+
+    def test_an_oversized_event_that_named_nothing_still_names_nothing(self):
+        """An event too large to hold is reduced to its head, and the head of one that
+        carried no error text has none either. Keeping the event's TYPE as the reduction's
+        `message` would make what is kept claim an explanation the original never gave —
+        and the cap would decide whether a caller can see an unexplained failure."""
+        kept = review_runner._reduced_event({"type": "turn.failed", "pad": "q" * 6000}, 2000)
+        self.assertEqual(review_runner._terminal_detail_parts(kept),
+                         ("turn.failed", "event-type"))
+        kept = review_runner._reduced_event(
+            {"type": "turn.failed", "message": "quota exhausted", "pad": "q" * 6000}, 2000)
+        self.assertEqual(review_runner._terminal_detail_parts(kept),
+                         ("quota exhausted", "message"))
+
+    def test_an_event_with_no_error_text_says_on_the_wire_that_it_is_a_name(self):
+        """End to end, because this is the pair a caller's breaker reads: an outage whose
+        CLI wrote its reason to stderr leaves a bare terminal event, and the status line has
+        to say that `turn.failed` is the event's name rather than its explanation."""
+        with tempfile.TemporaryDirectory() as d:
+            child = _child_printing(_transcript_event("half a review"),
+                                    json.dumps({"type": "turn.failed"}))
+            line = _run("--idle", "10", "--deadline", "20",
+                        "--findings", str(Path(d) / "findings.txt"),
+                        "--result-mode", "stream-transcript", "--status-detail",
+                        "--", PY, "-c", child)
+            self.assertEqual(line["status"], "error")
+            self.assertEqual(line["terminal_detail"], "turn.failed")
+            self.assertEqual(line["terminal_detail_source"], "event-type",
+                             "an event name was reported as the failure's own error text")
+
+    def test_a_terminal_failure_event_carries_its_own_text_through(self):
+        with tempfile.TemporaryDirectory() as d:
+            child = _child_printing(
+                _transcript_event("half a review"),
+                json.dumps({"type": "turn.failed",
+                            "error": {"message": "usage limit reached for this account"}}))
+            line = _run("--idle", "10", "--deadline", "20",
+                        "--findings", str(Path(d) / "findings.txt"),
+                        "--result-mode", "stream-transcript", "--status-detail",
+                        "--", PY, "-c", child)
+            self.assertEqual(line["status"], "error")
+            self.assertEqual(line["terminal_detail"],
+                             "usage limit reached for this account")
+
+
+class WhatIsRetainedIsBounded(unittest.TestCase):
+    """`--max-capture-bytes`, and the one rule everything here turns on: reviewer text is
+    dropped from the FRONT with the notice PREPENDED.
+
+    Appending it would break every capped reply that was otherwise intact, because the
+    answer is the last non-whitespace content of the transcript and anything after it means
+    there is no answer at all. These are the cases where a plausible implementation lands
+    the wrong answer rather than no answer."""
+
+    def _run_capped(self, directory, child, cap, *extra):
+        findings = Path(directory) / "findings.txt"
+        line = _run("--idle", "10", "--deadline", "30", "--findings", str(findings),
+                    "--result-mode", "stream-transcript", "--max-capture-bytes", str(cap),
+                    "--status-detail", *extra, "--", PY, "-c", child)
+        text = findings.read_text(encoding="utf-8") if findings.exists() else None
+        return line, text
+
+    @staticmethod
+    def _closing_object(text):
+        """The JSON object that is the last non-whitespace content, or None — the rule the
+        caller lands a reply by, restated here so these tests assert what it will see."""
+        tail = text.rstrip()
+        if not tail.endswith("}"):
+            return None
+        decoder = json.JSONDecoder()
+        index = tail.find("{")
+        while index != -1:
+            try:
+                value, end = decoder.raw_decode(tail, index)
+            except ValueError:
+                value, end = None, -1
+            if isinstance(value, dict) and end == len(tail):
+                return value
+            index = tail.find("{", index + 1)
+        return None
+
+    def test_an_oversized_reply_keeps_its_closing_object_and_says_it_was_cut(self):
+        with tempfile.TemporaryDirectory() as d:
+            child = _child_printing(
+                _transcript_event("x" * 5000),
+                _transcript_event(json.dumps({"findings": [], "summary": "done"})),
+                json.dumps({"type": "turn.completed"}))
+            line, text = self._run_capped(d, child, 2000)
+            self.assertEqual(line["status"], "ok", line)
+            self.assertTrue(line["capture_truncated"])
+            self.assertEqual(self._closing_object(text),
+                             {"findings": [], "summary": "done"},
+                             "the marker was appended, or the tail was dropped instead of "
+                             "the front — either way the reply no longer lands")
+            self.assertTrue(text.startswith("[review_runner]"),
+                            "the retained tail does not say it is only a tail")
+
+    def test_a_closing_object_larger_than_the_retained_tail_leaves_no_object(self):
+        """Losing later content must never promote an earlier one. The caller reads
+        "truncated, and no closing object" as infrastructure, so what this has to establish
+        is that the two facts are BOTH on the wire."""
+        with tempfile.TemporaryDirectory() as d:
+            earlier = json.dumps({"findings": [], "summary": "an example, not the answer"})
+            child = _child_printing(
+                _transcript_event(earlier),
+                _transcript_event(json.dumps({"findings": ["y" * 4000], "summary": "real"})),
+                json.dumps({"type": "turn.completed"}))
+            line, text = self._run_capped(d, child, 1000)
+            self.assertEqual(line["status"], "ok", line)
+            self.assertTrue(line["capture_truncated"])
+            self.assertIsNone(self._closing_object(text),
+                              "a fragment of the real answer parsed as an answer")
+            self.assertNotIn("an example, not the answer", text,
+                             "an earlier object survived to be landed as the reply")
+
+    def test_a_line_that_never_ends_is_an_overflow_not_a_shorter_transcript(self):
+        with tempfile.TemporaryDirectory() as d:
+            child = ("import sys, time\n"
+                     "sys.stdout.write('{' + 'z' * 300000)\n"
+                     "sys.stdout.flush()\n"
+                     "time.sleep(20)\n")
+            line, _text = self._run_capped(d, child, 1000)
+            self.assertEqual(line["status"], "error")
+            self.assertIn("capture overflow", line["reason"])
+
+    def test_an_oversized_terminal_event_keeps_its_head_and_marks_the_transcript(self):
+        with tempfile.TemporaryDirectory() as d:
+            child = _child_printing(
+                _transcript_event(json.dumps({"findings": [], "summary": "done"})),
+                json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                            "message": "the model stopped early",
+                            "structured_output": {"padding": "q" * 6000}}))
+            line, text = self._run_capped(d, child, 2500)
+            self.assertEqual(line["status"], "ok", line)
+            self.assertEqual(line["terminal_detail"], "the model stopped early")
+            self.assertTrue(line["capture_truncated"],
+                            "an event this program declined to hold whole was not reported")
+            self.assertEqual(self._closing_object(text),
+                             {"findings": [], "summary": "done"})
+
+    def test_trailing_malformed_output_does_not_take_the_capture_with_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            child = _child_printing(
+                _transcript_event(json.dumps({"findings": [], "summary": "done"})),
+                json.dumps({"type": "turn.completed"}),
+                "{not json at all", "")
+            line, text = self._run_capped(d, child, 100000)
+            self.assertEqual(line["status"], "ok", line)
+            self.assertEqual(self._closing_object(text),
+                             {"findings": [], "summary": "done"})
+
+    def test_a_cut_landing_inside_a_character_leaves_no_broken_one(self):
+        """The trim is measured in bytes and the text is characters, so the cut lands
+        mid-character as readily as anywhere else. A fragment rendered as U+FFFD would
+        reach a human as mojibake and, worse, could grow the retained tail past the cap it
+        was being trimmed to."""
+        state = {"transcript": ["é" * 500, '{"a": 1}'], "capture_cap": 301,
+                 "transcript_bytes": 1000 + len('{"a": 1}')}
+        review_runner._bound_transcript(state)
+        kept = "".join(state["transcript"])
+        self.assertNotIn("�", kept, "the cut left a broken character behind")
+        self.assertTrue(kept.endswith('{"a": 1}'), "the cut took the tail, not the front")
+        self.assertLessEqual(len(kept.encode("utf-8")), 301)
+        self.assertTrue(state["capture_truncated"])
+
+    # -- the other two result modes ------------------------------------------ #
+    def _run_capped_mode(self, directory, child, cap, mode, findings_name="findings.txt"):
+        findings = Path(directory) / findings_name
+        line = _run("--idle", "10", "--deadline", "30", "--findings", str(findings),
+                    "--result-mode", mode, "--max-capture-bytes", str(cap),
+                    "--status-detail", "--", PY, "-c", child)
+        text = findings.read_text(encoding="utf-8") if findings.exists() else None
+        return line, text
+
+    def test_an_oversized_result_event_is_bounded_like_the_transcript_is(self):
+        """The bound has to reach every mode that retains something, and this mode retains
+        the whole terminal event: `--findings` is written from its payload, so an event held
+        whole is the reviewer's entire output in this process's memory while the flag that
+        asked for a bound reports nothing dropped. Bounded the same way as assistant text —
+        the tail, and the notice in front of it — so a capped-but-intact reply still lands.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            payload = "x" * 5000 + json.dumps({"findings": [], "summary": "done"})
+            child = _child_printing(json.dumps(
+                {"type": "result", "subtype": "success", "is_error": False,
+                 "result": payload}))
+            line, text = self._run_capped_mode(d, child, 2000,
+                                               "stream-json-result-event")
+            self.assertEqual(line["status"], "ok", line)
+            self.assertTrue(line["capture_truncated"],
+                            "an event held whole was reported as nothing dropped")
+            self.assertLess(len(text.encode("utf-8")), 5000,
+                            "the cap did not reach what this mode publishes")
+            self.assertEqual(self._closing_object(text),
+                             {"findings": [], "summary": "done"},
+                             "the payload was cut from the end, so the reply no longer "
+                             "lands")
+            self.assertTrue(text.startswith("[review_runner]"),
+                            "the retained tail does not say it is only a tail")
+
+    def test_a_result_event_inside_the_cap_is_retained_exactly_as_it_arrived(self):
+        """The other half: the bound is a bound and not a rewrite. A reply that fits keeps
+        its bytes, and nothing says anything was dropped."""
+        with tempfile.TemporaryDirectory() as d:
+            payload = json.dumps({"findings": [], "summary": "done"})
+            child = _child_printing(json.dumps(
+                {"type": "result", "subtype": "success", "is_error": False,
+                 "result": payload}))
+            line, text = self._run_capped_mode(d, child, 2000,
+                                               "stream-json-result-event")
+            self.assertEqual(line["status"], "ok", line)
+            self.assertFalse(line["capture_truncated"])
+            self.assertEqual(text, payload)
+
+    def test_a_verdict_file_larger_than_the_cap_is_read_by_its_tail_and_left_alone(self):
+        """external-file mode's answer is the file the reviewer wrote, and this program does
+        not own it: it is not rewritten, and the caller reads all of it. What the cap bounds
+        is what this process HOLDS — read whole, a findings file of any size arrives in
+        memory here. The tail is what is read, because the verdict object a scan is looking
+        for is the file's last content.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            findings = Path(d) / "findings.txt"
+            verdict = {"findings": [], "overall": "ship it", "blocking_count": 0}
+            body = ("y" * 20000) + "\n" + json.dumps(verdict)
+            child = ("import pathlib\n"
+                     f"pathlib.Path({str(findings)!r}).write_text({body!r}, "
+                     "encoding='utf-8')\n")
+            line = _run("--idle", "10", "--deadline", "30", "--findings", str(findings),
+                        "--verdict-json", str(Path(d) / "verdict.json"),
+                        "--result-mode", "external-file", "--max-capture-bytes", "1000",
+                        "--status-detail", "--", PY, "-c", child)
+            self.assertEqual(line["status"], "ok", line)
+            self.assertEqual(findings.read_text(encoding="utf-8"), body,
+                             "the reviewer's own file was rewritten")
+            # What the cap is FOR, asserted at the read itself: nothing else on this path
+            # can show it, because the file on disk is complete either way and a status
+            # line cannot say how much memory this process was holding.
+            held = review_runner._read_verdict_file(findings, findings.stat().st_size,
+                                                    1000)
+            self.assertLessEqual(len(held.encode("utf-8")), 1000,
+                                 "a 20,000-byte file was held whole against a 1,000-byte "
+                                 "cap")
+            self.assertTrue(held.rstrip().endswith("}"),
+                            "the head was kept, so the object a scan looks for is gone")
+            # The scan still finds the object, because the tail is where it is.
+            self.assertEqual(line["verdict"], str(Path(d) / "verdict.json"),
+                             line.get("verdict_reason"))
+            self.assertFalse(line["capture_truncated"],
+                             "the published answer is the whole file, so nothing was cut "
+                             "from what a caller reads")
+
+    def test_a_verdict_file_within_the_cap_is_read_whole(self):
+        """The half that keeps the bound from becoming a shortener: a file under the cap is
+        read exactly as it was, by the same code path."""
+        with tempfile.TemporaryDirectory() as d:
+            findings = Path(d) / "findings.txt"
+            body = json.dumps({"findings": [], "overall": "ship it",
+                               "blocking_count": 0})
+            child = ("import pathlib\n"
+                     f"pathlib.Path({str(findings)!r}).write_text({body!r}, "
+                     "encoding='utf-8')\n")
+            line = _run("--idle", "10", "--deadline", "30", "--findings", str(findings),
+                        "--verdict-json", str(Path(d) / "verdict.json"),
+                        "--result-mode", "external-file", "--max-capture-bytes", "100000",
+                        "--", PY, "-c", child)
+            self.assertEqual(line["status"], "ok", line)
+            self.assertEqual(findings.read_text(encoding="utf-8"), body)
+            self.assertEqual(line["verdict"], str(Path(d) / "verdict.json"),
+                             line.get("verdict_reason"))
+
+    def test_the_notice_is_prepended_to_a_failed_runs_preserved_text_too(self):
+        with tempfile.TemporaryDirectory() as d:
+            child = _child_printing(
+                _transcript_event("x" * 5000),
+                json.dumps({"type": "turn.failed", "message": "gave up"}))
+            line, _text = self._run_capped(d, child, 2000)
+            self.assertEqual(line["status"], "error")
+            kept = Path(line["partial_findings"]).read_text(encoding="utf-8")
+            self.assertIn("dropped to stay within --max-capture-bytes", kept,
+                          "the file missing the most is the one that does not say so")
+
+
+class TwoWritersShareOneDisplayLog(unittest.TestCase):
+    """The stdout reader and the stderr drainer tee to one handle. A cap counted outside a
+    lock is a cap two threads overshoot by whatever each was holding, and the end marker —
+    the log's only completion signal — must land whatever the cap says."""
+
+    def _stream(self, directory, cap):
+        args = _parsed("--idle", "5", "--deadline", "30",
+                       "--findings", str(Path(directory) / "findings.txt"),
+                       "--display", str(Path(directory) / "display.log"),
+                       "--max-capture-bytes", str(cap),
+                       "--result-mode", "stream-transcript", "--", PY, "-c", "pass")
+        # No child: construction opens the display log and reads the args, and touches the
+        # process only by storing it. A reviewer spawned here would be one this test has to
+        # reap for a pipe it never reads.
+        return review_runner._Stream(None, args), Path(directory) / "display.log"
+
+    def test_concurrent_writers_stay_inside_the_cap_and_the_marker_still_lands(self):
+        with tempfile.TemporaryDirectory() as d:
+            cap = 4000
+            stream, log = self._stream(d, cap)
+            # 300 does not divide 4000, so one writer crosses the boundary and takes the
+            # truncating path — the case where a cap counted outside a lock overshoots. `z`
+            # appears in none of this program's own markers, so counting it counts exactly
+            # the reviewer-derived bytes and nothing else.
+            chunk = "z" * 300
+
+            def spam():
+                for _ in range(100):
+                    stream.write_display(chunk)
+
+            threads = [threading.Thread(target=spam) for _ in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            stream.write_display("[review_runner] end status=ok\n", bounded=False)
+            stream.display_fh.close()
+            text = log.read_text(encoding="utf-8")
+            self.assertIn("[review_runner] end status=ok", text,
+                          "the cap swallowed the log's only completion signal")
+            self.assertIn("display log capped", text, "no writer reached the cap at all")
+            self.assertLessEqual(text.count("z"), cap,
+                                 "four writers overshot a cap nothing serialized")
+
+
+class AFailedReadIsNotTheEndOfTheStream(unittest.TestCase):
+    """`os.read` raising is not EOF, and the difference decides what the status line claims.
+
+    The reader sets its done flag on every exit path, so a read that failed reaches the
+    outcome step looking exactly like a stream that ended: `drained` is True, whatever text
+    arrived first is published, and a review the machine cut short is reported as one the
+    reviewer finished. The status line is the only proof a caller has that an attempt
+    completed, so this is the shape that makes a failure look like a clean result.
+    """
+
+    def _args(self, directory, mode="stream-transcript"):
+        return _parsed("--idle", "5", "--deadline", "30",
+                       "--findings", str(Path(directory) / "findings.txt"),
+                       "--result-mode", mode, "--", PY, "-c", "pass")
+
+    def test_a_read_that_fails_is_recorded_rather_than_taken_for_eof(self):
+        with tempfile.TemporaryDirectory() as d:
+            proc = _reviewer("import time; time.sleep(30)")
+            self.addCleanup(proc.kill)
+            stream = review_runner._Stream(proc, self._args(d))
+            with unittest.mock.patch.object(review_runner.os, "read",
+                                            side_effect=OSError(5, "I/O error")):
+                stream.start()
+                self.assertTrue(stream.done.wait(timeout=10),
+                                "the reader never finished")
+            self.assertIn("reading the reviewer's output failed",
+                          stream.state.get("read_error") or "",
+                          "a failed read left no trace, so EOF and a fault are one state")
+
+    def test_the_watch_ends_the_run_under_the_faults_own_name(self):
+        """Not an idle timeout. Nothing stamps the heartbeat once the reader is gone, so the
+        idle clock would charge the child for silence that belongs to this program."""
+        with tempfile.TemporaryDirectory() as d:
+            proc = _reviewer("import time; time.sleep(30)")
+            self.addCleanup(proc.kill)
+            stream = review_runner._Stream(proc, self._args(d))
+            stream.start()
+            with stream.lock:
+                stream.state["read_error"] = "reading the reviewer's output failed: [Errno 5]"
+            status, reason = stream.watch(30, 30)
+            stream.settle(status)
+            self.assertEqual(status, "error", reason)
+            self.assertIn("[Errno 5]", reason)
+
+    def test_the_outcome_refuses_a_transcript_a_failed_read_cut_short(self):
+        with tempfile.TemporaryDirectory() as d:
+            args = self._args(d)
+            status, reason, text, _partial = review_runner._route_outcome(
+                args, "ok", None, True, 0,
+                _stream_state(transcript=["half a review"], terminal=None,
+                              read_error="reading the reviewer's output failed: "
+                                         "[Errno 28] No space left on device"),
+                threading.Lock())
+            self.assertEqual(status, "error")
+            self.assertIn("No space left on device", reason,
+                          "a storage fault must reach the caller as itself, so a caller "
+                          "counting the reviewer's bad answers does not charge it one")
+            self.assertIsNone(text)
+
+    def test_a_fault_after_the_reviewers_own_end_marker_costs_nothing(self):
+        """The boundary the refusal must not cross. Once the terminal event is in hand the
+        stream is over and only the pipe is still open — there is nothing left to lose."""
+        with tempfile.TemporaryDirectory() as d:
+            args = self._args(d)
+            status, reason, text, _partial = review_runner._route_outcome(
+                args, "ok", None, True, 0,
+                _stream_state(transcript=["the review"], terminal="ok",
+                              read_error="reading the reviewer's output failed: [Errno 5]"),
+                threading.Lock())
+            self.assertEqual((status, reason), ("ok", None))
+            self.assertEqual(text, "the review")
+
+
+class AVerdictFileThatCannotBeStattedIsNotAnAbsentOne(unittest.TestCase):
+    """`exists()` answers False for a path it cannot stat, and external-file mode reads that
+    as "the reviewer wrote no verdict" — charging a storage fault to the reviewer as a bad
+    answer. The two states need different responses: one is retried, the other is not.
+    """
+
+    def _args(self, directory):
+        return _parsed("--idle", "5", "--deadline", "10",
+                       # Resolved, so the comparison inside the test has both sides in the
+                       # same spelling: macOS answers `/var` with `/private/var`.
+                       "--findings", str(Path(directory).resolve() / "findings.txt"),
+                       "--result-mode", "external-file", "--", PY, "-c", "pass")
+
+    def test_a_findings_path_that_cannot_be_examined_is_a_routing_failure(self):
+        """ELOOP, because `Path.exists()` keeps a list of errors it reports as "not there"
+        and that is one of them — asking it about a path is how a fault becomes an absence.
+        `stat` has no such list, so only ENOENT answers."""
+        with tempfile.TemporaryDirectory() as d:
+            args = self._args(d)
+            Path(args.findings).write_text("a real verdict\n", encoding="utf-8")
+            wanted = os.path.abspath(args.findings)
+            real_stat = Path.stat
+
+            def refuse(self, *a, **kw):
+                if os.path.abspath(os.fspath(self)) == wanted:
+                    raise OSError(errno.ELOOP, "Too many levels of symbolic links")
+                return real_stat(self, *a, **kw)
+
+            with unittest.mock.patch.object(Path, "stat", refuse):
+                status, reason, text, _partial = review_runner._route_outcome(
+                    args, "ok", None, True, 0, _stream_state(), threading.Lock())
+            self.assertEqual(status, "error")
+            self.assertIn("routing failed", reason)
+            self.assertNotIn("wrote no verdict", reason,
+                             "a fault reading the file was charged to the reviewer")
+            self.assertIsNone(text)
+
+
+class ThePartialIsNeverWrittenThroughALinkNobodyChecked(unittest.TestCase):
+    """`Path.is_symlink()` answers False for everything it cannot stat, and on a platform
+    with no ``O_NOFOLLOW`` that False is the only thing between this and a write through a
+    link somebody else placed.
+    """
+
+    def test_a_path_whose_kind_cannot_be_established_is_not_written(self):
+        """ELOOP, because it is the error `Path.is_symlink()` reports as "not a link" — and
+        it is raised by the one thing this refuses to write through. `lstat` has no such
+        list: it answers, or it says nothing."""
+        with tempfile.TemporaryDirectory() as d:
+            # BOTH sides resolved, and resolved HERE: macOS answers `/var` with
+            # `/private/var` and Windows with an 8.3 short name, and `realpath` inside the
+            # patch below would call the very `lstat` it replaces.
+            findings = Path(d).resolve() / "findings.txt"
+            wanted = os.path.abspath(str(findings) + review_runner.PARTIAL_SUFFIX)
+            real_lstat = os.lstat
+
+            def refuse(path, *a, **kw):
+                if os.path.abspath(os.fspath(path)) == wanted:
+                    raise OSError(errno.ELOOP, "Too many levels of symbolic links")
+                return real_lstat(path, *a, **kw)
+
+            with unittest.mock.patch.object(review_runner.os, "lstat", refuse):
+                kept = review_runner._preserve_partial(findings, "half a review", "why")
+            self.assertIsNone(kept, "it wrote to a path it could not identify")
+            self.assertFalse(Path(str(findings) + review_runner.PARTIAL_SUFFIX).exists())
+
+    def test_an_absent_path_is_still_written(self):
+        """The positive control: ENOENT is the one answer that means "not a link"."""
+        with tempfile.TemporaryDirectory() as d:
+            findings = Path(d) / "findings.txt"
+            kept = review_runner._preserve_partial(findings, "half a review", "why")
+            self.assertIsNotNone(kept)
+            self.assertIn("half a review", Path(kept).read_text(encoding="utf-8"))
+
+
+class APartialNeverOverwritesWhatIsAlreadyThere(unittest.TestCase):
+    """The path is not this program's to claim, so it claims with ``O_EXCL`` and steps to the
+    next name. ``O_TRUNC`` here destroyed the earlier failure's transcript -- the one thing
+    preserving exists to keep -- and, on a hard link, the file at the other end of it."""
+
+    def test_an_earlier_partial_survives_and_the_second_run_takes_the_next_name(self):
+        with tempfile.TemporaryDirectory() as d:
+            findings = Path(d) / "findings.txt"
+            first = Path(str(findings) + review_runner.PARTIAL_SUFFIX)
+            first.write_text("the FIRST run's transcript", encoding="utf-8")
+            kept = review_runner._preserve_partial(findings, "the second run's transcript", "why")
+            self.assertEqual(first.read_text(encoding="utf-8"), "the FIRST run's transcript")
+            self.assertIsNotNone(kept)
+            self.assertNotEqual(Path(kept), first)
+            self.assertIn("the second run's transcript", Path(kept).read_text(encoding="utf-8"))
+
+    def test_a_hard_link_at_the_path_is_not_written_through(self):
+        with tempfile.TemporaryDirectory() as d:
+            findings = Path(d) / "findings.txt"
+            other = Path(d) / "somebody-elses.txt"
+            other.write_text("not the review runner's to touch", encoding="utf-8")
+            try:
+                os.link(other, Path(str(findings) + review_runner.PARTIAL_SUFFIX))
+            except (OSError, NotImplementedError, AttributeError) as exc:
+                self.skipTest(f"no hard links here: {exc}")
+            review_runner._preserve_partial(findings, "half a review", "why")
+            self.assertEqual(other.read_text(encoding="utf-8"), "not the review runner's to touch")
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "POSIX only")
+    def test_a_fifo_at_the_path_does_not_block_the_open(self):
+        """``os.open`` on a FIFO for writing blocks until a reader arrives, and this runs
+        after the deadline loop has ended -- so nothing would ever time it out. ``O_EXCL``
+        answers EEXIST instead. The test would HANG rather than fail if that regressed, which
+        is why the timeout is asserted around it rather than left to the suite."""
+        with tempfile.TemporaryDirectory() as d:
+            findings = Path(d) / "findings.txt"
+            os.mkfifo(str(findings) + review_runner.PARTIAL_SUFFIX)
+            done = threading.Event()
+            box = {}
+            def go():
+                box["kept"] = review_runner._preserve_partial(findings, "half a review", "why")
+                done.set()
+            threading.Thread(target=go, daemon=True).start()
+            self.assertTrue(done.wait(20), "the open blocked on the FIFO")
+            kept = box["kept"]
+            self.assertIsNotNone(kept, "the text was not preserved beside the FIFO")
+            self.assertIn("half a review", Path(kept).read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

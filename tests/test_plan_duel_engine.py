@@ -6,6 +6,7 @@ path derived from THIS file, so the suite runs from any working directory.
 """
 
 import contextlib
+import errno
 import io
 import json
 import math
@@ -803,9 +804,11 @@ class ResumeTests(_TempWorkdirMixin, unittest.TestCase):
         log = plan_duel.apply_resume(plan)
         self.assertNotIn("plan-a-round-0.md", log)
         self.assertTrue((wd / "plan-a-round-0.md").exists())
-        # Everything else still goes, including the stale live plan.
-        self.assertIn("plan-a.md", log)
-        self.assertFalse((wd / "plan-a.md").exists())
+        # Everything else still goes. The live plan-a.md stays: it is what proves the
+        # snapshot, so a resume killed before round 0 restores it can reuse Plan A again.
+        self.assertNotIn("plan-a.md", log)
+        self.assertEqual((wd / "plan-a.md").read_bytes(), (wd / "plan-a-round-0.md").read_bytes())
+        self.assertIn("participant-progress-0.md", log)
 
     def test_apply_resume_deletes_untrusted_plan_a_snapshot(self):
         wd = self._init_incomplete_with_snapshot_a(size=10)
@@ -1288,6 +1291,25 @@ class PreflightTests(_TempWorkdirMixin, unittest.TestCase):
                 emit=lambda _m: None,
             )
         self.assertFalse(wd.exists())
+
+    def test_a_new_run_given_a_long_inline_statement_reaches_preflight(self):
+        # One path component holds at most 255 bytes, and an ordinary paragraph is longer.
+        # Before Python 3.13 pathlib re-raises that ENAMETOOLONG from its probe instead of
+        # answering False, so the statement must be probed without letting it escape.
+        wd = self._tmpdir() / "wd"
+        with self.assertRaises(plan_duel.CliNotFoundError):
+            plan_duel.execute(
+                argument="Design a thing. " * 20,
+                workdir_arg=str(wd),
+                specs=self._specs(agent_b="definitely-not-a-real-cli-xyz"),
+                controller_name="Claude",
+                participant_name="Codex",
+                emit=lambda _m: None,
+            )
+
+    def test_a_long_inline_statement_resolves_to_itself(self):
+        statement = "Design a thing. " * 20
+        self.assertEqual(plan_duel._resolve_problem_statement(statement), statement)
 
 
 class JudgeCaptureTests(_TempWorkdirMixin, unittest.TestCase):
@@ -3029,9 +3051,9 @@ class WriteSummaryMissingSnapshotTests(_TempWorkdirMixin, unittest.TestCase):
     def test_a_failed_copy_never_stamps_whatever_was_already_there(self):
         """The stamp is only ever applied to a file THIS run wrote.
 
-        A missing `plan-a.md` used to raise. Now the copy is skipped and execution
-        continues to the stamp, which reads `plan-claude.md` — and a previous run may
-        have left one there. It would be stamped `| Format | v2 |` and named this duel's
+        A missing `plan-a.md` does not raise: the copy is skipped and execution continues
+        to the stamp, which reads `plan-claude.md` — and a previous run may have left one
+        there. It would be stamped `| Format | v2 |` and named this duel's
         winner, publishing an older plan as a result it had no part in.
         """
         wd = self._workdir(drop_live="a")
@@ -3196,8 +3218,11 @@ class ScenarioInitReusePlanATests(_ScenarioDriverMixin, unittest.TestCase):
         )
         # ...and it was never deleted on the way in.
         self.assertNotIn("Deleted plan-a-round-0.md", msgs)
-        # The rest of the reset still happened, and the duel still completed.
-        self.assertIn("Deleted plan-a.md", msgs)
+        # The rest of the reset still happened, and the duel still completed. The live
+        # plan-a.md stays beside its snapshot: that byte match is what lets a resume killed
+        # before round 0 restores it reuse Plan A again.
+        self.assertNotIn("Deleted plan-a.md", msgs)
+        self.assertIn("Deleted participant-progress-0.md", msgs)
         self.assertTrue((wd / "keep-me.txt").exists())
         self.assertIn("**Stopped due to:** Convergence", self._summary(wd))
 
@@ -3824,7 +3849,7 @@ class TimeoutFlagTests(_TempWorkdirMixin, unittest.TestCase):
     @unittest.skipUnless(os.name == "posix", "process groups are POSIX-only")
     def test_a_clean_run_does_not_signal_the_group(self):
         # The group kill is for the timeout and interrupt paths. Firing it after a CLI
-        # exits 0 is a behaviour change, not tidying: `subprocess.run` signalled nothing
+        # exits 0 is a behavior change, not tidying: `subprocess.run` signaled nothing
         # there, and a background helper the CLI deliberately left running in its group
         # would be killed for having been left. A drained success has no survivor holding
         # the pipes, so there is nothing the sweep could be for.
@@ -4484,8 +4509,8 @@ class ResumeRunDuelTests(_ResumeHarness, unittest.TestCase):
 
         `round.md` sends the judge to ⟪workdir⟫/plan-a.md and plan-b.md — the LIVE plans —
         and a resume restores those from the last completed round. Re-judging round 2 would
-        score round 3's plans and file the verdict as round 2's: a confident wrong number
-        where the old code left an obvious zero.
+        score round 3's plans and file the verdict as round 2's — a confident wrong number,
+        which is worse than the obvious zero a refusal leaves.
         """
         wd = self._seed(self._tmpdir() / "wd", 3, score=9)
         (wd / "judge-round-2.md").unlink()
@@ -4555,7 +4580,7 @@ class ResumeRunDuelTests(_ResumeHarness, unittest.TestCase):
 
     def test_every_preloaded_round_still_lands_in_scores(self):
         # The exit check indexes every round; a skipped entry raises KeyError instead of
-        # reproducing v1's treat-as-0 behaviour. A judge that cannot be re-run must still
+        # reproducing v1's treat-as-0 behavior. A judge that cannot be re-run must still
         # score, not vanish.
         wd = self._seed(self._tmpdir() / "wd", 3, score=5)
         (wd / "judge-round-3.md").unlink()
@@ -5085,7 +5110,7 @@ class TheSymlinkGuardIsReachedFromTheEngineItself(_ResumeHarness, unittest.TestC
     def test_a_real_round_reaches_both_guarded_writers(self):
         """The wiring itself, counted — "present" is what the guard already was.
 
-        A behavioural assertion can be satisfied by an engine that stopped writing the file
+        A behavioral assertion can be satisfied by an engine that stopped writing the file
         at all, so this records that one ordinary round actually enters `open_no_follow` in
         APPEND mode and `write_text_atomic`.
         """
@@ -5623,6 +5648,693 @@ class TheWindowsTimeoutEndsTheTreeNotJustTheShim(unittest.TestCase):
         calls = self._terminate_under("posix")
         self.assertFalse([c for c in calls if c[0] == "run"],
                          "POSIX kills the process GROUP; taskkill is not a POSIX program")
+
+
+class MalformedInputIsARefusalNotATraceback(_TempWorkdirMixin, unittest.TestCase):
+    """Each input here once ended a duel in a raw traceback, several after both plans were
+    paid for. Each must now degrade, or stop with a message naming what is wrong."""
+
+    def _run_main(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = plan_duel.main(list(argv))
+        return rc, err.getvalue()
+
+    def test_an_adapter_config_that_is_not_utf8_is_refused_by_name(self):
+        tmp = self._tmpdir()
+        cfg = tmp / "adapter.json"
+        cfg.write_bytes(json.dumps(_valid_config()).encode("utf-16"))
+        rc, err = self._run_main(
+            "Design the audit log.", "--adapter-config", str(cfg),
+            "--controller-name", "Claude", "--participant-name", "Codex",
+            "--workdir", str(tmp / "wd"))
+        self.assertEqual(rc, 2)
+        self.assertIn("adapter.json", err)
+
+    def test_an_adapter_config_saved_with_a_byte_order_mark_parses(self):
+        # Windows PowerShell 5.1's `-Encoding UTF8` writes one.
+        cfg = self._tmpdir() / "adapter.json"
+        cfg.write_bytes(b"\xef\xbb\xbf" + json.dumps(_valid_config()).encode("utf-8"))
+        specs = plan_duel.parse_adapter_config(plan_duel.read_text_normalized(cfg))
+        self.assertEqual(set(specs), set(plan_duel.REQUIRED_ROLES))
+
+    def test_a_problem_file_that_is_not_utf8_is_refused_by_name(self):
+        problem = self._tmpdir() / "problem.txt"
+        problem.write_bytes("Design the audit log.\n".encode("utf-16"))
+        with self.assertRaises(plan_duel.PlanDuelError) as ctx:
+            plan_duel._resolve_problem_statement(str(problem))
+        self.assertIn("problem.txt", str(ctx.exception))
+
+    def test_deeply_nested_json_degrades_wherever_it_is_parsed(self):
+        # Arrays, and one brace at most: the verdict scan starts a decode at every "{", so
+        # nesting braces would recurse once per brace and make the test slow, not stricter.
+        deep = "[" * 100000 + "1" + "]" * 100000
+        with self.assertRaises(plan_duel.AdapterConfigError):
+            plan_duel.parse_adapter_config(deep)
+        for label, text in (("bare", deep),
+                            ("in prose", 'Verdict follows. {"score": ' + deep + "}")):
+            with self.subTest(judge_file=label):
+                self.assertIsNone(plan_duel.parse_judge_json(text))
+        wd = self._tmpdir()
+        (wd / plan_duel.STATE_FILENAME).write_text(deep, encoding="utf-8")
+        self.assertIsNone(plan_duel.load_state(wd))
+
+    def test_a_score_too_long_to_convert_is_unparseable_not_fatal(self):
+        digits = "9" * 5000
+        for label, text in (("json", '{"score": "' + digits + '", "preferred": "A"}'),
+                            ("marker", "SCORE: " + digits + "\n\nPREFERRED: A\n")):
+            with self.subTest(form=label):
+                self.assertIsNone(plan_duel.parse_score(text))
+                self.assertIn("round 3", plan_duel.score_warning(text, 3))
+
+    @unittest.skipIf(os.name == "nt", "a file with no interpreter line is a POSIX exec failure")
+    def test_a_file_that_cannot_be_executed_is_a_process_error(self):
+        tool = self._tmpdir() / "not-a-program"
+        tool.write_text("this is not a program\n", encoding="utf-8")
+        tool.chmod(0o755)
+        with self.assertRaises(plan_duel.ProcessError):
+            plan_duel.run_cli([str(tool)])
+
+
+class ASummaryOutlivesWhatItReads(_TempWorkdirMixin, unittest.TestCase):
+    """The summary is written after the duel is paid for, and replayed after that: nothing it
+    reads may end it."""
+
+    def _finished_rounds(self, wd, rounds):
+        body = "This is a plan body sentence. " * 10 + "\n"
+        (wd / "problem.md").write_text("Problem statement.\n", encoding="utf-8")
+        for side in ("a", "b"):
+            (wd / f"plan-{side}.md").write_text(body, encoding="utf-8")
+            for n in range(0, rounds + 1):
+                (wd / f"plan-{side}-round-{n}.md").write_text(body, encoding="utf-8")
+        for n in range(1, rounds + 1):
+            (wd / f"judge-round-{n}.md").write_text(_sample_judge(score="7"), encoding="utf-8")
+
+    def test_an_unreadable_judge_file_is_warned_about_not_fatal(self):
+        wd = self._tmpdir() / "wd"
+        wd.mkdir()
+        self._finished_rounds(wd, 2)
+        real = plan_duel.read_text_tolerant
+
+        def reader(path):
+            if Path(path).name.startswith("judge-round-"):
+                raise PermissionError(13, "Permission denied", str(path))
+            return real(path)
+
+        msgs = []
+        with unittest.mock.patch.object(plan_duel, "read_text_tolerant", side_effect=reader):
+            summary = plan_duel.write_summary(
+                workdir=wd, rounds_run=2, stopped_due_to="Maximum rounds",
+                controller_name="Claude", participant_name="Codex", emit=msgs.append)
+        self.assertTrue(summary.is_file())
+
+    def test_replaying_a_finished_duel_whose_summary_holds_a_non_utf8_byte(self):
+        # write_text_atomic keeps such a byte of the workdir path with surrogateescape.
+        wd = self._tmpdir() / "wd"
+        wd.mkdir()
+        self._finished_rounds(wd, 1)
+        (wd / "summary.md").write_bytes(b"# Plan duel summary\n\nWorkdir: /tmp/caf\xe9\n")
+        specs = plan_duel.parse_adapter_config({
+            role: {"command": [sys.executable, str(_STUB)], "stdout": "file"}
+            for role in plan_duel.REQUIRED_ROLES})
+        msgs = []
+        rc = plan_duel.execute(argument=str(wd), specs=specs, controller_name="Claude",
+                               participant_name="Codex", emit=msgs.append)
+        self.assertEqual(rc, 0)
+        self.assertTrue(any("Plan duel summary" in m for m in msgs))
+
+
+class ArgumentsScoresAndLabelsMeanWhatTheySay(_TempWorkdirMixin, unittest.TestCase):
+    """An argument, a score or a label the engine could read as something else."""
+
+    def test_a_directory_that_is_not_a_duel_is_refused_before_any_cli_is_needed(self):
+        notes = self._tmpdir() / "duels"
+        notes.mkdir()
+        specs = plan_duel.parse_adapter_config({
+            role: {"command": ["definitely-not-a-real-cli-xyz"], "stdout": "file"}
+            for role in plan_duel.REQUIRED_ROLES})
+        with self.assertRaises(plan_duel.PlanDuelError) as ctx:
+            plan_duel.execute(argument=str(notes), specs=specs, controller_name="Claude",
+                              participant_name="Codex", emit=lambda _m: None)
+        self.assertNotIsInstance(ctx.exception, plan_duel.CliNotFoundError)
+        self.assertIn("problem.md", str(ctx.exception))
+
+    def test_an_auto_workdir_name_stays_short_enough_to_create(self):
+        tmp = self._tmpdir()
+        previous = Path.cwd()
+        os.chdir(tmp)
+        self.addCleanup(os.chdir, str(previous))
+        workdir = plan_duel._resolve_new_workdir(
+            None, "Rotate " + "a1b2c3d4" * 40 + " keys nightly.")
+        self.assertTrue(workdir.is_dir())
+
+    def test_a_whole_number_score_written_as_a_float_counts(self):
+        self.assertEqual(plan_duel.parse_score('{"score": 8.0, "preferred": "A"}'), 8)
+        self.assertIsNone(plan_duel.parse_score('{"score": 8.5, "preferred": "A"}'))
+
+    def test_a_word_that_starts_with_a_plan_label_is_left_alone(self):
+        out = plan_duel.rewrite_differences(
+            "Plan API gating: Plan A adds it. Plan Beta slips.", "Claude", "Codex")
+        self.assertEqual(out, "Plan API gating: Claude adds it. Plan Beta slips.")
+
+
+class ResumeAndRejudgeTrustOnlyWhatTheyShould(_ResumeHarness, unittest.TestCase):
+    """Resume paths that trusted a partial verdict, a stray draft, a missing snapshot or
+    the wrong names, and one that asked for CLIs it would never spawn."""
+
+    def _missing_clis(self):
+        return plan_duel.parse_adapter_config({
+            role: {"command": ["plan-duel-no-such-cli-xyz"], "stdout": "file"}
+            for role in plan_duel.REQUIRED_ROLES})
+
+    def test_a_resume_under_swapped_names_is_refused_before_anything_is_deleted(self):
+        wd = self._seed(self._tmpdir() / "wd", 3, score=9)
+        plan_duel.save_state(wd, plan_duel.RunState("Claude", "Codex"))
+        with self.assertRaises(plan_duel.PlanDuelError) as ctx:
+            plan_duel.execute(argument=str(wd), specs=self._specs(), controller_name="Codex",
+                              participant_name="Claude", emit=lambda _m: None)
+        self.assertIn("Claude", str(ctx.exception))
+        self.assertFalse((wd / "summary.md").exists())
+
+    def test_a_stopping_rounds_missing_snapshot_does_not_publish_a_later_plan(self):
+        wd = self._seed(self._tmpdir() / "wd", 4, score=9)  # converged at round 3
+        (wd / plan_duel.plan_snapshot_name("b", 3)).unlink()
+        (wd / "plan-b.md").write_text("LATER ROUND PLAN " * 30, encoding="utf-8")
+        rounds_run, stop, msgs = self._run(wd, start_round=5)
+        self.assertEqual((rounds_run, stop), (3, plan_duel.CONVERGENCE_LABEL))
+        live = wd / "plan-b.md"
+        self.assertFalse(live.is_file() and "LATER ROUND PLAN" in live.read_text(encoding="utf-8"),
+                         "a later round's plan is still the live plan published as round 3's")
+
+    def test_a_re_judge_marks_its_round_unfinished_before_it_dispatches(self):
+        wd = self._seed(self._tmpdir() / "wd", 3)
+        (wd / "judge-round-3.md").unlink()
+        state = plan_duel.RunState("Claude", "Codex")
+        state.rounds[3] = plan_duel.RoundState(plans_snapshotted=True, judge_completed=True, score=9)
+        plan_duel.save_state(wd, state)
+
+        def killed_mid_write(specs, values, message_path, **_kw):
+            message_path.write_text("SCORE: 9\n", encoding="utf-8")
+            raise KeyboardInterrupt
+
+        with unittest.mock.patch.object(plan_duel, "_dispatch_judge", side_effect=killed_mid_write):
+            with self.assertRaises(KeyboardInterrupt):
+                plan_duel._rejudge_round(workdir=wd, round_n=3, specs=self._specs(),
+                                         ctx=self._ctx(wd), emit=lambda _m: None, timeout=60,
+                                         state=state)
+        self.assertTrue(plan_duel.judge_needs_rerun(wd, 3, plan_duel.load_state(wd)))
+
+    def test_a_failed_re_judge_leaves_no_partial_verdict_behind(self):
+        wd = self._seed(self._tmpdir() / "wd", 3)
+        (wd / "judge-round-3.md").unlink()
+        state = self._interrupted_state(wd, 3)
+
+        def partial_then_fail(specs, values, message_path, **_kw):
+            message_path.write_text("SCORE: 9\n\nPREFERRED: B\n", encoding="utf-8")
+            raise plan_duel.PlanDuelError("the judge exited after a partial write")
+
+        with unittest.mock.patch.object(plan_duel, "_dispatch_judge", side_effect=partial_then_fail):
+            text = plan_duel._rejudge_round(workdir=wd, round_n=3, specs=self._specs(),
+                                            ctx=self._ctx(wd), emit=lambda _m: None, timeout=60,
+                                            state=state)
+        self.assertEqual(text, "")
+        self.assertFalse((wd / "judge-round-3.md").exists())
+
+    def test_the_timeout_help_says_a_resumed_judge_run_degrades(self):
+        help_text = " ".join(plan_duel.build_parser().format_help().split())
+        self.assertIn("scores that round 0", help_text)
+
+    def test_a_timed_out_agent_b_does_not_have_a_stray_draft_adopted(self):
+        wd = self._tmpdir() / "wd"
+        wd.mkdir()
+        (wd / "problem.md").write_text("p" * 400, encoding="utf-8")
+        (wd / "codex-draft.md").write_text("half a plan " * 60, encoding="utf-8")
+        specs = plan_duel.parse_adapter_config({
+            "agent_a": {"command": [sys.executable, str(_STUB), "--write-file",
+                                    "⟪workdir⟫/plan-a.md", "--content", "A" * 400],
+                        "stdout": "file"},
+            "agent_b": {"command": [sys.executable, str(_STUB), "--sleep", "30"],
+                        "stdout": "file"},
+            "judge": {"command": [sys.executable, str(_STUB)], "stdout": "clean-last-message"},
+        })
+        with self.assertRaises(plan_duel.AgentOutputError):
+            plan_duel.run_init_round(workdir=wd, specs=specs, ctx=self._ctx(wd),
+                                     emit=lambda _m: None, timeout=1,
+                                     state=plan_duel.RunState("Claude", "Codex"))
+        self.assertFalse((wd / "plan-b.md").exists())
+
+    def test_a_converged_duel_that_lost_its_summary_is_rebuilt_without_its_clis(self):
+        wd = self._seed(self._tmpdir() / "wd", 4, score=9)  # converged at round 3
+        msgs = []
+        rc = plan_duel.execute(argument=str(wd), specs=self._missing_clis(),
+                               controller_name="Claude", participant_name="Codex",
+                               emit=msgs.append)
+        self.assertEqual(rc, 0)
+        self.assertTrue((wd / "summary.md").is_file())
+
+    def test_a_resume_killed_before_plan_a_is_restored_still_reuses_it(self):
+        wd = self._tmpdir() / "wd"
+        wd.mkdir()
+        (wd / "problem.md").write_text("p" * 400, encoding="utf-8")
+        plan = "VALIDATED PLAN A " * 30
+        (wd / "plan-a.md").write_text(plan, encoding="utf-8")
+        (wd / plan_duel.plan_snapshot_name("a", 0)).write_text(plan, encoding="utf-8")
+        first = plan_duel.compute_resume(wd)
+        self.assertTrue(first.reuse_plan_a)
+        plan_duel.apply_resume(first)
+        # Killed here, before run_init_round copies the snapshot back over plan-a.md.
+        self.assertTrue(plan_duel.compute_resume(wd).reuse_plan_a)
+
+
+class TheStampAndTheSummaryClaimOnlyWhatHappened(_TempWorkdirMixin, unittest.TestCase):
+    """The verdict fields, the stamp and the Winner line, where each once took, rewrote or
+    claimed more than the run did."""
+
+    def _duel(self, plan_bytes):
+        wd = self._tmpdir() / "wd"
+        wd.mkdir()
+        (wd / "problem.md").write_text("Problem statement.\n", encoding="utf-8")
+        for side in ("a", "b"):
+            (wd / f"plan-{side}.md").write_bytes(plan_bytes)
+            for n in (0, 1):
+                (wd / f"plan-{side}-round-{n}.md").write_bytes(plan_bytes)
+        (wd / "judge-round-1.md").write_text("SCORE: 9\n\nPREFERRED: A\n", encoding="utf-8")
+        return wd
+
+    def _summarise(self, wd):
+        plan_duel.write_summary(workdir=wd, rounds_run=1, stopped_due_to="Convergence",
+                                controller_name="Claude", participant_name="Codex",
+                                emit=lambda _m: None)
+
+    def test_a_quoted_partial_object_does_not_override_the_markers_a_file_carries(self):
+        text = (
+            "SCORE: 5\n\n"
+            "DIFFERENCES:\n"
+            "1. Scope: Plan A: broad. Plan B: narrow. **Stronger: B** — focus\n\n"
+            "MISSED REJECTIONS: none\n\n"
+            "PREFERRED: B\n"
+            'A passing verdict would read {"score": 9, "preferred": "A", "differences": []}, '
+            "which this one does not.\n"
+        )
+        fields = plan_duel.extract_judge_fields(text)
+        self.assertEqual((fields.score, fields.preferred), (5, "B"))
+        self.assertIn("1. Scope:", fields.differences)
+        self.assertEqual((plan_duel.parse_score(text), plan_duel.parse_preferred(text)), (5, "B"))
+
+    def test_a_status_heading_inside_indented_code_is_not_the_plans(self):
+        plan = (
+            "# My Plan\n\nAn example of a status block:\n\n"
+            "    ## Status\n\n    | Field | Value |\n    |---|---|\n    | Format | v1 |\n\n"
+            "## Goal\n\nx\n"
+        )
+        out = plan_duel.stamp_winner_plan(plan)
+        self.assertIn("    | Format | v1 |", out)
+        self.assertIn("\n| Format | v2 |", out)
+        self.assertEqual(out.count("\n## Status"), 1)
+
+    def test_a_status_heading_with_no_table_does_not_take_a_later_sections_table(self):
+        plan = (
+            "# My Plan\n\n## Status\n\nIn progress.\n\n### Risks\n\n"
+            "| Phase | Risk |\n|---|---|\n| Phase | data loss |\n\n## Goal\n\nx\n"
+        )
+        out = plan_duel.stamp_winner_plan(plan)
+        self.assertIn("| Phase | data loss |", out)
+        self.assertLess(out.index("| Format | v2 |"), out.index("### Risks"))
+
+    def test_the_winner_line_claims_a_stamp_only_when_one_was_written(self):
+        wd = self._duel(b"# My Plan\n\n" + b"A body sentence. " * 20 + b"\n")
+        with unittest.mock.patch.object(plan_duel, "write_text_roundtrip",
+                                        side_effect=OSError(28, "No space left on device")):
+            with contextlib.redirect_stderr(io.StringIO()):
+                self._summarise(wd)
+        winner_line = next(line for line in (wd / "summary.md").read_text(encoding="utf-8").splitlines()
+                           if line.startswith("**Winner:**"))
+        self.assertNotIn("stamped `Format: v2`", winner_line)
+
+    def test_a_stamp_write_that_fails_part_way_leaves_the_winning_plan_intact(self):
+        target = self._tmpdir() / "plan-claude.md"
+        original = b"# Plan\n\n" + b"A body sentence. " * 40 + b"\n"
+        target.write_bytes(original)
+        real_fdopen = os.fdopen
+
+        class Refuses:
+            def __init__(self, handle):
+                self.handle = handle
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                self.handle.close()
+                return False
+
+            def write(self, _data):
+                raise OSError(28, "No space left on device")
+
+        with unittest.mock.patch.object(plan_duel.os, "fdopen",
+                                        lambda fd, *a, **k: Refuses(real_fdopen(fd, *a, **k))):
+            with self.assertRaises(OSError):
+                plan_duel.write_text_roundtrip(target, "# Plan\n\n| Format | v2 |\n")
+        self.assertEqual(target.read_bytes(), original)
+
+    def test_stamping_a_crlf_plan_keeps_its_line_endings(self):
+        wd = self._duel(b"# My Plan\r\n\r\n" + b"A body sentence.\r\n" * 20)
+        self._summarise(wd)
+        winner = (wd / "plan-claude.md").read_bytes()
+        self.assertIn(b"| Format | v2 |", winner)
+        self.assertEqual(winner.count(b"\n"), winner.count(b"\r\n"))
+
+
+class WhichProgramRunsAndWhatAnAdapterMeans(_TempWorkdirMixin, unittest.TestCase):
+    """Which program a bare CLI name runs, what a planted pipe does to a progress write, and
+    what an adapter's markers and stdout mode mean."""
+
+    def _chdir(self, target):
+        previous = Path.cwd()
+        os.chdir(target)
+        self.addCleanup(os.chdir, str(previous))
+
+    def test_a_cli_found_only_in_the_current_directory_is_refused(self):
+        cwd = self._tmpdir()
+        self._chdir(cwd)
+        planted = cwd / "codex.exe"
+        planted.write_text("", encoding="utf-8")
+        with unittest.mock.patch.object(plan_duel.shutil, "which", return_value=str(planted)), \
+             unittest.mock.patch.dict(os.environ, {"PATH": str(self._tmpdir())}):
+            with self.assertRaises(plan_duel.CliNotFoundError) as ctx:
+                plan_duel.resolve_executable("codex")
+        self.assertIn("current directory", str(ctx.exception))
+        # Named on PATH itself, the current directory is the user's choice, not a plant.
+        with unittest.mock.patch.object(plan_duel.shutil, "which", return_value=str(planted)), \
+             unittest.mock.patch.dict(os.environ, {"PATH": str(cwd)}):
+            self.assertEqual(Path(plan_duel.resolve_executable("codex")), planted)
+
+    def test_a_relative_path_entry_resolves_to_an_absolute_executable(self):
+        base = self._tmpdir()
+        self._chdir(base)
+        with unittest.mock.patch.object(plan_duel.shutil, "which",
+                                        return_value=os.path.join("bin", "codex")):
+            resolved = plan_duel.resolve_executable("codex")
+        self.assertEqual(resolved, str(base / "bin" / "codex"))
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "named pipes are a POSIX file type")
+    def test_a_named_pipe_at_a_progress_file_does_not_hang_the_duel(self):
+        wd = self._tmpdir()
+        pipes = [wd / "participant-progress-1.md", wd / plan_duel.PROGRESS_LOG_NAME]
+        for pipe in pipes:
+            os.mkfifo(pipe)
+
+        def release():
+            # Frees a write left waiting on a pipe, so the rest of the suite can run.
+            for _ in range(2):
+                for pipe in pipes:
+                    with contextlib.suppress(OSError):
+                        os.close(os.open(pipe, os.O_RDONLY | os.O_NONBLOCK))
+                time.sleep(0.1)
+
+        self.addCleanup(release)
+        ctx = plan_duel.DuelContext(workdir=wd, controller_name="Claude", participant_name="Codex")
+        finished = threading.Event()
+
+        def write():
+            plan_duel._progress(ctx, 1, "round 1: working")
+            finished.set()
+
+        threading.Thread(target=write, daemon=True).start()
+        self.assertTrue(finished.wait(5), "a progress write waited on a named pipe nobody reads")
+
+    def test_an_agent_role_whose_stdout_is_its_plan_has_that_stdout_captured(self):
+        wd = self._tmpdir()
+        specs = plan_duel.parse_adapter_config({
+            "agent_a": {"command": [sys.executable, str(_STUB), "--stdout", "P" * 400],
+                        "stdout": "clean-last-message"},
+            "agent_b": {"command": [sys.executable, str(_STUB)], "stdout": "file"},
+            "judge": {"command": [sys.executable, str(_STUB)], "stdout": "clean-last-message"},
+        })
+        ctx = plan_duel.DuelContext(workdir=wd, controller_name="Claude", participant_name="Codex")
+        plan_duel._dispatch_agent("agent_a", specs, ctx.values(round_n=0, prompt="Plan it."),
+                                  wd / "plan-a.md", ctx=ctx, side="a", round_n=0, workdir=wd,
+                                  timeout=60)
+        self.assertEqual((wd / "plan-a.md").read_text(encoding="utf-8"), "P" * 400)
+
+    def test_a_marker_the_engine_never_fills_is_refused_when_the_config_is_read(self):
+        config = {role: {"command": [sys.executable, str(_STUB), "--workdir", "⟪wrokdir⟫"],
+                         "stdout": "file"}
+                  for role in plan_duel.REQUIRED_ROLES}
+        with self.assertRaises(plan_duel.AdapterConfigError) as ctx:
+            plan_duel.parse_adapter_config(config)
+        self.assertIn("wrokdir", str(ctx.exception))
+
+    def test_on_windows_preflight_refuses_a_batch_wrapper_before_any_spawn(self):
+        # os.name is patched around code that builds no Path: pathlib picks its flavour
+        # from os.name when a Path is made, and WindowsPath cannot be made elsewhere.
+        specs = plan_duel.parse_adapter_config(
+            {role: {"command": ["codex"], "stdout": "file"} for role in plan_duel.REQUIRED_ROLES})
+        shim = r"C:\tools\npm\codex.cmd"
+        for os_name, refused in (("nt", True), ("posix", False)):
+            with self.subTest(os_name=os_name), \
+                 unittest.mock.patch.object(plan_duel, "resolve_executable", return_value=shim), \
+                 unittest.mock.patch.object(plan_duel.os, "name", os_name):
+                if refused:
+                    with self.assertRaises(plan_duel.CliNotFoundError) as ctx:
+                        plan_duel.preflight_executables(specs)
+                    self.assertIn("codex.cmd", str(ctx.exception))
+                else:
+                    plan_duel.preflight_executables(specs)
+
+
+class TheFixesHoldOnTheirOtherPaths(_ResumeHarness, unittest.TestCase):
+    """Paths the first round of fixes missed: an unusable marker beside a quoted object, an
+    unreadable or piped verdict on replay, and a batch wrapper on a resume that skips
+    preflight."""
+
+    def test_a_carried_marker_outranks_a_partial_object_even_when_its_value_is_unusable(self):
+        text = (
+            "SCORE: 50\n\nMISSED REJECTIONS: none\n\nPREFERRED: maybe\n"
+            'A passing verdict would read {"score": 9, "preferred": "A", '
+            '"missed_rejections": ["rollback"]}.\n'
+        )
+        self.assertIsNone(plan_duel.parse_score(text))
+        self.assertIn("50", plan_duel.score_warning(text, 3))
+        self.assertIsNone(plan_duel.parse_preferred(text))
+        self.assertEqual(plan_duel.extract_judge_fields(text).missed_rejections, "none")
+
+    def test_an_unreadable_earlier_verdict_is_replayed_as_it_was_predicted(self):
+        wd = self._seed(self._tmpdir() / "wd", 3, score=9)  # converged at round 3
+        real = plan_duel.read_text_tolerant
+
+        def reader(path):
+            if Path(path).name == "judge-round-1.md":
+                raise PermissionError(13, "Permission denied", str(path))
+            return real(path)
+
+        specs = plan_duel.parse_adapter_config({
+            role: {"command": ["plan-duel-no-such-cli-xyz"], "stdout": "file"}
+            for role in plan_duel.REQUIRED_ROLES})
+        with unittest.mock.patch.object(plan_duel, "read_text_tolerant", side_effect=reader):
+            rc = plan_duel.execute(argument=str(wd), specs=specs, controller_name="Claude",
+                                   participant_name="Codex", emit=lambda _m: None)
+        self.assertEqual(rc, 0)
+        self.assertTrue((wd / "summary.md").is_file())
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "named pipes are a POSIX file type")
+    def test_a_named_pipe_at_a_judge_path_is_not_read(self):
+        pipe = self._tmpdir() / "judge-round-1.md"
+        os.mkfifo(pipe)
+
+        def release():
+            # Frees a read left waiting on the pipe, so the rest of the suite can run.
+            with contextlib.suppress(OSError):
+                os.close(os.open(pipe, os.O_WRONLY | os.O_NONBLOCK))
+
+        self.addCleanup(release)
+        result = []
+        finished = threading.Event()
+
+        def read():
+            result.append(plan_duel._judge_text_or_none(pipe))
+            finished.set()
+
+        threading.Thread(target=read, daemon=True).start()
+        self.assertTrue(finished.wait(5), "a judge read waited on a named pipe nobody writes")
+        self.assertEqual(result, [None])
+
+    def test_a_batch_wrapper_is_refused_at_dispatch_when_preflight_was_skipped(self):
+        # os.name is patched around code that builds no Path, as in the preflight test.
+        shim = r"C:\tools\npm\judge.cmd"
+        with unittest.mock.patch.object(plan_duel, "resolve_executable", return_value=shim), \
+             unittest.mock.patch.object(plan_duel.subprocess, "Popen",
+                                        side_effect=AssertionError("spawned a batch wrapper")), \
+             unittest.mock.patch.object(plan_duel.os, "name", "nt"):
+            with self.assertRaises(plan_duel.CliNotFoundError):
+                plan_duel.run_cli(["judge", "a multi-line\nprompt"])
+
+
+# A symlink that points at itself. `os.stat` answers ELOOP -- the filesystem cannot resolve
+# the name at all -- and `Path.exists()` / `.is_file()` fold that into False, the same answer
+# they give for a name with nothing at it. It is the one unreadable state these tests can
+# create on any platform without elevation and without depending on who is running them:
+# `chmod 0o000` does not stop root and does not stop Windows.
+def _unresolvable(path: Path) -> Path:
+    """Make ``path`` a self-referential symlink and return it."""
+    path.symlink_to(path.name)
+    return path
+
+
+_CAN_LOOP = True
+try:
+    with tempfile.TemporaryDirectory() as _probe:
+        _loop = _unresolvable(Path(_probe) / "loop")
+        _CAN_LOOP = not _loop.exists() and _loop.is_symlink()
+except (OSError, NotImplementedError):  # pragma: no cover - platform dependent
+    _CAN_LOOP = False
+
+NEEDS_UNRESOLVABLE = unittest.skipUnless(
+    _CAN_LOOP, "this platform/user cannot create an unresolvable symlink")
+
+
+@NEEDS_UNRESOLVABLE
+class AnUnreadableArtifactIsNotAnAbsentOne(_TempWorkdirMixin, unittest.TestCase):
+    """A resume derives every fact from a file, so a read that failed must not answer one.
+
+    The existence predicates fold ELOOP into False, so a name the filesystem cannot resolve
+    reads as a name with nothing at it. Each case below puts one duel artifact into that
+    state and asserts the engine says so, rather than spending a dispatch, overwriting a
+    frozen input or discarding the round markers it had earned. The ENOENT half is asserted
+    beside each, because narrowing what counts as absent is a fix only if absent still is.
+    """
+
+    def test_an_unreadable_state_file_is_not_a_duel_that_wrote_no_state(self):
+        """None means "no state" to every caller, including the resume's name guard."""
+        wd = self._tmpdir()
+        _unresolvable(wd / plan_duel.STATE_FILENAME)
+        with self.assertRaises(OSError):
+            plan_duel.load_state(wd)
+
+    def test_an_absent_state_file_is_still_none(self):
+        self.assertIsNone(plan_duel.load_state(self._tmpdir()))
+
+    def test_an_unparseable_state_file_is_still_none(self):
+        """The other tolerated case, unchanged: a torn write is not a read failure."""
+        wd = self._tmpdir()
+        (wd / plan_duel.STATE_FILENAME).write_text("{not json", encoding="utf-8")
+        self.assertIsNone(plan_duel.load_state(wd))
+
+    def test_an_unreadable_frozen_input_is_not_overwritten_by_the_live_plan(self):
+        """Treating it as missing replaces the round's immutable input with today's plan."""
+        wd = self._tmpdir()
+        (wd / "plan-a.md").write_text("live A" * 50, encoding="utf-8")
+        (wd / "plan-b.md").write_text("live B" * 50, encoding="utf-8")
+        _unresolvable(wd / plan_duel.plan_snapshot_name("a", 0))
+        with self.assertRaises(OSError):
+            plan_duel.freeze_round_inputs(wd, 1)
+
+    def test_an_absent_frozen_input_is_still_created_from_the_live_plan(self):
+        wd = self._tmpdir()
+        (wd / "plan-a.md").write_text("live A" * 50, encoding="utf-8")
+        (wd / "plan-b.md").write_text("live B" * 50, encoding="utf-8")
+        frozen = plan_duel.freeze_round_inputs(wd, 1)
+        self.assertTrue(frozen.plan_a.is_file() and frozen.plan_b.is_file())
+
+    def test_an_unreadable_verdict_is_not_re_judged(self):
+        """Re-judging spends a paid dispatch and overwrites the answer already on disk."""
+        wd = self._tmpdir()
+        _unresolvable(wd / "judge-round-1.md")
+        with self.assertRaises(OSError):
+            plan_duel.judge_needs_rerun(wd, 1, None)
+
+    def test_an_absent_verdict_is_still_re_judged(self):
+        self.assertTrue(plan_duel.judge_needs_rerun(self._tmpdir(), 1, None))
+
+    def test_an_unreadable_direct_child_is_not_dropped_from_the_snapshot_scan(self):
+        """A completed round missing from the scan makes the resume re-run paid work."""
+        wd = self._tmpdir()
+        (wd / "problem.md").write_text("p", encoding="utf-8")
+        _unresolvable(wd / plan_duel.plan_snapshot_name("a", 1))
+        with self.assertRaises(OSError):
+            plan_duel.scan_snapshots(wd)
+
+    def test_a_summary_that_cannot_be_resolved_does_not_read_as_an_unfinished_duel(self):
+        """`has_summary=False` ends a finished duel by re-running it from the last round.
+
+        The refusal comes from the shared listing (`_direct_child_files`) before
+        `has_summary` is computed, so this pins the OUTCOME rather than that one line:
+        whichever guard fires, the scan must not answer "there is no summary".
+        """
+        wd = self._tmpdir()
+        (wd / "problem.md").write_text("p", encoding="utf-8")
+        _unresolvable(wd / "summary.md")
+        with self.assertRaises(OSError):
+            plan_duel.scan_snapshots(wd)
+
+    def test_an_empty_workdir_still_scans_as_having_nothing(self):
+        scan = plan_duel.scan_snapshots(self._tmpdir())
+        self.assertFalse(scan.has_summary or scan.has_live_a or scan.has_problem)
+
+
+class ANameTooLongToResolveIsNotAnAbsentName(unittest.TestCase):
+    """``ENAMETOOLONG`` says the path could not be RESOLVED, which establishes nothing about
+    what stands at the name — a long alias answers it for a file that is really there.
+
+    The one call that must still answer False is the positional argument probed as a path
+    before it is taken as inline text, where an ordinary paragraph is longer than a path
+    component may be. That tolerance lives at `_path_test`, with its reason, and is asserted
+    below so the helper's stricter reading cannot travel to it.
+    """
+
+    def test_it_propagates(self):
+        too_long = OSError(errno.ENAMETOOLONG, "File name too long")
+        with unittest.mock.patch.object(os, "stat", side_effect=too_long):
+            with self.assertRaises(OSError) as raised:
+                plan_duel._mode_or_absent(Path("some-name"))
+        self.assertEqual(raised.exception.errno, errno.ENAMETOOLONG)
+
+    def test_the_link_inspection_propagates_it_too(self):
+        too_long = OSError(errno.ENAMETOOLONG, "File name too long")
+        with unittest.mock.patch.object(os, "lstat", side_effect=too_long):
+            with self.assertRaises(OSError):
+                plan_duel._mode_or_absent(Path("some-name"), follow=False)
+
+    def test_a_genuinely_absent_name_is_still_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(plan_duel._mode_or_absent(Path(tmp) / "nothing"))
+
+    def test_a_statement_too_long_to_be_a_path_is_still_inline_text(self):
+        """The local tolerance: an inline problem statement is not a file that is missing."""
+        statement = "Design a thing. " * 40
+        self.assertFalse(plan_duel._path_test(Path.is_file, Path(statement)))
+        self.assertEqual(plan_duel._resolve_problem_statement(statement), statement)
+
+
+@unittest.skipUnless(os.name == "posix", "the defect is in POSIX permission bits; Windows has "
+                     "no group or world bits to lose, and reports 0o666 or 0o444 for every file")
+class AStampKeepsThePlansPermissions(unittest.TestCase):
+    """The winner is stamped by a temporary file and a rename. `mkstemp` creates 0600 and
+    `os.replace` keeps whatever the temporary had, so a plan every teammate could read became
+    readable by whoever ran the duel the moment it was stamped. The mode travels with the
+    content: an existing file keeps its own, a new one gets what a plain create would."""
+
+    def test_an_existing_files_mode_survives_the_atomic_write(self):
+        import os, stat, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path = plan_duel.Path(d) / "plan.md"
+            path.write_text("before\n", encoding="utf-8")
+            os.chmod(path, 0o644)
+            plan_duel._write_bytes_atomic(path, b"after\n")
+            self.assertEqual(path.read_bytes(), b"after\n")
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode) & 0o077, 0o044,
+                             "the stamp took group and world read away")
+
+    def test_a_new_file_gets_the_umasks_mode_not_mkstemps(self):
+        import os, stat, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path = plan_duel.Path(d) / "new.md"
+            old = os.umask(0o022)
+            try:
+                plan_duel._write_bytes_atomic(path, b"x\n")
+            finally:
+                os.umask(old)
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o644)
 
 
 if __name__ == "__main__":

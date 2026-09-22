@@ -82,14 +82,19 @@ from the index and say so:
 git restore --staged <path>       # older git: git reset HEAD <path>
 ```
 
-**In a repository with no commits, both of those fail** — `fatal: could not resolve HEAD`,
-because each names a commit to restore the index *from* and there is not one yet. That is
-the same unborn repository this skill handles above, and a first commit is exactly where a
-stray `.env` is most likely to be sitting. Use the form that needs no history:
+**In a repository with no commits, both of those fail** — `git restore --staged` with
+`fatal: could not resolve HEAD`, and `git reset HEAD <path>` with `fatal: ambiguous
+argument 'HEAD'` — because each names a commit to restore the index *from* and there is
+not one yet. That is the same unborn repository this skill handles above, and a first
+commit is exactly where a stray `.env` is most likely to be sitting. Use the form that
+needs no history:
 
 ```bash
-git rm --cached <path>            # unstages without a HEAD; leaves the file on disk
+git reset -- <path>               # unstages with no HEAD; leaves the file on disk
 ```
+
+Not `git rm --cached`: it refuses the moment the file was edited after being staged — the
+shape a secret caught mid-edit has — and needs `-f` to get past it.
 
 ---
 

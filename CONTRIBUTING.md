@@ -80,6 +80,12 @@ Preserve the core workflow. Portability fixes are welcome; workflow redesign bel
 separate proposal. If you rename or remove a companion-skill reference (`cyw`, `tdd`,
 `plan-init`), run the validator — cross-reference checks flag stale mentions elsewhere.
 
+**US spelling, everywhere.** Prose, comments, docstrings, identifiers: `behavior`, not
+`behaviour`; `normalize`, not `normalise`; `catalog`, not `catalogue`. This covers every
+tracked file except `LICENSE` and `NOTICE`, which are legal text and stay as they are.
+Nothing enforces it — a spelling check would guard none of the three things this project's
+checks exist for, so adding one would earn it deletion rather than a place in the gate.
+
 ### Editing a skill from inside an agent session
 
 Asking an agent to improve its own skill edits the **installed copy** under
@@ -263,4 +269,4 @@ and it explains why one of those three reads exactly like a rule that *is* check
 - [ ] You have said which runtime(s) you actually tried the skill in
 - [ ] If you added or renamed a skill, cross-reference checks still pass
 - [ ] README's table and skill count updated, and `skill-budgets.json` if sizes moved
-- [ ] CHANGELOG updated if user-visible behaviour changed
+- [ ] CHANGELOG updated if user-visible behavior changed

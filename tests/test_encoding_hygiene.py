@@ -11,7 +11,7 @@ contains a non-ASCII byte. That is how twelve of them survived in
 `validate_cross_runtime.py`, and a bare read against a currently-ASCII file breaks the day
 someone adds an em dash to it.
 
-This test is the exhaustive half. It reads the source, not the behaviour, so a bare call is
+This test is the exhaustive half. It reads the source, not the behavior, so a bare call is
 a failure the moment it is written, whatever the file it points at contains today.
 
 Scope is the Python that SHIPS, discovered rather than listed — see `shipped_python()`.
@@ -208,9 +208,9 @@ class EntrypointsPinTheirOutputEncoding(unittest.TestCase):
     dash. So an entrypoint that does not reconfigure its streams dies *reporting* — after the
     work succeeded, which is the worst moment for it.
 
-    Source-read rather than behavioural, on the same argument the module docstring makes: a
+    Source-read rather than behavioral, on the same argument the module docstring makes: a
     run only fails today if the message it happens to print carries a non-ASCII byte. The
-    behavioural half — which also catches a preamble placed after the first print — is
+    behavioral half — which also catches a preamble placed after the first print — is
     `test_install_py.OutputSurvivesANonUtf8Console`.
     """
 

@@ -48,7 +48,29 @@ project at all, so there is nothing to ignore.
    [ -n "$root" ] || { echo "project root not resolved — see step 1" >&2; exit 1; }
    base="${TMPDIR:-/tmp}"
    case "$base" in /*) ;; *) base=/tmp ;; esac          # absolute
-   case "$base/" in "$root"/*) base=/tmp ;; esac        # and outside the audited tree
+   # Compared by WHERE IT LEADS, not how it is spelled: a symlink or a `..` segment can
+   # spell a path outside the tree and resolve inside it, which puts the whole report in the
+   # code under review. `pwd -P` answers with every pathname link resolved, and a base that
+   # cannot even be entered is not a base. A bind mount is NOT covered — it is not a link,
+   # and no pathname comparison sees through one.
+   base=$( (cd -P -- "$base" 2>/dev/null && pwd -P) ) || base=$( (cd -P -- /tmp 2>/dev/null && pwd -P) )
+   # A root that cannot be resolved is refused, not compared as text: text is the comparison
+   # these two lines exist to replace.
+   root_real=$( (cd -P -- "$root" 2>/dev/null && pwd -P) ) \
+     || { echo "project root could not be resolved — see step 1" >&2; exit 1; }
+   # The trailing slash comes OFF, because `pwd -P` answers `/` for the filesystem root and
+   # the comparison below would then read `//*` — a pattern no single-slash path matches, so
+   # every base would pass as outside a tree that contains everything. Stripped, the pattern
+   # is `/*`, everything matches, and the refusal below fires as it should.
+   root_real=${root_real%/}
+   case "$base/" in "$root_real"/*) base=$( (cd -P -- /tmp 2>/dev/null && pwd -P) ) ;; esac
+   # The FALLBACK is checked too, and refused rather than used: an audit rooted at /tmp
+   # itself would otherwise put the report inside the tree being read. The PowerShell block
+   # below already refuses that case; this one accepted it.
+   [ -n "$base" ] || { echo "no temp directory outside the audited tree; set TMPDIR" >&2; exit 1; }
+   case "$base/" in "$root_real"/*)
+     echo "no temp directory outside the audited tree; set TMPDIR and re-run" >&2; exit 1 ;;
+   esac
    run="$base/security-review-$(basename "$root")-$(date +%Y%m%d-%H%M%S)-$$"
    mkdir "$run" || exit 1   # plain mkdir: it FAILS on an existing directory rather than
                             # silently adopting one, so a run never inherits another's files
@@ -56,7 +78,7 @@ project at all, so there is nothing to ignore.
    ```
 
    On a native-Windows shell, the same three checks against `$env:TEMP` — absolute, outside
-   the audited tree, and a fresh directory. Written out rather than summarised as
+   the audited tree, and a fresh directory. Written out rather than summarized as
    "checked the same way", which is worse than saying nothing because it reads as a
    guarantee while performing none of the checks:
 
@@ -80,6 +102,51 @@ project at all, so there is nothing to ignore.
    # two never matches — the containment check would be inert on the platform it targets.
    function ConvertTo-Comparable($p) { ($p -replace '/', '\').TrimEnd('\') + '\' }
 
+   # WHERE IT LEADS, not how it is spelled. GetFullPath collapses a `..` segment, and then
+   # EVERY component is followed to its target — not just the leaf. A junction above the
+   # candidate moves everything below it: `C:\work` linked to `D:\repo` leaves `C:\work\tmp`
+   # looking unrelated to the root it sits inside, and the textual comparison this replaced
+   # caught exactly that. Bounded, so a cycle cannot spin; a relative target resolves
+   # against its own link's directory, not the caller's.
+   function Resolve-Physical($p) {
+       try { $p = [System.IO.Path]::GetFullPath($p) } catch { return $null }
+       for ($pass = 0; $pass -lt 16; $pass++) {
+           # ROOT FIRST, shallowest link before deepest. A relative target means nothing
+           # until the directory holding it is itself physical: `..\scratch` beneath a
+           # junction otherwise reads against the junction's SPELLED parent, and a directory
+           # inside the audited tree comes back looking like one outside it.
+           $chain, $probe = @(), $p
+           while ($probe) { $chain = @($probe) + $chain; $probe = Split-Path -Parent $probe }
+           $swapped = $false
+           foreach ($probe in $chain) {
+               $item = Get-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+               $target = if ($item) { @($item.Target)[0] } else { $null }
+               if ($target) {
+                   if (-not [System.IO.Path]::IsPathRooted($target)) {
+                       # Combine, not string concatenation: it joins with the platform's
+                       # separator, and GetFullPath collapses a `..` only across one it
+                       # recognises. The parent of a top-level entry is the ROOT, which
+                       # `Split-Path` reports as nothing — and combining a relative target
+                       # with nothing yields a relative path, which then resolves against
+                       # whatever directory the caller happened to be in. On macOS the
+                       # top-level `var` entry is a relative link to `private/var`, so this
+                       # is an ordinary path there rather than a curiosity.
+                       $holder = Split-Path -Parent $probe
+                       if (-not $holder) { $holder = [System.IO.Path]::GetPathRoot($probe) }
+                       $target = [System.IO.Path]::Combine($holder, $target)
+                   }
+                   try {
+                       $p = [System.IO.Path]::GetFullPath($target + $p.Substring($probe.Length))
+                   } catch { return $null }
+                   $swapped = $true
+                   break
+               }
+           }
+           if (-not $swapped) { return $p }
+       }
+       return $null   # sixteen swaps and still a link: unresolvable, so not a safe base
+   }
+
    # Absolute, and outside the repository being audited — a TEMP redirected inside it
    # would put the whole report in the user's tree, which this skill must never do.
    #
@@ -93,8 +160,15 @@ project at all, so there is nothing to ignore.
        # directory and so names no fixed location. NOT IsPathFullyQualified either:
        # that is .NET Core only, and Windows PowerShell 5.1 is in the support matrix.
        if ($candidate -notmatch '^([A-Za-z]:[\\/]|\\\\)') { return $false }
+       $candidate = Resolve-Physical $candidate
+       if (-not $candidate) { return $false }
+       # A root that cannot be resolved — a link chain past the bound, a path that cannot be
+       # read — is a REFUSAL. Falling back to its spelling hands the decision to the text
+       # this function exists to distrust.
+       $rootReal = Resolve-Physical $repoRoot
+       if (-not $rootReal) { return $false }
        return -not (ConvertTo-Comparable $candidate).StartsWith(
-           (ConvertTo-Comparable $repoRoot), [StringComparison]::OrdinalIgnoreCase)
+           (ConvertTo-Comparable $rootReal), [StringComparison]::OrdinalIgnoreCase)
    }
    # Built by interpolation, not Join-Path, and each rung guarded on its variable being
    # set. Join-Path resolves through the PowerShell drive provider: given an unset

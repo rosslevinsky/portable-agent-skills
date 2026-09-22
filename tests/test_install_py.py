@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tests for `install.py`, the single-file installer.
 
-Organised around the promises the installer makes, because those are what a reader needs to
+Organized around the promises the installer makes, because those are what a reader needs to
 trust and what a future edit must not quietly withdraw:
 
   * it installs what it says, into every target, and records it;
@@ -77,6 +77,13 @@ def make_source(root: Path, names=("alpha", "beta")) -> Path:
 
 class InstallBase(unittest.TestCase):
     def setUp(self):
+        # These tests call the command functions DIRECTLY, which is a way into the installer
+        # that skips `main` — and `main` is where the CLI pins its streams to utf-8 before
+        # printing the em dash every mode prints. Without this the pass depended on some
+        # OTHER test in the same process having called `main` first, and a run that split
+        # this class away from that one failed under an ASCII stdout while the code was
+        # perfectly correct.
+        install.prepare_streams()
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name)
@@ -253,16 +260,17 @@ class LinksAreUnlinkedNeverFollowed(InstallBase):
         rmtree.assert_not_called()
         self.assertFalse(stand_in.exists(), "the reparse point was never detached")
 
-    def test_the_pre_312_fallback_reads_the_reparse_tag_and_not_the_bit(self):
+    def test_the_windows_branch_reads_the_reparse_tag_and_not_the_bit(self):
         """Every reparse point sets FILE_ATTRIBUTE_REPARSE_POINT, and most of them are not
         links: a cloud-storage placeholder directory and a ProjFS root both carry the bit.
-        On 3.10 and 3.11 there is no `is_junction()` to ask, so the fallback must read the
-        reparse TAG.
+        The junction question is answered from the lstat this already has, so the TAG is what
+        has to be read.
 
         Testing the bit alone calls an ordinary synced directory a link, and `_remove` then
-        tries to detach a real non-empty directory — `unlink` refuses a directory, `rmdir`
-        refuses a non-empty one, and an update that used to succeed fails instead. A user
-        whose skills sit under a synced home directory meets that on every skill they have.
+        tries to detach a real non-empty directory — `unlink` refuses a directory and
+        `rmdir` refuses a non-empty one, so the update fails on a skill that is perfectly
+        installable. A user whose skills sit under a synced home directory meets that on
+        every skill they have.
         """
         reparse_bit = 0x400
         symlink, junction, cloud = 0xA000000C, 0xA0000003, 0x9000101A
@@ -272,22 +280,18 @@ class LinksAreUnlinkedNeverFollowed(InstallBase):
                 self.st_file_attributes = reparse_bit
                 self.st_reparse_tag = tag
 
-        class PreThreeTwelvePath:
-            """A 3.10/3.11 `Path`: no `is_junction`, and `lstat` sees a reparse point."""
-            is_junction = None
+        class WindowsPath:
+            """A Windows `Path`: `lstat` sees a reparse point, with no S_IFLNK on it."""
 
             def __init__(self, tag):
                 self._tag = tag
 
-            def is_symlink(self):
-                return False
-
             def lstat(self):
                 return FakeStat(self._tag)
 
-        self.assertTrue(install._is_link(PreThreeTwelvePath(symlink)))
-        self.assertTrue(install._is_link(PreThreeTwelvePath(junction)))
-        self.assertFalse(install._is_link(PreThreeTwelvePath(cloud)),
+        self.assertTrue(install._is_link(WindowsPath(symlink)))
+        self.assertTrue(install._is_link(WindowsPath(junction)))
+        self.assertFalse(install._is_link(WindowsPath(cloud)),
                          "a cloud-storage placeholder directory is not a link")
 
     @NEEDS_SYMLINKS
@@ -497,7 +501,7 @@ class MutationProofs(InstallBase):
 
 
 class ThreeGapsTheOldSuiteNamed(unittest.TestCase):
-    """Behaviours the bash suite covered that the first draft of `install.py` dropped.
+    """Behaviors the bash suite covered that the first draft of `install.py` dropped.
 
     Found by READING the suite being deleted rather than deleting it. All three were
     reproduced before they were fixed, which is the only reason to trust the fix — and the
@@ -780,7 +784,7 @@ class AnInterpreterBelowTheFloorIsRefusedBeforeAnyFileMoves(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("python3.9"), "no 3.9 interpreter to check against")
     def test_a_real_old_interpreter_copies_nothing(self):
-        """The behavioural half: the guard has to run before the copy, not just return 2."""
+        """The behavioral half: the guard has to run before the copy, not just return 2."""
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "t"
             proc = subprocess.run(
@@ -899,10 +903,11 @@ class ThePruneRecordsWhatIsThereAndWhatWasCopied(InstallBase):
             "the manifest claims a release that never copied a file into this target")
 
     def test_the_summary_line_reports_the_version_the_manifest_records(self):
-        """One tool, one answer. It used to print two.
+        """One tool, one answer, taken from one place.
 
-        The summary printed the PACK's version while the manifest recorded the previous
-        one, so the same run reported `version 2026.09.0` and stored `2026.01.0`.
+        The summary and the manifest are two readings of the same fact, and a summary that
+        reads the PACK's version while the manifest records what was installed makes one run
+        report `version 2026.09.0` and store `2026.01.0`.
         """
         self.assertEqual(self.install(), 0)
         install.write_manifest(self.target, ["beta"], "2026.01.0")   # alpha unowned
@@ -924,6 +929,41 @@ class ThePruneRecordsWhatIsThereAndWhatWasCopied(InstallBase):
         install.write_manifest(self.target, ["alpha", "beta"], "2026.01.0")
         self.assertEqual(self.install(), 0)
         self.assertNotEqual(self.manifest()[1].get("version"), "2026.01.0")
+
+    def test_a_first_install_records_this_release(self):
+        """The other control, on the shape the version rule is most likely to break: a
+        target with no manifest, nothing owned and nothing retained."""
+        out = io.StringIO()
+        with unittest.mock.patch.object(install.sys, "stdout", out):
+            self.assertEqual(self.install(), 0)
+        self.assertEqual(self.manifest()[1].get("version"), install.pack_version())
+
+    def test_a_skill_that_could_not_be_examined_holds_the_version_back(self):
+        """The release stamp describes the files on disk, and a skill this run KEPT rather
+        than copied is still at the release before it.
+
+        A name nobody could examine is not in `writable` at all, so a run where every
+        remaining writable skill lands looks complete from `writable` alone — and stamps
+        this release over a skill it did not touch. The manifest is the only record of which
+        release a user is running, so `--verify` then reports current for content that is
+        not."""
+        self.assertEqual(self.install(), 0)
+        install.write_manifest(self.target, ["alpha", "beta"], "2026.01.0")
+        out = io.StringIO()
+        with _one_path_refuses("lstat", self.target / "beta",
+                               PermissionError(13, "Permission denied")), \
+                unittest.mock.patch.object(install.sys, "stdout", out):
+            self.assertEqual(install.do_install([self.target], self.source), 1)
+
+        names, meta = self.manifest()
+        self.assertIn("beta", names, "the fixture: an unexamined skill stays owned")
+        self.assertTrue((self.target / "alpha" / "SKILL.md").is_file(),
+                        "the fixture: the writable skill did land")
+        self.assertEqual(
+            meta.get("version"), "2026.01.0",
+            "the manifest records this release while a skill this pack ships was never "
+            "updated")
+        self.assertIn("version 2026.01.0", out.getvalue())
 
 
 class VerifyNamesEachProblemOnce(InstallBase):
@@ -1050,11 +1090,11 @@ class ANameThatCouldInjectAManifestEntryIsRefused(InstallBase):
 class OwnershipIsRecordedBeforeAnyFileIsTouched(InstallBase):
     """One property replaces a recovery state machine: a failure leaves an OWNED state.
 
-    The installer used to copy first and record last, so every failure between the two
-    produced a directory it had created and did not claim. The next run then refused its own
-    work — `SKIPPED … no manifest of ours claims it` — and only `--force` got past it, which
-    is the flag that also deletes a user's own directory. A blocked manifest path left two
-    skills live and unowned, and an ordinary retry installed zero of them and exited 1.
+    Copying first and recording last makes every failure between the two produce a directory
+    the installer created and did not claim. The next run then refuses its own work —
+    `SKIPPED … no manifest of ours claims it` — and only `--force` gets past it, which is the
+    flag that also deletes a user's own directory. A blocked manifest path leaves two skills
+    live and unowned, and an ordinary retry installs zero of them and exits 1.
     """
 
     def test_a_retry_after_a_failed_manifest_write_is_an_ordinary_run(self):
@@ -1393,6 +1433,221 @@ class TheManifestIsReadableByWhoeverCanReadTheSkills(InstallBase):
                          "uninstall exited 0 over a full install")
         self.assertTrue((self.target / "alpha").is_dir(),
                         "it removed skills it could not confirm it owned")
+
+
+@contextlib.contextmanager
+def _one_path_refuses(method: str, path, error: OSError):
+    """Make one ``Path`` method fail for ONE path and behave normally everywhere else.
+
+    Injected rather than produced with `chmod`: mode 000 does not deny the owner on Windows,
+    so a permission fixture would SKIP on the platform where the link and path hazards
+    actually live — and these ask what the code does with an error, not how one is made.
+
+    Both sides of the comparison are made absolute before comparing, because macOS answers
+    `/var` with `/private/var` and Windows hands back 8.3 short names.
+    """
+    real = getattr(Path, method)
+    wanted = os.path.abspath(os.fspath(path))
+
+    def refuse(self, *args, **kwargs):
+        if os.path.abspath(os.fspath(self)) == wanted:
+            raise error
+        return real(self, *args, **kwargs)
+
+    with unittest.mock.patch.object(Path, method, refuse):
+        yield
+
+
+class APathThatCannotBeExaminedIsNotAnAbsentOne(InstallBase):
+    """`exists()`, `is_dir()` and `is_symlink()` answer False for everything they cannot
+    stat, and ownership here is decided entirely by those answers.
+
+    Read as absence, an unreadable path is claimed and copied over in one direction and
+    dropped from the manifest in the other — and the second is permanent: the skill is left
+    on disk owned by nothing, so nothing will ever update or remove it.
+    """
+
+    def test_a_name_that_cannot_be_examined_is_neither_claimed_nor_copied(self):
+        with _one_path_refuses("lstat", self.target / "alpha",
+                               PermissionError(13, "Permission denied")):
+            code = install.do_install([self.target], self.source)
+
+        self.assertEqual(code, 1, "a name it could not examine is not a clean install")
+        names, _meta = self.manifest()
+        self.assertNotIn("alpha", names,
+                         "the manifest claims a directory nobody established was free — "
+                         "and the copy that follows deletes whatever is there")
+        self.assertFalse((self.target / "alpha").exists(), "it copied over it anyway")
+        self.assertIn("beta", names, "the control: the rest of the install still happened")
+
+    def test_an_update_keeps_owning_a_skill_it_could_not_examine(self):
+        """The second half of the same question, on the install path. The name is still in
+        the pack and still owned, so it reaches neither the skipped list nor the prune —
+        and a record settled from what was copied drops it while it is still on disk."""
+        self.assertEqual(self.install(), 0)
+        with _one_path_refuses("lstat", self.target / "alpha",
+                               PermissionError(13, "Permission denied")):
+            code = install.do_install([self.target], self.source)
+
+        self.assertEqual(code, 1)
+        self.assertTrue((self.target / "alpha" / "SKILL.md").is_file(),
+                        "the fixture did not hold: alpha is still installed")
+        self.assertIn("alpha", self.manifest()[0],
+                      "an installed skill was disclaimed because one stat failed — nothing "
+                      "will update or remove it now without --force")
+
+    def test_asking_whether_a_path_is_a_link_either_answers_or_raises(self):
+        """The question every caller of it acts on: the removal hands a False to a recursive
+        delete, the walk descends it, and `--verify` compares what is behind it."""
+        with _one_path_refuses("lstat", self.target / "alpha",
+                               PermissionError(13, "Permission denied")):
+            with self.assertRaises(OSError):
+                install._is_link(self.target / "alpha")
+        # And the control: a name that is simply not there is not a link.
+        self.assertFalse(install._is_link(self.target / "nothing-here"))
+
+    def test_uninstall_keeps_the_record_of_a_name_it_could_not_examine(self):
+        self.assertEqual(self.install(), 0)
+        with _one_path_refuses("lstat", self.target / "alpha",
+                               PermissionError(13, "Permission denied")):
+            code = install.do_uninstall([self.target])
+
+        self.assertEqual(code, 1)
+        self.assertTrue((self.target / "alpha").is_dir(), "the fixture did not hold")
+        names, _meta = self.manifest()
+        self.assertIn("alpha", names,
+                      "a skill it could not examine was dropped from the manifest while "
+                      "still on disk: the next --uninstall prints 'nothing owned here' and "
+                      "exits 0 over it, and nothing can ever remove it")
+        self.assertNotIn("beta", names, "the control: what was removed is not still claimed")
+
+    def test_verify_says_it_could_not_look_rather_than_certifying(self):
+        self.assertEqual(self.install(), 0)
+        out = io.StringIO()
+        with _one_path_refuses("lstat", self.target / "alpha",
+                               PermissionError(13, "Permission denied")), \
+                unittest.mock.patch.object(install.sys, "stdout", out):
+            code = install.do_verify([self.target], self.source)
+
+        printed = out.getvalue()
+        self.assertEqual(code, install.MISMATCH,
+                         f"a check that could not read a skill certified the install:\n"
+                         f"{printed}")
+        self.assertIn("UNKNOWN   alpha", printed)
+        self.assertNotIn("MISSING   alpha", printed,
+                         "'not on disk' is a definite claim about a name nobody could read")
+
+    def test_verify_cannot_certify_a_directory_it_could_not_list(self):
+        """The same hole one layer up. A listing that fails contributes no children, which
+        is indistinguishable from a directory that is genuinely empty — so the comparison is
+        satisfied by whatever the other side happens to hold."""
+        self.assertEqual(self.install(), 0)
+        out = io.StringIO()
+        with _one_path_refuses("iterdir", self.target / "alpha" / "references",
+                               PermissionError(13, "Permission denied")), \
+                unittest.mock.patch.object(install.sys, "stdout", out):
+            code = install.do_verify([self.target], self.source)
+
+        printed = out.getvalue()
+        self.assertEqual(code, install.MISMATCH, printed)
+        self.assertIn("references (could not be read", printed,
+                      "the report blamed the files behind the unreadable directory for "
+                      "being missing, which says nothing about what is actually there")
+
+    def test_two_sides_that_could_not_be_read_do_not_compare_equal(self):
+        """Two failed reads carry the SAME reason, so the two trees compare equal and a
+        comparison that skips equal values certifies two directories nobody listed.
+
+        One denial covers both sides whenever they share a parent — a pack and an install
+        under one home directory, a permission sweep, a Windows sharing violation on a name
+        that is open in both trees. Restoring access recovers nothing, because the run that
+        exited 0 is the answer the operator acts on."""
+        self.assertEqual(self.install(), 0)
+        self.assertEqual(install.do_verify([self.target], self.source), 0, "control")
+        out = io.StringIO()
+        denied = PermissionError(13, "Permission denied")
+        with _one_path_refuses("iterdir", self.source / "alpha" / "references", denied), \
+                _one_path_refuses("iterdir", self.target / "alpha" / "references", denied), \
+                unittest.mock.patch.object(install.sys, "stdout", out):
+            code = install.do_verify([self.target], self.source)
+
+        printed = out.getvalue()
+        self.assertEqual(code, install.MISMATCH,
+                         f"an install was certified over a directory neither side could "
+                         f"list:\n{printed}")
+        self.assertIn("references (could not be read", printed)
+
+    def test_a_pack_directory_that_cannot_be_listed_is_reported_too(self):
+        """The source half on its own: the installed side is fine and says nothing, so the
+        pack's own unreadable directory is the only thing that can stop the certificate."""
+        self.assertEqual(self.install(), 0)
+        out = io.StringIO()
+        with _one_path_refuses("iterdir", self.source / "alpha" / "references",
+                               PermissionError(13, "Permission denied")), \
+                unittest.mock.patch.object(install.sys, "stdout", out):
+            code = install.do_verify([self.target], self.source)
+
+        printed = out.getvalue()
+        self.assertEqual(code, install.MISMATCH, printed)
+        self.assertIn("could not be read", printed)
+
+
+class ASourceItCannotReadIsNotAnEmptyPack(InstallBase):
+    """Discovery decides what the pack ships, and `--verify` and the prune both act on it: a
+    skill that silently leaves the pack is called RETIRED on the user's machine and deleted.
+    """
+
+    def test_a_source_that_cannot_be_listed_is_refused_as_unreadable(self):
+        """Both readings refuse, so what this holds is the REASON given. "No skills found
+        under X" is a statement about the pack, made by a run that never saw it — and it is
+        the one an operator acts on, by looking for a source that is right there."""
+        self.assertEqual(self.install(), 0)
+        err = io.StringIO()
+        with _one_path_refuses("iterdir", self.source,
+                               PermissionError(13, "Permission denied")), \
+                contextlib.redirect_stderr(err):
+            code = install.do_install([self.target], self.source)
+
+        self.assertEqual(code, 1)
+        self.assertIn("could not be read", err.getvalue())
+        self.assertNotIn("no skills found", err.getvalue(),
+                         "an unreadable pack was reported as an empty one")
+        self.assertTrue((self.target / "alpha" / "SKILL.md").is_file(),
+                        "an install ran against a pack nobody could read")
+        self.assertIn("alpha", self.manifest()[0])
+
+    def test_a_skill_whose_marker_cannot_be_read_does_not_leave_the_pack(self):
+        self.assertEqual(self.install(), 0)
+        with _one_path_refuses("stat", self.source / "beta" / "SKILL.md",
+                               PermissionError(13, "Permission denied")):
+            code = install.do_install([self.target], self.source)
+
+        self.assertEqual(code, 1)
+        self.assertTrue((self.target / "beta" / "SKILL.md").is_file(),
+                        "an installed skill was PRUNED as retired because one file in the "
+                        "pack could not be read")
+        self.assertIn("beta", self.manifest()[0])
+
+
+class ATargetItCannotCompareIsNotADifferentDirectory(InstallBase):
+    """The comparison that stops an install deleting the pack it copies from.
+
+    A target is refused when it resolves to the source or contains it. `samefile` answering
+    False because it RAISED is not a target that compared different — and the refusal for a
+    target whose real path is unknown already says exactly this one step earlier.
+    """
+
+    def test_a_comparison_that_could_not_be_made_refuses_the_target(self):
+        err = io.StringIO()
+        with unittest.mock.patch.object(install.os.path, "samefile",
+                                        side_effect=PermissionError(13, "Permission denied")), \
+                contextlib.redirect_stderr(err):
+            code = install.do_install([self.target], self.source)
+
+        self.assertEqual(code, 1)
+        self.assertIn("could not be compared", err.getvalue())
+        self.assertFalse((self.target / "alpha").exists(),
+                         "it installed into a target it could not show was not the source")
 
 
 if __name__ == "__main__":

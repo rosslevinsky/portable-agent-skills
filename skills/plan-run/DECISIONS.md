@@ -12,7 +12,13 @@ The check in `Publish` is:
 
 ```bash
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
-if [ "$(git rev-parse HEAD)" != "$(git rev-parse --verify --quiet "origin/$BRANCH")" ]; then
+DEFAULT=$(git ls-remote --symref origin HEAD 2>/dev/null | awk '$1=="ref:" && $3=="HEAD" {sub("refs/heads/","",$2); print $2; exit}')
+[ -n "$DEFAULT" ] || DEFAULT=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')
+if [ "$BRANCH" = "HEAD" ]; then
+  echo "Detached HEAD — committed but NOT pushing."
+elif [ "$BRANCH" = "${DEFAULT:-main}" ] || [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
+  echo "On default branch '$BRANCH' — committed but NOT pushing."
+elif [ "$(git rev-parse HEAD)" != "$(git ls-remote --heads origin "refs/heads/$BRANCH" 2>/dev/null | awk -v r="refs/heads/$BRANCH" '$2 == r { print $1 }')" ]; then
   git push origin HEAD
 fi
 ```
@@ -35,6 +41,27 @@ right for free: a ref that does not exist yet compares unequal, so the branch ge
 phase advanced the branch, so an unrelated unpushed commit gets published too. That is
 accepted, because the alternative needs a pre-crash SHA and an unpublished tip is the
 deadlock this prevents.
+
+`DEFAULT` has two sources for the same reason, and each single-source version loses a case
+the pair keeps.
+
+**`git remote set-head origin -a` and then the local `refs/remotes/origin/HEAD`.** Setting
+that ref refuses unless the tracking ref for the default branch already exists, so a clone
+that never fetched it leaves `DEFAULT` empty, and a trunk named neither `main` nor `master`
+walks past both literals straight onto the branch the guard protects.
+
+**The remote's advertised HEAD alone.** Empty whenever the network is, which is the commoner
+way to lose: one transient failure and the same trunk is pushed to.
+
+**The local ref first, the remote only where it is unset.** Trusts a stale ref. A default
+that moved leaves the clone naming the old branch, the new trunk matches neither it nor the
+literals, and the phase publishes straight to it. So the remote decides where it answers and
+the local ref stands in where it does not.
+
+**Refusing to push when neither source answers.** A clone of an empty remote has no local
+ref, no advertised HEAD and no trunk to protect, and a refusal there strands every phase of a
+new repository. The literals stay as the floor instead: `main` and `master` are guarded with
+no answer at all, and any other name by whichever source replied.
 
 ## Why the tracker carries no format marker
 

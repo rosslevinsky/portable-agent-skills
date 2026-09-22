@@ -168,7 +168,7 @@ stated plus anything implied by the scope. At least one entry required.
 consistent. Use actual paths from the codebase. Group by:
 - "Will change" — files that get edited or created
 - "Must stay consistent" — callers/consumers that must still work
-- "Tests" — test files that need new or changed tests. For new behaviour, prefer
+- "Tests" — test files that need new or changed tests. For new behavior, prefer
   TDD: the failing test is written before the implementation that makes it pass.
 
 ---
@@ -216,11 +216,13 @@ exactly as the two-cell table row shown in the template.
 ## Step 7 — Register the plan in the discovery index
 
 **Only when the plan lives under `plans/`** — that is, the user accepted the default in
-Step 2 and Step 5 generated a `<slug>`. Off that path there is no slug to link and no
-index to belong to: skip this step, and **never create `plans/` to hold a row**. The row
-snippet resolves relative to `plans/README.md`, so a plan written to `docs/proposal.md`
-would be indexed as `plans/<slug>/` — a link to nothing, in a directory invented to hold
-it. `/plan-phase` and `/plan-run` both refuse to invent that directory; this must too.
+**The test is the plan's path, not the slug.** A plan under `plans/` gets a row, and the
+row's link is its own directory relative to `plans/README.md` — `plans/<slug>/` on the
+default path, `custom/` for a plan the user wrote to `plans/custom/plan.md`. Keying on the
+generated slug instead left that second plan out of an index the Overview promises it a row
+in. A plan written anywhere else has no row that would resolve: skip this step, and **never
+create `plans/` to hold a row** — `docs/proposal.md` would be indexed as `plans/<slug>/`, a
+link to nothing in a directory invented to hold it. `/plan-phase` and `/plan-run` both refuse to invent that directory; this must too.
 
 On the default path, maintain `plans/README.md` as the discovery index (it renders on
 GitHub/GitLab), using the create/append snippets in `references/plan-template.md`:

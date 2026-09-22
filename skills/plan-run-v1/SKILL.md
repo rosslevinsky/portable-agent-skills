@@ -96,11 +96,16 @@ phase's boxes already ticked in its own document — and **which** boxes, becaus
 decides where you re-enter:
 
 - **Any Task or Test box unticked** → the phase is incomplete. Carry on to 3b and run it.
-- **Tasks and Tests ticked, but the Exit Criteria are not** → the work exists and has not
+- **Tasks and Tests ticked, and no Exit Criterion ticked** → the work exists and has not
   been *gated*. Re-enter at **3e**: run the verification, then 3f's review, then 3g. A tick
   on the last test is not a record that the suite was run afterwards, and the crash window
   between them is real — resuming at 3h here would commit and push work that nothing
   checked, which is the one outcome the gate exists to prevent.
+- **Exit Criteria partly ticked** → 3i ticks them one at a time, so a crash inside it
+  leaves exactly this, and the gate has already passed. Read it as the bookkeeping branch
+  below, not as ungated work: re-entering at 3e re-runs a gate that passed and lands the
+  bookkeeping-only commit that branch exists to avoid. The one case where the gate did
+  *not* finish is work files this phase owns being dirty too — that is the branch above.
 - **Tasks, Tests and Exit Criteria all ticked, `phases.md` still `- [ ]`** → the work is
   done and gated, and only bookkeeping is outstanding, whether or not the push got as far as
   the remote. Go to **3i** to finish the bookkeeping, then run **3h's push block alone** —
@@ -153,14 +158,14 @@ Follow all conventions defined in the project's `AGENTS.md`/`CLAUDE.md` (or
 equivalent). If no agent-instruction file exists, follow the existing patterns found
 in the codebase.
 
-**Testing discipline (red → green, self-sufficient).** For every task that adds new behaviour:
+**Testing discipline (red → green, self-sufficient).** For every task that adds new behavior:
 
 - **Order.** Logic, APIs, and utilities: write the failing test **first**; UI and wiring:
-  tests alongside. No new behaviour ships without tests — not optional.
-- **Red for the right reason.** Run the new test and confirm it fails because the behaviour is
+  tests alongside. No new behavior ships without tests — not optional.
+- **Red for the right reason.** Run the new test and confirm it fails because the behavior is
   *absent* — an import/attribute error for something new, or a **failing assertion** when
   extending an API that already exists — not from a broken test. If it passes
-  immediately, the behaviour already exists — stop and note it instead of adding code.
+  immediately, the behavior already exists — stop and note it instead of adding code.
 - **Minimum green, no regressions.** Write the least code that passes, then run the affected
   suite and confirm nothing previously green broke.
 - **Never fake green.** Don't weaken/delete assertions, edit the test to fit the code, or add
@@ -186,8 +191,8 @@ Run every command listed in the phase's Verification section. If any command fai
 4. Do not proceed until verification is clean
 
 A command that outruns one foreground call runs under the runtime's background-execution
-facility where that facility reports the exit; otherwise launch it once and, in a later call,
-poll for a marker it writes. Never poll a command-line pattern (`pgrep -f`, `pkill -f`,
+facility, which reports the exit. Reach for that first. Only where a runtime has none, launch
+it once and, in a later call, poll for a marker it writes. Never poll a command-line pattern (`pgrep -f`, `pkill -f`,
 `ps | grep`): the shell running your poll holds the command text in its own argv, so the
 pattern matches the poller and the loop never exits. Put the command in a file, so nothing
 re-expands it, and launch it in its own process group (`set -m`) and, where `setsid`
@@ -198,6 +203,14 @@ line: errexit exempts `a` in `a && b`); have it append a marker
 that carries its exit status, bound the poll, and read the work's outcome from that marker
 — a non-zero exit from the poll itself is the poll dying, not the verification failing:
 
+> **Adapter note — this block is `sh`/Bash syntax.** `setsid`, `nohup`, `&` and `seq` exist
+> in no native-Windows shell. Prefer the runtime's own background facility there; failing
+> that, run this under Git Bash or WSL, or make the same three decisions with your shell's
+> own primitives: `Start-Process` detaches the work, the wrapper appends
+> `"WORK-EXIT rc=$LASTEXITCODE"` so the marker carries the outcome, and a bounded
+> `Select-String -Quiet` loop polls for it **and fails when it never appears**. **The
+> decisions are the contract, not the spelling.**
+
 ```bash
 # the command itself is in /abs/path/work.sh, written with your file tool, one command per line
 rm -f /abs/path/work.log; set -m; S=$(command -v setsid || true)
@@ -205,6 +218,9 @@ $S nohup bash -c 'set +e; bash -eo pipefail /abs/path/work.sh; printf "\nWORK-EX
   > /abs/path/work.log 2>&1 < /dev/null &
 # later call
 for i in $(seq 1 240); do grep -q '^WORK-EXIT rc=' /abs/path/work.log 2>/dev/null && break; sleep 15; done
+# The loop ends either way, so the poll has to SAY which: without this it exits 0 on a
+# timeout and the caller reads "no marker yet" as "the work is done".
+grep -q '^WORK-EXIT rc=' /abs/path/work.log 2>/dev/null || { echo "timed out waiting for WORK-EXIT" >&2; exit 1; }
 ```
 
 ### 3f — Check your work
@@ -254,22 +270,23 @@ code, no unintended files. Fix and re-stage if anything unexpected appears. Then
 > **Adapter note — this block is `sh`/Bash syntax.** The `if`/`elif`, `$(...)` and
 > `[ ... ]` forms do not parse in `cmd` or PowerShell, so on a native-Windows shell run it
 > under Git Bash or WSL, or carry out the same decisions with your shell's own syntax:
-> commit only when something is staged, and push only when the tip is not already
-> published. **The decisions are the contract, not the spelling** — a completed phase that
+> commit only when something is staged, skip a detached HEAD, skip the default branch, and
+> push only when the tip is not already published. **The decisions are the contract, not the spelling** — a completed phase that
 > cannot run this block is a phase left uncommitted.
 
 ```bash
 if git diff --staged --quiet; then
   echo "Nothing to commit for this phase (verification-only) — skipping commit."
 else
-  git commit -m "<commit message from phase document>"
+  git commit -m "<commit message from phase document>" || exit
 fi
 # The push sits OUTSIDE that branch, and asks the repository rather than remembering what
 # just happened: a crash between the commit and the push leaves a resumed run with nothing
 # staged, and a push nested in the `else` above would then never run — stranding the very
 # commit 3a's resume check looks for.
 branch="$(git rev-parse --abbrev-ref HEAD)"
-default="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')"
+default="$(git ls-remote --symref origin HEAD 2>/dev/null | awk '$1=="ref:" && $3=="HEAD" {sub("refs/heads/","",$2); print $2; exit}')"
+[ -n "$default" ] || default="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')"
 # Two destinations to skip — never fail on them, since the work is committed either way.
 if [ "$branch" = "HEAD" ]; then
   # Detached: `--abbrev-ref HEAD` answers the literal string, so `git push origin HEAD`
@@ -277,9 +294,23 @@ if [ "$branch" = "HEAD" ]; then
   echo "Detached HEAD — committed but NOT pushing. Check out a branch and push."
 elif [ "$branch" = "${default:-main}" ] || [ "$branch" = "main" ] || [ "$branch" = "master" ]; then
   # Plan execution belongs on a feature branch; pushing each phase to main/master
-  # publishes work-in-progress to the trunk.
+  # publishes work-in-progress to the trunk. **The remote is asked, and the local ref is
+  # what answers when it cannot.** `refs/remotes/origin/HEAD` is only as true as the last
+  # fetch, so a default that moved leaves the clone naming the old one; asking only the
+  # remote fails the other way, since a network that is down leaves the answer empty and a
+  # trunk named neither `main` nor `master` walks past both literals. Each covers the other's
+  # way of being wrong.
   echo "On default branch '$branch' — committed but NOT pushing. Move this work to a feature branch."
-elif [ "$(git rev-parse HEAD)" != "$(git rev-parse --verify --quiet "origin/$branch")" ]; then
+# ASKS THE REMOTE, not this clone's copy of it. `origin/<branch>` is only as fresh as
+# the last fetch, so a branch deleted or rewound elsewhere leaves that ref matching
+# HEAD: the push is skipped and the phase is ticked with nothing published. An empty
+# answer — no such branch, or no network — differs from HEAD and pushes, which fails
+# loudly rather than silently doing nothing.
+# The full ref name AND an equality test on what comes back. `ls-remote`'s patterns match
+# from the right on path components, so a bare `feature` matches `archive/feature` and even
+# `refs/heads/feature` matches `archive/refs/heads/feature`. Either hit would skip
+# publishing the branch actually asked about; comparing the ref column ends the class.
+elif [ "$(git rev-parse HEAD)" != "$(git ls-remote --heads origin "refs/heads/$branch" 2>/dev/null | awk -v r="refs/heads/$branch" '$2 == r { print $1 }')" ]; then
   git push origin HEAD
 fi
 ```
@@ -383,24 +414,25 @@ git add -A
 git diff --staged        # STOP HERE. Plan bookkeeping only; see above.
 ```
 
-Once it is — and **if putting that content through a gate changed a file, `git add -A`
-again**, or the index still holds the version the gate rejected:
+Once it is — and **if putting that content through a gate changed a file, `git add` that
+file**, or the index still holds the version the gate rejected:
 
 ```bash
 if git diff --staged --quiet; then
   echo "Nothing to finalize — the tracker and phase statuses are already committed."
 else
-  git commit -m "docs(plan): mark the plan complete"
+  git commit -m "docs(plan): mark the plan complete" || exit
 fi
 # OUTSIDE that branch, and the same two skipped destinations as 3h, for 3h's reasons: a
 # crash between the commit and the push leaves a resumed run with nothing staged.
 branch="$(git rev-parse --abbrev-ref HEAD)"
-default="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')"
+default="$(git ls-remote --symref origin HEAD 2>/dev/null | awk '$1=="ref:" && $3=="HEAD" {sub("refs/heads/","",$2); print $2; exit}')"
+[ -n "$default" ] || default="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')"
 if [ "$branch" = "HEAD" ]; then
   echo "Detached HEAD — committed but NOT pushing. Check out a branch and push."
 elif [ "$branch" = "${default:-main}" ] || [ "$branch" = "main" ] || [ "$branch" = "master" ]; then
   echo "On default branch '$branch' — committed but NOT pushing. Move this work to a feature branch."
-elif [ "$(git rev-parse HEAD)" != "$(git rev-parse --verify --quiet "origin/$branch")" ]; then
+elif [ "$(git rev-parse HEAD)" != "$(git ls-remote --heads origin "refs/heads/$branch" 2>/dev/null | awk -v r="refs/heads/$branch" '$2 == r { print $1 }')" ]; then
   git push origin HEAD
 fi
 ```

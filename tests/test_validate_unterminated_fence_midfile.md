@@ -2,7 +2,7 @@
 
 The companion fixture beside this one has a single fence, which is the easy shape to
 detect. This one has three, and the unbalanced one is the
-**first** — the case the scan used to re-pair its way past in silence.
+**first** — the case a scan pairing fences off the nearest partner walks past in silence.
 
 A fence opens here and is never closed:
 

@@ -15,7 +15,7 @@ description: >
 
 # Execute Plan (v2)
 
-_Progress: observable — the orchestrator hands each delegated phase worker (and its independent-review sub-agent) an append-only per-phase progress file; non-blocking and read by nothing on the correctness path. See "Delegation" below._
+_Progress: observable — the orchestrator hands each delegated phase worker an append-only per-phase progress file; non-blocking and read by nothing on the correctness path. See "Delegation" below._
 
 ## Overview
 
@@ -66,7 +66,7 @@ evidence record and in `as-built.md`.
 You are the **orchestrator**. Every step below is yours by default: run it here, in this
 conversation, one phase at a time. Where sub-agents exist you **may** instead hand a phase's
 implementation to a **worker** — a fresh sub-agent starting with a clean context, so context
-stops accumulating across phases and a later phase is not coloured by an earlier one's
+stops accumulating across phases and a later phase is not colored by an earlier one's
 rationalization.
 
 Writing `execution.md`, the independent review, and the commit and push are never
@@ -86,14 +86,14 @@ decision, settled by the isolation bound above and by nothing else — collapse 
 "parallelize when it's big" fans concurrent writers over shared state.
 
 > **Claude adapter:** dispatch a phase with the Agent tool (subagent_type general-purpose),
-> passing the worker's brief — the three input paths **and the result contract from
+> passing the worker's brief — the three input paths, the progress file's path, this skill, **and the result contract from
 > `references/phase-worker-contract.md`**, which a general-purpose sub-agent does not load on
 > its own — and read the result from the sub-agent's final message; in-harness there is no
 > flag that can enforce its shape.
 > **Codex adapter:** in an interactive session spawn a per-phase worker agent
 > conversationally; autonomously (no user available), script it per phase with `codex exec -s workspace-write -c
 > approval_policy=never -C <dir> --output-schema <this skill>/references/phase-worker-schema.json
-> --output-last-message <file> "<the worker's brief — the three input paths and the result
+> --output-last-message <file> "<the worker's brief — the three input paths, the progress file's path, this skill, and the result
 > contract from references/phase-worker-contract.md>" < /dev/null`, which does enforce it.
 > **The brief is that trailing positional argument.** It is spelled out because the
 > paragraph below says the prompt is already in argv, and a template with nowhere to put it
@@ -113,9 +113,11 @@ decision, settled by the isolation bound above and by nothing else — collapse 
 > the worker could not write its own last line. Gitignore that directory so the throwaway
 > log never lands in a commit. Nothing on the correctness path reads it, so the run
 > completes identically whether or not anyone watches; a failed write is ignored. The review
-> sub-agent is not handed one — it runs read-only and cannot write it, and `diff-review`'s
-> supervisor already streams its output. **Claude adapter:** tail it with the Monitor tool,
-> narrating each new line. **Any runtime:** `tail -f` it in another pane.
+> sub-agent is not handed one — it runs read-only and cannot write it. On rung 1
+> `diff-review`'s supervisor streams its output; on rung 2 the review is an in-harness
+> sub-agent that returns in one shot, with nothing to watch. **Claude adapter:** tail it with the Monitor tool,
+> narrating each new line. **Any runtime:** `tail -f` it in another pane — `Get-Content
+> -Wait` in PowerShell, which has no `tail`.
 
 One invariant holds whoever runs the work, and with the never-delegated three above it is why
 delegation changes speed but not outcome: within each phase the order is **author
@@ -225,13 +227,19 @@ depend on it, and Publish does not.
 Two boxes cannot be true yet, because **Publish** owns them: any CI-round box, and any
 post-publish box naming a repository, ref and commit. Ignore them here.
 
+Throughout these branches, **the plan's own documents** means `plan.md`, `execution.md`, the
+phase documents and `as-built.md` — wherever Step 1 found them, named as files and not as a
+directory prefix. A plan may sit at the repository root or in `docs/`, and a prefix test
+there exempts the entire tree: work a crash left dirty would read as expected bookkeeping,
+and branch 3 ends at a `git add -A` that commits it unverified.
+
 - **Any other box unticked** → the phase is incomplete. Go to **Satisfy**.
 - **Everything else ticked** → the work is done and only bookkeeping is outstanding. Do not
   re-run the phase and do not simply tick its box. Read which window the crash left you in
   off **observable state**, in this order — never off commit identity, since a phase that
   took Publish's remediation path legitimately has more than one commit:
 
-  1. **Files this phase owns are dirty outside `plans/<slug>/`** → the crash landed before a
+  1. **Files this phase owns are dirty, beyond the plan's own documents** → the crash landed
      commit, this phase's or a remediation's. Re-enter at **Satisfy**'s verification, scoped
      to what is dirty, then **Gate**, then **Publish**.
   2. **Otherwise the push destination is not at `HEAD`** → the crash landed between the commit
@@ -263,13 +271,14 @@ post-publish box naming a repository, ref and commit. Ignore them here.
      invent a push to another repository, or repeat one already made. Neither → **stop and
      report**, and never tick it off another commit's run.
 
-  **Branches 2 and 3 are not "the tree is clean."** Metadata left dirty *inside*
-  `plans/<slug>/` is expected at every one of these points and proves nothing: the previous
+  **Branches 2 and 3 are not "the tree is clean."** Metadata left dirty in **the plan's own
+  documents** is expected at every one of these points and proves nothing: the previous
   phase's tick is deliberately uncommitted, and this phase's own ticked boxes and evidence
   record are written before the commit that carries them. A phase whose only output is that
-  metadata commits nothing at all and still reaches 3.
+  metadata still reaches 3, and its commit carries those ticks and that record.
 
-  **And if what is dirty outside `plans/<slug>/` is work this phase does not own**, branch 1
+  **And if what is dirty beyond the plan's own documents is work this phase does not own**,
+  branch 1
   is the wrong reading — it would review someone else's change as this phase's and sweep it
   into this phase's commit. Compare against the phase's Work and its evidence record's
   changed line, then **stop and ask** — when ownership is unclear, and equally when it is
@@ -302,48 +311,55 @@ published artifact — check whether its outcome already exists; if it does, tic
 instead of acting.** A tick is a record, not a lock: a crash between the action and the tick
 is exactly the case that leaves an unticked box behind a completed action.
 
-**Timing.** During the work run only the new or affected tests; once the Work boxes are
-complete, run each Verification command once. Diagnose and fix failures and re-run until
+**Timing.** During the work run the touched test(s), not the module holding them; once the
+Work boxes are complete, run each Verification command once. Diagnose and fix failures and re-run until
 clean — a failure is a blocker even if your change did not cause it (fix it, or surface it
 through the blocking protocol if it is demonstrably pre-existing and out of scope). Tick each
 box in **Tests** as its test is written and passing.
 
 **Waiting for a long command.** A command that outruns one foreground call runs under the
-runtime's background-execution facility where that facility reports the exit. Where it does
-not, launch the command once and, in a **later call**, poll for an artifact it writes. Never
-poll a command-line pattern (`pgrep -f`, `pkill -f`, `ps | grep`): the shell running your
-poll holds the command text in its own argv, so the pattern matches the poller and the loop
-never exits. Have the command append a marker carrying its exit status, so the marker is the
-outcome and not just the end:
+runtime's background-execution facility, which reports the exit. Reach for that first, every
+time. **Everything below is the fallback for a runtime that has none** — it is long because
+the idiom is fiddly, not because it is the normal path.
+
+Launch the command once and, in a **later call**, poll for an artifact it writes. Never poll
+a command-line pattern (`pgrep -f`, `ps | grep`): the shell running your poll holds the
+command text in its own argv, so the pattern matches the poller and the loop never exits.
+Have the command append a marker carrying its exit status, so the marker is the outcome and
+not just the end:
+
+> **Adapter note — this block is `sh`/Bash syntax.** `setsid`, `nohup`, `&` and `seq` exist
+> in no native-Windows shell. Prefer the runtime's own background facility there; failing
+> that, run this under Git Bash or WSL, or make the same three decisions with your shell's
+> own primitives: `Start-Process` detaches the work, the wrapper appends
+> `"WORK-EXIT rc=$LASTEXITCODE"` so the marker carries the outcome, and a bounded
+> `Select-String -Quiet` loop polls for it **and fails when it never appears**. **The
+> decisions are the contract, not the spelling.**
 
 ```bash
 # Launch call, detached so the work outlives it. Literal paths: shell state does not survive.
-# The command itself is in /abs/path/work.sh, written with your file tool, one command per line.
+# The command itself is in /abs/path/work.sh, written with your file tool, ONE COMMAND PER
+# LINE — errexit exempts `a` in `a && b`, so a failed test on a chained line would let the
+# next line report success.
 rm -f /abs/path/work.log; set -m; S=$(command -v setsid || true)
 $S nohup bash -c 'set +e; bash -eo pipefail /abs/path/work.sh; printf "\nWORK-EXIT rc=%s\n" "$?"' \
   > /abs/path/work.log 2>&1 < /dev/null &
 # A later call. Bounded — a poll that can spin forever is the orphan this rule prevents.
 for i in $(seq 1 240); do grep -q '^WORK-EXIT rc=' /abs/path/work.log 2>/dev/null && break; sleep 15; done
+# The loop ends either way, so the poll has to SAY which: without this it exits 0 on a
+# timeout and the caller reads "no marker yet" as "the work is done".
+grep -q '^WORK-EXIT rc=' /abs/path/work.log 2>/dev/null || { echo "timed out waiting for WORK-EXIT" >&2; exit 1; }
 ```
 
-The marker cannot match the poller because `grep` reads a file, not the process table;
-removing the old log first stops a previous run's marker matching. `set -m` gives the
-background job its own process group, `nohup` ignores the hangup, and `setsid` puts it in
-its own session where the command exists (Linux; macOS ships none). A runtime that kills a
-timed-out call's process group cannot reach the work on any host; one that kills the whole
-session cannot reach it only where `setsid` ran — which is one more reason the runtime's own
-background facility comes first. The command lives in a file so nothing re-expands it:
-a `$(…)` in a quoted command string would run in the launching shell, not the work's. The
-outer `bash -c` starts with `set +e`, so `$?` is captured whatever errexit the launching
-environment exports; `bash -eo pipefail` runs the file so a sequence stops at its first
-failing step and a failed producer in a pipe (`npm test | tee`) is not hidden by its
-consumer, and a missing file is a non-zero marker rather than a silent non-start. One
-command per line in that file: errexit exempts `a` in `a && b`, so a failed test on a
-chained line lets the next line report success. `printf`'s leading newline
-lands the marker on its own line after output with no trailing newline. Where you also need to know the work is still alive, write its
-PID to a file at launch and poll `kill -0` on it — a PID cannot match a pattern, and it
-tells you liveness only, never the outcome: the marker still carries that. (PowerShell:
-`Select-String -Quiet` and `Get-Process -Id`; the rule is the marker, not the syntax.)
+Why each piece is there. `grep` reads a file, not the process table, so the marker cannot
+match the poller; the `rm -f` stops a previous run's marker matching. `set -m`, `nohup` and
+`setsid` keep the work alive when the runtime kills a timed-out call's process group or
+session — and `setsid` is Linux-only, one more reason to prefer the facility. The command
+lives in a file so a `$(…)` cannot re-expand in the launching shell. `set +e` captures the
+status whatever errexit the environment exports; `bash -eo pipefail` stops at the first
+failing step rather than letting a `tee` hide a failed producer; `printf`'s leading newline
+puts the marker on its own line. For liveness, write the PID at launch and poll `kill -0` —
+it tells you alive, never the outcome.
 
 Two things the marker's absence means. **A non-zero exit from the poll is the poll dying or
 timing out, not the work failing** — the work's outcome is the `rc=` in the marker, and a
@@ -353,15 +369,15 @@ marker's where you polled: a phase reported complete with its log part-way is no
 Never add a trailing `&` inside a call already run in the background — the outer shell
 returns at once, the call is reported finished, and the work runs on unobserved.
 
-**Testing discipline (red → green, self-sufficient).** For every item that adds new behaviour:
+**Testing discipline (red → green, self-sufficient).** For every item that adds new behavior:
 
 - **Order.** Logic, APIs and utilities: write the failing test **first**; UI and wiring: tests
-  alongside. No new behaviour ships without tests — not optional.
-- **Red for the right reason.** Confirm the new test fails because the behaviour is *absent* —
+  alongside. No new behavior ships without tests — not optional.
+- **Red for the right reason.** Confirm the new test fails because the behavior is *absent* —
   an import/attribute error for something new, or a **failing assertion** when extending an
-  API that already exists — not from a broken test. If it passes immediately, the behaviour
+  API that already exists — not from a broken test. If it passes immediately, the behavior
   already exists — stop and note it instead of adding code.
-- **Minimum green.** Write the least code that passes, then re-run only the affected test(s).
+- **Minimum green.** Write the least code that passes; red and green re-run that test alone.
 - **Never fake green.** Do not weaken or delete assertions, edit the test to fit the code, or
   add `# noqa` / `eslint-disable` / test-only branches in production code to force a pass —
   fix the implementation.
@@ -447,7 +463,7 @@ clean, so a later round cannot reprocess stale findings.
 
 **Cap the loop at 2 review passes**, then adjudicate what is still open yourself: **fix** it
 (re-running the scoped test(s), plus `web-verify` when rendered UI changed), or **refute it
-with evidence** recorded in the document. A reviewer-labelled blocker is cleared by a fix or
+with evidence** recorded in the document. A reviewer-labeled blocker is cleared by a fix or
 an evidenced refutation and never downgraded by fiat. One you can neither fix nor refute stays
 **open**: leave the phase's box unticked, record it, and surface it — escalating to a human
 where there is one, otherwise reporting rather than committing. Never commit past an open
@@ -501,7 +517,7 @@ Now decide. If anything unexpected is staged, fix and re-stage before going on. 
 if git diff --staged --quiet; then
   echo "Nothing to commit for this phase (verification/reconciling) — skipping commit."
 else
-  git commit -m "<conventional-commit subject + why, from the phase's Goal and evidence>"
+  git commit -m "<conventional-commit subject + why, from the phase's Goal and evidence>" || exit
 fi
 # Push when the branch tip is not yet on its push destination. Deliberately OUTSIDE the
 # branch above, and deliberately stateless, so a resumed run recomputes the same answer
@@ -510,7 +526,8 @@ fi
 # conventional `origin` with a same-named branch — substitute your own destination ref
 # otherwise (`@{push}` resolves it where an upstream is configured).
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
-DEFAULT=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')
+DEFAULT=$(git ls-remote --symref origin HEAD 2>/dev/null | awk '$1=="ref:" && $3=="HEAD" {sub("refs/heads/","",$2); print $2; exit}')
+[ -n "$DEFAULT" ] || DEFAULT=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')
 # Two destinations a phase must never publish to, both SKIPPED rather than failed — the
 # work is committed either way, and a run that stops here would strand it.
 if [ "$BRANCH" = "HEAD" ]; then
@@ -519,10 +536,29 @@ if [ "$BRANCH" = "HEAD" ]; then
   echo "Detached HEAD — committed but NOT pushing. Check out a branch and push."
 elif [ "$BRANCH" = "${DEFAULT:-main}" ] || [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
   # Plan execution belongs on a feature branch; pushing each phase to the trunk publishes
-  # work in progress. `DEFAULT` is empty where `origin/HEAD` was never set, hence the
-  # literal fallbacks beside it.
+  # work in progress. `DEFAULT` is empty where neither source answered, hence the literal
+  # fallbacks beside it.
+  #
+  # **The remote is asked, and the local ref is what answers when it cannot.** Neither alone
+  # is enough, and each covers the other's way of being wrong. `refs/remotes/origin/HEAD` is
+  # only as true as the last fetch, so a default that moved leaves the clone naming the old
+  # one — and reading it first means the new trunk matches nothing and the phase publishes
+  # straight to it. Asking only the remote fails the other way: a network that is down leaves
+  # the answer empty, and a trunk named neither `main` nor `master` walks past both literals.
+  # So the remote decides where it replies, and the local ref holds the guard up where it
+  # does not. A clone that never fetched the default branch has no local ref at all, which is
+  # the case the remote is here for.
   echo "On default branch '$BRANCH' — committed but NOT pushing. Move this work to a feature branch."
-elif [ "$(git rev-parse HEAD)" != "$(git rev-parse --verify --quiet "origin/$BRANCH")" ]; then
+# ASKS THE REMOTE, not this clone's copy of it. `origin/<branch>` is only as fresh as
+# the last fetch, so a branch deleted or rewound elsewhere leaves that ref matching
+# HEAD: the push is skipped and the phase is ticked with nothing published. An empty
+# answer — no such branch, or no network — differs from HEAD and pushes, which fails
+# loudly rather than silently doing nothing.
+# The full ref name AND an equality test on what comes back. `ls-remote`'s patterns match
+# from the right on path components, so a bare `feature` matches `archive/feature` and even
+# `refs/heads/feature` matches `archive/refs/heads/feature`. Either hit would skip
+# publishing the branch actually asked about; comparing the ref column ends the class.
+elif [ "$(git rev-parse HEAD)" != "$(git ls-remote --heads origin "refs/heads/$BRANCH" 2>/dev/null | awk -v r="refs/heads/$BRANCH" '$2 == r { print $1 }')" ]; then
   git push origin HEAD
 fi
 ```
@@ -688,25 +724,26 @@ git diff --staged        # STOP HERE. The paragraph above is about THIS diff: an
                          # beyond plans/<slug>/ has not been through a gate.
 ```
 
-Once it is only what it should be — and **if the gate above changed a file, `git add -A`
-again**, or the index still holds the version the gate rejected:
+Once it is only what it should be — and **if the gate above changed a file, `git add` that
+file**, or the index still holds the version the gate rejected:
 
 ```bash
 if git diff --staged --quiet; then
   echo "Nothing to finalize — as-built and the final tick are already committed."
 else
-  git commit -m "docs(plan): finalize as-built.md and mark plan complete"
+  git commit -m "docs(plan): finalize as-built.md and mark plan complete" || exit
 fi
 # OUTSIDE that branch, and the same checks as Publish: a crash between the commit and the
 # push leaves a resumed run with nothing staged, so a nested push would never run. The two
 # skipped destinations are Publish's, for Publish's reasons.
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
-DEFAULT=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')
+DEFAULT=$(git ls-remote --symref origin HEAD 2>/dev/null | awk '$1=="ref:" && $3=="HEAD" {sub("refs/heads/","",$2); print $2; exit}')
+[ -n "$DEFAULT" ] || DEFAULT=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')
 if [ "$BRANCH" = "HEAD" ]; then
   echo "Detached HEAD — committed but NOT pushing. Check out a branch and push."
 elif [ "$BRANCH" = "${DEFAULT:-main}" ] || [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
   echo "On default branch '$BRANCH' — committed but NOT pushing. Move this work to a feature branch."
-elif [ "$(git rev-parse HEAD)" != "$(git rev-parse --verify --quiet "origin/$BRANCH")" ]; then
+elif [ "$(git rev-parse HEAD)" != "$(git ls-remote --heads origin "refs/heads/$BRANCH" 2>/dev/null | awk -v r="refs/heads/$BRANCH" '$2 == r { print $1 }')" ]; then
   git push origin HEAD
 fi
 ```

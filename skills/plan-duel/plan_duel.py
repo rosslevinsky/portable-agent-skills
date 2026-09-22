@@ -19,8 +19,8 @@ Known limitation — native Windows batch shims. If ``shutil.which`` resolves a 
 CLI to a ``.cmd``/``.bat`` (common for npm-installed CLIs, and this module resolves bare
 names through ``which`` so ``PATHEXT`` is honoured), Windows runs it through the shell,
 which reinterprets ``%VAR%`` / ``&`` in arguments outside Python's quoting — and the
-arguments here are whole generated prompts. Prefer a non-shim executable, or run the duel
-under WSL/Git-Bash on Windows.
+arguments here are whole generated prompts. Preflight refuses a shim on native Windows;
+use a non-shim executable, or run the duel under WSL.
 
 Function groups, each spawning no subprocess so the ``unittest`` suite can exercise them
 directly:
@@ -69,7 +69,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Collection, Mapping, Sequence
+from typing import Callable, Collection, Mapping, Sequence
 
 
 # --------------------------------------------------------------------------- #
@@ -112,9 +112,12 @@ class AgentOutputError(PlanDuelError):
     it is appended after an em-dash and kept on the ``.cause`` attribute.
     """
 
-    def __init__(self, halt_message: str, *, cause: str | None = None):
+    def __init__(self, halt_message: str, *, cause: str | None = None,
+                 spawn_failed: bool = False):
         self.halt_message = halt_message
         self.cause = cause
+        # True when the CLI itself failed (a timeout or a failed exit), not the output check.
+        self.spawn_failed = spawn_failed
         super().__init__(halt_message if cause is None else f"{halt_message} — {cause}")
 
 
@@ -353,6 +356,13 @@ def _parse_role_spec(role: str, raw: object) -> RoleSpec:
             f"role '{role}' 'command' must contain only strings"
         )
     command = tuple(command)
+    unfilled = sorted(set().union(*(find_placeholders(part) for part in command)) - PLACEHOLDERS)
+    if unfilled:
+        rendered = ", ".join(f"{PLACEHOLDER_OPEN}{name}{PLACEHOLDER_CLOSE}" for name in unfilled)
+        raise AdapterConfigError(
+            f"role '{role}' command uses marker(s) this engine never fills: {rendered} "
+            f"(it fills: {', '.join(sorted(PLACEHOLDERS))})"
+        )
 
     stdout = raw["stdout"]
     if not isinstance(stdout, str) or stdout not in STDOUT_MODES:
@@ -370,8 +380,8 @@ def _parse_role_spec(role: str, raw: object) -> RoleSpec:
             raise AdapterConfigError(
                 f"role '{role}' asks for prompt_mode {prompt_mode!r}, which this engine "
                 f"honours nowhere: the prompt reaches a CLI only through an argv "
-                f"placeholder. It used to be accepted and then ignored, so the CLI ran "
-                f"with no prompt at all. Put the prompt placeholder in 'command' and "
+                f"placeholder. Accepting it and ignoring it would run the CLI with no "
+                f"prompt at all. Put the prompt placeholder in 'command' and "
                 f"use prompt_mode 'arg'."
             )
         raise AdapterConfigError(
@@ -429,7 +439,7 @@ def parse_adapter_config(data: str | dict) -> dict[str, RoleSpec]:
     if isinstance(data, str):
         try:
             obj = json.loads(data)
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, RecursionError) as exc:
             raise AdapterConfigError(f"adapter config is not valid JSON: {exc}") from exc
     else:
         obj = data
@@ -494,6 +504,13 @@ SCORE_MIN = 0
 SCORE_MAX = 10
 
 
+def _is_complete_verdict(obj: Mapping[str, object]) -> bool:
+    """Whether ``obj`` carries every verdict field. Only such an object outranks a marker the
+    file carries: a partial one may be an example quoted in the prose, so it fills only the
+    fields the markers leave empty."""
+    return JUDGE_JSON_KEYS <= set(obj)
+
+
 def _is_judge_verdict(obj: object) -> bool:
     """True if ``obj`` looks like the judge's verdict rather than incidental JSON."""
     return (
@@ -516,7 +533,7 @@ def parse_judge_json(text: str) -> dict | None:
         return None
     try:
         whole = json.loads(stripped)
-    except ValueError:
+    except (ValueError, RecursionError):
         pass
     else:
         if _is_judge_verdict(whole):
@@ -529,11 +546,23 @@ def parse_judge_json(text: str) -> dict | None:
             continue
         try:
             candidate, _ = decoder.raw_decode(text, index)
-        except ValueError:
+        except (ValueError, RecursionError):
             continue
         if _is_judge_verdict(candidate):
             found = candidate
     return found
+
+
+def _digits_to_int(digits: str) -> int | None:
+    """``int(digits)``, or ``None`` past the interpreter's digit limit.
+
+    Python 3.11+ refuses to convert more than 4,300 digits, and a judge file is written by a
+    model: a number that long is no score, so it takes the unparseable path.
+    """
+    try:
+        return int(digits)
+    except ValueError:
+        return None
 
 
 def _json_score(obj: Mapping[str, object]) -> int | None:
@@ -547,10 +576,13 @@ def _json_score(obj: Mapping[str, object]) -> int | None:
         return None
     if isinstance(value, int):
         return value
+    # A judge with no enforced schema writes 8.0 for 8; a fraction is no rubric score.
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
     if isinstance(value, str):
         number = _FIRST_INT_RE.search(value)
         if number is not None:
-            return int(number.group(0))
+            return _digits_to_int(number.group(0))
     return None
 
 
@@ -560,7 +592,7 @@ def _marker_score(text: str) -> int | None:
     if line is None:
         return None
     number = _FIRST_INT_RE.search(line.group(1))
-    return int(number.group(0)) if number is not None else None
+    return _digits_to_int(number.group(0)) if number is not None else None
 
 
 def _usable_score(value: int | None) -> int | None:
@@ -588,7 +620,7 @@ def raw_score(text: str) -> int | None:
     send a user to look for a missing line in a file that plainly shows a number.
     """
     obj = parse_judge_json(text)
-    if obj is not None:
+    if obj is not None and (_SCORE_LINE_RE.search(text) is None or _is_complete_verdict(obj)):
         value = _json_score(obj)
         if value is not None:
             return value
@@ -604,11 +636,15 @@ def parse_score(text: str) -> int | None:
     narrower than it was.
     """
     obj = parse_judge_json(text)
-    if obj is not None:
+    marker = _usable_score(_marker_score(text))
+    # A SCORE: line counts as carried even when its value is unusable: an out-of-range score
+    # is warned about as written, never replaced by a quoted partial object.
+    carries_marker = _SCORE_LINE_RE.search(text) is not None
+    if obj is not None and (not carries_marker or _is_complete_verdict(obj)):
         score = _usable_score(_json_score(obj))
         if score is not None:
             return score
-    return _usable_score(_marker_score(text))
+    return marker
 
 
 def score_warning(text: str, round_n: int) -> str:
@@ -935,11 +971,15 @@ def parse_preferred(text: str) -> str | None:
     apart from "there was no label" use :func:`read_preferred_marker` directly.
     """
     obj = parse_judge_json(text)
-    if obj is not None:
+    label = read_preferred_marker(text)
+    marker = label.side
+    # A PREFERRED: line that names no side still counts as carried, as a SCORE: line does.
+    carries_marker = marker is not None or label.unreadable is not None
+    if obj is not None and (not carries_marker or _is_complete_verdict(obj)):
         value = obj.get("preferred")
         if isinstance(value, str) and value.strip().upper() in ("A", "B"):
             return value.strip().upper()
-    return read_preferred_marker(text).side
+    return marker
 
 
 def resolve_winner(
@@ -978,7 +1018,8 @@ def read_text_normalized(path: str | os.PathLike[str]) -> str:
     would run a duel against a config nobody wrote. Files a third-party CLI wrote go through
     :func:`read_text_tolerant`.
     """
-    return _normalize_newlines(Path(path).read_bytes().decode("utf-8"))
+    # utf-8-sig drops a leading byte-order mark, which PowerShell 5.1's -Encoding UTF8 writes.
+    return _normalize_newlines(Path(path).read_bytes().decode("utf-8-sig"))
 
 
 def read_text_tolerant(path: str | os.PathLike[str]) -> str:
@@ -991,6 +1032,47 @@ def read_text_tolerant(path: str | os.PathLike[str]) -> str:
     that. Deliberately NOT the shared default — see :func:`read_text_normalized`.
     """
     return _normalize_newlines(Path(path).read_bytes().decode("utf-8", "replace"))
+
+
+def _mode_or_absent(path: Path, *, follow: bool = True) -> int | None:
+    """``path``'s ``st_mode``, or ``None`` when nothing can be at that name.
+
+    **A read has three outcomes and the existence predicates report two.** Which errors
+    they fold into False is not "the file is not there": ``Path.exists()`` and its siblings
+    answer False for ``ELOOP`` and ``EBADF`` as readily as for ``ENOENT``, so a symlink
+    loop — a name the filesystem cannot resolve at all — reads as a name with nothing at
+    it. ``os.path.exists()`` is broader still and swallows every ``OSError``, and the set
+    each of them folds has changed between interpreter versions, so the answer to "is this
+    unreadable file there" depends on which Python is running.
+
+    This fixes the set: absent is ``ENOENT`` and ``ENOTDIR`` (a parent component is not a
+    directory), the two that really do mean nothing can be at this name. ``ENAMETOOLONG``
+    is not one of them: it says the path could not be RESOLVED, which establishes nothing
+    about what stands at the name — a long alias for a real file answers it too, so reading
+    it as absence drops a file that is right there. Every other ``OSError`` propagates, on
+    every version.
+
+    ``follow=False`` inspects the link itself, for callers asking whether a name IS a link.
+    """
+    try:
+        return (os.stat if follow else os.lstat)(path).st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+
+
+def _present(path: Path) -> bool:
+    """Is anything at ``path``? Absent answers False; unreadable raises.
+
+    Follows the link, like the ``Path.exists()`` each caller used before it: a dangling
+    link is a name with nothing at it, and a looping one is a name that cannot be resolved.
+    """
+    return _mode_or_absent(path) is not None
+
+
+def _is_file(path: Path) -> bool:
+    """Is ``path`` a regular file? Absent answers False; unreadable raises."""
+    mode = _mode_or_absent(path)
+    return mode is not None and stat.S_ISREG(mode)
 
 
 def read_text_roundtrip(path: str | os.PathLike[str]) -> str:
@@ -1010,17 +1092,25 @@ def read_text_roundtrip(path: str | os.PathLike[str]) -> str:
     )
 
 
-def write_text_roundtrip(path: str | os.PathLike[str], text: str) -> None:
-    """The exact inverse of :func:`read_text_roundtrip` — see it for why.
+def write_text_roundtrip(
+    path: str | os.PathLike[str], text: str, *, newline: str = "\n"
+) -> None:
+    """The exact inverse of :func:`read_text_roundtrip` — see it for why. ``newline`` puts back
+    the line ending the file was read with.
 
-    Through :func:`open_no_follow`, like every other write into the workdir.
-    ``Path.write_bytes`` follows a planted link — mostly unreachable while ``copy_bytes`` had
-    just ``os.replace``d a fresh regular file over the winner path, and no longer so now that
-    a missing live plan is a warned SKIP.
+    A symlink standing at ``path`` is refused, like every other write into the workdir; a
+    missing live plan is a warned SKIP, so the stamp can reach a link an agent planted. The
+    bytes land through :func:`_write_bytes_atomic`: the winner is rewritten in place, and a
+    truncating write that failed part-way would leave it empty.
     """
-    open_no_follow(
-        Path(path), _normalize_newlines(text).encode("utf-8", "surrogateescape")
-    )
+    path = Path(path)
+    if path.is_symlink():
+        raise PlanDuelError(
+            f"refusing to write through a symlink: {path}. A duel artifact must be a "
+            f"regular file; a link here would send the write outside the workdir."
+        )
+    data = _normalize_newlines(text).replace("\n", newline).encode("utf-8", "surrogateescape")
+    _write_bytes_atomic(path, data)
 
 
 def write_text_utf8(
@@ -1062,7 +1152,9 @@ def open_no_follow(path: Path, data: bytes, *, append: bool = False) -> None:
             f"refusing to write through a symlink: {path}. A duel artifact must be a "
             f"regular file; a link here would send the write outside the workdir."
         )
-    flags = os.O_WRONLY | os.O_CREAT | nofollow
+    # O_NONBLOCK, and the regular-file check below: a named pipe planted at an agent-writable
+    # path would otherwise hold the open, or the write, until something read it.
+    flags = os.O_WRONLY | os.O_CREAT | nofollow | getattr(os, "O_NONBLOCK", 0)
     flags |= os.O_APPEND if append else os.O_TRUNC
     try:
         handle = os.open(path, flags, 0o666)
@@ -1073,6 +1165,9 @@ def open_no_follow(path: Path, data: bytes, *, append: bool = False) -> None:
                 f"a regular file; a link here would send the write outside the workdir."
             ) from exc
         raise
+    if not stat.S_ISREG(os.fstat(handle).st_mode):
+        os.close(handle)
+        raise PlanDuelError(f"refusing to write to {path}: it is not a regular file")
     with os.fdopen(handle, "wb") as out:
         out.write(data)
 
@@ -1094,6 +1189,13 @@ def write_text_atomic(path: str | os.PathLike[str], text: str) -> None:
     # in the summary carries surrogate escapes under a non-UTF-8 locale, and a strict
     # encode threw away three completed rounds at the final write.
     data = text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8", "surrogateescape")
+    _write_bytes_atomic(path, data)
+
+
+def _write_bytes_atomic(path: Path, data: bytes) -> None:
+    """``data`` into ``path`` by a temporary file beside it and ``os.replace``: the file is the
+    old one or the new one, never a truncated one. ``os.replace`` swaps a link standing at
+    ``path`` rather than following it."""
     handle, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     tmp = Path(tmp_name)
     try:
@@ -1101,6 +1203,17 @@ def write_text_atomic(path: str | os.PathLike[str], text: str) -> None:
             out.write(data)
             out.flush()
             os.fsync(out.fileno())
+        # The mode travels with the content. `mkstemp` creates 0600 and `os.replace` keeps
+        # whatever the temporary had, so a plan every teammate could read became readable by
+        # whoever ran the duel the moment it was stamped. An existing file keeps its own
+        # mode; a new one gets what a plain create would have, which is the umask's answer.
+        try:
+            mode = os.stat(path).st_mode & 0o7777
+        except FileNotFoundError:
+            current = os.umask(0)
+            os.umask(current)
+            mode = 0o666 & ~current
+        os.chmod(tmp, mode)
         os.replace(tmp, path)
     finally:
         if tmp.exists():
@@ -1236,8 +1349,12 @@ def _direct_child_files(workdir: Path):
     Subdirectories are skipped — cleanup deletes only direct children and NEVER
     recurses (the v1 contract), so nested artifact-named files are untouched.
     """
+    # `_is_file`, not `entry.is_file()`. This listing answers "which rounds completed",
+    # "which artifacts a resume deletes" and "is init incomplete"; an entry dropped because
+    # its name would not resolve makes a completed round look unrun, and an init-incomplete
+    # verdict deletes the plans of the round it could not see.
     for entry in sorted(Path(workdir).iterdir(), key=lambda item: item.name):
-        if entry.is_file():
+        if _is_file(entry):
             yield entry
 
 
@@ -1272,9 +1389,9 @@ def cleanup_all_artifacts(
     """Delete every duel artifact (full-reset globs) among direct children.
 
     Preserves ``problem.md`` / ``summary.md`` / ``state.json`` and any non-duel
-    file. ``keep`` spares additional artifact names by exact match — used to carry
-    an already-validated Plan A across an init-incomplete resume instead of paying
-    to regenerate it. With the default empty ``keep`` the deletion log is unchanged.
+    file. ``keep`` spares additional artifact names by exact match, which is how an
+    already-validated Plan A crosses an init-incomplete resume instead of being paid
+    for twice. With the default empty ``keep`` the deletion log is unchanged.
     Returns the normalized relative names deleted. Never recurses.
     """
     workdir = Path(workdir)
@@ -1294,7 +1411,7 @@ def cleanup_all_artifacts(
 # --------------------------------------------------------------------------- #
 STATE_FILENAME = "state.json"
 
-# Written at claim time so a workdir can be recognised as THIS tool's, rather than
+# Written at claim time so a workdir can be recognized as THIS tool's, rather than
 # inferred from a file called problem.md - an ordinary name that an ordinary directory
 # may hold. See _looks_like_duel_workdir.
 DUEL_MARKER_FILENAME = ".plan-duel"
@@ -1380,13 +1497,22 @@ def save_state(workdir: str | os.PathLike[str], state: RunState) -> None:
 
 
 def load_state(workdir: str | os.PathLike[str]) -> RunState | None:
-    """Read ``state.json`` if present and parseable, else ``None`` (never raises)."""
+    """Read ``state.json`` if absent or unparseable, else ``None``.
+
+    ``None`` means the file is NOT THERE or does not parse. It does not mean the file
+    could not be read: an unreadable ``state.json`` raises, because ``None`` is taken by
+    every caller as "this duel wrote no state", which discards every round marker, makes a
+    judged round look unjudged, and skips the guard that refuses a resume whose controller
+    and participant names differ from the ones the duel started with.
+    """
     path = Path(workdir) / STATE_FILENAME
-    if not path.exists():
+    if not _present(path):
         return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError, ValueError):
+    except FileNotFoundError:
+        return None  # removed between the check and the read
+    except (json.JSONDecodeError, ValueError, RecursionError):
         return None
     if not isinstance(data, dict):
         return None
@@ -1443,10 +1569,13 @@ def scan_snapshots(workdir: str | os.PathLike[str]) -> SnapshotScan:
         plan_a_rounds=frozenset(plan_a),
         plan_b_rounds=frozenset(plan_b),
         judge_rounds=frozenset(judge),
-        has_live_a=(workdir / "plan-a.md").is_file(),
-        has_live_b=(workdir / "plan-b.md").is_file(),
-        has_summary=(workdir / "summary.md").is_file(),
-        has_problem=(workdir / "problem.md").is_file(),
+        # `_is_file` throughout: `has_summary` False ends a finished duel by re-running
+        # it, and `has_live_*` False loses the audit line that says a stale plan is about
+        # to be deleted. Neither may be derived from a name that would not resolve.
+        has_live_a=_is_file(workdir / "plan-a.md"),
+        has_live_b=_is_file(workdir / "plan-b.md"),
+        has_summary=_is_file(workdir / "summary.md"),
+        has_problem=_is_file(workdir / "problem.md"),
     )
 
 
@@ -1516,14 +1645,14 @@ def compute_resume(workdir: str | os.PathLike[str]) -> ResumePlan:
         snapshot_a = workdir / plan_snapshot_name("a", 0)
         live_a = workdir / "plan-a.md"
         reuse_plan_a = False
-        if 0 in scan.plan_a_rounds and snapshot_a.is_file():
+        if 0 in scan.plan_a_rounds and _is_file(snapshot_a):
             # PROOF of completeness, not a heuristic. The snapshot is a byte copy of the live
             # plan the engine already validated, so an exact match can only hold if the copy
             # finished. This closes the gap a size gate leaves open: a snapshot interrupted
             # past 200 bytes by an older, non-atomic build still looks big enough.
             reuse_plan_a = (
                 file_size_bytes(snapshot_a) >= MIN_AGENT_OUTPUT_BYTES
-                and live_a.is_file()
+                and _is_file(live_a)
                 and live_a.read_bytes() == snapshot_a.read_bytes()
             )
             if not reuse_plan_a:
@@ -1579,7 +1708,7 @@ def compute_resume(workdir: str | os.PathLike[str]) -> ResumePlan:
             )
     for side, snapshot in (("a", copies[0][0]), ("b", copies[1][0])):
         live = workdir / f"plan-{side}.md"
-        if live.is_file() and live.read_bytes() != snapshot.read_bytes():
+        if _is_file(live) and live.read_bytes() != snapshot.read_bytes():
             audit.append(
                 f"Stale live plan-{side}.md differs from its round-{lcr} snapshot; "
                 f"it will be overwritten by the snapshot (v1 resume behavior)."
@@ -1606,7 +1735,10 @@ def apply_resume(plan: ResumePlan) -> list[str]:
     if plan.complete:
         return []
     if plan.init_incomplete:
-        keep = (plan_snapshot_name("a", 0),) if plan.reuse_plan_a else ()
+        # plan-a.md stays with its snapshot: compute_resume trusts the snapshot only while the
+        # two match byte for byte, so deleting it here makes a resume killed before
+        # run_init_round restores it pay for Plan A again.
+        keep = (plan_snapshot_name("a", 0), "plan-a.md") if plan.reuse_plan_a else ()
         return cleanup_all_artifacts(plan.workdir, keep=keep)
     log = cleanup_higher_rounds(plan.workdir, plan.last_completed_round)
     for src, dst in plan.copies:
@@ -1650,9 +1782,13 @@ def freeze_round_inputs(
     prior = round_n - 1
     frozen_a = workdir / plan_snapshot_name("a", prior)
     frozen_b = workdir / plan_snapshot_name("b", prior)
-    if not frozen_a.exists():
+    # `_present`, not `.exists()`. A frozen input whose name will not resolve is not a
+    # frozen input that is missing, and the difference is destructive: `.exists()` says no,
+    # the copy below overwrites the round's immutable snapshot with whatever the live plan
+    # currently holds, and the judge scores a round against inputs it was never given.
+    if not _present(frozen_a):
         copy_bytes(workdir / live_a, frozen_a)
-    if not frozen_b.exists():
+    if not _present(frozen_b):
         copy_bytes(workdir / live_b, frozen_b)
     return FrozenInputs(round=round_n, plan_a=frozen_a, plan_b=frozen_b)
 
@@ -1676,6 +1812,10 @@ def resolve_executable(argv0: str) -> str:
         # then raise PermissionError at spawn time — after the preceding agent has
         # already been paid for, which is exactly what preflight exists to prevent.
         # ``X_OK`` is not meaningful on Windows, where this degrades to existence.
+        # `os.access` answers a question the filesystem may refuse to answer, and both
+        # branches below are refusals, so its two-valued answer authorizes nothing: an
+        # unknown here becomes `CliNotFoundError` before any agent is paid for, which is
+        # what preflight is for.
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return str(candidate.resolve())
         if candidate.is_file():
@@ -1684,7 +1824,37 @@ def resolve_executable(argv0: str) -> str:
     resolved = shutil.which(argv0)
     if resolved is None:
         raise CliNotFoundError(f"CLI not found on PATH: {argv0}")
+    # Absolute, so a relative PATH entry names one file whatever directory a role runs in.
+    resolved = os.path.abspath(resolved)
+    # Windows searches the current directory before PATH, and that directory is normally the
+    # repository being planned: a program planted there would run with the adapters' flags.
+    cwd = os.path.normcase(os.getcwd())
+    listed = {
+        os.path.normcase(os.path.abspath(entry))
+        for entry in os.environ.get("PATH", os.defpath).split(os.pathsep)
+    }
+    if os.path.normcase(os.path.dirname(resolved)) == cwd and cwd not in listed:
+        raise CliNotFoundError(
+            f"{argv0} resolves to {resolved}, in the current directory rather than on PATH; "
+            f"refusing to run a program from the directory the duel was started in. Start "
+            f"it from another directory, or name the CLI by absolute path."
+        )
     return resolved
+
+
+def _refuse_batch_shim(resolved: str, argv0: str) -> None:
+    """On Windows, refuse a CLI that resolves to a ``.cmd`` or ``.bat`` wrapper.
+
+    Windows runs one through ``cmd.exe``, which ends an argument at a newline and reinterprets
+    ``%`` and ``&``, and the arguments that matter here are multi-line prompts: the duel would
+    fail at its first spawn, or run a prompt nobody wrote. String-only, with no ``Path``.
+    """
+    if os.name == "nt" and os.path.splitext(resolved)[1].lower() in (".cmd", ".bat"):
+        raise CliNotFoundError(
+            f"{argv0} resolves to {resolved}, a batch wrapper that Windows runs through "
+            f"cmd.exe, which mangles the multi-line prompts this engine passes. Point the "
+            f"adapter at the program the wrapper launches, or run the duel under WSL."
+        )
 
 
 def preflight_executables(specs: Mapping[str, RoleSpec]) -> None:
@@ -1708,9 +1878,11 @@ def preflight_executables(specs: Mapping[str, RoleSpec]) -> None:
             missing[argv0].append(role)
             continue
         try:
-            resolve_executable(argv0)
+            resolved = resolve_executable(argv0)
         except CliNotFoundError:
             missing[argv0] = [role]
+            continue
+        _refuse_batch_shim(resolved, argv0)
     if missing:
         detail = "; ".join(
             f"{cli} (needed by {', '.join(roles)})" for cli, roles in missing.items()
@@ -1816,6 +1988,9 @@ def run_cli(
     if not argv:
         raise CliExecutionError("cannot run an empty argv")
     resolved = resolve_executable(argv[0])
+    # Here as well as in preflight: a resume past the round cap skips preflight and still
+    # dispatches a judge.
+    _refuse_batch_shim(resolved, argv[0])
     full_argv = [resolved, *argv[1:]]
 
     stdout_handle = None
@@ -1861,14 +2036,19 @@ def run_cli(
             stdout_arg = stdout_handle
         else:
             stdout_arg = subprocess.PIPE
-        proc = subprocess.Popen(
-            full_argv,
-            stdin=subprocess.DEVNULL,
-            stdout=stdout_arg,
-            stderr=subprocess.PIPE,
-            cwd=str(cwd) if cwd is not None else None,
-            **popen_kwargs,
-        )
+        try:
+            proc = subprocess.Popen(
+                full_argv,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_arg,
+                stderr=subprocess.PIPE,
+                cwd=str(cwd) if cwd is not None else None,
+                **popen_kwargs,
+            )
+        except OSError as exc:
+            # A file that passed the executable checks but is no program (no interpreter
+            # line, not a Windows image) halts like any failed spawn, naming it.
+            raise CliExecutionError(f"CLI could not be started: {argv[0]} — {exc}") from exc
         drained = terminated = completed = False
         try:
             try:
@@ -1894,7 +2074,7 @@ def run_cli(
             #
             # Skipped where signalling is wrong rather than merely redundant. The timeout
             # path already escalated, so repeating the ladder would double this call's
-            # worst-case duration. And a CLEAN run must not be signalled at all: pipes at EOF
+            # worst-case duration. And a CLEAN run must not be signaled at all: pipes at EOF
             # means no survivor holds them, while a group kill would still reach a background
             # helper the CLI deliberately left running.
             if not (terminated or completed):
@@ -1961,13 +2141,16 @@ def _agent_output_is_usable(path: Path) -> bool:
 def _agent_output_rejection(path: Path) -> str:
     """Why :func:`_agent_output_is_usable` said no, in a few words for the halt line.
 
-    The halt used to carry only the CLI's own tail, and an agent that exits 0 after writing a
-    SHORT plan leaves a tail that reads like success — `wrote /…/plan-a.md` — beside a file
-    that exists and looks fine. The message then points away from the cause, and the only way
-    to learn the real one is to read this source for the 200-byte floor.
+    The halt needs its own reason rather than the CLI's tail alone. An agent that exits 0
+    after writing a SHORT plan leaves a tail that reads like success — `wrote /…/plan-a.md`
+    — beside a file that exists and looks fine, so a message built from the tail points away
+    from the cause and the 200-byte floor is findable only by reading this source.
     """
     try:
-        if not path.exists():
+        # `_present`: "was not written" is a claim about the agent, and a path whose name
+        # merely would not resolve has not earned it. `_present` raises there, and the
+        # handler below reports the read failure by name.
+        if not _present(path):
             return f"{path.name} was not written"
         if not stat.S_ISREG(os.lstat(path).st_mode):
             return f"{path.name} is not a regular file"
@@ -2042,6 +2225,10 @@ def status_tail(
         try:
             raw = source if isinstance(source, bytes) else Path(source).read_bytes()
         except OSError:
+            # Tolerated here and nowhere else: this builds the TAIL of a halt message that
+            # is already being raised for its own reason. Skipping an unreadable capture
+            # costs a sentence of explanation, never a decision — the halt happens either
+            # way, and no caller derives a fact from the result.
             continue
         # Decode with replacement, never strictly: a CLI may emit non-UTF-8 bytes, and
         # a diagnostic must neither raise (replacing the halt it exists to explain) nor
@@ -2082,9 +2269,9 @@ def run_agent(
             timeout=timeout,
         )
     except CliTimeoutError as exc:
-        raise AgentOutputError(halt, cause="CLI timed out") from exc
+        raise AgentOutputError(halt, cause="CLI timed out", spawn_failed=True) from exc
     except ProcessError as exc:
-        raise AgentOutputError(halt, cause=str(exc)) from exc
+        raise AgentOutputError(halt, cause=str(exc), spawn_failed=True) from exc
 
     # Regular file, readable, and big enough — see ``_agent_output_is_usable``. A DIRECTORY
     # at this path reports an ``st_size`` of 4096 on Linux, so a size-only check accepts it
@@ -2142,7 +2329,9 @@ def capture_judge_message(
     except ProcessError as exc:
         raise JudgeOutputError(f"Judge process failed at round {round_n}: {exc}") from exc
 
-    if not message_path.exists() or file_size_bytes(message_path) == 0:
+    # `_present`, so an unreadable capture is not charged to the judge as "produced no
+    # output". It raises instead, and `main` reports the OSError with the path in it.
+    if not _present(message_path) or file_size_bytes(message_path) == 0:
         raise JudgeOutputError(f"Judge produced no output at round {round_n}.")
     return read_text_tolerant(message_path)
 
@@ -2248,7 +2437,7 @@ def _label_re(label: str) -> re.Pattern[str]:
     """Match one judge-field LABEL at the head of a line, decoration and case tolerant.
 
     The same Markdown a judge wraps ``PREFERRED:`` in it wraps the other two labels in, so
-    all three are recognised the same way. ``match.end()`` is where the label's own inline
+    all three are recognized the same way. ``match.end()`` is where the label's own inline
     value starts, which is what :func:`_block_after` needs.
     """
     return re.compile(
@@ -2268,7 +2457,7 @@ class JudgeFields:
     ``score`` is the verdict's integer score (``None`` if missing/unparseable),
     ``differences`` the differences block, ``missed_rejections`` the missed-rejections value
     (``"none"`` when there are none), ``preferred`` ``'A'`` / ``'B'`` / ``None``, and
-    ``justification`` the winner's defence paragraph.
+    ``justification`` the winner's defense paragraph.
 
     ``differences`` is a rendered STRING in both parse paths — the JSON verdict's array is
     rendered into the same numbered lines the marker contract used. That keeps one
@@ -2398,7 +2587,9 @@ def render_missed_rejections(value: object) -> str:
     return _MISSED_NONE
 
 
-def _overlay_json_fields(obj: Mapping[str, object], legacy: JudgeFields) -> JudgeFields:
+def _overlay_json_fields(
+    obj: Mapping[str, object], legacy: JudgeFields, carried: Collection[str] = ()
+) -> JudgeFields:
     """Overlay a decoded verdict onto the marker-parsed fields, FIELD BY FIELD.
 
     Every field falls through to ``legacy`` unless the object carries a usable value for it
@@ -2410,8 +2601,13 @@ def _overlay_json_fields(obj: Mapping[str, object], legacy: JudgeFields) -> Judg
     differences and justification the markers really carry. With the overlay, the worst case
     of a false adoption is that nothing changes.
     """
+    # A partial object may be an example quoted in the prose: it fills only the fields no
+    # marker line carries (``carried``), and only a complete verdict replaces what one does.
+    complete = _is_complete_verdict(obj)
     differences_raw = obj.get("differences")
-    if isinstance(differences_raw, str):
+    if not complete and "differences" in carried:
+        differences = legacy.differences
+    elif isinstance(differences_raw, str):
         differences = differences_raw.strip() or legacy.differences
     elif isinstance(differences_raw, Sequence):
         differences = render_differences(list(differences_raw))
@@ -2419,13 +2615,16 @@ def _overlay_json_fields(obj: Mapping[str, object], legacy: JudgeFields) -> Judg
         differences = legacy.differences
 
     missed_raw = obj.get("missed_rejections")
-    missed = (
-        render_missed_rejections(missed_raw)
-        if isinstance(missed_raw, (str, Sequence))
-        else legacy.missed_rejections
-    )
+    if not complete and "missed_rejections" in carried:
+        missed = legacy.missed_rejections
+    elif isinstance(missed_raw, (str, Sequence)):
+        missed = render_missed_rejections(missed_raw)
+    else:
+        missed = legacy.missed_rejections
 
     justification = obj.get("justification")
+    if not complete and "justification" in carried:
+        justification = None
     return JudgeFields(
         score=legacy.score,
         differences=differences,
@@ -2484,13 +2683,20 @@ def extract_judge_fields(text: str) -> JudgeFields:
         justification=justification,
     )
     obj = parse_judge_json(normalized)
-    return legacy if obj is None else _overlay_json_fields(obj, legacy)
+    carried = {
+        name
+        for name, index in (("differences", diff_idx), ("missed_rejections", missed_idx),
+                            ("justification", pref_idx))
+        if index is not None
+    }
+    return legacy if obj is None else _overlay_json_fields(obj, legacy, carried)
 
 
 # Longest-first alternation so ``Stronger: A`` wins over a bare ``Plan A`` overlap;
 # a single left-to-right pass means a substituted value is never re-scanned (so a
 # concrete name that itself contains a token like ``B`` cannot be double-rewritten).
-_DIFF_TOKEN_RE = re.compile(r"Stronger: A|Stronger: B|Plan A|Plan B")
+# Whole labels only: "Plan API" is not "Plan A" followed by "PI".
+_DIFF_TOKEN_RE = re.compile(r"\b(?:Stronger: A|Stronger: B|Plan A|Plan B)\b")
 
 
 def rewrite_differences(
@@ -2567,6 +2773,10 @@ def _fenced_lines(lines: Sequence[str]) -> list[bool]:
     return flags
 
 
+# A markdown heading: up to three spaces of indent, since four make an indented code block.
+_ATX_HEADING_RE = re.compile(r"^ {0,3}#{1,6}(?:\s|$)")
+
+
 def _table_row_key(line: str) -> str | None:
     """First cell of a markdown table row (``| Format | v2 |`` → ``"Format"``)."""
     stripped = line.strip()
@@ -2607,7 +2817,7 @@ def stamp_winner_plan(text: str) -> str:
         (
             i
             for i, line in enumerate(lines)
-            if not fenced[i] and line.strip() == "## Status"
+            if not fenced[i] and _ATX_HEADING_RE.match(line) and line.strip() == "## Status"
         ),
         None,
     )
@@ -2619,8 +2829,8 @@ def stamp_winner_plan(text: str) -> str:
             if _is_separator_row(lines[i]):
                 sep_idx = i
                 break
-            if lines[i].strip().startswith("## "):
-                break  # next section before any table
+            if _ATX_HEADING_RE.match(lines[i]):
+                break  # any heading, a subsection included, ends the Status section's content
         if sep_idx is not None:
             end_idx = sep_idx + 1
             for i in range(sep_idx + 1, len(lines)):
@@ -2728,6 +2938,7 @@ def assemble_summary(
     justification: str,
     differences_rewritten: str,
     missed_rejections: str,
+    winner_stamped: bool = True,
 ) -> str:
     """Render the full ``summary.md`` body from computed pieces (pure, no I/O).
 
@@ -2745,9 +2956,11 @@ def assemble_summary(
         f"(0 = initial plans, 1–{rounds_run} = critique rounds)"
     )
     out.append(f"**Stopped due to:** {stopped_due_to}")
+    # Claimed only when the stamp landed: a replay prints this line as the duel's result.
     out.append(
         f"**Winner:** {winner_name} → {workdir_display}/{winner_file} "
-        "(stamped `Format: v2` — feed it to `/plan-phase`)"
+        + ("(stamped `Format: v2` — feed it to `/plan-phase`)" if winner_stamped
+           else "(NOT stamped — see the warning above; the round snapshots hold every plan)")
     )
     out.append("")
     out.append("## Score trajectory")
@@ -2875,7 +3088,9 @@ def problem_slug(text: str, *, max_words: int = 4) -> str:
     }
     words = re.findall(r"[a-z0-9]+", text.lower())
     meaningful = [w for w in words if w not in _stop] or words
-    slug = "-".join(meaningful[:max_words]) or "duel"
+    # Capped by length as well as by word count: one long token (a hash, an identifier)
+    # otherwise makes a directory name the file system refuses.
+    slug = "-".join(meaningful[:max_words])[:64].strip("-") or "duel"
     # The stem is what Windows matches, so `con.md` is reserved exactly as `con` is.
     if slug.split(".")[0] in _WINDOWS_RESERVED_NAMES:
         slug = f"{slug}-duel"
@@ -2893,7 +3108,7 @@ def _round_context(workdir: Path, round_n: int) -> str:
     if round_n <= 1:
         return "This is the first critique round."
     prior = workdir / f"judge-round-{round_n - 1}.md"
-    if prior.is_file():
+    if _is_file(prior):
         score = parse_score(read_text_tolerant(prior))
         if score is not None:
             return f"The judge scored convergence at {score}/10 last round."
@@ -2973,7 +3188,10 @@ class DuelContext:
                 f"one-line placeholder prompt instead of the {template_name} template")
             return fallback
         path = Path(self.skill_dir) / template_name
-        if not path.is_file():
+        # `_is_file`: the degraded branch below says the template "is missing" and
+        # dispatches a one-line placeholder in its place. An unreadable template is a
+        # different fact and must not be reported, or acted on, as an absent one.
+        if not _is_file(path):
             self._warn_degraded(
                 f"{path} is missing, so {role} round {round_n} is being dispatched with "
                 f"a one-line placeholder prompt")
@@ -3005,9 +3223,9 @@ class DuelContext:
     def _warn_degraded(self, detail: str) -> None:
         """Say it, once per distinct message, on stderr.
 
-        Every one of these paths used to be silent, in a tool whose next action is to spend a
+        A silent degrade is the wrong default in a tool whose next action is to spend a
         paid model call: a duel that produced nothing useful because the prompt was twelve
-        words looked exactly like one whose agents were unhelpful, and cost the same.
+        words looks exactly like one whose agents were unhelpful, and costs the same.
         De-duplicated because these fire per role per round and a repeated line teaches a
         reader to skim.
         """
@@ -3046,7 +3264,9 @@ def _dispatch_agent(
             side=side,
             round_n=round_n,
             cwd=cwd,
-            status_to=status_to,
+            # A role whose stdout is its result has that stdout land in the plan file, as a
+            # judge's lands in its message file.
+            status_to=output_file if spec.stdout == "clean-last-message" else status_to,
             timeout=timeout,
         )
 
@@ -3295,7 +3515,11 @@ def run_init_round(
             timeout=timeout,
             status_to=workdir / "participant-round-0-status.md",
         )
-    except AgentOutputError:
+    except AgentOutputError as exc:
+        # Only a CLI that exited cleanly without a usable plan-b.md gets the fallback: after
+        # a timeout or a failed exit, a recent stray .md is a killed agent's draft.
+        if exc.spawn_failed:
+            raise
         recovered = recover_agent_b_round0(workdir)
         if recovered is None:
             raise
@@ -3426,7 +3650,9 @@ def run_duel(
     scores: dict[int, int] = {}
     for n in range(1, start_round):
         judge_path = workdir / f"judge-round-{n}.md"
-        judge_text = read_text_tolerant(judge_path) if judge_path.is_file() else ""
+        # Read as _replay_stops_before_spawning and write_summary read it: an unreadable
+        # verdict degrades like a missing one, so the replay predicted is the replay run.
+        judge_text = _judge_text_or_none(judge_path) or ""
         parsed = parse_score(judge_text) if judge_text else None
         # Only the LAST completed round can be re-judged: `round.md` sends the judge to the
         # LIVE plan-a.md / plan-b.md, which `apply_resume` restores from the last completed
@@ -3484,8 +3710,21 @@ def run_duel(
                 # over a later round's plans.
                 for side in ("a", "b"):
                     snapshot = workdir / plan_snapshot_name(side, round_n)
-                    if snapshot.is_file():
-                        copy_bytes(snapshot, workdir / f"plan-{side}.md")
+                    live = workdir / f"plan-{side}.md"
+                    # `_is_file`: the else branch DELETES the live plan and reports the
+                    # side as unwritten, so a snapshot whose name merely would not resolve
+                    # would cost the user a plan and put a false line in the summary.
+                    if _is_file(snapshot):
+                        copy_bytes(snapshot, live)
+                    else:
+                        # The live plan is a later round's, and published it would carry this
+                        # round's score and winner; the summary reports the side as unwritten.
+                        with contextlib.suppress(FileNotFoundError):
+                            live.unlink()
+                        emit(
+                            f"Warning: round {round_n}'s Plan {side.upper()} snapshot is "
+                            f"missing, so no final plan is published for that side."
+                        )
                 emit(
                     f"Rounds after {round_n} are on disk but the duel had already stopped "
                     f"there; publishing round {round_n}'s plans."
@@ -3545,10 +3784,34 @@ def judge_needs_rerun(
     alone — the engine cannot tell a truncated write from a genuinely unparseable one.
     """
     path = workdir / f"judge-round-{round_n}.md"
-    if not path.is_file() or file_size_bytes(path) == 0:
+    # `_is_file`: a verdict whose name will not resolve is not a verdict that is missing.
+    # Read as missing it is re-judged — a paid dispatch spent on a question already
+    # answered, and the answer on disk overwritten by it.
+    if not _is_file(path) or file_size_bytes(path) == 0:
         return True
     marker = state.rounds.get(round_n) if state is not None else None
     return marker is not None and not marker.judge_completed
+
+
+def _replay_stops_before_spawning(
+    workdir: Path, start_round: int, state: "RunState | None"
+) -> bool:
+    """Whether :func:`run_duel`'s replay of the rounds before ``start_round`` ends the duel
+    without a spawn: the last of them needs no re-judge, and the exit checks already fire on
+    the verdicts on disk. Such a resume only writes the summary, so it needs no CLI. Mirrors
+    run_duel's preload and exit checks; a change to either changes this.
+    """
+    last_round = start_round - 1
+    if last_round < 1 or judge_needs_rerun(workdir, last_round, state):
+        return False
+    scores: list[int] = []
+    for round_n in range(1, last_round + 1):
+        text = _judge_text_or_none(workdir / f"judge-round-{round_n}.md")
+        parsed = parse_score(text) if text else None
+        scores.append(0 if parsed is None else parsed)
+        if evaluate_exit(round_n, scores).stop:
+            return True
+    return False
 
 
 def _rejudge_round(
@@ -3585,6 +3848,10 @@ def _rejudge_round(
         # round's verdict, so it degrades below rather than being suppressed.
         with contextlib.suppress(FileNotFoundError):
             judge_path.unlink()
+        # Marked unfinished before the dispatch, as a critique round's judge is: a re-judge
+        # killed mid-write leaves a fragment that a marker still saying complete would trust.
+        state.rounds[round_n] = RoundState(plans_snapshotted=True, judge_completed=False)
+        save_state(workdir, state)
         judge_text = _dispatch_judge(
             specs,
             ctx.values(round_n=round_n, prompt=ctx.prompt("judge", round_n)),
@@ -3597,6 +3864,10 @@ def _rejudge_round(
     except (PlanDuelError, OSError) as exc:
         # PlanDuelError is the base of JudgeOutputError and ProcessError, so this is the
         # old tuple plus every other deliberate failure — TemplateError above all.
+        # A failure after a partial write leaves bytes the summary would read back as this
+        # round's score and preferred side, so they go too.
+        with contextlib.suppress(OSError):
+            judge_path.unlink()
         emit(f"Re-judging round {round_n} failed ({exc}); its score falls back to 0.")
         return ""
     # The round's plans were already snapshotted — that is what made it a completed round
@@ -3618,8 +3889,9 @@ def _rejudge_round(
 
 def _stamp_winner(
     workdir: Path, winner_file: str, written_finals: set[Path], emit
-) -> None:
-    """Stamp the winning plan with the v2 markers — but ONLY a file this run wrote.
+) -> bool:
+    """Stamp the winning plan with the v2 markers — but ONLY a file this run wrote. Returns
+    whether the stamp was written, which the summary's Winner line reports.
 
     Read-modify-write of a file the AGENT wrote, so the decode has to round-trip: the stamp
     adds rows and must not rewrite bytes it never looked at.
@@ -3643,18 +3915,22 @@ def _stamp_winner(
             f"stamped as the winner. Any file at that path is left exactly as it was "
             f"and is not this duel's output — read the round snapshots instead."
         )
-        return
+        return False
 
     try:
+        original = winner_path.read_bytes()
         stamped = stamp_winner_plan(read_text_roundtrip(winner_path))
     except OSError as exc:
         sys.stderr.write(
             f"Warning: could not stamp the winning plan {winner_path}: {exc}. "
             f"The summary below is complete; the plan file is not marked.\n"
         )
-        return
+        return False
     try:
-        write_text_roundtrip(winner_path, stamped)
+        # A CRLF plan stays CRLF: the stamp adds rows and must not rewrite the other lines.
+        write_text_roundtrip(
+            winner_path, stamped, newline="\r\n" if b"\r\n" in original else "\n"
+        )
     # PlanDuelError beside OSError: the write REFUSES a winner path standing as a
     # symlink, and that refusal is not an OSError. Refusing is right; losing the
     # summary over a decoration is not — which is what this whole function says.
@@ -3663,6 +3939,24 @@ def _stamp_winner(
             f"Warning: could not write the stamp back to {winner_path}: {exc}. "
             f"The summary below is complete; the plan file is not marked.\n"
         )
+        return False
+    return True
+
+
+def _judge_text_or_none(path: Path) -> str | None:
+    """A judge file's text, or ``None`` when it is absent, not a regular file, or unreadable.
+
+    The summary is written after the duel is paid for, so an unreadable verdict degrades
+    exactly as a missing one does.
+    """
+    try:
+        # A regular file only: a named pipe at a judge path would hold the read open, outside
+        # any spawn's timeout.
+        if not stat.S_ISREG(os.stat(path).st_mode):
+            return None
+        return read_text_tolerant(path)
+    except OSError:
+        return None
 
 
 def write_summary(
@@ -3676,7 +3970,7 @@ def write_summary(
 ) -> Path:
     """Assemble + write ``summary.md`` and print it (the Step 3 orchestrator).
 
-    Extracts the final judge fields, resolves the winner, renames the live plans to their
+    Extracts the final judge fields, resolves the winner, copies the live plans to their
     slugged names, stamps ONLY the winner with the v2 markers, builds the score-trajectory
     table, and applies the scoped A/B → name rewrite to the differences block.
 
@@ -3693,13 +3987,12 @@ def write_summary(
     # Guard the read like every other judge read and degrade to empty fields — v1 treats a
     # missing final score as 0 and still emits summary.md.
     judge_path = workdir / f"judge-round-{rounds_run}.md"
-    judge_text = ""
-    if judge_path.is_file():
-        judge_text = read_text_tolerant(judge_path)
-    else:
-        # No file at all, so there is no number to name — score_warning yields the
+    judge_text = _judge_text_or_none(judge_path)
+    if judge_text is None:
+        # No readable file, so there is no number to name — score_warning yields the
         # unparseable form here. An out-of-range score was already warned about by the
         # round that produced it (or by the resume preload).
+        judge_text = ""
         emit(score_warning("", rounds_run))
     fields = extract_judge_fields(judge_text)
     if fields.preferred is None:
@@ -3751,7 +4044,7 @@ def write_summary(
         else:
             written_finals.add(destination)
 
-    _stamp_winner(workdir, winner_file, written_finals, emit)
+    stamped = _stamp_winner(workdir, winner_file, written_finals, emit)
 
     # Word counts are Optional: a snapshot that is absent scores `—` rather than
     # raising. See :func:`word_count_file`.
@@ -3762,10 +4055,8 @@ def write_summary(
         if n == 0:
             score: int | None = None
         else:
-            judge_n = workdir / f"judge-round-{n}.md"
-            parsed = (
-                parse_score(read_text_tolerant(judge_n)) if judge_n.is_file() else None
-            )
+            judge_n_text = _judge_text_or_none(workdir / f"judge-round-{n}.md")
+            parsed = parse_score(judge_n_text) if judge_n_text is not None else None
             score = 0 if parsed is None else parsed
         trajectory.append((n, score, a_words, b_words))
 
@@ -3785,6 +4076,7 @@ def write_summary(
             fields.differences, controller_name, participant_name
         ),
         missed_rejections=fields.missed_rejections,
+        winner_stamped=stamped,
     )
     summary_path = workdir / "summary.md"
     # ATOMIC, because this file's existence is what every later resume reads as "the
@@ -3811,6 +4103,21 @@ def _write_completion_terminator(
     )
 
 
+def _path_test(test: Callable[[Path], bool], path: Path) -> bool:
+    """``test(path)``, answering False for a name too long to be a path.
+
+    The positional argument is probed as a path before it is taken as inline text, and an
+    ordinary paragraph is longer than one path component may be. Before Python 3.13 pathlib
+    raises that ENAMETOOLONG from ``is_dir`` and ``is_file`` instead of answering False.
+    """
+    try:
+        return test(path)
+    except OSError as exc:
+        if exc.errno == errno.ENAMETOOLONG:
+            return False
+        raise
+
+
 def _resolve_problem_statement(argument: str | None) -> str:
     """Resolve the new-run problem statement (file path → contents, else inline)."""
     if not argument:
@@ -3818,8 +4125,14 @@ def _resolve_problem_statement(argument: str | None) -> str:
             "No problem statement provided. Pass inline text or a file path."
         )
     candidate = Path(argument)
-    if candidate.is_file():
-        return read_text_normalized(candidate)
+    if _path_test(Path.is_file, candidate):
+        try:
+            return read_text_normalized(candidate)
+        except UnicodeDecodeError as exc:
+            raise PlanDuelError(
+                f"{argument} is not UTF-8 text ({exc.reason} at byte {exc.start}); "
+                f"save it as UTF-8 and re-run."
+            ) from exc
     return argument
 
 
@@ -3837,11 +4150,15 @@ def _looks_like_duel_workdir(path: Path) -> bool:
     and both are on the reset's deletion list. Every name below is one the engine alone
     emits, so a legacy workdir still resumes.
     """
-    if (path / DUEL_MARKER_FILENAME).is_file():
+    # `_is_file` on all three. False here refuses the resume, which is the safe direction
+    # — but it refuses it with a message telling the operator the directory holds none of
+    # this tool's artifacts, which is a claim about the tree, not about an unresolvable
+    # name.
+    if _is_file(path / DUEL_MARKER_FILENAME):
         return True
-    if not (path / "problem.md").is_file():
+    if not _is_file(path / "problem.md"):
         return False
-    if (path / STATE_FILENAME).is_file():
+    if _is_file(path / STATE_FILENAME):
         return True
     scan = scan_snapshots(path)
     if scan.plan_a_rounds or scan.plan_b_rounds or scan.judge_rounds or scan.has_summary:
@@ -3987,7 +4304,7 @@ def execute(
     resume_dir: Path | None = None
     if argument:
         path = Path(argument)
-        if path.is_dir() and (path / "problem.md").is_file():
+        if _path_test(Path.is_dir, path) and _is_file(path / "problem.md"):
             if not _looks_like_duel_workdir(path):
                 raise PlanDuelError(
                     f"{argument} holds a problem.md but none of this tool's artifacts, so "
@@ -3999,6 +4316,12 @@ def execute(
                     f"it and re-run."
                 )
             resume_dir = path.resolve()
+        elif _path_test(Path.is_dir, path):
+            raise PlanDuelError(
+                f"{argument} is a directory with no problem.md, so it is neither a duel to "
+                f"resume nor a problem statement. Pass a duel workdir to resume one, or a "
+                f"problem file or the problem as text to start one."
+            )
 
     if resume_dir is not None:
         workdir = resume_dir
@@ -4006,7 +4329,9 @@ def execute(
         ctx.started_monotonic = time.monotonic()
         plan = compute_resume(workdir)
         if plan.complete:
-            emit(read_text_normalized(workdir / "summary.md"))
+            # Tolerant: write_text_atomic keeps a non-UTF-8 byte of the workdir path with
+            # surrogateescape, which a strict read of the same file refuses.
+            emit(read_text_tolerant(workdir / "summary.md"))
             return 0
         # Before apply_resume deletes anything: a missing CLI must not cost the user their
         # artifacts. Skipped when this resume will spawn nothing — a duel whose rounds are all
@@ -4014,7 +4339,22 @@ def execute(
         # requiring the CLIs would block recovering it. A resume PAST the cap can dispatch one
         # judge to recover the last round's verdict, and this condition still does not require
         # the CLIs for it: the re-judge degrades to v1's 0 and says so, an announced cost.
-        if plan.init_incomplete or plan.start_round <= MAX_ROUNDS:
+        saved_state = load_state(workdir)
+        if saved_state is not None and saved_state.controller_name and (
+            (saved_state.controller_name, saved_state.participant_name)
+            != (controller_name, participant_name)
+        ):
+            raise PlanDuelError(
+                f"{workdir} was started with {saved_state.controller_name} as controller and "
+                f"{saved_state.participant_name} as participant, but this resume names "
+                f"{controller_name} and {participant_name}. Plan A and Plan B belong to the "
+                f"runtimes that wrote them, so resume with the names the duel started with."
+            )
+        # Nor when the verdicts on disk already end the duel: replaying them spawns nothing.
+        if plan.init_incomplete or (
+            plan.start_round <= MAX_ROUNDS
+            and not _replay_stops_before_spawning(workdir, plan.start_round, saved_state)
+        ):
             preflight_executables(specs)
             preflight_schema(specs, schema_values)
         for name in apply_resume(plan):
@@ -4038,9 +4378,9 @@ def execute(
         preflight_executables(specs)
         preflight_schema(specs, schema_values)
         # The other way into the refusal above, and the one whose default message would
-        # be unhelpful: `--workdir <a duel>` with NO positional argument used to resume.
-        # It now cannot, so say what to type instead of "no problem statement provided".
-        if not argument and workdir_arg and (Path(workdir_arg) / "problem.md").is_file():
+        # be unhelpful: `--workdir <a duel>` with NO positional argument does not resume.
+        # Say what to type, rather than "no problem statement provided".
+        if not argument and workdir_arg and _is_file(Path(workdir_arg) / "problem.md"):
             raise PlanDuelError(
                 f"{workdir_arg} already holds a duel. To resume it, pass it as the "
                 f"positional argument rather than --workdir."
@@ -4144,7 +4484,8 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help="Wall-clock ceiling for EACH agent/judge spawn, in seconds "
         f"(default: {DEFAULT_SPAWN_TIMEOUT_SECONDS:g}). A spawn that exceeds it is "
-        "killed and halts the duel; there is no way to disable the bound.",
+        "killed and halts the duel, except a resume's judge re-run, which scores that "
+        "round 0; there is no way to disable the bound.",
     )
     return parser
 
@@ -4179,6 +4520,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     try:
         specs = parse_adapter_config(read_text_normalized(args.adapter_config))
+    except UnicodeDecodeError as exc:
+        sys.stderr.write(
+            f"plan-duel: {args.adapter_config} is not UTF-8 text ({exc.reason} at byte "
+            f"{exc.start}); save it as UTF-8 and re-run.\n"
+        )
+        return 2
     except (PlanDuelError, OSError) as exc:
         sys.stderr.write(f"plan-duel: {exc}\n")
         return 2

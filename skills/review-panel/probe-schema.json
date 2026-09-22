@@ -1,0 +1,81 @@
+{
+  "title": "review-panel capability probe result",
+  "description": "What the one capability probe returns: whether this tree can be built and whether its tests can be run, each answered by trying it, with the command that was tried and what came back. `unknown` is a real answer and the honest one where the tree names no build step or no test command — never guess `no` from silence. The probe raises no findings and judges no code: these two answers are collected so that what the run could and could not execute can be stated plainly, and a count of established findings never read as a count of validated ones.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["build", "tests", "summary"],
+  "properties": {
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["answer", "argv", "cwd", "exit_status", "output", "truncated"],
+      "description": "Whether the tree builds, by whatever building means here — compiling it, installing it, running the build its own files describe. `yes` = the command succeeded. `no` = it ran and the build failed. `unknown` = nothing in the tree names a build step, none could be attempted, or you attempted one and it settled nothing — the program was missing, the command would not finish — in which case keep the argv and the status you got. Where a tree has no build of its own, the nearest thing that shows the sources are well-formed counts, and `argv` says what that was. A `yes` here exits 0 and a `no` does not; an answer that disagrees with its own exit status is refused.",
+      "properties": {
+        "answer": {
+          "type": "string",
+          "enum": ["yes", "no", "unknown"],
+          "description": "yes, no, or unknown — and unknown whenever nothing was run."
+        },
+        "argv": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "The command as an argument vector, first element the program; the empty array where nothing was run, which only an `unknown` answer may say."
+        },
+        "cwd": {
+          "type": "string",
+          "description": "Working directory relative to the root of the disposable copy; `.` for the root, and `.` where nothing was run."
+        },
+        "exit_status": {
+          "type": ["integer", "null"],
+          "description": "The process exit status, or the launcher's where the program could not start; null only where nothing was run at all."
+        },
+        "output": {
+          "type": "string",
+          "description": "Captured stdout and stderr together, bounded to the size the brief states, the tail kept when cut; the empty string where nothing was run."
+        },
+        "truncated": {
+          "type": "boolean",
+          "description": "Whether `output` was cut to the bound."
+        }
+      }
+    },
+    "tests": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["answer", "argv", "cwd", "exit_status", "output", "truncated"],
+      "description": "Whether the tests RUN, which is not whether they pass. `yes` = a runner started and reported results, failing ones included. `no` = a runner started and could not run the suite at all. `unknown` = the tree names no test command, none could be attempted, or you attempted one and it settled nothing, in which case keep the argv and the status you got. Put how many failed in `summary`; a red suite that ran is still `yes` and exits non-zero, because the question is whether this tree can execute anything, not whether it passes.",
+      "properties": {
+        "answer": {
+          "type": "string",
+          "enum": ["yes", "no", "unknown"],
+          "description": "yes, no, or unknown — and unknown whenever nothing was run."
+        },
+        "argv": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "The command as an argument vector, first element the program; the empty array where nothing was run, which only an `unknown` answer may say."
+        },
+        "cwd": {
+          "type": "string",
+          "description": "Working directory relative to the root of the disposable copy; `.` for the root, and `.` where nothing was run."
+        },
+        "exit_status": {
+          "type": ["integer", "null"],
+          "description": "The process exit status, or the launcher's where the program could not start; null only where nothing was run at all."
+        },
+        "output": {
+          "type": "string",
+          "description": "Captured stdout and stderr together, bounded to the size the brief states, the tail kept when cut; the empty string where nothing was run."
+        },
+        "truncated": {
+          "type": "boolean",
+          "description": "Whether `output` was cut to the bound."
+        }
+      }
+    },
+    "summary": {
+      "type": "string",
+      "description": "One paragraph: what the tree says about how it is built and tested, what you ran, and what a person reading the report needs in order to know what this run could and could not execute. Say plainly where you found nothing to run."
+    }
+  }
+}

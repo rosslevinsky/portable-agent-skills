@@ -90,8 +90,8 @@ Use this exploration to inform phase granularity. Phases should be:
 Think through the full sequence before presenting anything to the user. Consider:
 
 1. **Foundation first** — schema changes, new models, interface definitions before their consumers
-2. **Tests are mandatory, not optional** — every phase that introduces new behaviour must include
-   tests for that behaviour. For API endpoints, business logic, and utilities: prefer TDD
+2. **Tests are mandatory, not optional** — every phase that introduces new behavior must include
+   tests for that behavior. For API endpoints, business logic, and utilities: prefer TDD
    (failing test written before implementation). For UI and wiring code: tests written
    alongside. No phase is complete without its tests passing.
 3. **Backend before frontend** (usually) — or at least the API contract before the UI
@@ -201,7 +201,7 @@ Before starting this phase, confirm:
 _For logic, API endpoints, and utilities: write failing tests before implementation (TDD).
 For UI and wiring: write tests alongside the code._
 
-- [ ] `<path/to/test_file>` — <what behaviour it covers>
+- [ ] `<path/to/test_file>` — <what behavior it covers>
 - [ ] <additional test file if needed>
 
 ## Verification

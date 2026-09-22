@@ -120,6 +120,92 @@ class SceneThreshold(unittest.TestCase):
             f"an in-range threshold should fall through, got: {good.stderr!r}")
 
 
+@unittest.skipIf(BASH is None or os.name == "nt",
+                 "the ffmpeg stub is a `#!/bin/sh` script, which Windows cannot run as a "
+                 "command at all")
+class TheOutputPathIsHandledAsAPathNotAsSyntax(unittest.TestCase):
+    """Three ways the output directory's own name broke the run.
+
+    Every case here needs to reach the ffmpeg calls, which the rest of this module
+    deliberately never does — so ffmpeg is stubbed on PATH. The stub records the argv it
+    was handed and whatever it could read from this script's stdin, then behaves like the
+    image2 muxer: `%04d` becomes a number and `%%` becomes one literal percent.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="ef-path-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.argv_log = self.tmp / "argv.log"
+        self.stdin_log = self.tmp / "stdin.log"
+        self.video = self.tmp / "clip.webm"
+        self.video.write_text("not really a video\n", encoding="utf-8")
+
+        bin_dir = self.tmp / "bin"
+        bin_dir.mkdir()
+        stub = bin_dir / "ffmpeg"
+        stub.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s\\n' \"$@\" >> {self.argv_log}\n"
+            f"head -c 40 >> {self.stdin_log} 2>/dev/null || true\n"
+            "last=\"\"\n"
+            "for a in \"$@\"; do last=\"$a\"; done\n"
+            "out=$(printf '%s' \"$last\" | sed 's/%04d/0001/; s/%%/%/g')\n"
+            "dir=$(dirname \"$out\")\n"
+            "[ -d \"$dir\" ] || exit 0\n"
+            "touch \"$dir/change-0001.png\" \"$dir/change-0002.png\" 2>/dev/null || true\n"
+            "exit 0\n",
+            encoding="utf-8")
+        stub.chmod(0o755)
+        self.env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+    def _run(self, outdir, cwd=None):
+        return subprocess.run(
+            [BASH, str(SCRIPT), str(self.video), str(outdir), "0.30"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=60, env=self.env, cwd=cwd, input="SENTINEL-ON-STDIN\n")
+
+    def _frames(self, outdir):
+        return sorted(Path(outdir).glob("run-*/change-*.png"))
+
+    def test_an_output_directory_whose_name_starts_with_a_dash(self):
+        """`mkdir`, `find` and ffmpeg all read a leading `-` as an option, so the run died
+        before extracting anything."""
+        # RELATIVE, so the `-` is the first character of the argument itself. An
+        # absolute path with a dashed component never reaches the bug.
+        result = self._run("-dashed", cwd=self.tmp)
+        self.assertEqual(result.returncode, 0,
+                         f"exit {result.returncode}: {result.stderr.strip()[:300]}")
+        self.assertTrue(self._frames(self.tmp / "-dashed"), "no frames were written")
+
+    def test_an_output_directory_whose_name_contains_a_percent(self):
+        """ffmpeg's image2 muxer reads `%` ANYWHERE in the output path as a format
+        specifier, not only in the basename, so `100%-done` sent frames elsewhere or
+        failed outright. `%%` is its literal percent."""
+        outdir = self.tmp / "100%-done"
+        result = self._run(outdir)
+        self.assertEqual(result.returncode, 0,
+                         f"exit {result.returncode}: {result.stderr.strip()[:300]}")
+        handed = self.argv_log.read_text(encoding="utf-8")
+        pattern = [line for line in handed.splitlines() if line.endswith(".png")]
+        self.assertTrue(pattern, "ffmpeg was never given an output pattern")
+        for line in pattern:
+            self.assertIn("100%%-done", line,
+                          "the percent in the directory name reaches ffmpeg unescaped, "
+                          "where it is a format specifier and not a character")
+        self.assertTrue(self._frames(outdir), "no frames were written")
+
+    def test_ffmpeg_cannot_eat_the_scripts_stdin(self):
+        """Called inside a `while read` loop, ffmpeg consumed the caller's remaining input
+        — and a stray `q` in it stops extraction early while the script still reports
+        success."""
+        result = self._run(self.tmp / "frames")
+        self.assertEqual(result.returncode, 0, result.stderr.strip()[:300])
+        seen = self.stdin_log.read_text(encoding="utf-8") if self.stdin_log.exists() else ""
+        self.assertEqual(seen, "",
+                         f"ffmpeg read {seen!r} from the script's stdin, which belongs to "
+                         f"whatever called it")
+
+
 class LineEndingsAreTheRepositorysDecisionNotTheClonesTests(unittest.TestCase):
     """A shell script checked out with CRLF is a shell script that does not run.
 
@@ -133,7 +219,7 @@ class LineEndingsAreTheRepositorysDecisionNotTheClonesTests(unittest.TestCase):
 
     `web-verify/SKILL.md` tells the user to run this file, and it is the only shell script the
     pack ships. Whether the CI runner happens to check out LF is not the question: a user's
-    clone is the artefact that matters, so the bytes are pinned in `.gitattributes`.
+    clone is the artifact that matters, so the bytes are pinned in `.gitattributes`.
 
     Asserted through `git check-attr`, which reads the guarantee rather than a consequence of
     it — the bytes on a Linux host are LF whatever the attributes say. Skipped without git:

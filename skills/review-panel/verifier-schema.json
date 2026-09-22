@@ -1,0 +1,169 @@
+{
+  "title": "review-panel verifier result",
+  "description": "What one verifier returns for its batch: exactly one verdict per candidate it was handed, by candidate id. A verdict is one of four statuses. `reproduced` needs evidence — the argv that ran, where, its exit status, its bounded output and which kind of run it was; a `reproduced` with none is rejected by the engine. `confirmed_by_reading` and `refuted` are the reading outcomes for a claim that cannot be run; `confirmed_by_reading` may carry the evidence of a documentary run — a search over the tree that checks the reading — and `refuted` may also carry the evidence of a reproduction that did not show the failure. `unresolved` covers a reproduction that exists but could not execute, and any claim the verifier could neither confirm nor refute; it is reported as such and never absorbed. A severity revision cannot exist without its rationale. An established verdict names the test that should be red before the fix lands, and an `unresolved` one names which of four things would settle it, so the open questions can be grouped by what would settle them rather than left in one heap. Nothing here addresses a reader, a slot or a lens: the verifier answers per candidate, and there is no rebuttal round.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "verdicts",
+    "summary"
+  ],
+  "properties": {
+    "verdicts": {
+      "type": "array",
+      "description": "One entry per candidate in the payload, in any order; every candidate exactly once.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "candidate",
+          "status",
+          "evidence",
+          "rationale",
+          "revision",
+          "test_first",
+          "unresolved_reason",
+          "needs_files"
+        ],
+        "properties": {
+          "candidate": {
+            "type": "string",
+            "description": "The candidate id as the payload gives it, e.g. `cand-007`."
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "reproduced",
+              "confirmed_by_reading",
+              "refuted",
+              "unresolved"
+            ],
+            "description": "reproduced = the proposed (or an equivalent) reproduction was run and showed the failure; confirmed_by_reading = the claim cannot be run and reading the cited lines establishes it, optionally with a documentary run that checks the reading; refuted = the claim is wrong, by a run that did not show the failure or by reading; unresolved = a reproduction that could not execute, or a claim that could be neither confirmed nor refuted. A candidate that carries a proposed reproduction is never confirmed_by_reading: run it, or report unresolved."
+          },
+          "evidence": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": false,
+            "required": [
+              "argv",
+              "cwd",
+              "exit_status",
+              "output",
+              "truncated",
+              "run_kind",
+              "shows"
+            ],
+            "description": "What was run, where, what it produced, and which kind of run it was. Required for reproduced; present for a refuted or unresolved verdict when something was run; on confirmed_by_reading permitted only with run_kind 'documentary', since a run of the code itself is a reproduction; null for any verdict where nothing ran.",
+            "properties": {
+              "argv": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "The command as an argument vector, first element the program."
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Working directory relative to the root of the disposable copy; `.` for the root."
+              },
+              "exit_status": {
+                "type": "integer",
+                "description": "The process exit status, or the launcher's when the program could not start."
+              },
+              "output": {
+                "type": "string",
+                "description": "Captured stdout and stderr, bounded to the size the brief states; the tail is kept when cut."
+              },
+              "truncated": {
+                "type": "boolean",
+                "description": "Whether `output` was cut to the bound."
+              },
+              "run_kind": {
+                "type": "string",
+                "enum": [
+                  "executed",
+                  "documentary"
+                ],
+                "description": "What this run did. `executed` = the command ran the code under review and the output is what that code did. `documentary` = the command inspected the tree without running that code — a search for a string, a listing, a checksum — and the output shows what is written rather than what happens. Both are legitimate evidence and the status is judged the same way; they are counted and labelled apart, because a report that calls a text search a reproduction promises a reader a run that never happened."
+              },
+              "shows": {
+                "type": "string",
+                "minLength": 1,
+                "description": "One sentence saying what this run establishes, in your own words -- \"Shows that no caller of getCollection exists in the reviewed set\". The command and its output do not say why you ran them, and the same broad run attached to several defects has no single reason a reader can infer. Write the reason, not a restatement of the command.",
+                "pattern": "\\S"
+              }
+            }
+          },
+          "rationale": {
+            "type": "string",
+            "description": "Why this status: for a run, what the output shows; for a reading, the lines and the mechanism; for unresolved, what was tried and what stopped it."
+          },
+          "test_first": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The test that should be RED before the fix lands and green after it: where it belongs, the input or state it constructs, and what it asserts. This is what turns an agreement between readers into something a person can check, so it is required for `reproduced` and for `confirmed_by_reading`. It is `null` for `refuted`, which has nothing to fix; for `unresolved`, give one where you already know what it would be and `null` where you do not."
+          },
+          "unresolved_reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "needs_a_run",
+              "needs_a_file_outside_the_scope",
+              "needs_a_product_decision",
+              "blocked_by_the_environment",
+              null
+            ],
+            "description": "Which of four things would settle this, required for `unresolved` and `null` for every other status. `needs_a_run` = only running something can decide it, and no run was made or could be built here. `needs_a_file_outside_the_scope` = the answer is in a caller, a configuration file or a dependency this review does not cover; name it in the rationale AND in `needs_files`. `needs_a_product_decision` = the code plainly does what it does, and whether that is wrong is the owner's call, not a reader's. `blocked_by_the_environment` = a run was attempted and the host stopped it — a missing program, a copy that could not be written, a command that would not finish. That last one is kept apart from the rest on purpose: an environment failure is not an open question about the code."
+          },
+          "revision": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": false,
+            "required": [
+              "severity",
+              "rationale"
+            ],
+            "description": "A revised severity with its reason, or null to leave the proposed severity as it stands. The report renders the revision beside the proposal; the engine never infers one.",
+            "properties": {
+              "severity": {
+                "type": "string",
+                "enum": [
+                  "blocker",
+                  "major",
+                  "minor",
+                  "nit"
+                ],
+                "description": "The same four levels the reader proposes in."
+              },
+              "rationale": {
+                "type": "string",
+                "description": "Why the proposed level is wrong and this one is right."
+              }
+            }
+          },
+          "needs_files": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The files that would settle this claim, by path, when `unresolved_reason` is `needs_a_file_outside_the_scope` — the caller, configuration file or dependency this review does not cover. Name them here as well as in the rationale: the rationale is prose and nothing can add prose up, and the report counts how many open claims each file would settle so that widening the next job's scope is a decision with a number against it. Paths are relative and are by definition outside the reviewed set, so they are not checked against the snapshot. Empty or absent for every other reason, and for every status other than `unresolved`."
+          }
+        }
+      }
+    },
+    "summary": {
+      "type": "string",
+      "description": "One paragraph on what was verified, how many were run, and anything the batch as a whole shows."
+    }
+  }
+}

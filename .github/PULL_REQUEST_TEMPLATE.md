@@ -23,4 +23,4 @@
 - [ ] `python3 scripts/validate_cross_runtime.py skills/` passes
 - [ ] `python3 scripts/validate_cross_runtime.py --test-fixtures tests` passes
 - [ ] `python3 -m unittest discover -s tests -p 'test_*.py'` passes
-- [ ] If this changes user-visible behaviour, README / CHANGELOG updated
+- [ ] If this changes user-visible behavior, README / CHANGELOG updated

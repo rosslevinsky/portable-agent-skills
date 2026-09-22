@@ -7,8 +7,11 @@ The `test_validate_*.md` fixtures beside this file exercise rules inside
 **"Runtime documents"** means every `*.md` under `skills/` except `DECISIONS.md`: a ledger
 recording *why* a rule was dropped must be free to quote the dropped rule.
 """
+import argparse
+import dataclasses
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -19,6 +22,52 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SKILLS = REPO_ROOT / "skills"
 
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
+
+
+def working_bash():
+    """A bash that can actually RUN something, or `None`.
+
+    Not `shutil.which("bash")`. Windows ships `C:\\Windows\\System32\\bash.exe` — the WSL
+    launcher — which is on `PATH` whether or not a distribution is installed. Without one it
+    exits non-zero and writes nothing, so a suite that trusted `which` ran every case against
+    a shell that never started and read the empty output as a failed assertion.
+
+    Duplicated from the other suite that needs it rather than shared, for the reason its copy
+    gives: these modules are self-contained by design, and a `tests/` package would be a
+    bigger change than the eight lines it saves.
+    """
+    for candidate in (os.environ.get("BASH"), shutil.which("bash")):
+        if not candidate:
+            continue
+        try:
+            probe = subprocess.run([candidate, "-c", "printf ok"], capture_output=True,
+                                   text=True, encoding="utf-8", errors="replace", timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if probe.returncode == 0 and probe.stdout.strip() == "ok":
+            return candidate
+    return None
+
+
+BASH = working_bash()
+
+
+def run_bash(code, **kwargs):
+    """Run a shipped shell block from a FILE, never as `bash -c <string>`.
+
+    An argv is encoded with the filesystem encoding. These blocks carry em dashes in their
+    comments, so under a non-UTF-8 locale — which CI runs deliberately, as a proxy for
+    Windows' encoding — passing one as an argument raises UnicodeEncodeError before bash is
+    even started. A file is bytes on disk and its name is ASCII, so neither has to survive
+    an encode. It is also what the blocks themselves tell a caller to do.
+    """
+    for key, value in (("capture_output", True), ("text", True), ("encoding", "utf-8"),
+                       ("errors", "replace"), ("timeout", 60)):
+        kwargs.setdefault(key, value)
+    with tempfile.TemporaryDirectory() as holder:
+        script = Path(holder) / "block.sh"
+        script.write_text(code, encoding="utf-8")
+        return subprocess.run([BASH, str(script)], **kwargs)
 import validate_cross_runtime as vcr  # noqa: E402
 
 # The skills that push on the user's behalf at a phase boundary, unattended. `commit` also
@@ -29,9 +78,15 @@ import validate_cross_runtime as vcr  # noqa: E402
 PUSHING_EXECUTORS = ("plan-run", "plan-run-v1")
 
 # A guard that derives the default branch rather than assuming `main`, plus the literal
-# fallbacks for a repository whose `origin/HEAD` is not set. This is the shape
-# `plan-run-v1/SKILL.md` already ships; naming it here is what makes "port it" checkable.
-_DEFAULT_BRANCH_DERIVATION = "symbolic-ref"
+# fallbacks for a repository the remote never answered for. All four push blocks ship the
+# same shape; naming it here is what makes "port it" checkable.
+#
+# The derivation must ASK THE REMOTE. Reading `refs/remotes/origin/HEAD` was the earlier
+# shape and it has a hole: the command that sets that ref refuses unless the matching
+# tracking ref already exists, so a clone that never fetched the default branch leaves the
+# variable empty — and a trunk named neither `main` nor `master` then clears the literal
+# fallbacks too, and the push lands on it. `ls-remote --symref` needs no tracking ref.
+_DEFAULT_BRANCH_DERIVATION = "ls-remote --symref"
 
 # The variable the block bound the CURRENT BRANCH to. Every comparison below must name it:
 # `[ "$mode" = "main" ]` tests something else entirely and guards nothing, while reading
@@ -78,7 +133,7 @@ _WRITE_VERB = re.compile(
 # likeliest to read "must not create or edit a `.gitignore`". Flagging that would leave the
 # assertion with no wording that satisfies it. Deliberately excludes "without" and a bare
 # "no": the instruction in the tree reads "if it exists **without** the entry, append", and
-# a negator that broad would suppress the very offence this looks for.
+# a negator that broad would suppress the very offense this looks for.
 _NEGATOR = re.compile(
     r"\b(?:not|never|don't|cannot|can't|rather than|instead of|avoid|refrain"
     r"|no need|nothing to)\b",
@@ -307,10 +362,13 @@ class PushGuards(unittest.TestCase):
         self.assertEqual(
             offences, [],
             "a phase-boundary push must never land on the trunk. The guard derives the "
-            "default branch (`git symbolic-ref --quiet --short refs/remotes/origin/HEAD`) "
-            "and compares the current branch to it, falling back to `main`/`master` where "
-            "`origin/HEAD` is unset — then skips the push and says so, rather than "
-            "failing:\n  " + "\n  ".join(offences))
+            "default branch from the remote's advertised HEAD (`git ls-remote --symref "
+            "origin HEAD`) and compares the current branch to it, falling back to "
+            "`main`/`master` where the remote did not answer — then skips the push and says "
+            "so, rather than failing. Reading `refs/remotes/origin/HEAD` instead is the "
+            "shape with the hole: it is unset in a clone that never fetched the default "
+            "branch, and a trunk named neither `main` nor `master` then passes every "
+            "test:\n  " + "\n  ".join(offences))
 
     def test_every_push_path_is_guarded_against_a_detached_head(self):
         offences = unguarded(guards_detached_head)
@@ -324,12 +382,13 @@ class PushGuards(unittest.TestCase):
     def test_a_push_the_tokens_surround_but_no_branch_guards(self):
         """The shape a token scan waves through: everything present, nothing conditional.
 
-        `guards_*` used to read the whole block, so a snippet could derive the default
-        branch, mention `main`, bind `HEAD` and then push unconditionally — every marker in
-        place, no guard anywhere. The predicates read the conditions *enclosing the push*.
+        A `guards_*` predicate reading the whole block passes a snippet that derives the
+        default branch, mentions `main`, binds `HEAD` and then pushes unconditionally —
+        every marker in place, no guard anywhere. These read the conditions *enclosing the
+        push*.
         """
         code = shell_code(
-            'default="$(git symbolic-ref --short refs/remotes/origin/HEAD)"\n'
+            'default="$(git ls-remote --symref origin HEAD)"\n'
             'echo main\n'
             'branch=HEAD\n'
             'git push origin HEAD\n')
@@ -339,7 +398,7 @@ class PushGuards(unittest.TestCase):
         self.assertFalse(guards_detached_head(denied, own, code))
 
     def test_a_conditional_that_does_not_test_the_branch_is_not_a_guard(self):
-        code = ('default="$(git symbolic-ref --short refs/remotes/origin/HEAD)"\n'
+        code = ('default="$(git ls-remote --symref origin HEAD)"\n'
                 'if [ -n "$default" ]; then\n  git push origin HEAD\nfi\n')
         (_, denied, own), = enclosing_conditions(code)
         self.assertFalse(guards_default_branch(denied, own, code))
@@ -348,8 +407,7 @@ class PushGuards(unittest.TestCase):
         """The predicates must accept the fix, or phase 2 has nothing it can write."""
         code = shell_code(
             'branch="$(git rev-parse --abbrev-ref HEAD)"\n'
-            'default="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD '
-            "2>/dev/null | sed 's#^origin/##')\"\n"
+            'default="$(git ls-remote --symref origin HEAD 2>/dev/null)"\n'
             'if [ "$branch" = "HEAD" ]; then\n'
             '  echo "Detached HEAD — committed but NOT pushing."\n'
             'elif [ "$branch" = "${default:-main}" ] || [ "$branch" = "master" ]; then\n'
@@ -371,7 +429,7 @@ class PushGuards(unittest.TestCase):
         would call it guarded — the single worst answer this file can give.
         """
         code = ('branch="$(git rev-parse --abbrev-ref HEAD)"\n'
-                'default="$(git symbolic-ref --short refs/remotes/origin/HEAD)"\n'
+                'default="$(git ls-remote --symref origin HEAD)"\n'
                 'if [ "$branch" = "HEAD" ] || [ "$branch" = "main" ]; then :; fi\n'
                 'git push origin HEAD\n')
         (_, denied, own), = enclosing_conditions(code)
@@ -382,7 +440,7 @@ class PushGuards(unittest.TestCase):
     def test_a_push_on_the_same_line_as_then_is_still_seen_as_guarded(self):
         """The inequality governing the push directly — the other correct shape."""
         code = ('branch="$(git rev-parse --abbrev-ref HEAD)"\n'
-                'default="$(git symbolic-ref --short refs/remotes/origin/HEAD)"\n'
+                'default="$(git ls-remote --symref origin HEAD)"\n'
                 'if [ "$branch" != "main" ]; then git push origin HEAD; fi\n')
         (_, denied, own), = enclosing_conditions(code)
         self.assertTrue(guards_default_branch(denied, own, code))
@@ -390,7 +448,7 @@ class PushGuards(unittest.TestCase):
     def test_a_comparison_against_something_other_than_the_branch_is_not_a_guard(self):
         """`[ "$mode" = "main" ]` reads like a guard and tests nothing about the branch."""
         code = ('branch="$(git rev-parse --abbrev-ref HEAD)"\n'
-                'default="$(git symbolic-ref --short refs/remotes/origin/HEAD)"\n'
+                'default="$(git ls-remote --symref origin HEAD)"\n'
                 'if [ "$mode" = "main" ]; then :; else git push origin HEAD; fi\n')
         (_, denied, own), = enclosing_conditions(code)
         self.assertFalse(guards_default_branch(denied, own, code))
@@ -399,12 +457,12 @@ class PushGuards(unittest.TestCase):
         """What satisfies these assertions, written down so a future author can satisfy it.
 
         A `case`/`esac` guard, a guard inside a shell function, and a condition wrapped across
-        lines are **not** recognised — a recorded limitation: each errs toward reporting a
+        lines are **not** recognized — a recorded limitation: each errs toward reporting a
         push as *unguarded*, so the failure mode is a red suite over correct prose, never a
         green suite over a push to the trunk.
         """
         derive = ('branch="$(git rev-parse --abbrev-ref HEAD)"\n'
-                  'default="$(git symbolic-ref --short refs/remotes/origin/HEAD)"\n')
+                  'default="$(git ls-remote --symref origin HEAD)"\n')
         for shape, code in (
             ("equality denied by an earlier branch",
              derive + 'if [ "$branch" = "main" ]; then :; else git push origin HEAD; fi\n'),
@@ -426,7 +484,7 @@ class PushGuards(unittest.TestCase):
                                 (' = "HEAD"', guards_detached_head)):
             with self.subTest(cmp_=cmp_):
                 code = ('branch="$(git rev-parse --abbrev-ref HEAD)"\n'
-                        'default="$(git symbolic-ref --short refs/remotes/origin/HEAD)"\n'
+                        'default="$(git ls-remote --symref origin HEAD)"\n'
                         f'if [ "$branch"{cmp_} ]; then git push origin HEAD; fi\n')
                 (_, denied, own), = enclosing_conditions(code)
                 self.assertFalse(predicate(denied, own, code))
@@ -444,6 +502,189 @@ class PushGuards(unittest.TestCase):
     def test_a_tilde_fence_is_scanned_too(self):
         (_, body), = fenced_blocks("~~~bash\ngit push origin HEAD\n~~~\n")
         self.assertEqual(len(enclosing_conditions(body)), 1)
+
+
+def commit_push_blocks(skill: str) -> list[tuple[str, str]]:
+    """`(where, block)` for every fenced block in `skill` that commits and then pushes."""
+    blocks: dict[str, str] = {}
+    for doc, line, _denied, _own, code in push_sites(skill):
+        if "git commit" in code:
+            blocks.setdefault(code, f"{_rel(doc)}:{line}")
+    return [(where, code) for code, where in blocks.items()]
+
+
+@unittest.skipIf(os.name == "nt" or not (BASH and shutil.which("git")),
+                 "runs the shipped sh blocks under bash; native Windows runs their decisions "
+                 "in its own shell, as the adapter notes say")
+class CommitAndPushBlocksRun(unittest.TestCase):
+    """Each commit-and-push block, run in a throwaway repository with a bare `origin`.
+
+    `PushGuards` reads what a block tests. Only running it shows what a rejected commit or an
+    unset `origin/HEAD` does to the push decision.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        # No inherited config, hooks path, signing or repository location: the blocks answer
+        # from the repository this test builds and nothing else.
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        self.env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+                        GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+                        GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+        self.blocks = [b for skill in PUSHING_EXECUTORS for b in commit_push_blocks(skill)]
+        self.assertTrue(self.blocks, "no commit-and-push block found — discovery broke")
+
+    def git(self, cwd: Path, *args: str) -> str:
+        return subprocess.run(["git", *args], cwd=cwd, env=self.env, check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    def published(self, name: str, default: str, branch: str) -> tuple[Path, Path]:
+        """A repository on `branch`, pushed, with a change staged. `origin` is a bare
+        repository whose HEAD names `default`, joined by `git remote add`, which creates no
+        local `origin/HEAD`."""
+        remote, work = self.tmp / f"{name}.git", self.tmp / name
+        self.git(self.tmp, "init", "-q", "--bare", str(remote))
+        self.git(remote, "symbolic-ref", "HEAD", f"refs/heads/{default}")
+        self.git(self.tmp, "init", "-q", str(work))
+        self.git(work, "checkout", "-q", "-b", default)
+        (work / "a.txt").write_text("a\n", encoding="utf-8")
+        self.git(work, "add", "a.txt")
+        self.git(work, "commit", "-q", "-m", "a")
+        self.git(work, "remote", "add", "origin", str(remote))
+        self.git(work, "push", "-q", "origin", default)
+        if branch != default:
+            self.git(work, "checkout", "-q", "-b", branch)
+            self.git(work, "push", "-q", "origin", branch)
+        (work / "b.txt").write_text("b\n", encoding="utf-8")
+        self.git(work, "add", "b.txt")
+        return work, remote
+
+    def run_block(self, block: str, cwd: Path) -> subprocess.CompletedProcess:
+        return run_bash(block, cwd=cwd, env=self.env,
+                              capture_output=True, text=True, timeout=120)
+
+    def test_a_commit_a_hook_rejects_ends_the_block_in_failure(self):
+        """With the tip already published nothing after the commit fails on its own, so the
+        commit must: a block that exits 0 there sends the runner on to tick uncommitted work."""
+        for i, (where, block) in enumerate(self.blocks):
+            with self.subTest(block=where):
+                work, _remote = self.published(f"hook{i}", "main", "feature")
+                hook = work / ".git" / "hooks" / "pre-commit"
+                hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+                hook.chmod(0o755)
+                proc = self.run_block(block, work)
+                self.assertNotEqual(
+                    proc.returncode, 0,
+                    f"a rejected commit ended the block with exit 0:\n{proc.stdout}{proc.stderr}")
+
+    def test_a_default_branch_with_no_local_origin_head_is_not_pushed(self):
+        """A default named anything but `main` or `master` must be learned from the remote
+        when `origin/HEAD` was never set, or every phase is pushed straight to it."""
+        for i, (where, block) in enumerate(self.blocks):
+            with self.subTest(block=where):
+                work, remote = self.published(f"trunk{i}", "trunk", "trunk")
+                before = self.git(remote, "rev-parse", "refs/heads/trunk")
+                proc = self.run_block(block, work)
+                self.assertEqual(
+                    self.git(remote, "rev-parse", "refs/heads/trunk"), before,
+                    f"the block pushed to the default branch:\n{proc.stdout}{proc.stderr}")
+
+    def test_a_custom_default_is_still_guarded_when_the_remote_cannot_be_answered(self):
+        """Why the LOCAL ref is asked first.
+
+        `refs/remotes/origin/HEAD` needs no network and is right in any ordinary clone.
+        Asking the remote before it made an unreachable network the reason the guard stopped
+        working: the lookup came back empty, `main` and `master` both missed a trunk called
+        `trunk`, and the phase published straight to it — a far commoner way to lose than the
+        unfetched-clone case that ordering was meant to fix.
+        """
+        for i, (where, block) in enumerate(self.blocks):
+            with self.subTest(block=where):
+                work, _remote = self.published(f"offline{i}", "trunk", "trunk")
+                # What an ordinary clone carries, and then a remote nothing can reach.
+                self.git(work, "remote", "set-head", "origin", "trunk")
+                self.git(work, "remote", "set-url", "origin", str(self.tmp / "gone.git"))
+                proc = self.run_block(block, work)
+                self.assertIn(
+                    "NOT pushing", proc.stdout,
+                    f"the guard did not fire with the remote unreachable:\n"
+                    f"{proc.stdout}{proc.stderr}")
+
+    def test_a_default_that_moved_is_guarded_though_the_clone_still_names_the_old_one(self):
+        """Why the REMOTE is asked and the local ref only answers when it cannot.
+
+        `refs/remotes/origin/HEAD` is as true as the last fetch and no truer. Read first, a
+        default that has moved leaves the clone naming the old one, the new trunk matches
+        neither it nor the literals, and the phase publishes straight to the branch the guard
+        exists to protect. Asking only the remote fails the other way, which
+        `test_a_custom_default_is_still_guarded_when_the_remote_cannot_be_answered` pins.
+        """
+        for i, (where, block) in enumerate(self.blocks):
+            with self.subTest(block=where):
+                work, remote = self.published(f"moved{i}", "main", "trunk")
+                # The remote's default moves to `trunk`; the clone goes on naming `main`.
+                self.git(remote, "symbolic-ref", "HEAD", "refs/heads/trunk")
+                self.git(work, "remote", "set-head", "origin", "main")
+                self.assertEqual(
+                    self.git(work, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"),
+                    "origin/main", "the fixture did not leave a stale local default")
+                before = self.git(remote, "rev-parse", "refs/heads/trunk")
+                proc = self.run_block(block, work)
+                self.assertEqual(
+                    self.git(remote, "rev-parse", "refs/heads/trunk"), before,
+                    f"pushed to the branch that is now the default:\n{proc.stdout}{proc.stderr}")
+                self.assertIn("NOT pushing", proc.stdout,
+                              f"the remote is unchanged, but not because the guard fired:\n"
+                              f"{proc.stdout}{proc.stderr}")
+
+    def test_a_default_branch_is_not_pushed_with_no_remote_tracking_refs_at_all(self):
+        """The case the test above CANNOT reach, and the reason it could not.
+
+        Pushing a branch creates its remote-tracking ref. So `origin/trunk` exists up there,
+        and `git remote set-head origin -a` — which refuses with "Not a valid ref" unless
+        that ref is already present — succeeded, set `origin/HEAD`, and the guard worked.
+        Every derivation that reads `refs/remotes/origin/HEAD` passes that test while being
+        blind here.
+
+        With the tracking refs gone, such a derivation yields nothing, `${default:-main}`
+        collapses to `main`, and neither literal fallback matches a trunk called `trunk`:
+        the push lands on the default branch. Asking the remote for its advertised HEAD
+        needs no tracking ref and answers `trunk` either way."""
+        for i, (where, block) in enumerate(self.blocks):
+            with self.subTest(block=where):
+                work, remote = self.published(f"notrack{i}", "trunk", "trunk")
+                for ref in self.git(work, "for-each-ref", "--format=%(refname)",
+                                    "refs/remotes").splitlines():
+                    self.git(work, "update-ref", "-d", ref.strip())
+                self.assertEqual(
+                    self.git(work, "for-each-ref", "--format=%(refname)", "refs/remotes"), "",
+                    "the setup left a remote-tracking ref, so this reaches no further than the "
+                    "test above")
+                before = self.git(remote, "rev-parse", "refs/heads/trunk")
+                proc = self.run_block(block, work)
+                self.assertEqual(
+                    self.git(remote, "rev-parse", "refs/heads/trunk"), before,
+                    f"the block pushed to the default branch:\n{proc.stdout}{proc.stderr}")
+                # Not just "did not push": a block that failed for some unrelated reason
+                # would also leave the remote untouched and would pass on that alone.
+                self.assertIn(
+                    "NOT pushing", proc.stdout,
+                    f"the remote is unchanged, but not because the guard fired:\n"
+                    f"{proc.stdout}{proc.stderr}")
+
+
+class TheRestageAfterAGateNamesTheFile(unittest.TestCase):
+    """Finalization unstages the paths the run does not own. Re-staging a gated file with a
+    sweep puts them back, and the commit that follows carries and pushes them."""
+
+    def test_no_executor_sweeps_the_index_again_after_unstaging(self):
+        for skill in PUSHING_EXECUTORS:
+            with self.subTest(skill=skill):
+                text = " ".join((SKILLS / skill / "SKILL.md").read_text(encoding="utf-8").split())
+                self.assertFalse("`git add -A` again" in text,
+                                 "re-stage the file the gate changed by name, not with a sweep")
 
 
 def commit_push_step() -> str:
@@ -692,10 +933,10 @@ class UntrackedNoiseIsSubtractedButOnlyWhenGitCanSaySo(unittest.TestCase):
     def test_a_tracked_file_under_a_tooling_directory_is_still_scanned(self):
         """Both halves of the subtraction, in a repository this test builds.
 
-        It used to read this repository and name `.claude/settings.json`, which is a fact
-        about one checkout rather than about the code: a repository without that directory
-        fails the assertion on its first run for a reason unrelated to the behaviour under
-        test. A fixture states the behaviour where the behaviour lives.
+        Reading this repository and naming `.claude/settings.json` would assert a fact about
+        one checkout rather than about the code: a repository without that directory fails on
+        its first run for a reason unrelated to the behavior under test. A fixture states the
+        behavior where the behavior lives.
         """
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -866,7 +1107,8 @@ class PrivacyGuardCoversTheWholeRepository(unittest.TestCase):
 
     CANARY = "/home/someone/secret"  # hygiene-exempt: the canary itself
 
-    # Files the old sweep did not reach. Each is a real shipped path, not a fixture.
+    # Files a sweep scoped to `skills/` does not reach. Each is a real shipped path, not a
+    # fixture.
     BLIND_SPOTS = (
         # `install.sh` and `install.ps1` were the original two entries and the reason this
         # canary exists — 47 KB of path-handling shell where a real home path is likeliest
@@ -917,7 +1159,7 @@ class PrivacyGuardCoversTheWholeRepository(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertTrue(
                     any(p.search(path) for p in self.vcr.PRIVATE_PATH_PATTERNS),
-                    f"{path} is a home directory and was not recognised as one")
+                    f"{path} is a home directory and was not recognized as one")
         for path in ("/usr/share/x", "/Userspace/lib", "/homebrew/bin"):
             with self.subTest(path=path):
                 self.assertFalse(
@@ -931,7 +1173,7 @@ class PrivacyGuardCoversTheWholeRepository(unittest.TestCase):
         """git stores the target string, so a dangling link still publishes its path.
 
         POSIX-only, and skipped rather than weakened: on Windows `rglob` does not reliably
-        enumerate a dangling link, so the test failed there while the behaviour it checks is
+        enumerate a dangling link, so the test failed there while the behavior it checks is
         about what a POSIX author committed.
         """
         import tempfile
@@ -1484,6 +1726,1068 @@ class TheContractAndTheCodeNameEachOther(unittest.TestCase):
             ["Parallel", "Shell Assumptions", "Verifying a skill pack"],
             "the set of sections with no lexical rule changed — if that is deliberate, "
             "update this list in the same change so the next reader sees the two together")
+
+
+class TheUnbornRepoUnstageActuallyUnstages(unittest.TestCase):
+    """The one command this skill offers for a staged secret in a repository with no commits.
+
+    `git rm --cached` refuses the moment the file was edited after being staged — which is
+    exactly the shape a secret caught mid-edit has — so the advice failed in the single case
+    it exists for, and the first commit is where a stray `.env` is likeliest to be sitting.
+    """
+
+    # Matched across a line break: prose gets rewrapped, and an anchor that breaks on
+    # rewrapping sends both tests below to read the end of the file instead.
+    MARKER = re.compile(r"Use the form that\s+needs no history:")
+
+    def _shipped_command(self):
+        text = (SKILLS / "commit" / "SKILL.md").read_text(encoding="utf-8")
+        parts = self.MARKER.split(text, 1)
+        self.assertEqual(len(parts), 2, "the unborn-repo paragraph moved; update this test")
+        blocks = fenced_blocks(parts[1])
+        self.assertTrue(blocks, "no code block follows that sentence")
+        return shell_code(blocks[0][1]).strip()
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_it_unstages_a_secret_edited_after_staging_and_keeps_the_file(self):
+        command = self._shipped_command().replace("<path>", ".env")
+        self.assertTrue(command.startswith("git "), command)
+        with tempfile.TemporaryDirectory() as d:
+            def git(*args):
+                return subprocess.run(("git",) + args, cwd=d,
+                                      capture_output=True, text=True)
+            git("init", "-q", ".")
+            git("config", "user.email", "t@example.com")
+            git("config", "user.name", "t")
+            secret = Path(d) / ".env"
+            secret.write_text("SECRET=1\n", encoding="utf-8")
+            git("add", ".env")
+            secret.write_text("SECRET=2\n", encoding="utf-8")  # edited AFTER staging
+            done = subprocess.run(command.split(), cwd=d, capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0,
+                             f"the shipped command {command!r} failed: "
+                             f"{done.stderr.strip()}")
+            self.assertEqual(git("diff", "--cached", "--name-only").stdout.strip(), "",
+                             "the secret is still staged for the first commit")
+            self.assertTrue(secret.exists(), "the working-tree copy was removed with it")
+
+    def test_the_two_failures_are_named_separately(self):
+        """One error was quoted for both commands, and they do not fail alike: `restore
+        --staged` cannot resolve HEAD, while `reset HEAD <path>` calls HEAD an ambiguous
+        argument. A reader given the wrong message looks for the wrong problem."""
+        text = (SKILLS / "commit" / "SKILL.md").read_text(encoding="utf-8")
+        # Whitespace-normalized: every phrase below is one a rewrap can split across
+        # lines, and an assertion that breaks on rewrapping reports the wrong thing.
+        paragraph = " ".join(self.MARKER.split(text, 1)[0][-1200:].split())
+        self.assertIn("could not resolve HEAD", paragraph)
+        self.assertIn("ambiguous argument", paragraph,
+                      "`git reset HEAD <path>` fails with its own message, not that one")
+
+
+PWSH = (os.environ.get("PWSH") or shutil.which("pwsh")
+        or shutil.which("powershell"))
+
+
+class TheRunDirectoryIsOutsideTheAuditedTree(unittest.TestCase):
+    """This skill's central promise is that it never writes into the code it is reading.
+
+    Both safety checks compared how a path is SPELLED. A symlink, a bind mount or a `..`
+    segment can spell a path outside the tree and resolve inside it, and the whole report
+    then lands in the user's source.
+    """
+
+    DOC = SKILLS / "security-review-codebase" / "references" / "hierarchical-mode.md"
+
+    def _block(self, marker):
+        found = [body for _line, body in fenced_blocks(self.DOC.read_text(encoding="utf-8"))
+                 if marker in body]
+        self.assertEqual(len(found), 1, f"expected exactly one block containing {marker!r}")
+        return found[0]
+
+    @unittest.skipUnless(BASH and shutil.which("git") and os.name == "posix",
+                         "the POSIX half of the document, and its link needs privileges "
+                         "on Windows")
+    def test_a_temp_directory_that_resolves_inside_the_tree_is_refused(self):
+        block = self._block("security-review-$(basename")
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            (repo / "scratch").mkdir(parents=True)
+            for args in (("init", "-q", "."), ("config", "user.email", "t@example.com"),
+                         ("config", "user.name", "t")):
+                subprocess.run(("git",) + args, cwd=repo, capture_output=True, text=True)
+            # Spelled outside the repository, resolving inside it.
+            link = Path(d) / "link"
+            link.symlink_to(repo / "scratch", target_is_directory=True)
+
+            env = dict(os.environ, TMPDIR=str(link))
+            done = run_bash(block, cwd=repo, env=env,
+                                  capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            run = Path(done.stdout.strip().splitlines()[-1])
+            self.addCleanup(shutil.rmtree, str(run), True)
+            inside = str(run.resolve()).startswith(str(repo.resolve()) + os.sep)
+            self.assertFalse(inside,
+                             f"the run directory {run} resolves inside the audited tree at "
+                             f"{repo} — the report would be written into the code under review")
+
+    @unittest.skipUnless(BASH and shutil.which("git") and os.name == "posix",
+                         "the POSIX half of the document")
+    def test_a_safe_temp_directory_is_still_used_as_given(self):
+        """The other half of resolving: a base that leads outside must be kept. A guard, not
+        a reproduction — it passes before the fix too. Without it, a resolve that failed
+        silently would send every run to /tmp and cost the project name with it."""
+        block = self._block("security-review-$(basename")
+        with tempfile.TemporaryDirectory() as d:
+            repo, safe = Path(d) / "repo", Path(d) / "safe"
+            repo.mkdir()
+            safe.mkdir()
+            for args in (("init", "-q", "."), ("config", "user.email", "t@example.com"),
+                         ("config", "user.name", "t")):
+                subprocess.run(("git",) + args, cwd=repo, capture_output=True, text=True)
+            done = run_bash(block, cwd=repo,
+                                  env=dict(os.environ, TMPDIR=str(safe)),
+                                  capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            run = Path(done.stdout.strip().splitlines()[-1])
+            self.addCleanup(shutil.rmtree, str(run), True)
+            self.assertTrue(run.is_dir(), "the run directory was not created")
+            self.assertEqual(run.parent.resolve(), safe.resolve(),
+                             "a safe TMPDIR was discarded, so every run lands in /tmp")
+            self.assertIn("security-review-repo-", run.name, "the project name was lost")
+
+    def test_the_windows_check_resolves_both_paths_before_comparing(self):
+        """Asserted on the source, because the block cannot run here: its own
+        fully-qualified test demands a drive letter or a UNC path, so every POSIX path is
+        refused before the containment check is ever reached."""
+        block = self._block("Test-SafeBase")
+        self.assertIn("function Resolve-Physical", block,
+                      "nothing resolves a junction or a `..` segment before the compare")
+        safe = block.split("function Test-SafeBase", 1)[1].split("\n   }", 1)[0]
+        for side in ("$candidate", "$repoRoot"):
+            self.assertIn(f"Resolve-Physical {side}", safe,
+                          f"{side} is still compared as spelled")
+
+    @unittest.skipUnless(PWSH, "no PowerShell on this host")
+    def test_the_windows_block_parses(self):
+        """Nothing in this repository has ever parsed that block. A typo in it fails on a
+        user's Windows machine, which is the one place it runs."""
+        block = self._block("Test-SafeBase")
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "block.ps1"
+            src.write_text(block, encoding="utf-8")
+            check = (
+                "$errs = $null\n"
+                "[void][System.Management.Automation.Language.Parser]::ParseFile("
+                f"'{src}', [ref]$null, [ref]$errs)\n"
+                "if ($errs.Count) {{ $errs | ForEach-Object {{ $_.ToString() }}; exit 1 }}\n"
+            ).replace("{{", "{").replace("}}", "}")
+            done = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", check],
+                                  capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
+
+class TheBoundedPollReportsWhatItActuallySaw(unittest.TestCase):
+    """The poll's own exit status is what a caller reads.
+
+    It exited 0 whether the marker arrived or the clock ran out, while the paragraph beside
+    it says a non-zero exit means the poll timed out — so a caller learned "finished" from
+    a run that never finished. And the block is Bash throughout, on a step whose text
+    claims any host.
+    """
+
+    FILES = ("plan-run", "plan-run-v1")
+
+    def _detach_block(self, skill):
+        doc = (SKILLS / skill / "SKILL.md").read_text(encoding="utf-8")
+        blocks = [body for _line, body in fenced_blocks(doc) if "WORK-EXIT rc=%s" in body]
+        self.assertEqual(len(blocks), 1, f"{skill}: expected exactly one detach block")
+        return blocks[0]
+
+    def _run_poll(self, skill, log_text):
+        block = self._detach_block(skill)
+        start = block.index("for i in $(seq")
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "work.log"
+            log.write_text(log_text, encoding="utf-8")
+            # Two substitutions only: the literal path this skill documents, and the loop's
+            # timing. The predicate and the exit behavior under test are shipped as-is.
+            code = (block[start:].replace("/abs/path/work.log",
+                                          str(log).replace("\\", "/"))
+                                 .replace("$(seq 1 240)", "$(seq 1 1)")
+                                 .replace("sleep 15", "sleep 0"))
+            return run_bash(code, capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace", timeout=60)
+
+    @unittest.skipUnless(BASH, "needs bash")
+    def test_a_marker_that_arrived_is_success(self):
+        for skill in self.FILES:
+            with self.subTest(skill=skill):
+                done = self._run_poll(skill, "some output\nWORK-EXIT rc=0\n")
+                self.assertEqual(done.returncode, 0,
+                                 f"{skill}: a finished run was reported as a failure: "
+                                 f"{done.stderr.strip()[:200]}")
+
+    @unittest.skipUnless(BASH, "needs bash")
+    def test_a_marker_that_never_arrived_is_not_success(self):
+        for skill in self.FILES:
+            with self.subTest(skill=skill):
+                done = self._run_poll(skill, "output, and no marker at all\n")
+                self.assertNotEqual(done.returncode, 0,
+                                    f"{skill}: the poll ran out of time and still exited 0, "
+                                    f"so an unfinished run reads as a finished one")
+
+    def test_the_detach_block_says_what_a_native_windows_shell_should_do(self):
+        """`setsid`, `nohup`, `&` and `seq` exist in no native-Windows shell. Naming the
+        primitives for each decision is this family's own idiom — the decisions are the
+        contract, not the spelling — and it beats shipping a second implementation that
+        nothing here tests."""
+        for skill in self.FILES:
+            with self.subTest(skill=skill):
+                doc = " ".join((SKILLS / skill / "SKILL.md")
+                               .read_text(encoding="utf-8").split())
+                for primitive, decision in (("Start-Process", "detaching the work"),
+                                            ("LASTEXITCODE", "carrying the exit status"),
+                                            ("Select-String", "polling for the marker")):
+                    if primitive not in doc:
+                        self.fail(f"{skill}: no native-Windows answer for {decision} — "
+                                  f"{primitive} appears nowhere in the skill")
+
+
+class TheResumeExemptionIsAFileSetNotADirectory(unittest.TestCase):
+    """What a resumed run treats as "expected metadata" decides whether it re-verifies.
+
+    Expressed as anything under `plans/<slug>/`, it assumes the plan lives under `plans/`.
+    Step 1 finds a plan anywhere — the repository root, or `docs/` — and the prefix then
+    exempts the whole tree: work a crash left dirty reads as bookkeeping, the resume skips
+    re-verification and the gate, and branch 3 ends at a `git add -A` that commits it.
+    """
+
+    def _select(self):
+        doc = (SKILLS / "plan-run" / "SKILL.md").read_text(encoding="utf-8")
+        start = doc.index("### Select")
+        return " ".join(doc[start:doc.index("### Satisfy", start)].split())
+
+    def test_the_exemption_is_not_written_as_a_directory_prefix(self):
+        select = self._select()
+        if "plans/<slug>/" in select:
+            self.fail("Select still decides on a `plans/<slug>/` prefix, which exempts the "
+                      "whole repository for a plan that sits at its root")
+
+    def test_the_exemption_names_the_documents_it_means(self):
+        """Anchored on the phrase, not on a paragraph. Searching the whole step passes
+        vacuously — Select's opening names these files for an unrelated reason — and
+        searching one paragraph misses a definition that is deliberately stated up front,
+        before the branches that use it."""
+        select = self._select()
+        phrase = "the plan's own documents"
+        if phrase not in select:
+            self.fail("Select names no exemption at all, so each branch is back to "
+                      "deciding on a directory")
+        definition = select[select.index(phrase):][:400]
+        for name in ("execution.md", "as-built.md"):
+            if name not in definition:
+                self.fail(f"the exemption is never defined in terms of {name}, so what "
+                          f"counts as bookkeeping is left to the reader to guess")
+
+    def test_a_metadata_only_phase_is_not_said_to_commit_nothing(self):
+        """Publish stages the whole tree, so that phase's commit carries its ticks and its
+        evidence record. Saying it commits nothing contradicts the step that runs next."""
+        select = self._select()
+        if "commits nothing at all" in select:
+            self.fail("Select says a metadata-only phase commits nothing, while Publish's "
+                      "`git add -A` commits its ticked boxes and evidence record")
+
+
+class ThePushAsksTheRemoteNotItsLocalCopy(unittest.TestCase):
+    """`origin/<branch>` is only as fresh as the last fetch.
+
+    A branch deleted or rewound elsewhere leaves that ref still matching HEAD, so the guard
+    decides the work is already published, skips the push, and the phase is ticked with
+    nothing on the remote. Every one of the four push sites asked the local copy.
+    """
+
+    def _guards(self):
+        for skill in ("plan-run", "plan-run-v1"):
+            doc = (SKILLS / skill / "SKILL.md").read_text(encoding="utf-8")
+            for line, body in fenced_blocks(doc):
+                if "git push origin HEAD" not in body:
+                    continue
+                start = re.search(r"^\s*(BRANCH|branch)=", body, re.M)
+                self.assertIsNotNone(start, f"{skill}:{line}: no branch lookup in the block")
+                yield skill, line, body[start.start():]
+
+    def test_the_four_push_sites_are_found(self):
+        """Anti-vacuity: the case below proves nothing if it iterates over nothing."""
+        found = [(skill, line) for skill, line, _guard in self._guards()]
+        self.assertEqual(len(found), 4, f"expected four push sites, found {found}")
+
+    @unittest.skipUnless(shutil.which("git") and BASH, "needs git and bash")
+    def test_a_remote_branch_deleted_elsewhere_is_pushed_again(self):
+        for skill, line, guard in self._guards():
+            with self.subTest(skill=skill, line=line), tempfile.TemporaryDirectory() as d:
+                bare, work = Path(d) / "origin.git", Path(d) / "work"
+                subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True,
+                               capture_output=True)
+                subprocess.run(["git", "clone", "-q", str(bare), str(work)], check=True,
+                               capture_output=True)
+
+                def git(*args):
+                    return subprocess.run(("git",) + args, cwd=work, capture_output=True,
+                                          text=True, encoding="utf-8", errors="replace")
+
+                git("config", "user.email", "t@example.com")
+                git("config", "user.name", "t")
+                git("checkout", "-q", "-b", "feature")
+                (work / "f.txt").write_text("one\n", encoding="utf-8")
+                git("add", "f.txt")
+                git("commit", "-qm", "one")
+                git("push", "-q", "origin", "HEAD")
+                # A DECOY. `ls-remote`'s patterns match from the right on path components,
+                # so a bare `feature` also matches `archive/feature` — and a guard that
+                # accepts that hit skips publishing the branch it was asked about.
+                git("push", "-q", "origin", "HEAD:refs/heads/archive/feature")
+                # And one that survives asking for the exact ref, since the pattern still
+                # matches from the right: `refs/heads/feature` matches this too.
+                git("push", "-q", "origin",
+                    "HEAD:refs/heads/archive/refs/heads/feature")
+                # Deleted straight in the remote, so this clone's `origin/feature` stays
+                # behind — exactly what a branch rewound or deleted by someone else leaves.
+                subprocess.run(["git", "-C", str(bare), "update-ref", "-d",
+                                "refs/heads/feature"], check=True, capture_output=True)
+                def remote_tip(ref):
+                    """What the guard asks: the hash of the ref whose NAME matches exactly.
+
+                    `ls-remote`'s patterns match from the right, so both decoys above answer
+                    a pattern query. A precondition asked loosely is answered by a branch
+                    nobody enquired about, and this case then proves nothing.
+                    """
+                    out = git("ls-remote", "--heads", "origin", ref).stdout
+                    return "".join(line.split("\t")[0] for line in out.splitlines()
+                                   if line.split("\t")[1:] == [ref])
+
+                self.assertEqual(remote_tip("refs/heads/feature"), "",
+                                 "the remote branch was not actually removed")
+
+                done = run_bash(guard, cwd=work, capture_output=True,
+                                      text=True, encoding="utf-8", errors="replace",
+                                      timeout=60)
+                restored = remote_tip("refs/heads/feature")
+                self.assertTrue(
+                    restored,
+                    f"{skill}:{line}: the push was skipped because the LOCAL copy of the "
+                    f"remote ref still matched HEAD, so the commit stayed unpublished while "
+                    f"the phase ticks anyway. Block said: "
+                    f"{(done.stdout + done.stderr).strip()[:160]!r}")
+
+
+class TheV1WindowsNoteAndResumeAreComplete(unittest.TestCase):
+    """Two places in the superseded suite where a partial statement changes what happens.
+
+    Its commit-and-push block carries four decisions. The adapter note for a native-Windows
+    shell — the one place a reader is told to reimplement the block — listed two, and the two
+    it left out are the guards that stop every phase being pushed to the default branch.
+
+    And its resume reads "Tasks and Tests ticked, Exit Criteria not" as ungated work. The
+    bookkeeping step ticks those criteria ONE AT A TIME, so a crash inside it leaves some
+    ticked: that reads as ungated, re-runs the gate, and lands the bookkeeping-only commit
+    the third branch exists to avoid.
+    """
+
+    def _doc(self):
+        return " ".join((SKILLS / "plan-run-v1" / "SKILL.md")
+                        .read_text(encoding="utf-8").split())
+
+    def _windows_note(self):
+        """Anchored on wording unique to the commit-and-push note. Two adapter notes in this
+        file now open with the same sentence, and the first one is the detached-work block's."""
+        doc = self._doc()
+        start = doc.index("carry out the same decisions with your shell's own syntax")
+        return doc[start:start + 600]
+
+    def test_the_windows_note_names_all_four_decisions(self):
+        note = self._windows_note()
+        for phrase, decision in (("staged", "committing only when something is staged"),
+                                 ("already published", "skipping an already-published tip"),
+                                 ("detached", "refusing to push a detached HEAD"),
+                                 ("default branch", "refusing to push the default branch")):
+            if phrase not in note:
+                self.fail(f"the note omits {decision}, so a reader reimplementing this "
+                          f"block on Windows drops that guard")
+
+    def test_the_resume_accounts_for_partly_ticked_exit_criteria(self):
+        doc = self._doc()
+        start = doc.index("Tasks and Tests ticked")
+        branch = doc[start:start + 900]
+        if "partly ticked" not in branch:
+            self.fail("the resume treats any unticked Exit Criterion as ungated work, so a "
+                      "crash part-way through ticking them re-runs a gate that passed and "
+                      "commits nothing but the ticks")
+
+
+class ShippedTextSaysWhatTheCodeDoes(unittest.TestCase):
+    """Six places where a document promised something the program does not do.
+
+    Every check here reads whitespace-normalized text: these are sentences, and a sentence
+    that gets rewrapped must not change the answer.
+    """
+
+    def _norm(self, *parts):
+        # Blockquote markers are stripped first. Half of what these check lives inside `>`
+        # quotes, and a sentence wrapped across two quoted lines keeps a `>` in the middle
+        # of it — which is how one of these passed while checking nothing.
+        text = (SKILLS.joinpath(*parts)).read_text(encoding="utf-8")
+        return " ".join(re.sub(r"(?m)^\s*>\s?", "", text).split())
+
+    def test_diff_review_does_not_promise_an_exact_recount(self):
+        """The supervisor FLOORS the count: a positive claim is never lowered to 0, and an
+        unrecognised severity floors it at 1. So the published number can exceed the
+        entries listed, and a gate told it matches them is told wrong."""
+        text = self._norm("diff-review", "SKILL.md")
+        if "never lowered to 0" not in text:
+            self.fail("SKILL.md describes the recount without its floor, so the published "
+                      "count is presented as equal to the blocker/major entries")
+
+    def test_the_schema_does_not_promise_equality(self):
+        schema = " ".join((SKILLS / "diff-review" / "review-schema.json")
+                          .read_text(encoding="utf-8").split())
+        if "must equal the number of such entries" in schema:
+            self.fail("the schema still tells a gate the count equals the entries in "
+                      "`findings`, which the floor makes untrue")
+
+    def test_the_rung_one_lines_say_their_paths_are_absolute(self):
+        """With `--cwd` set the supervisor refuses a relative output path, and the skill
+        reads that refusal as grounds to fall back to a same-model reviewer."""
+        text = self._norm("diff-review", "SKILL.md")
+        start = text.index("Claude adapter (Claude is running this review)")
+        if "absolute" not in text[max(0, start - 400):start]:
+            self.fail("nothing near the adapter lines says those paths must be absolute")
+
+    def test_the_writer_claim_is_about_edit_tools(self):
+        """Two lines below it, the same paragraph says the rung-1 Claude reviewer's shell
+        commands can still write. The absolute claim contradicts its own next sentence."""
+        text = self._norm("diff-review", "SKILL.md")
+        if "a reviewer that can write is not a review" in text:
+            self.fail("the flat claim is still there, beside the admission that this "
+                      "reviewer's shell commands can write")
+
+    def test_review_panel_names_git_as_a_prerequisite(self):
+        """Auditing a tree inside a repository asks git what is tracked, and `plan` refuses
+        without it — while the prerequisite paragraph names only Python."""
+        text = self._norm("review-panel", "SKILL.md")
+        start = text.index("a prerequisite the skill checks")
+        if "git" not in text[start:start + 300]:
+            self.fail("only Python is named as a prerequisite, and git is needed too")
+
+    def test_plan_phase_does_not_send_the_reader_to_its_own_step_5(self):
+        """Step 5 writes phase documents. The cross-model review lives in `plan-run`."""
+        text = self._norm("plan-phase", "SKILL.md")
+        start = text.index("cross-model")
+        if "see Step 5" in text[start:start + 300]:
+            self.fail("the overview sends the reader to Step 5 for the cross-model review, "
+                      "which Step 5 never mentions")
+
+
+class PlanRunsOwnDocumentsAgreeWithEachOther(unittest.TestCase):
+    """Six statements in `plan-run` that its own neighbours, adapters or code contradict."""
+
+    def _plan_run(self, *parts):
+        text = (SKILLS / "plan-run").joinpath(*parts).read_text(encoding="utf-8")
+        return " ".join(re.sub(r"(?m)^\s*>\s?", "", text).split())
+
+    def test_the_progress_line_does_not_promise_the_reviewer_a_log(self):
+        """The note below it says the review sub-agent is NOT handed one, because it runs
+        read-only and cannot write."""
+        text = self._plan_run("SKILL.md")
+        line = text[text.index("_Progress: observable"):][:400]
+        if "independent-review sub-agent" in line:
+            self.fail("the Progress line hands the review sub-agent a progress file, which "
+                      "the Delegation note says it never gets")
+
+    def test_the_reviewer_exemption_does_not_rest_on_streaming_alone(self):
+        """Only rung 1 streams. On rung 2 the review is an in-harness sub-agent and nothing
+        streams at all, so "it already streams" explains nothing there."""
+        text = self._plan_run("SKILL.md")
+        start = text.index("sub-agent is not handed one")
+        if "rung 2" not in text[start:start + 400]:
+            self.fail("the exemption cites diff-review's streaming without saying that only "
+                      "rung 1 streams")
+
+    def test_watching_the_log_is_possible_on_windows(self):
+        text = self._plan_run("SKILL.md")
+        start = text.index("`tail -f` it in another pane")
+        if "Get-Content" not in text[max(0, start - 200):start + 200]:
+            self.fail("`tail -f` is offered as the any-runtime answer, and no stock Windows "
+                      "shell has it")
+
+    def test_the_briefs_pass_what_the_contract_requires(self):
+        """The contract names a fourth input and points at this skill for the procedure.
+        A worker handed neither has no progress file to write and no procedure to follow."""
+        text = self._plan_run("SKILL.md")
+        start = text.index("Claude adapter:** dispatch a phase")
+        adapters = text[start:start + 1600]
+        if "progress file" not in adapters:
+            self.fail("neither adapter brief passes the progress file the contract and the "
+                      "Progress line both promise the worker")
+
+    def test_the_as_built_template_does_not_hardcode_the_plan_filename(self):
+        text = self._plan_run("references", "as-built-template.md")
+        if "](./plan.md)" in text:
+            self.fail("the template links to `./plan.md`, but a plan can carry any name, so "
+                      "the link is broken or points at the wrong file")
+
+    def test_the_decisions_quote_matches_the_shipped_check(self):
+        """A ledger arguing for a rule has to quote the rule it argues for."""
+        quoted = self._plan_run("DECISIONS.md")
+        start = quoted.index("The check in `Publish` is:")
+        block = quoted[start:start + 900]
+        for token, what in (("ls-remote", "asking the remote rather than its local copy"),
+                            ('"HEAD"', "the detached-HEAD guard"),
+                            ("DEFAULT", "the default-branch guard")):
+            if token not in block:
+                self.fail(f"the quoted check is missing {what}")
+        # Token presence is not the quote being current: `ls-remote` is also in the
+        # published-tip line, so a quote still carrying a retired derivation of `DEFAULT`
+        # passed the loop above. The derivation lines are held to the shipped block verbatim.
+        derivation = {
+            " ".join(line.split())
+            for _where, code in commit_push_blocks("plan-run")
+            for line in code.splitlines()
+            if line.startswith("DEFAULT=") or line.startswith('[ -n "$DEFAULT" ]')
+        }
+        self.assertTrue(derivation, "no `DEFAULT` derivation found in a shipped push block")
+        for line in sorted(derivation):
+            if line not in block:
+                self.fail(f"the quoted check derives DEFAULT differently from the shipped "
+                          f"block; missing: {line}")
+
+
+class PlanInitAndDemoVideoKeepTheirPromises(unittest.TestCase):
+    """Three promises whose mechanism was somewhere else, or nowhere."""
+
+    def _norm(self, *parts):
+        text = SKILLS.joinpath(*parts).read_text(encoding="utf-8")
+        return " ".join(re.sub(r"(?m)^\s*>\s?", "", text).split())
+
+    def test_the_index_step_keys_on_the_path_not_the_slug(self):
+        """The Overview promises a row for any plan under `plans/`. Step 7 skipped unless
+        Steps 2 and 5 had generated a slug, so `plans/custom/plan.md` — under `plans/`, and
+        perfectly linkable — got none."""
+        text = self._norm("plan-init", "SKILL.md")
+        if "Step 2 and Step 5 generated a `<slug>`" in text:
+            self.fail("Step 7 still decides on whether a slug was generated, so a plan the "
+                      "user placed under `plans/` himself is left out of the index")
+
+    def test_the_template_says_which_marker_is_actually_read(self):
+        """Calling both rows markers invites someone to treat `Suite` as required, or to
+        drop `Format` as decoration. One is refused on; the other is a record."""
+        text = self._norm("plan-init", "references", "plan-template.md")
+        if "nothing reads it" not in text:
+            self.fail("the template presents Format and Suite as equally required, though "
+                      "only Format is checked")
+
+    def test_the_tour_spec_records_what_the_subtitles_need(self):
+        """`subtitles.md` derives timing from each step's start and duration, citing the
+        tour spec. The spec's `step()` had a comment where the recording should be, and
+        cited `subtitles.md` back."""
+        spec = self._norm("demo-video", "references", "guided-tour-spec.md")
+        for token in ("duration", "push"):
+            if token not in spec:
+                self.fail(f"the tour spec never records {token}, so subtitle timing has no "
+                          f"source and each file points at the other for it")
+
+
+class TheSafetyChecksSurviveTheirOwnFixes(unittest.TestCase):
+    """Four ways a containment or timing check is right in the small and wrong overall.
+
+    Two are the shape a fix itself introduces. Resolving only the leaf of a path leaves a
+    junction ABOVE it unresolved, which is worse than comparing the paths as text — text at
+    least catches a temp base spelled under the root. And a clock started when the module
+    loads runs before the recording exists, so every caption carries the launch offset.
+    """
+
+    DOC = SKILLS / "security-review-codebase" / "references" / "hierarchical-mode.md"
+
+    def _block(self, marker):
+        found = [body for _line, body in fenced_blocks(self.DOC.read_text(encoding="utf-8"))
+                 if marker in body]
+        self.assertEqual(len(found), 1, f"expected one block containing {marker!r}")
+        return found[0]
+
+    def _ps_function(self, name):
+        """One function lifted out by brace matching, so it can be tested without running
+        the whole block — which resolves a repository root and throws outside one."""
+        block = self._block("Test-SafeBase")
+        start = block.index(f"function {name}(")
+        i, depth = block.index("{", start), 0
+        while True:
+            if block[i] == "{":
+                depth += 1
+            elif block[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        return block[start:i + 1]
+
+    @unittest.skipUnless(PWSH, "no PowerShell on this host (set PWSH= to point at one)")
+    def test_a_link_above_the_leaf_is_resolved_too(self):
+        """A junction ABOVE the candidate moves everything below it. `C:\\work` linked to
+        `D:\\repo` leaves `C:\\work\\tmp` looking unrelated to the root it sits inside — and
+        the textual comparison this replaced caught that one, so resolving only the leaf
+        made the case worse."""
+        with tempfile.TemporaryDirectory() as d:
+            real = Path(d) / "real"
+            (real / "inner").mkdir(parents=True)
+            link = Path(d) / "link"
+            try:
+                link.symlink_to(real, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"cannot create a link here: {exc}")
+            script = Path(d) / "fn.ps1"
+            script.write_text(self._ps_function("Resolve-Physical") +
+                              f'\nResolve-Physical "{link / "inner"}"\n', encoding="utf-8")
+            done = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-File", str(script)],
+                                  capture_output=True, text=True, timeout=120)
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            answer = Path(done.stdout.strip())
+            self.assertEqual(answer.resolve(), (real / "inner").resolve(),
+                             "the ancestor link was left unresolved, so containment is "
+                             "decided against a path that is not where the files land")
+
+    @unittest.skipUnless(BASH and os.name == "posix", "the POSIX half of the document")
+    def test_the_fallback_base_is_checked_too(self):
+        """An audit rooted where the fallback lives. The PowerShell block already refuses
+        this; POSIX quietly accepted it."""
+        block = self._block("security-review-$(basename")
+        fallback = Path("/tmp")   # the block's own fallback, not the platform's
+        done = run_bash(block, cwd=str(fallback),
+                              env=dict(os.environ, TMPDIR=str(fallback)),
+                              capture_output=True, text=True, timeout=60)
+        if done.returncode == 0:
+            stray = done.stdout.strip().splitlines()[-1]
+            self.addCleanup(shutil.rmtree, stray, True)
+            self.fail(f"an audit rooted at {fallback} put its run directory at {stray}, "
+                      f"inside the tree it is reading")
+        self.assertIn("outside", (done.stdout + done.stderr).lower())
+
+    def test_the_comment_claims_only_what_pwd_p_resolves(self):
+        """`pwd -P` resolves pathname links. A bind mount is not a link, and claiming it is
+        covered is the same class of defect these commits were fixing."""
+        text = " ".join(self.DOC.read_text(encoding="utf-8").split())
+        window = text[text.index("Compared by WHERE IT LEADS"):][:500]
+        if "bind mount" in window and "NOT covered" not in window:
+            self.fail("the comment lists a bind mount among what it resolves, and `pwd -P` "
+                      "does not see through one")
+        if "NOT covered" not in window:
+            self.fail("the comment never states its limit, so the next reader assumes a "
+                      "mount alias is handled")
+
+    def test_the_tour_clock_starts_with_the_recording(self):
+        """`t0` at module level runs before Playwright creates the page, so every caption
+        carries the launch offset — the very error the subtitle document warns about."""
+        spec = (SKILLS / "demo-video" / "references" / "guided-tour-spec.md").read_text(
+            encoding="utf-8")
+        if "const t0 = Date.now();" in spec:
+            self.fail("t0 is captured at module evaluation, before the recording exists")
+        if "beforeEach" not in spec:
+            self.fail("t0 is set in the test body, which runs after any hook that already "
+                      "used the recorded page — that time is video the captions miss")
+        start = spec.index("beforeEach")
+        if "t0 = Date.now()" not in spec[start:start + 400]:
+            self.fail("t0 is never set in the first hook to receive the page")
+
+
+class TheResolversAnswerIsPhysicalOrItIsNothing(unittest.TestCase):
+    """The remaining ways a path check can be satisfied by a spelling.
+
+    Resolution has to proceed from the root DOWN. A relative target means nothing until the
+    directory holding it is itself physical: `..\\scratch` under a junction reads against the
+    junction's spelled parent, not the real one. And where resolution cannot finish, the
+    answer must be a refusal — falling back to the unresolved spelling hands the decision to
+    the text the resolver exists to distrust.
+    """
+
+    DOC = SKILLS / "security-review-codebase" / "references" / "hierarchical-mode.md"
+
+    def _block(self, marker):
+        found = [body for _line, body in fenced_blocks(self.DOC.read_text(encoding="utf-8"))
+                 if marker in body]
+        self.assertEqual(len(found), 1, f"expected one block containing {marker!r}")
+        return found[0]
+
+    def _ps_function(self, name):
+        block = self._block("Test-SafeBase")
+        start = block.index(f"function {name}(")
+        i, depth = block.index("{", start), 0
+        while True:
+            if block[i] == "{":
+                depth += 1
+            elif block[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        return block[start:i + 1]
+
+    @unittest.skipUnless(PWSH, "no PowerShell on this host (set PWSH= to point at one)")
+    def test_a_relative_target_resolves_against_its_real_parent(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "repo"
+            (root / "sub").mkdir(parents=True)
+            (root / "scratch").mkdir()
+            try:
+                # `alias` -> repo/sub, and repo/sub/temp -> ../scratch, written RELATIVE.
+                (Path(d) / "alias").symlink_to(root / "sub", target_is_directory=True)
+                (root / "sub" / "temp").symlink_to("../scratch", target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"cannot create a link here: {exc}")
+            script = Path(d) / "fn.ps1"
+            script.write_text(self._ps_function("Resolve-Physical") +
+                              f'\nResolve-Physical "{Path(d) / "alias" / "temp"}"\n',
+                              encoding="utf-8")
+            done = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-File", str(script)],
+                                  capture_output=True, text=True, timeout=120)
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            answer = Path(done.stdout.strip())
+            self.assertEqual(answer.resolve(), (root / "scratch").resolve(),
+                             "the relative target was resolved against the junction's "
+                             "spelled parent, so a directory inside the audited tree reads "
+                             "as one outside it")
+
+    @unittest.skipUnless(BASH and os.name == "posix", "needs a POSIX bash")
+    def test_an_audit_rooted_at_the_filesystem_root_is_refused(self):
+        """`case "$base/" in "$root_real"/*)` becomes `//*` when the root is `/`, which no
+        single-slash path matches — so every base read as outside a tree that contains
+        everything. The trailing slash has to come off before the comparison."""
+        block = self._block("security-review-$(basename")
+        done = run_bash(block, cwd="/",
+                              env=dict(os.environ, TMPDIR="/tmp"),
+                              capture_output=True, text=True, timeout=60)
+        if done.returncode == 0:
+            stray = done.stdout.strip().splitlines()[-1]
+            self.addCleanup(shutil.rmtree, stray, True)
+            self.fail(f"an audit rooted at / accepted {stray}, which is inside it")
+        self.assertIn("outside", (done.stdout + done.stderr).lower())
+
+    def test_an_unresolvable_root_is_refused_not_assumed(self):
+        safe = self._ps_function("Test-SafeBase")
+        if "$rootReal = $repoRoot" in safe:
+            self.fail("a root that cannot be resolved falls back to its spelling, which is "
+                      "the comparison the resolver exists to replace")
+
+    def test_the_posix_fallback_is_resolved_wherever_it_is_assigned(self):
+        """Two paths assign the fallback: the base cannot be entered, and the base resolves
+        inside the tree. Both have to resolve it, or `/tmp` is compared as text."""
+        block = self._block("security-review-$(basename")
+        # From the resolution onward. The relative-path guard above it assigns a literal
+        # `/tmp` and is then resolved by the line below it, which is fine; what must not
+        # happen is an unresolved assignment surviving PAST that point.
+        tail = block[block.index("base=$( (cd -P"):]
+        bare = [line.strip() for line in tail.splitlines()
+                if re.search(r"base=/tmp(\s|$)", line) and not line.strip().startswith("#")]
+        if bare:
+            self.fail(f"a fallback is assigned the literal /tmp after resolution: {bare}")
+        self.assertIn("cd -P -- /tmp", block,
+                      "the fallback is never resolved anywhere, so /tmp is compared as text")
+
+
+class TheMaintainersGuideNamesNothingThatWasRenamed(unittest.TestCase):
+    """`review-panel/references/architecture.md` explains two programs by naming their
+    internals. A guide naming something that no longer exists is worse than no guide: a
+    reader trusts it, finds nothing, and cannot tell a rename from their own mistake.
+
+    Two checks, and the second is the one that survives editing. The first pins the symbols
+    the guide is *required* to name, so deleting a section fails here rather than quietly
+    narrowing what the guide covers. The second holds every private name the guide mentions
+    in backticks — whatever they turn out to be — against the modules, so a symbol added to
+    the guide later is covered without anyone extending a list. A leading underscore is the
+    discriminator because ordinary prose never carries one.
+    """
+
+    GUIDE = SKILLS / "review-panel" / "references" / "architecture.md"
+
+    # Named in the guide and resolved in the module it belongs to. The value is the
+    # attribute's owner: "engine" is `review_panel.py`, "driver" is `review_panel_run.py`.
+    REQUIRED = {
+        "_MockDialect": "engine",
+        "_MOCK_DIALECTS": "engine",
+        "_for_stem": "engine",
+        "_fence_language": "engine",
+        "_FENCE_LANGUAGES": "engine",
+        "_mock_only": "engine",
+        "_statements": "engine",
+        # The guide's order — strings located before comments are stripped — is this
+        # function, and a reader told the order without the name cannot go and read it.
+        "_strip_comments": "engine",
+        "subject_map": "engine",
+        "subjects_by_name": "engine",
+        "subjects_by_mention": "engine",
+        "SUBJECT_BY_NAME": "engine",
+        "SUBJECT_BY_MENTION": "engine",
+        "SUBJECT_HOW_SAID": "engine",
+        "UNIT_COMPLETE": "engine",
+        "UNIT_FAILED": "engine",
+        "UNIT_MISSING": "engine",
+        "ROUNDS": "driver",
+        "WRITE_CAPABLE_KINDS": "driver",
+    }
+
+    # The engine's stage markers, by the constant that holds each one. `reported` is the
+    # newest and the easiest to leave out of a table that is otherwise still correct.
+    #
+    # TWO SETS, because the constants are two different kinds of thing and one table
+    # conflating them is what put a stage in the guide that the loop never passes through.
+    # `UNITS_STAGE_CONSTANTS` is what `units.json` can hold, which is what the driver's
+    # `ROUNDS` keys on and what the guide's table is about. `ROUTED_STAGE` is written into
+    # `candidates.json` as a TYPE TAG -- `_read_candidates` refuses a file whose `stage` is
+    # not `routed` -- so it is a real run value, and belongs in the vocabulary the guide may
+    # quote, but never in the table.
+    UNITS_STAGE_CONSTANTS = ("READING_STAGE", "VERIFICATION_STAGE", "CLUSTERED_STAGE",
+                             "SYNTHESIZED_STAGE", "REPORTED_STAGE")
+    STAGE_CONSTANTS = UNITS_STAGE_CONSTANTS + ("ROUTED_STAGE",)
+
+    @classmethod
+    def setUpClass(cls):
+        skill_dir = SKILLS / "review-panel"
+        if str(skill_dir) not in sys.path:
+            sys.path.insert(0, str(skill_dir))
+        import review_panel
+        import review_panel_run
+        cls.modules = {"engine": review_panel, "driver": review_panel_run}
+        cls.text = cls.GUIDE.read_text(encoding="utf-8")
+        cls.quoted = set(re.findall(r"`([^`\n]+)`", cls.text))
+
+    def test_every_required_symbol_is_named_and_exists(self):
+        missing_from_guide, missing_from_code = [], []
+        for name, where in self.REQUIRED.items():
+            if name not in self.quoted:
+                missing_from_guide.append(name)
+            if not hasattr(self.modules[where], name):
+                missing_from_code.append(f"{name} ({where})")
+        self.assertEqual(missing_from_guide, [],
+                         "the guide no longer names these, so a section it is required to "
+                         "cover has gone or been reworded past recognition")
+        self.assertEqual(missing_from_code, [],
+                         "the guide names these and the code does not define them")
+
+    def _markers(self):
+        """The test-name markers, read out of the engine rather than listed here.
+
+        `_test` and `_spec` are DATA the guide quotes, not symbols, and a hand-written
+        exemption list would have to be extended by whoever adds a marker.
+        """
+        engine = self.modules["engine"]
+        return set(engine._SUBJECT_MARKERS_TRAILING) | set(engine._SUBJECT_MARKERS_LEADING)
+
+    def _vocabulary(self):
+        """Every value the run's own namespaces can take, built from the two programs.
+
+        The driver's verbs, the stage markers, the attempt states, the dispositions, the
+        three unit landings and the dialect keys. A skill's own directory name is admitted
+        beside them because the guide legitimately names a sibling skill, and that is a
+        different namespace rather than an exemption from this one.
+        """
+        engine, driver = self.modules["engine"], self.modules["driver"]
+        return (set(driver._SUBCOMMANDS) | set(driver.OUTCOMES) | set(driver.ROUNDS)
+                | {driver.ADJUDICATED, driver.RESOLVED, driver.DECIDED,
+                   driver.ORPHAN_CLAIM, driver.RUNNING, driver.UNCERTAIN}
+                | {engine.UNIT_COMPLETE, engine.UNIT_FAILED, engine.UNIT_MISSING}
+                | {getattr(engine, name) for name in self.STAGE_CONSTANTS}
+                | set(engine._MOCK_DIALECTS)
+                | {p.name for p in SKILLS.iterdir() if p.is_dir()})
+
+    # ---- the direction that catches a name the guide INVENTS --------------------
+    # The checks above ask whether a value the code has appears in the guide, which cannot
+    # fail on a name the code never had: replacing every `plan` with `plna` left them all
+    # green. These three ask the opposite question, of whatever the guide happens to quote,
+    # so they hold without anyone extending a list.
+
+    def test_every_private_name_the_guide_quotes_resolves(self):
+        unresolved = [token for token in sorted(self.quoted)
+                      if re.fullmatch(r"_[A-Za-z][A-Za-z0-9_]*", token)
+                      and token not in self._markers()
+                      and not any(hasattr(module, token)
+                                  for module in self.modules.values())]
+        self.assertEqual(unresolved, [],
+                         "the guide names private symbols that neither program defines")
+
+    def test_every_constant_name_the_guide_quotes_resolves(self):
+        """The same shape for the public constants — `ROUNDS`, `UNIT_MISSING`, the rest.
+
+        Two characters is enough to be one: at a three-character floor an invented `OK`
+        passed, and no real constant is helped by the extra letter.
+        """
+        unresolved = [token for token in sorted(self.quoted)
+                      if re.fullmatch(r"[A-Z][A-Z0-9_]+", token)
+                      and token not in self._markers()
+                      and not any(hasattr(module, token)
+                                  for module in self.modules.values())]
+        self.assertEqual(unresolved, [],
+                         "the guide names constants that neither program defines")
+
+    def test_every_run_value_the_guide_quotes_is_one_the_run_can_take(self):
+        """A hyphenated lowercase token is a value out of the run's own vocabulary — a
+        disposition, an attempt state, a driver verb. Nothing else in the guide is spelled
+        that way, so membership can be required rather than mere presence."""
+        invented = [token for token in sorted(self.quoted)
+                    if re.fullmatch(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)+", token)
+                    and token not in self._vocabulary()]
+        self.assertEqual(invented, [],
+                         "the guide quotes run values the two programs never produce")
+
+    def test_every_plain_word_the_guide_quotes_occurs_in_the_code(self):
+        """The catch-all under the two above: a bare lowercase word in backticks — a verb, a
+        stage, a field, a dialect key — must appear as a whole word in one of the two
+        programs. Weaker than membership, because this shape also covers JSON keys and field
+        names that no enumeration holds; strong enough for the thing it is here for, which is
+        a name the guide invented and the code has never had."""
+        source = "\n".join(
+            (SKILLS / "review-panel" / name).read_text(encoding="utf-8")
+            for name in ("review_panel.py", "review_panel_run.py"))
+        invented = [token for token in sorted(self.quoted)
+                    if re.fullmatch(r"[a-z][a-z0-9]*", token)
+                    and token not in self._markers()
+                    and not re.search(rf"\b{re.escape(token)}\b", source)]
+        self.assertEqual(invented, [],
+                         "the guide quotes lowercase names that appear nowhere in either "
+                         "program, so they are the guide's invention")
+
+    def _unnamed(self, values):
+        """The ones the guide does not quote. A list, so a failure prints what is missing
+        rather than dumping every name the guide does quote — which `assertIn` against a
+        set of two hundred does, and nobody reads."""
+        return sorted(v for v in values if v not in self.quoted)
+
+    def test_the_name_rule_markers_the_guide_lists_are_the_markers_there_are(self):
+        """The guide spells the marker list out, in the engine's own order. A marker added
+        to either tuple and not to the guide makes the name rule read as narrower than it
+        is, which is exactly the kind of thing a maintainer would trust."""
+        engine = self.modules["engine"]
+        missing = self._unnamed(engine._SUBJECT_MARKERS_TRAILING
+                                + engine._SUBJECT_MARKERS_LEADING)
+        self.assertEqual(missing, [],
+                         "these strip a test's name and the guide never names them")
+
+    def test_the_dialect_fields_the_guide_counts_are_the_fields_there_are(self):
+        """The guide tells a maintainer to fill "the seven fields of `_MockDialect`" and
+        then names them. An eighth field added to the dataclass leaves that procedure
+        incomplete with nothing else to notice."""
+        engine = self.modules["engine"]
+        fields = [f.name for f in dataclasses.fields(engine._MockDialect)]
+        self.assertIn(f"{self.NUMBER_WORDS[len(fields)]} fields of `_MockDialect`",
+                      self.text, "the guide counts the dialect's fields wrongly")
+        self.assertEqual(self._unnamed(fields), [],
+                         "these are dialect fields the guide never names")
+
+    def test_the_attempt_and_disposition_vocabularies_are_complete(self):
+        driver = self.modules["driver"]
+        states = (driver.ADJUDICATED, driver.RESOLVED, driver.DECIDED,
+                  driver.ORPHAN_CLAIM, driver.RUNNING, driver.UNCERTAIN)
+        self.assertEqual(self._unnamed(states + tuple(driver.OUTCOMES)), [],
+                         "the guide's attempt vocabulary omits these")
+
+    # ---- the enumerations, each bound to the namespace it claims --------------------
+    # Asking whether a word occurs SOMEWHERE in the source is too weak for a list that
+    # claims to BE a namespace: a stage called `routing`, a command called `preview` and a
+    # dialect key `ruby` all passed that way, because each word is in the source doing some
+    # other job. Each check below pins its list to the real namespace instead, and fails
+    # first if its anchor sentence has gone — a span that matches nothing must not read as
+    # a list with nothing wrong in it.
+
+    def _span(self, pattern):
+        found = re.search(pattern, self.text, re.DOTALL)
+        self.assertIsNotNone(
+            found, f"the guide no longer carries the sentence this check reads "
+                   f"({pattern!r}); it cannot be checked, so it fails rather than passing")
+        span = found.group(1)
+        tokens = set(re.findall(r"`([^`\n]+)`", span))
+        self.assertTrue(tokens, f"no quoted names in the span matched by {pattern!r}")
+        return tokens
+
+    NUMBER_WORDS = {4: "four", 6: "six", 7: "seven", 8: "Eight"}
+
+    def test_the_stage_table_lists_stages_and_only_stages(self):
+        """Every marker in the table's first column is one `units.json` can hold.
+
+        Scoped to `units.json` deliberately. The table is about what the loop does next,
+        and the loop reads that file; a row for a marker written somewhere else describes
+        a step the run never takes.
+        """
+        engine = self.modules["engine"]
+        stages = {getattr(engine, name) for name in self.UNITS_STAGE_CONSTANTS}
+        rows = re.findall(r"(?m)^\|\s*(`[^|]+?)\s*\|", self.text)
+        self.assertGreaterEqual(len(rows), len(stages) - 1,
+                                "the stage table has lost rows, or stopped being a table")
+        listed = {t for row in rows for t in re.findall(r"`([^`]+)`", row)}
+        self.assertEqual(listed - stages, set(),
+                         "the stage table's first column names markers `units.json` never "
+                         "holds")
+        self.assertEqual(stages - listed, set(),
+                         "`units.json` can hold markers the stage table omits")
+
+    def test_the_type_tag_is_explained_and_is_not_a_table_row(self):
+        """`routed` is a real run value that is NOT a stage, and the guide has to say so.
+
+        Without this, the two obvious repairs are both wrong: dropping the constant from
+        the vocabulary makes a value the engine really writes unquotable, and leaving it in
+        the stage table puts a step in the guide that the loop never passes through. The
+        one correct answer -- name it, and say what it is instead -- is the one nothing
+        would otherwise hold.
+        """
+        engine = self.modules["engine"]
+        tag = engine.ROUTED_STAGE
+        rows = re.findall(r"(?m)^\|\s*(`[^|]+?)\s*\|", self.text)
+        listed = {t for row in rows for t in re.findall(r"`([^`]+)`", row)}
+        self.assertNotIn(tag, listed,
+                         f"`{tag}` is in the stage table; it is written to "
+                         f"{engine.CANDIDATES_FILE_NAME}, never to "
+                         f"{engine.UNITS_FILE_NAME}, so no round is keyed on it")
+        self.assertIn(tag, self.text,
+                      f"the guide never mentions `{tag}`, so a reader meeting it in a run "
+                      "directory has nothing to read")
+        # Paragraph-scoped rather than a distance in characters, and in either order: the
+        # explanation can open with the name or arrive at it, and a test that pins which
+        # fails on a rewrite that changed nothing a reader would notice.
+        said = [p for p in self.text.split("\n\n") if tag in p and "type tag" in p]
+        self.assertTrue(said,
+                        f"the guide names `{tag}` but no paragraph says it is a type tag "
+                        "rather than a stage, which is the whole of what a reader needs")
+
+    def test_the_driver_verb_list_is_the_parsers_subcommands(self):
+        driver = self.modules["driver"]
+        listed = self._span(r"command surface is \w+ verbs — (.*?) — and")
+        self.assertEqual(listed, set(driver._SUBCOMMANDS),
+                         "the guide's list of driver verbs is not the driver's verbs")
+        self.assertIn(f"is {self.NUMBER_WORDS[len(driver._SUBCOMMANDS)]} verbs", self.text,
+                      "the guide counts the driver's verbs wrongly")
+
+    def test_the_engine_subcommand_list_is_the_parsers_subcommands(self):
+        """Read off `build_parser`, so a subcommand added or renamed moves this."""
+        engine = self.modules["engine"]
+        subs = {a for action in engine.build_parser()._actions
+                if isinstance(action, argparse._SubParsersAction)
+                for a in action.choices}
+        listed = self._span(r"it never spawns a worker\*\*: (.*?) for parsing one reply")
+        self.assertEqual(listed, subs,
+                         "the guide's list of engine subcommands is not the engine's")
+
+    def test_the_dialect_key_list_is_the_tables_keys(self):
+        engine = self.modules["engine"]
+        listed = self._span(r"keys map to \w+ dialects today: (.*?)\n\n")
+        self.assertEqual(listed, set(engine._MOCK_DIALECTS),
+                         "the guide claims dialect keys the table does not have, or omits "
+                         "keys it does")
+        distinct = len({id(d) for d in engine._MOCK_DIALECTS.values()})
+        self.assertIn(f"{self.NUMBER_WORDS[len(engine._MOCK_DIALECTS)]} keys map to "
+                      f"{self.NUMBER_WORDS[distinct]} dialects", self.text,
+                      "the guide counts the dialect table wrongly")
+
+    def test_the_skill_sends_a_maintainer_here_exactly_once(self):
+        """One pointer and no more. A dispatcher does not read this guide and must not be
+        sent into it mid-run, so the sentence says who it is for and stays out of the steps."""
+        skill = (SKILLS / "review-panel" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertEqual(skill.count("references/architecture.md"), 1,
+                         "SKILL.md points at the maintainer's guide more than once")
 
 
 if __name__ == "__main__":

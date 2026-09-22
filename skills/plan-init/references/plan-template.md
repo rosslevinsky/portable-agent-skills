@@ -11,8 +11,10 @@ directory. That is `plans/<slug>/plan.md` by default, and wherever the user name
 otherwise. Every literal `plans/<slug>/` below is the default spelled out, not a
 requirement — the index row at the end of this file is qualified the same way, and for the
 same reason. The Status
-table's `| Format | v2 |` and `| Suite | … |` rows are the load-bearing v2 markers — emit
-them exactly, and emit nothing else in that table (no status cell, per Step 6). Write no
+table's `| Format | v2 |` row is the one every v2 skill checks: `/plan-phase` and `/plan-run`
+refuse a plan that lacks it. `| Suite | … |` records which suite produced the plan and
+nothing reads it. Emit both exactly, and emit nothing else in that table (no status cell,
+per Step 6). Write no
 phases and no grouping.
 
 ```markdown
@@ -60,7 +62,7 @@ _Only when a question went unanswered — omit the section entirely otherwise._
 - `path/to/shared/thing` — reason
 
 **Tests** _(TDD preferred: write failing tests before the implementation that makes them pass)_**:**
-- `path/to/test_file.py` — what behaviour it covers
+- `path/to/test_file.py` — what behavior it covers
 
 ---
 

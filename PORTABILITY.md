@@ -105,9 +105,25 @@ A verifier's independence has three rungs, strongest first:
    produced it. Weakest, and the only rung always available.
 
 State the ladder, never a single rung: name the strongest rung the skill wants and what it
-falls back to. Coverage is preserved all the way down — only the strength of the judgement
+falls back to. Coverage is preserved all the way down — only the strength of the judgment
 varies with what the host offers. A skill that *requires* rung 1 or 2 is not portable,
 because no runtime is obliged to provide either.
+
+**One exception, and the test for it is narrow.** A skill may require a rung when
+independence is the **product** rather than a quality gate over it. The rule above assumes a
+skill that does something useful and has its work checked: strip the checking and a weaker
+but real answer survives, which is what makes degrading correct. Where the checking *is* the
+answer, there is nothing underneath to degrade to, and the fallback is not a weaker version
+of the skill — it is a different and misleading one.
+
+`review-panel` is the case. Its whole claim is that a finding was raised by one reader and
+judged by a stranger; at rung 3 one context does both, so the run cannot say the only thing
+it exists to say. It therefore requires two spawnable workers and **refuses** a host that
+cannot supply them, naming the slot that landed nothing. That is the honest answer: a
+refusal a caller can act on, rather than a document whose own text has to disclaim it.
+
+The test is whether the degraded output is *the same kind of thing*, weaker. A review with
+one less pair of eyes is. A review with no second pair of eyes at all is not a review.
 
 Independence buys the one thing prose cannot: a verifier who is not the finder. Prose can
 ask a context to refute its own finding; it cannot make that a second opinion. What prose
@@ -184,7 +200,7 @@ specified. Two accelerator shapes recur:
   execute sequentially"). This improves wall-clock only.
 - **Context hygiene (fresh-context-per-phase delegation)** — an orchestrator hands each
   unit of work to a *fresh* sub-agent so context doesn't accumulate across units and later
-  work isn't coloured by earlier-unit rationalization. For this to be sound the durable
+  work isn't colored by earlier-unit rationalization. For this to be sound the durable
   state must live on disk (so the fresh worker needs no conversation memory), and the
   orchestrator must keep shared-state writes, the independent review, and the commit for
   itself — never delegating them to the worker.
@@ -513,7 +529,7 @@ and belongs here; the rest is repository maintenance and lives in
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
 A v2 `plan.md` carries a `| Format | v2 |` Status-table row. The v2 skills act only on marked
-plans, and the `-v1` skills stay **marker-agnostic in behaviour** — the marker never changes
+plans, and the `-v1` skills stay **marker-agnostic in behavior** — the marker never changes
 what a v1 skill *does*. The one allowed exception is a **read-only refuse-and-redirect
 guard**: `plan-phase-v1` / `plan-run-v1` may detect a `Format: v2` plan solely to stop and
 point the user at `/plan-phase` / `/plan-run`, never to act on it.

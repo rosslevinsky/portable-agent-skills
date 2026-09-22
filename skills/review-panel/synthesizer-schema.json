@@ -1,0 +1,55 @@
+{
+  "title": "review-panel synthesis result",
+  "description": "One reading of the whole defect list: the words this run groups its defects by, and for each defect what goes wrong in plain language, what to do about it, and which other defects it belongs beside. Nothing here settles whether a defect is real — another stage did that, and this one cannot reopen it, revise a severity or remove a defect from the run. Every defect the payload lists appears here exactly once; a reply that drops one, repeats one, or names one the payload never listed is refused whole, and the report is then grouped by status as it was before this round existed.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["tiers", "defects", "summary"],
+  "properties": {
+    "tiers": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string", "minLength": 1},
+      "description": "The run's whole vocabulary, in the order a reader should work through it: each entry a short plain-language name for what a group of these defects breaks, e.g. `Money can be taken twice`. Name as few as the list really has — a reader who has to hold fourteen headings in mind has no grouping at all. Every defect below names one of these and nothing else; an assignment naming a tier absent from this list is refused on its own and that defect falls back to being grouped by its status."
+    },
+    "defects": {
+      "type": "array",
+      "description": "One entry per defect in the payload's `Your defects` section, in any order. Together they cover that list exactly: no defect twice, none left out, and none invented.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["defect", "tier", "what_goes_wrong", "fix", "cross_references"],
+        "properties": {
+          "defect": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The defect id, spelled as the payload spells it, e.g. `D7`."
+          },
+          "tier": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Which of the names in `tiers` this defect belongs under. Exactly one, copied character for character from that list."
+          },
+          "what_goes_wrong": {
+            "type": "string",
+            "minLength": 1,
+            "description": "What actually happens, in plain language and in your own voice: the mechanism, and what a person using this software sees when it goes wrong. Write it for someone who has not read the finding, from the material in the payload; where that material is thin, say less rather than inventing the rest. This is read as your impression and the report says so, so do not write it in the voice of something that was checked."
+          },
+          "fix": {
+            "type": "string",
+            "minLength": 1,
+            "description": "What to do about it, concretely enough to start: what changes, where, and what to be careful of. It is a proposal, not an instruction that was verified — where the payload's material does not tell you enough to be concrete, say what would have to be decided first."
+          },
+          "cross_references": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "description": "The ids of other defects this one should be read beside, as the payload spells them, or an empty list. Name one only where the two are genuinely connected — the same mechanism, the same call path, one causing or masking the other — never because they sit in the same file. The engine drops any reference whose id is not a defect in this run, or whose defect touches no file this one touches."
+          }
+        }
+      }
+    },
+    "summary": {
+      "type": "string",
+      "description": "One paragraph for a person reading the report: what the tiers came out as and why, which defects were hardest to place, and where your reading of a mechanism is a guess rather than something the payload told you."
+    }
+  }
+}

@@ -30,7 +30,7 @@ Before writing any code:
 ### 1a — Read the feature spec
 
 The argument passed to `/tdd` is the feature to implement. Parse it to identify:
-- What behaviour needs to exist
+- What behavior needs to exist
 - What layer it lives in (API, business logic, UI component, hook, utility)
 - What the expected inputs and outputs are
 
@@ -74,8 +74,8 @@ Note what's available — do not reinvent what already exists.
 
 **Rules:**
 - Write tests before any implementation
-- Tests must exercise behaviour that does not exist yet — this is intentional
-- Run tests; confirm the failure is caused by that absent behaviour, not by a broken test
+- Tests must exercise behavior that does not exist yet — this is intentional
+- Run tests; confirm the failure is caused by that absent behavior, not by a broken test
 - If tests pass immediately, the feature already exists — stop and report that to the user
 
 Write the tests in the appropriate location following the project's existing conventions
@@ -89,10 +89,10 @@ Show the failure output. A correct red takes either shape:
   you are calling has nothing behind it: `ImportError`, `ModuleNotFoundError`,
   `Cannot find module`, `AttributeError`, a `TypeError` naming an argument the function
   does not accept yet, or a `NotImplementedError` raised by a stub. These are the common
-  shapes, not a closed set: what makes a red correct is that the *behaviour* is absent,
+  shapes, not a closed set: what makes a red correct is that the *behavior* is absent,
   not which exception carries the news. Adding a parameter to an existing function reds
   as a `TypeError`, and that is a legitimate red — not a broken test to be repaired.
-- **New behaviour on an API that already exists** — a **failing assertion**: the call
+- **New behavior on an API that already exists** — a **failing assertion**: the call
   runs and returns the old answer. This is the usual red when extending existing code,
   and it is a valid red, not a broken test.
 
@@ -125,7 +125,7 @@ If the implementation has obvious duplication, poor naming, or violates project 
 
 - Clean it up
 - Run tests again to confirm they still pass
-- Do not add new behaviour during refactor
+- Do not add new behavior during refactor
 
 If nothing needs cleanup, skip this phase.
 
@@ -144,8 +144,8 @@ After tests are green, summarize:
 **All passing:** yes / no
 
 **What's covered:**
-- <behaviour 1>
-- <behaviour 2>
+- <behavior 1>
+- <behavior 2>
 
 **Known gaps (not covered by these tests):**
 - <gap 1 if any>

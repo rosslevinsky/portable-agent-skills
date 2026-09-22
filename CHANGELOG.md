@@ -8,6 +8,251 @@ Versions use [Calendar Versioning](https://calver.org/) in the form
 A MICRO bump in the same month indicates a follow-up release; a new month
 starts from `.0` again.
 
+## [2026.09.3] - 2026-09-21
+
+### Added
+
+- **`/review-panel` — a new skill, and the heaviest correctness review in the pack.** You
+  point it at a set of files and say what you are worried about. It splits them into areas
+  and reads every area with **two agents at once, neither of which is handed anything the
+  other produced**, each given a different angle to read for. Blindness here is a property of
+  what each worker is given, not a sandbox: nothing stops a worker reading the run directory,
+  and the skill says so where it lists what the run claims. Every finding is then handed to an agent that did
+  **not** raise it, which tries to settle the claim by *running* it in a throwaway copy of
+  the tree rather than by arguing — and reports the command it ran, the exit status and the
+  output. Name a different runtime in each slot of the adapter file and that challenger is
+  the other model; the run pins the pairing you wrote, not whatever happens to be installed.
+
+  Two things make it different from every other review here. **Nobody ever checks their own
+  finding.** And **every file you gave it is accounted for**: the run fails by name if a path
+  was left unassigned, and the report names the files no reader reached — which is a check on
+  the assignment rather than a promise that every file was read, since a reading unit can
+  still fail. `/security-review-codebase` lists what it did not review; this is the one that
+  refuses to finish without an answer for every file. It reports; it never
+  edits your tree.
+
+  **You run it with one command and read the report.** Write a small job file saying what you
+  are worried about and which tree to read, write an adapter file naming the two worker
+  command lines, and start it; it plans the run, launches every worker, lands every reply and
+  writes the report. Stop it at any point by creating the file it names on its first line —
+  what is running finishes and the run exits where you can restart it, picking up with no
+  work redone and none lost.
+
+  Needs Python 3.10+ for its bundled engine, `git` whenever the tree it reads is a
+  repository, the `diff-review` skill installed beside it (its worker supervisor lives
+  there), and **a host that can run two workers at once**.
+  On one that cannot, it refuses and says which slot answered nothing, rather than producing a
+  report. That is deliberate: every finding here is judged by a worker that did not raise it,
+  so a single worker doing both jobs is not a weaker review — it is a different one, and the
+  document would have to disclaim the only thing it exists to establish.
+
+  It does not replace anything. `/diff-review` is anchored to a change set,
+  `/security-review-codebase` sweeps a whole tree for vulnerabilities, and this reads
+  whatever you name for whatever problem you state.
+
+  **What it hands you is a document written to be fixed from**, with numbered sections you
+  can refer to by part. It opens by saying what the document is — what a defect here means,
+  what established, unresolved and refuted mean — alongside what the run established and
+  what it could not: the counts, whether anything could be built or run, and which tracked
+  files the scope never reached. Files are named by a short name throughout, with one legend
+  table decoding every one of them, so an index row is a name you can read rather than a
+  path that fills the line. Then an index of every defect there is something to do about —
+  most severe first, cheapest fix first within that — a by-file view for whoever takes a
+  file and closes what is in it, and the defects themselves.
+
+  **The defects are grouped by what they break**, under plain-language headings a person
+  would use, inside the established and unresolved sections rather than as a flat list in
+  severity order. Each carries a short id you can cite in a sentence and one line of
+  metadata, and where that grouping round returned an answer, two more things written to be
+  acted on: what goes wrong, and the fix. The test that should fail first is there whenever
+  the agent that checked the finding wrote one. A defect that should be
+  read beside another links to it. Claims a challenger dismissed, the run's own machinery
+  and the raw notes the narrative was written from go to an appendix; nothing you need to
+  fix something is down there.
+
+  **A missing test is reported as a test to write, not as a defect and not as a dismissed
+  claim.** One round of the panel reads your tests and asks which shapes of input none of
+  them constructs; what it finds goes to a section of its own, by file and then by line,
+  each entry carrying the input nothing tries, the test the reader proposed, and what the
+  checker found when it went looking for a test that already covers it. It is checked by a
+  stranger like everything else, but against a different question — *does any test in scope
+  build this input?* — because asking whether a missing test is a failure has only one
+  answer, and it is the wrong one. Beside the Markdown report the run writes the same facts
+  as JSON, and the same document as an HTML page with a contents list and links.
+
+  **The report carries the job that produced it**, printed as JSON in an appendix section
+  along with the command that runs it again — so whoever was sent the report can re-run the
+  same audit without the run directory or the job file, given the same tree and an adapter
+  file of their own. The page says outright which pieces it cannot supply. The root is
+  replaced by a placeholder, since the tree is on their disk at their path.
+
+  **The narrative, the fix and the links are marked as one agent's reading**, in a sentence
+  where the defects begin, because nothing checked them. Everything else in the report traces to a
+  worker that verified it or to the engine's own records, and the report does not let the
+  two sound alike. A connection between two defects is checked as far as it can be — the
+  other defect has to exist and the two have to touch a file in common — and one that fails
+  is dropped and named rather than printed. Whether they are related *in the way the prose
+  says* is not something this run establishes, and it says so.
+
+  **It is honest about what it could not do**, which is the part a polished report makes
+  easy to forget. A count of established defects is never presented as a count of validated
+  ones: if nothing could be executed, that is said in the same breath as the number. A
+  command that searched the source without running it counts as evidence and is labelled as
+  what it is, so ten reproductions are never reported as ten runs of your code when only
+  six of them were.
+  It also tells you plainly that finding *more* is not the same as finding *yours* —
+  measured over one tree, successive runs reported far more defects while catching fewer of
+  five bugs already known to its owner.
+
+  **And it prices what it left open.** Where a checker could not settle a claim because the
+  answer lives in a file you did not put in scope, the appendix lists those files with how
+  many defects each one would settle — so pulling one more file into the next run is a
+  decision with a number against it rather than a guess. Beside it, one line per checking
+  agent with how its answers fell, because two agents asked comparable questions and
+  answering far fewer of them is a fact about that agent and not about your code.
+
+- **`/diff-review` — two opt-in flags for a reviewer that stops answering.** `--status-detail`
+  puts the provider's own refusal text on the status line, so a quota message arrives as what
+  it is rather than as *the reviewer exited 1* — which matters when every remaining request
+  would spend itself against an account that is already refusing. `--max-capture-bytes`
+  bounds how much of a reply is held in memory, and drops from the front rather than the
+  back, so a capped reply still ends in the object the caller is looking for. Both default to
+  off, and pass neither and the capture limits are what they were. The status object is not
+  quite: it gains `partial_findings` naming the kept transcript whenever a failed
+  transcript-mode run left one, which is new in this release and arrives without either
+  flag. And `blocking_count` in the verdict is now read as a count when the reviewer wrote
+  it as a string or a whole-number float, and written back as an integer; a gate that read
+  it as text before will see a number.
+
+- **`/diff-review` keeps what a failed reviewer managed to say.** When a reviewer dies part
+  way through a transcript-mode run, the text it produced is written beside your `--findings`
+  path under a `.partial` name, and the status object names it under `partial_findings`. The
+  findings path itself stays empty, because that path means a review completed and a
+  truncated review filed there reads as a clean one. The name is claimed rather than
+  overwritten, so a second failure in the same directory takes the next free name and both
+  transcripts survive; nothing already at the path is truncated, and a pipe sitting there
+  cannot stall the run.
+
+- **`REVIEWS.md`, a plain-English comparison of every review skill in the pack**, linked from
+  the README. Five skills here could all be called "a review" and they are not
+  interchangeable. It sets them side by side: who reads the work, how much that reader
+  already knows, whether a second model is involved at all, and who is allowed to challenge
+  a finding once somebody raises it — which is the question that actually separates them, and
+  the one nobody asks.
+
+### Changed
+
+- **The bundled CI workflow's jobs are renamed, and a fork that requires the old names by
+  branch protection will block every merge until it is updated.** `.github/workflows/validate.yml`
+  used to define `validate` and `windows`. It now defines `tested`, `suite`, `non-utf8` and `gate`.
+  **Require `gate` and nothing else**: it stands for every job above it, so a shard or a
+  platform can be added or removed without a required check going stale in either direction.
+  The suite is now sharded four ways on each of Linux, macOS and Windows, with a separate
+  four-shard run under a C locale; and a push to `main` whose tree has already been proved
+  green by the pull request behind it skips the test jobs, which the proving run establishes
+  by recording the tree it actually checked out.
+
+### Fixed
+
+A little over a hundred defects, found by reading every skill against its own code and
+running the engines against hostile input. Grouped by what you would notice:
+
+- **The installer no longer reads "I cannot look at this" as "there is nothing here."** A
+  path it could not stat — a permission it lacks, a name the filesystem refuses — was treated
+  the same as a path that does not exist. Installing then reported success over a skill it
+  had not replaced, and removing reported nothing to remove. It now says which target it
+  could not read, marks that skill skipped, and carries on with the rest. The same correction went through the bundled engines, which had the
+  same shape in their own file reads: absence is only a missing file or a missing directory,
+  and every other failure says so rather than answering the question wrongly.
+
+- **`/plan-duel` — interruptions and odd input no longer end a duel badly.** A duel resumed
+  after a crash now refuses cleanly rather than deleting work when the roles have changed,
+  and never publishes a plan from a round that did not finish. A score it cannot parse is
+  treated as unscored rather than fatal, and a whole-number score written with a decimal point is now
+  accepted where it used to be discarded — which can change when a duel converges. Where a
+  judge's reply carries both the `SCORE:`/`PREFERRED:` markers and a JSON example, the
+  markers win; the example used to.
+
+  Files that are not UTF-8, deeply nested JSON and a directory with no problem statement are
+  each refused by name, with the reason, instead of crashing or half-running. A file saved as
+  UTF-8 **with** a byte-order mark now reads correctly rather than failing — PowerShell
+  writes them. A long problem statement typed straight into the command is read as text, not
+  as a filename.
+
+  **On Windows, two participant commands that ran before are now refused before dispatch.**
+  One that resolves to a `.cmd` or `.bat` wrapper: point the adapter at the program the
+  wrapper invokes, or run the duel under WSL. And one that resolves to the directory the
+  duel was started from rather than to an entry on `PATH` — Windows searches the current
+  directory first, and that directory is normally the repository being planned, so a
+  program planted there would run with the adapters' flags. Name the CLI by absolute path,
+  or start the duel from another directory.
+
+  Two adapter changes worth knowing if you wrote your own: an adapter containing a
+  placeholder the skill does not recognize is now rejected rather than passed through, and a
+  participant declaring `stdout: clean-last-message` has its output written to the plan file
+  instead of the status file.
+
+  When a winner is stamped, the plan's line endings are preserved, the real status section is
+  chosen rather than an indented example of one, the write is atomic, and a stamp that did
+  not succeed is reported as such instead of assumed.
+- **`/diff-review` — a hung or crashing reviewer can no longer take the review with it.** The
+  supervisor cleans up processes that outlive the reviewer, handles being interrupted while
+  it is mid-record, and no longer blocks forever on a pipe nobody drains. A verdict it cannot
+  write is reported as exactly that, rather than as a failed review — so a completed review is
+  never thrown away over a bookkeeping problem. A reviewer program sitting in the checked-out
+  tree is still never executed, but the rest of your `PATH` is now searched for a real one.
+- **`/plan-run` and `/plan-run-v1` — commit, push and waiting all got more careful.** A commit
+  your git hooks reject now stops the block in failure instead of sailing on. A file changed
+  by a gate is re-staged by name. Waiting for a long-running command was already bounded; it
+  now **fails** when the finish marker never arrives, instead of falling out of the loop and
+  carrying on as though the work had succeeded, and the native-Windows equivalents are
+  spelled out. During a phase it runs the tests it touched rather than the whole module
+  holding them, which is several times faster where a module holds one slow class.
+
+  **Two changes to when a phase publishes.** The default branch is now asked of the remote's
+  advertised HEAD first, with this clone's `origin/HEAD` as the fallback where the remote
+  does not answer, rather than read from that local ref alone — a clone that never fetched
+  the default branch has no such ref, and where your default branch was named neither
+  `main` nor `master`, the guard meant to keep work off the trunk let every phase push
+  straight to it. And whether the
+  branch tip is already published is now asked of the remote by exact ref, so a branch
+  deleted or rewound elsewhere no longer matches a stale local copy and silently skips the
+  push.
+
+  **Resuming is more careful in both generations.** A v1 phase resumed with its exit criteria
+  only partly ticked, and a v2 plan resumed from outside `plans/<slug>/` with modified work
+  files, each take a different bookkeeping and verification path than before.
+- **`/web-verify` — frame extraction stops mangling paths.** An output directory whose name
+  begins with `-` is treated as a path, a `%` in a path reaches `ffmpeg` escaped, and `ffmpeg`
+  no longer reads from the shell's standard input — so a loop feeding it filenames no longer
+  loses every line after the first. It now says that extracting frames
+  needs Bash as well as `ffmpeg`.
+- **`/security-review-codebase` and `/diff-review` now say where the heavier review lives.**
+  The security audit stays about security: a correctness defect it notices on the way is
+  mentioned to you in one line and never filed as a finding, and it names `/review-panel`
+  as the skill for a whole-tree correctness sweep. `/diff-review` does the same at the end
+  of a review where the change set warrants more than one reader; neither launches it.
+- **`/commit`, `/security-review-codebase`, `/plan-init`, `/plan-phase`, `/demo-video` — smaller
+  corrections.** Unstaging in a repository with no commits yet works on a file edited after
+  staging, and each unstage failure names itself. **The security review's deep mode now
+  refuses to put its report inside the tree it is auditing.** It resolves the temporary
+  directory it writes to — `TMPDIR`, or `/tmp` — by where the path actually leads rather
+  than how it is spelled, and where even the fallback lies inside the audited tree it stops
+  with "no temp directory outside the audited tree; set TMPDIR". A project at `/tmp/proj`
+  is unaffected — `/tmp` was and is outside it. What stops now is an audit rooted at `/tmp`
+  itself, or a `TMPDIR` that spells a path outside the tree and resolves inside it through
+  a link or a `..`; before, that report was written into the code under review. A plan is
+  indexed by its own path rather than a generated name. The walkthrough spec records the timing
+  its subtitles are derived from. The plan-tracker checker compares phase filenames by
+  Windows' own case rules on Windows, so a tracker link whose case differs from the phase
+  file on disk is matched rather than reported as an unlisted phase, and the tracker itself
+  is found whatever its case.
+- **Documentation that disagreed with the code now matches it.** Around twenty places where a
+  skill promised behavior its own program did not have — a prerequisite that named only
+  Python when git was needed too, a cross-reference pointing at the wrong step, a claim about
+  what a reviewer is prevented from doing that was broader than the truth. `/plan-duel`'s
+  prerequisites also named the wrong construct as the one Python 2 stops at.
+
 ## [2026.09.2] - 2026-09-06
 
 ### Changed
@@ -274,6 +519,7 @@ release](README.md#installing-a-previous-release) to return to it.
 
 Initial release.
 
+[2026.09.3]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.3
 [2026.09.2]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.2
 [2026.09.1]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.1
 [2026.09.0]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.0

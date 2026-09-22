@@ -16,7 +16,7 @@ Agent A is the controller runtime (⟪controller_name⟫); Agent B is the partic
 runtime (⟪participant_name⟫). The A/B → runtime-name mapping is applied only here, in
 the summary — it is never revealed to the agents or the judge during the rounds. The
 lowercase file slugs are ⟪controller_slug⟫ and ⟪participant_slug⟫ (e.g. a runtime name
-`Foo` → slug `foo`); the renamed plan files are plan-⟪controller_slug⟫.md and
+`Foo` → slug `foo`); the copied plan files are plan-⟪controller_slug⟫.md and
 plan-⟪participant_slug⟫.md.
 
 ---

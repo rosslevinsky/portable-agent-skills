@@ -40,6 +40,7 @@ import hashlib
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -100,6 +101,10 @@ def pack_version() -> str:
     try:
         text = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8", errors="replace")
     except OSError:
+        # Tolerated here and nowhere else, because this read cannot produce a confident
+        # answer: a changelog that is absent and one that cannot be read both fall through to
+        # git and then to `unknown`, which claims nothing. The worst it can do is record a
+        # version less specific than the pack's, and `--verify` reports that as a mismatch.
         text = ""
     for line in text.splitlines():
         match = _VERSION_HEADING.match(line)
@@ -120,6 +125,35 @@ def pack_version() -> str:
     return "unknown"
 
 
+def _source_entries(source: Path) -> list[Path]:
+    """Every child of ``source``, or nothing when there is no such directory.
+
+    ``is_dir()`` answers False for a directory it cannot stat, and a source read as empty is
+    not a harmless answer: the install refuses over it, ``--verify`` calls every installed
+    skill retired, and an update PRUNES them from the user's machine. Absent is ENOENT, or a
+    path that is not a directory; anything else raises for the caller to refuse on.
+    """
+    try:
+        return sorted(source.iterdir(), key=lambda entry: entry.name)
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+
+
+def _holds_a_skill(entry: Path) -> bool:
+    """Is ``entry`` a directory holding a ``SKILL.md``?
+
+    ``stat`` rather than ``is_dir()``/``is_file()``, which answer False for everything they
+    cannot stat: a skill whose ``SKILL.md`` cannot be read would silently leave the pack, and
+    an update then prunes the installed copy as retired.
+    """
+    try:
+        if not stat.S_ISDIR(entry.stat().st_mode):
+            return False
+        return stat.S_ISREG((entry / "SKILL.md").stat().st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+
+
 def discover_skills(source: Path) -> list[str]:
     """Every directory under ``source`` holding a ``SKILL.md``, sorted.
 
@@ -127,12 +161,9 @@ def discover_skills(source: Path) -> list[str]:
     Plain sort on the name: the manifest must be byte-identical between machines, and
     locale-dependent ordering is not.
     """
-    if not source.is_dir():
-        return []
     return sorted(
-        entry.name for entry in source.iterdir()
-        if entry.is_dir() and (entry / "SKILL.md").is_file()
-        and is_safe_name(entry.name)
+        entry.name for entry in _source_entries(source)
+        if _holds_a_skill(entry) and is_safe_name(entry.name)
     )
 
 
@@ -142,12 +173,9 @@ def unsafe_source_names(source: Path) -> list[str]:
     Separate from ``discover_skills`` because a silent skip is how a malformed name goes
     unnoticed: the install is simply short one skill and exits 0.
     """
-    if not source.is_dir():
-        return []
     return sorted(
-        entry.name for entry in source.iterdir()
-        if entry.is_dir() and (entry / "SKILL.md").is_file()
-        and not is_safe_name(entry.name)
+        entry.name for entry in _source_entries(source)
+        if _holds_a_skill(entry) and not is_safe_name(entry.name)
     )
 
 
@@ -221,7 +249,7 @@ def read_manifest(target: Path) -> tuple[list[str], dict[str, str]]:
     except OSError as exc:
         # Present and unreadable. Reporting "no manifest" here lets the caller confuse
         # "nothing is owned" with "I could not find out", and those need opposite
-        # behaviour — it is what let `--uninstall` exit 0 over a full install.
+        # behavior — it is what let `--uninstall` exit 0 over a full install.
         raise ManifestUnreadable(f"{path}: {exc.strerror or exc}") from exc
     for line in text.splitlines():
         line = line.strip()
@@ -345,7 +373,7 @@ def install_skill(source: Path, target: Path, name: str) -> None:
     and because ``--verify`` compares the installed file set against the pack.
 
     The trade, stated plainly: a copy that dies part-way leaves the skill incomplete rather
-    than leaving the old version in place, which is recoverable from the pack.
+    than intact at its installed version. The pack is what recovers it.
     """
     live = target / name
     _remove(live)
@@ -362,8 +390,12 @@ def _overlaps(a: Path, b: Path) -> bool:
         if x == y:
             return True
         try:
-            return x.exists() and y.exists() and os.path.samefile(x, y)
-        except OSError:
+            return os.path.samefile(x, y)
+        except (FileNotFoundError, NotADirectoryError):
+            # ENOENT is the only error that answers the question: a path that is not there
+            # is not the directory being guarded. Every other error means the comparison did
+            # not happen, and answering False to it is how an install deletes the pack it
+            # copies from — so it is raised and the caller refuses the target.
             return False
 
     if same(a, b):
@@ -395,6 +427,7 @@ def do_install(targets: list[Path], source: Path, force: bool = False) -> int:
     source_real = source.resolve()
     overlapping = []
     unresolvable = []
+    uncomparable: list[tuple[Path, OSError]] = []
     resolved: list[tuple[Path, Path]] = []
     for target in targets:
         try:
@@ -409,14 +442,28 @@ def do_install(targets: list[Path], source: Path, force: bool = False) -> int:
             # leaves the guard open in exactly the case it exists for.
             unresolvable.append(target)
             continue
+        try:
+            clashes = _overlaps(candidate, source_real)
+        except OSError as exc:
+            # The same reasoning as the branch above, one step further in: a comparison that
+            # could not be made is not a comparison that came back different, and a target
+            # which cannot be shown NOT to be the source is refused rather than installed to.
+            uncomparable.append((target, exc))
+            continue
         resolved.append((target, candidate))
-        if _overlaps(candidate, source_real):
+        if clashes:
             overlapping.append(target)
     if unresolvable:
         for target in unresolvable:
             print(f"error: {target} cannot be resolved to a real path, so it cannot be "
                   f"compared against the skills source — refusing to install into it",
                   file=sys.stderr)
+        return 1
+    if uncomparable:
+        for target, exc in uncomparable:
+            print(f"error: {target} could not be compared against the skills source "
+                  f"({exc}), so it cannot be shown not to be it — refusing to install "
+                  f"into it", file=sys.stderr)
         return 1
     if overlapping:
         for target in overlapping:
@@ -429,14 +476,27 @@ def do_install(targets: list[Path], source: Path, force: bool = False) -> int:
     # that the second deletes whole on its way past.
     for index, (first, first_real) in enumerate(resolved):
         for second, second_real in resolved[index + 1:]:
-            if _overlaps(first_real, second_real):
+            try:
+                clashes = _overlaps(first_real, second_real)
+            except OSError as exc:
+                print(f"error: {first} and {second} could not be compared ({exc}); one may "
+                      f"contain the other, in which case installing to both deletes the "
+                      f"first", file=sys.stderr)
+                return 1
+            if clashes:
                 print(f"error: {first} and {second} are the same directory or one contains "
                       f"the other; installing to both would delete the first",
                       file=sys.stderr)
                 return 1
 
-    names = discover_skills(source)
-    rejected = unsafe_source_names(source)
+    try:
+        names = discover_skills(source)
+        rejected = unsafe_source_names(source)
+    except OSError as exc:
+        # A source that cannot be listed is not a source holding nothing: copying from what
+        # could be read would install a short pack and prune the rest from the user's disk.
+        print(f"error: the skills source {source} could not be read: {exc}", file=sys.stderr)
+        return 1
     for name in rejected:
         print(f"error: {name!r} is not a usable skill directory name and was skipped; it "
               f"could not be recorded in a manifest or created on Windows", file=sys.stderr)
@@ -460,18 +520,34 @@ def do_install(targets: list[Path], source: Path, force: bool = False) -> int:
             failed = True
             continue
 
+        # 0. Is anything standing at each name — in THREE states, because two cannot carry
+        #    it. Both decisions below turn on this answer, and they fail in opposite
+        #    directions: a name read as free is claimed in the manifest and copied over,
+        #    while a name read as gone is dropped from the record with its directory still on
+        #    the user's disk. Unknown is neither.
+        occupied: dict[str, bool | None] = {}
+        for name in sorted(set(names) | set(previously_owned)):
+            if not is_recordable_name(name):
+                continue
+            try:
+                occupied[name] = _occupied(target / name)
+            except OSError as exc:
+                print(f"error: {target / name} could not be examined: {exc}",
+                      file=sys.stderr)
+                occupied[name] = None
+                failed = True
+
         # 1. Decide what may be written. A directory this installer never recorded is the
         #    user's, and this is where that is refused — before the manifest claims it and
         #    long before anything is deleted.
         writable: list[str] = []
         for name in names:
-            live = target / name
-            # `exists()` follows a link and answers False for a dangling one, so it alone
-            # reports a name as free while a broken link still holds it — and the link most
-            # likely to be standing there on Windows is a junction, which `is_symlink()`
-            # does not see. Occupancy is `exists()` OR `_is_link`, here and at every other
-            # site asking the same question.
-            if (live.exists() or _is_link(live)) and name not in previously_owned:
+            if occupied[name] is None:
+                print(f"  {target}: SKIPPED {name} — whether a directory of that name is "
+                      f"already here could not be established, and a name that cannot be "
+                      f"examined is not a free one", file=sys.stderr)
+                continue
+            if occupied[name] and name not in previously_owned:
                 if not force:
                     print(f"  {target}: SKIPPED {name} — a directory of that name is "
                           f"already here and no manifest of ours claims it. Re-run with "
@@ -493,7 +569,7 @@ def do_install(targets: list[Path], source: Path, force: bool = False) -> int:
                    or version)
         retained = [name for name in previously_owned
                     if is_recordable_name(name) and name not in writable
-                    and ((target / name).exists() or _is_link(target / name))]
+                    and occupied.get(name) is not False]
         intent = sorted(set(writable) | set(retained))
         try:
             if intent:
@@ -527,6 +603,11 @@ def do_install(targets: list[Path], source: Path, force: bool = False) -> int:
         for name in retained:
             if name in names:
                 continue
+            if occupied.get(name) is None:
+                # Reported above, and not pruned: a directory that cannot be examined cannot
+                # be shown to be the one the manifest names. It stays owned by way of
+                # `unexamined` below.
+                continue
             try:
                 _remove(target / name)
                 print(f"  {target}: pruned retired skill {name}")
@@ -539,8 +620,20 @@ def do_install(targets: list[Path], source: Path, force: bool = False) -> int:
         #    could not, and stamps this release ONLY when every skill it names landed — a
         #    partial run keeps the version already recorded, because the files still on
         #    disk are that release's.
-        final = sorted(set(writable) | set(survived_prune))
-        stamped = version if (writable and installed == writable) else carried
+        # A name nobody could examine stays in the record, retired or not: it is not in
+        # `writable` and it was not pruned, so without this the settle write drops it while
+        # its directory is still on disk — owned by nothing, and unreachable from then on.
+        unexamined = {name for name in retained if occupied.get(name) is None}
+        final = sorted(set(writable) | set(survived_prune) | unexamined)
+        # A skill this run KEPT but did not copy still holds the previous release's files,
+        # so the stamp waits for it too. Copying every writable skill is not the whole
+        # question: a skill retained because nobody could establish what is at its name is
+        # not in `writable` at all, so `installed == writable` alone calls the target
+        # updated while a skill this pack still ships sits there at the old release —
+        # and the manifest is the only record of which release a user is running.
+        not_updated = [name for name in final if name in names and name not in installed]
+        stamped = (version if (writable and installed == writable and not not_updated)
+                   else carried)
         if final != intent or stamped != carried:
             try:
                 if final:
@@ -569,6 +662,20 @@ def do_uninstall(targets: list[Path]) -> int:
         if not names:
             print(f"  {target}: no manifest, nothing owned here")
             continue
+        # Occupancy first, in three states: there, gone, or unanswerable. The removal and the
+        # record below both read it, and "gone" is what drops a name from the manifest — so a
+        # name that could not be examined must never take that branch.
+        occupied: dict[str, bool | None] = {}
+        for name in names:
+            if not is_recordable_name(name):
+                continue
+            try:
+                occupied[name] = _occupied(target / name)
+            except OSError as exc:
+                print(f"error: {target / name} could not be examined: {exc}",
+                      file=sys.stderr)
+                occupied[name] = None
+                failed = True
         removed = 0
         for name in names:
             if not is_recordable_name(name):
@@ -576,11 +683,12 @@ def do_uninstall(targets: list[Path]) -> int:
                       f"refusing to act on it", file=sys.stderr)
                 failed = True
                 continue
-            path = target / name
-            if not (path.exists() or _is_link(path)):
+            if occupied[name] is not True:
                 continue
+            path = target / name
             try:
                 _remove(path)
+                occupied[name] = False
                 removed += 1
             except OSError as exc:
                 print(f"error: could not remove {path}: {exc}", file=sys.stderr)
@@ -588,11 +696,10 @@ def do_uninstall(targets: list[Path]) -> int:
         # The record outlives what could not be removed. Deleting it unconditionally leaves
         # the skill on disk owned by nothing, so the next `--uninstall` reports nothing owned
         # and exits 0 while the skill is still installed. A name is dropped when its directory
-        # is gone, and only then.
+        # is gone, and only then — which is why an unanswerable name is kept too.
         remaining = [
             name for name in names
-            if not is_recordable_name(name)
-            or (target / name).exists() or _is_link(target / name)
+            if not is_recordable_name(name) or occupied[name] is not False
         ]
         try:
             if remaining:
@@ -611,40 +718,38 @@ def do_uninstall(targets: list[Path]) -> int:
 def _is_link(path: Path) -> bool:
     """True when ``path`` is a symlink or a Windows junction.
 
-    Two questions, because Python answers them separately: ``is_symlink()`` does not report a
-    junction, and ``Path.is_junction()`` arrived in **3.12** while this pack supports
-    **3.10+**, so the fallback asks the OS itself.
+    Two questions, because the OS answers them separately: a symlink sets ``S_IFLNK`` while a
+    junction is a directory carrying a reparse tag. One ``lstat`` answers both — and it is
+    asked directly rather than through ``is_symlink()`` and ``is_junction()``, which catch
+    their own errors and answer False: a helper built on those cannot tell a path that is not
+    a link from one it could not examine, which is the whole distinction below. (``lstat``
+    describes the link itself where ``stat`` would follow it and report on the target.)
 
-    **The fallback reads the reparse TAG, not the reparse bit.** Every reparse point sets
+    **It reads the reparse TAG, not the reparse bit.** Every reparse point sets
     FILE_ATTRIBUTE_REPARSE_POINT — a cloud-storage placeholder directory, a ProjFS root and
     a deduplicated file all carry it, and none of them is a link. Testing the bit alone
     calls an ordinary synced directory a link, and `_remove` then tries to *detach* it:
-    ``unlink`` refuses a directory, ``rmdir`` refuses a non-empty one, and an update that
-    used to succeed fails instead. A user whose skills sit under a synced home directory
-    meets that on every skill they have.
+    ``unlink`` refuses a directory and ``rmdir`` refuses a non-empty one, so the update
+    fails on a skill that is perfectly installable. A user whose skills sit under a synced
+    home directory meets that on every skill they have.
 
     It matters because a junction is the Windows shape of the hazard `--link` was removed
     over: a skill root pointing at the source means editing the installed instructions edits
     the source.
+
+    **An error that is not ENOENT is raised, never read as "no".** Every caller acts on a
+    False here: the removal hands the path to a recursive delete, the walk descends it, and
+    ``--verify`` compares what is behind it and reports a link as a clean installed copy —
+    the condition ``--link`` was removed to prevent, reached through the command whose job is
+    to certify it has not happened.
     """
     try:
-        if path.is_symlink():
-            return True
-    except OSError:
-        return False
-    is_junction = getattr(path, "is_junction", None)
-    if is_junction is not None:
-        try:
-            return bool(is_junction())
-        except OSError:
-            return False
-    # Python 3.10 / 3.11. `lstat()` describes the link itself where `stat()` would follow it
-    # and report on the target. Both attributes below are Windows-only, so a missing one
-    # answers no rather than raising.
-    try:
         st = path.lstat()
-    except OSError:
+    except (FileNotFoundError, NotADirectoryError):
         return False
+    if stat.S_ISLNK(getattr(st, "st_mode", 0)):
+        return True
+    # Both attributes below are Windows-only, so a missing one answers no rather than raising.
     if not getattr(st, "st_file_attributes", 0) & 0x400:  # FILE_ATTRIBUTE_REPARSE_POINT
         return False
     return getattr(st, "st_reparse_tag", 0) in (
@@ -653,22 +758,52 @@ def _is_link(path: Path) -> bool:
     )
 
 
+def _occupied(path: Path) -> bool:
+    """Is anything standing at ``path`` — file, directory, or link, dangling or not?
+
+    ``exists()`` follows a link and answers False for a dangling one, and it answers False for
+    every path it cannot stat as well; the link most likely to be standing there on Windows is
+    a junction, which ``is_symlink()`` does not see either. ``lstat`` asks about the name
+    itself and raises rather than guessing, so absent is ENOENT and nothing else.
+
+    Every caller decides ownership from this: a name read as free is claimed and copied over,
+    and a name read as gone is dropped from the manifest while its directory is still there.
+    """
+    try:
+        path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    return True
+
+
 def _entries(root: Path):
-    """Yield every path under ``root``, WITHOUT descending through a link.
+    """Yield ``(path, unreadable reason or None)`` for everything under ``root``, WITHOUT
+    descending through a link.
 
     ``rglob`` follows a directory symlink, which on a loop never terminates and on a link
     into the source would walk the pack itself.
+
+    **A directory that cannot be listed is yielded with its reason rather than skipped.**
+    Skipping it contributes no children, which is indistinguishable from a directory that is
+    genuinely empty — so a comparison between two trees would be satisfied by whatever the
+    other side happens to hold under a path nobody could read.
     """
     stack = [root]
     while stack:
         current = stack.pop()
         try:
             children = sorted(current.iterdir())
-        except OSError:
+        except OSError as exc:
+            yield current, (exc.strerror or str(exc))
             continue
         for child in children:
-            yield child
-            if child.is_dir() and not _is_link(child):
+            try:
+                descend = child.is_dir() and not _is_link(child)
+            except OSError as exc:
+                yield child, (exc.strerror or str(exc))
+                continue
+            yield child, None
+            if descend:
                 stack.append(child)
 
 
@@ -695,8 +830,11 @@ def tree(root: Path) -> dict[str, tuple[str, str | None]]:
             return ("unreadable", exc.strerror or str(exc))
 
     out = {"": entry(root)}
-    for child in _entries(root):
-        out[child.relative_to(root).as_posix()] = entry(child)
+    for child, unreadable in _entries(root):
+        key = "" if child == root else child.relative_to(root).as_posix()
+        # The walk's answer wins over the entry's: a directory that was described fine and
+        # then could not be listed is a hole in this mapping, and saying so is the point.
+        out[key] = ("unreadable", unreadable) if unreadable is not None else entry(child)
     return out
 
 
@@ -705,19 +843,29 @@ def _differences(shipped: dict, landed: dict) -> list[str]:
 
     Absent, extra, wrong kind, wrong content and unreadable all fall out of comparing two
     mappings, rather than being four passes each with its own edge cases.
+
+    **Unreadable is checked before equality, because two unreadable sides are equal.** They
+    carry the same ``("unreadable", reason)`` when one permission change covers both trees —
+    a pack and an install under one denied parent, or one name refused on both sides — and
+    an equality test reads that as a match and certifies two things nobody read. Whatever
+    the other side holds, a side this could not read stops the certificate.
     """
     out: list[str] = []
     for relative in sorted(set(shipped) | set(landed)):
         want, got = shipped.get(relative), landed.get(relative)
         label = relative or "."
-        if want == got:
-            continue
         if want is None:
             out.append(f"{label} (not in this pack)")
         elif got is None:
             out.append(f"{label} (missing)")
+        elif got[0] == "unreadable" and want[0] == "unreadable":
+            out.append(f"{label} (could not be read: here {got[1]}; in the pack {want[1]})")
         elif got[0] == "unreadable":
             out.append(f"{label} (could not be read: {got[1]})")
+        elif want[0] == "unreadable":
+            out.append(f"{label} (the pack's own copy could not be read: {want[1]})")
+        elif want == got:
+            continue
         elif want[0] != got[0]:
             out.append(f"{label} (a {got[0]} where the pack ships a {want[0]})")
         else:
@@ -732,7 +880,14 @@ def do_verify(targets: list[Path], source: Path) -> int:
     though nothing is broken, and saying so is the point: this is the command the repair
     procedure relies on, and a state it cannot see is a state nobody will fix.
     """
-    available = set(discover_skills(source))
+    try:
+        available = set(discover_skills(source))
+    except OSError as exc:
+        # Not the same answer as an empty pack: comparing against what could be read would
+        # call every skill it could not see RETIRED, and certify the rest.
+        print(f"error: the skills source {source} could not be read: {exc} — nothing to "
+              f"verify against", file=sys.stderr)
+        return NOTHING_TO_COMPARE
     if not available:
         # A mistyped `--source` names a directory holding no skills, and every question
         # below is then asked against an empty pack, so a fresh target "matches" it.
@@ -757,24 +912,44 @@ def do_verify(targets: list[Path], source: Path) -> int:
             print(f"  {target}: no manifest — nothing installed by this installer")
             nothing_installed += 1
             continue
-        missing = [n for n in names if not (target / n).is_dir()]
+        # What is at each listed name, in one guarded pass. `is_dir()` and `_is_link()`
+        # answer False for anything they cannot stat, so a skill whose state is unknown would
+        # be reported as not installed and then never compared — a check saying a definite
+        # thing about a name it could not read. Absent is ENOENT; anything else gets a line
+        # of its own, and counts.
+        missing: list[str] = []
+        linked: list[str] = []
+        comparable: list[str] = []
+        unreadable: list[tuple[str, str]] = []
+        for name in names:
+            path = target / name
+            try:
+                if not _occupied(path) or not path.is_dir():
+                    missing.append(name)
+                # A skill root that is a LINK is not an installed copy, whatever is behind
+                # it — walking through it and comparing the referent reports a clean install
+                # of a tree pointed at the source, which is the condition `--link` was
+                # removed to prevent, reached through the command that certifies. `_is_link`
+                # covers the Windows junction spelling too.
+                elif _is_link(path):
+                    linked.append(name)
+                else:
+                    comparable.append(name)
+            except OSError as exc:
+                unreadable.append((name, exc.strerror or str(exc)))
         # A name already reported MISSING is not also RETIRED: two lines for one skill
-        # reads as two problems and offers two remedies. MISSING is the actionable one.
-        stale = [n for n in names if n not in available and n not in set(missing)]
+        # reads as two problems and offers two remedies. MISSING is the actionable one, and
+        # a name nobody could read is not evidence about the pack at all.
+        unknown = {name for name, _ in unreadable}
+        stale = [n for n in names
+                 if n not in available and n not in set(missing) and n not in unknown]
         absent = [n for n in sorted(available) if n not in names]
-        # A skill root that is a LINK is not an installed copy, whatever is behind it —
-        # walking through it and comparing the referent reports a clean install of a tree
-        # pointed at the source, which is the condition `--link` was removed to prevent,
-        # reached through the command that certifies. `_is_link` covers the Windows
-        # junction spelling too.
-        linked = [n for n in names
-                  if n not in missing and _is_link(target / n)]
         # Both directions, in one comparison: a path the pack ships and the install lacks,
         # a path the install holds and the pack does not, a link where a file belongs, and
         # bytes that differ are the same question asked of two mappings.
         differs = []
-        for name in names:
-            if name in missing or name in linked or name not in available:
+        for name in comparable:
+            if name not in available:
                 continue
             gaps = _differences(tree(source / name), tree(target / name))
             if gaps:
@@ -783,6 +958,9 @@ def do_verify(targets: list[Path], source: Path) -> int:
         print(f"  {target}: {len(names)} listed, version {version}")
         for name in missing:
             print(f"    MISSING   {name} is listed but not on disk")
+        for name, why in unreadable:
+            print(f"    UNKNOWN   {name} could not be examined, so nothing here is a "
+                  f"statement about it: {why}")
         for name in linked:
             print(f"    LINKED    {name} is a link, not a copy — this installer only "
                   f"copies, so editing it would edit whatever it points at")
@@ -796,8 +974,8 @@ def do_verify(targets: list[Path], source: Path) -> int:
         outdated = version != expected_version
         if outdated:
             print(f"    VERSION   recorded {version}, this pack is {expected_version}")
-        problems += (len(missing) + len(linked) + len(stale) + len(absent) + len(differs)
-                     + (1 if outdated else 0))
+        problems += (len(missing) + len(unreadable) + len(linked) + len(stale) + len(absent)
+                     + len(differs) + (1 if outdated else 0))
     # A real mismatch outranks an absent install: it is the one that needs repairing rather
     # than installing, and with several targets the actionable answer is the one to report.
     if problems:
@@ -846,6 +1024,28 @@ def python_too_old(version_info=None) -> str:
             f"are copied rather than a traceback part-way through.")
 
 
+def prepare_streams() -> None:
+    """Pin stdout and stderr to utf-8 before anything is printed.
+
+    Every mode prints an em dash, and this is the FIRST command a user runs — on Windows a
+    console code page such as cp932 cannot represent one, so redirecting the output raises
+    UnicodeEncodeError while reporting a perfectly good install. Pinned to utf-8 so the
+    bytes do not depend on the locale, `replace` so this can never itself raise. Guarded
+    because a caller may have replaced either stream with an object that has no
+    `reconfigure`, or one that refuses.
+
+    Named rather than inlined into :func:`main` because it changes process-wide state that
+    a caller reaching a command function DIRECTLY does not get. Anything calling one of
+    those without going through `main` has to say so by calling this, instead of relying on
+    something else in the process having called `main` first.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):  # pragma: no cover - depends on host stream
+            pass
+
+
 def main(argv=None) -> int:
     # Checked FIRST, before argument parsing and before any file is touched, because the
     # failure it prevents is a half-done install rather than a bad exit code.
@@ -854,17 +1054,7 @@ def main(argv=None) -> int:
         print(refusal, file=sys.stderr)
         return 2
 
-    # Every mode prints an em dash, and this is the FIRST command a user runs — on Windows
-    # a console code page such as cp932 cannot represent one, so redirecting the output
-    # raises UnicodeEncodeError while reporting a perfectly good install. Pinned to utf-8
-    # so the bytes do not depend on the locale, `replace` so this can never itself raise.
-    # Guarded because a caller may have replaced either stream with an object that has no
-    # `reconfigure`, or one that refuses.
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
-        except (AttributeError, ValueError):  # pragma: no cover - depends on host stream
-            pass
+    prepare_streams()
 
     parser = argparse.ArgumentParser(
         description="Install the portable agent skills.",

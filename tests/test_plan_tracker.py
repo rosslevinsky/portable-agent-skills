@@ -15,10 +15,14 @@ there.
 """
 
 import contextlib
+import errno
 import io
+import ntpath
+import os
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
@@ -163,7 +167,7 @@ REJECTS = [
      "- [x] [Phase 1: A](./phase-01-a.md)\n"
      "+ [ ] [Phase 2: B](./phase-02-b.md)\n",
      ("phase-01-a.md",), "not the canonical form"),
-    # `.rstrip()` strips Unicode whitespace, quietly normalising a line the canonical form
+    # `.rstrip()` strips Unicode whitespace, quietly normalizing a line the canonical form
     # does not admit. Only ASCII space and tab may follow the link.
     ("non-ascii-trailing-whitespace",
      "- [ ] [Phase 1: A](./phase-01-a.md)\u00a0\n"
@@ -274,7 +278,7 @@ class LegacyIsIdentifiedPositively(TrackerBase):
         ("legacy-entry-naming-a-missing-document",
          "- phase: phase-01-a\n", ()),
         # `\s` and `.strip()` both admit Unicode whitespace. A vertical tab in the list
-        # marker, or NEL where the space belongs, normalised a malformed line into a
+        # marker, or NEL where the space belongs, normalized a malformed line into a
         # well-formed entry and retired the whole file from checking.
         ("legacy-entry-with-a-vertical-tab-list-marker",
          "-\vphase: phase-01-a\n", ("phase-01-a.md",)),
@@ -444,6 +448,262 @@ class TheEntrypointIsEncodingSafe(unittest.TestCase):
                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                  and n.func.attr == "reconfigure"]
         self.assertTrue(calls, "main() must reconfigure its streams to utf-8")
+
+
+class AnUnreadableDirectoryIsNotAnEmptyOne(TrackerBase):
+    """"Every phase document is linked" is a claim, and a short listing cannot support it.
+
+    ``Path.glob`` and ``Path.rglob`` swallow the :class:`OSError` from a directory they
+    cannot list and return fewer entries, with nothing raised. Two rules here are keyed on
+    exactly that listing — "no checkbox links this phase-*.md", and "which execution.md
+    files exist under this directory" — so a short answer prints "Tracker validation
+    passed" over a phase that would never run.
+
+    The error is injected rather than produced by ``chmod``: ``chmod(0o000)`` does not stop
+    root and does not stop Windows at all, so a test relying on it silently stops testing
+    on two of the three CI platforms.
+    """
+
+    def _denying_listdir(self, target: Path):
+        real = os.listdir
+
+        def fake(path=".", *a, **k):
+            if Path(path) == target:
+                raise PermissionError(13, "Permission denied", str(path))
+            return real(path, *a, **k)
+
+        return unittest.mock.patch.object(check_plan_tracker.os, "listdir", fake)
+
+    def test_a_plan_directory_that_cannot_be_listed_is_an_error(self):
+        plan = self.root / "p"
+        plan.mkdir()
+        (plan / "phase-01-a.md").write_text("# A\n", encoding="utf-8")
+        (plan / "phase-02-b.md").write_text("# B\n", encoding="utf-8")
+        tracker = plan / "execution.md"
+        tracker.write_text(T_HEAD + T_VALID, encoding="utf-8")
+        with self._denying_listdir(plan):
+            errors, notices = check_tracker(tracker)
+        self.assertEqual(notices, [])
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("could not be listed", errors[0])
+
+    def test_a_well_formed_tracker_in_a_readable_directory_still_passes(self):
+        """The other half: narrowing what counts as "nothing here" must not fail a clean one."""
+        plan = self.root / "p"
+        plan.mkdir()
+        (plan / "phase-01-a.md").write_text("# A\n", encoding="utf-8")
+        (plan / "phase-02-b.md").write_text("# B\n", encoding="utf-8")
+        tracker = plan / "execution.md"
+        tracker.write_text(T_HEAD + T_VALID, encoding="utf-8")
+        self.assertEqual(check_tracker(tracker), ([], []))
+
+    def test_a_directory_scan_that_cannot_walk_refuses_rather_than_reporting_passed(self):
+        plan = self.root / "plans" / "p"
+        plan.mkdir(parents=True)
+        (plan / "phase-01-a.md").write_text("# A\n", encoding="utf-8")
+        (plan / "phase-02-b.md").write_text("# B\n", encoding="utf-8")
+        (plan / "execution.md").write_text(T_HEAD + T_VALID, encoding="utf-8")
+        real_walk = os.walk
+
+        def failing_walk(top, onerror=None, **kwargs):
+            yield from real_walk(top, onerror=onerror, **kwargs)
+            if onerror is not None:
+                onerror(PermissionError(13, "Permission denied", str(top)))
+
+        buffer = io.StringIO()
+        with unittest.mock.patch.object(check_plan_tracker.os, "walk", failing_walk):
+            with contextlib.redirect_stdout(buffer):
+                code = run_tracker_check(self.root / "plans")
+        self.assertEqual(code, 1)
+        self.assertIn("Cannot scan", buffer.getvalue())
+        self.assertNotIn("validation passed", buffer.getvalue())
+
+    def test_a_readable_directory_scan_still_reports_what_it_checked(self):
+        plan = self.root / "plans" / "p"
+        plan.mkdir(parents=True)
+        (plan / "phase-01-a.md").write_text("# A\n", encoding="utf-8")
+        (plan / "phase-02-b.md").write_text("# B\n", encoding="utf-8")
+        (plan / "execution.md").write_text(T_HEAD + T_VALID, encoding="utf-8")
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = run_tracker_check(self.root / "plans")
+        self.assertEqual(code, 0)
+        self.assertIn("1 tracker(s) checked", buffer.getvalue())
+
+
+def _windows_is_file(path: Path) -> bool:
+    """`_is_file` as Windows answers it: the name is opened by the platform's case rule.
+
+    The suite's own filesystem is case-sensitive, so a linked `./phase-02-b.md` cannot be
+    made to open the `Phase-02-b.md` beside it. This supplies that half of the platform,
+    which is what makes the listing comparison — the half under test — legible.
+    """
+    try:
+        names = os.listdir(path.parent)
+    except OSError:
+        return False
+    wanted = ntpath.normcase(path.name)
+    return any(ntpath.normcase(name) == wanted and (path.parent / name).is_file()
+               for name in names)
+
+
+def _case_is_folded_here() -> bool:
+    """Whether this platform's own case rule folds case.
+
+    Asked of `os.path.normcase`, which is the same call the checker makes, so an unpatched
+    case below states the host's answer instead of assuming a case-sensitive one. It is
+    read at assertion time rather than at import, so the patched cases move it too and the
+    branch each takes is exercised on every platform.
+    """
+    return os.path.normcase("A") != "A"
+
+
+class TheCaseRuleIsThePlatformsOwn(TrackerBase):
+    """These names are matched here and then OPENED by `plan-run`, so one rule has to serve.
+
+    Windows opens `Phase-02-B.MD` by the link `./phase-02-b.md`. Matching case-sensitively
+    there reads a differently-cased phase document as no phase document at all — the tracker
+    lists phase 1, phase 2 sits unexecuted, and the check prints passed — and reads a
+    properly linked one as unlisted, failing a tracker that is correct. `normcase` is the
+    platform's rule and `fnmatch` applies it, so each case patches Windows's rule in and the
+    unpatched case beside it asserts what the HOST's rule says — never a fixed POSIX answer,
+    which is simply the wrong answer on the one platform this class is about and is a red
+    Windows job rather than a check of anything.
+
+    Windows's own `ntpath.normcase` is patched in rather than simulated with `str.lower`,
+    and the CI Windows job is what proves the two agree.
+    """
+
+    def _as_windows(self):
+        return unittest.mock.patch.object(os.path, "normcase", ntpath.normcase)
+
+    def _plan_listing_only_phase_one(self) -> Path:
+        plan = self.root / "p"
+        plan.mkdir()
+        (plan / "phase-01-a.md").write_text("# A\n", encoding="utf-8")
+        (plan / "Phase-02-B.MD").write_text("# B\n", encoding="utf-8")
+        tracker = plan / "execution.md"
+        tracker.write_text(T_HEAD + "- [x] [Phase 1: A](./phase-01-a.md)\n",
+                           encoding="utf-8")
+        return tracker
+
+    def test_a_differently_cased_phase_document_is_unlisted_on_windows(self):
+        tracker = self._plan_listing_only_phase_one()
+        with self._as_windows():
+            errors, notices = check_tracker(tracker)
+        self.assertEqual(notices, [])
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("Phase-02-B.MD", errors[0])
+        self.assertIn("no checkbox links it", errors[0])
+
+    def test_the_same_name_is_not_a_phase_document_here(self):
+        """The unpatched half, against the host's own rule rather than a POSIX one.
+
+        Where case is not folded, two names differing in case are two files and only one is
+        a phase document: reporting the other would fail a tracker that is right. Where it
+        IS folded — and the Windows job is a place this runs — `Phase-02-B.MD` is the phase
+        document `./phase-02-b.md` opens, so the unlisted finding is the right answer and
+        asserting its absence asserts the defect.
+        """
+        tracker = self._plan_listing_only_phase_one()
+        errors, notices = check_tracker(tracker)
+        self.assertEqual(notices, [])
+        if not _case_is_folded_here():
+            self.assertEqual(errors, [])
+            return
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("Phase-02-B.MD", errors[0])
+        self.assertIn("no checkbox links it", errors[0])
+
+    def test_a_linked_phase_document_is_not_reported_unlisted_on_windows(self):
+        """The over-correction: matching case-insensitively while comparing case-sensitively
+        turns every correctly linked phase on Windows into 'no checkbox links it'."""
+        plan = self.root / "p"
+        plan.mkdir()
+        (plan / "phase-01-a.md").write_text("# A\n", encoding="utf-8")
+        (plan / "Phase-02-b.md").write_text("# B\n", encoding="utf-8")
+        tracker = plan / "execution.md"
+        tracker.write_text(T_HEAD + T_VALID, encoding="utf-8")
+        with self._as_windows(), \
+                unittest.mock.patch.object(check_plan_tracker, "_is_file", _windows_is_file):
+            errors, notices = check_tracker(tracker)
+        self.assertEqual((errors, notices), ([], []))
+
+    def test_a_directory_scan_checks_a_differently_cased_tracker_on_windows(self):
+        plan = self.root / "plans" / "p"
+        plan.mkdir(parents=True)
+        (plan / "phase-01-a.md").write_text("# A\n", encoding="utf-8")
+        (plan / "Execution.md").write_text(T_HEAD, encoding="utf-8")   # no checkboxes
+        buffer = io.StringIO()
+        with self._as_windows(), contextlib.redirect_stdout(buffer):
+            code = run_tracker_check(self.root / "plans")
+        self.assertEqual(code, 1, buffer.getvalue())
+        self.assertIn("no phase checkboxes", buffer.getvalue())
+
+    def test_a_directory_scan_here_still_inspects_only_execution_md(self):
+        """The unpatched half: a phase document is never itself read as a tracker, whichever
+        rule the host applies to `Execution.md`.
+
+        The tracker is written valid, so the scan passes on both kinds of platform and the
+        COUNT is what differs — one where the case rule folds, none where it does not. What
+        neither may do is inspect `phase-01-a.md`, which carries no checkbox and would fail
+        the scan the moment it was read as a tracker.
+        """
+        plan = self.root / "plans" / "p"
+        plan.mkdir(parents=True)
+        (plan / "phase-01-a.md").write_text("# A\n", encoding="utf-8")
+        (plan / "Execution.md").write_text(T_HEAD + "- [x] [Phase 1: A](./phase-01-a.md)\n",
+                                           encoding="utf-8")
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = run_tracker_check(self.root / "plans")
+        self.assertEqual(code, 0, buffer.getvalue())
+        checked = 1 if _case_is_folded_here() else 0
+        self.assertIn(f"{checked} tracker(s) checked", buffer.getvalue())
+
+
+class ANameTooLongToResolveIsNotAnAbsentName(unittest.TestCase):
+    """`ENAMETOOLONG` says the path could not be RESOLVED, which is not a name with nothing
+    at it: a long alias answers it for a file that is really there.
+
+    The errno is injected rather than built from a 300-character name, because which errno a
+    platform reports for one of those is its own business and this asks what the helper does
+    with the errno. The tracker's own grammar admits a slug longer than one path component
+    may be, so the call site that examines a linked phase document REPORTS that rather than
+    letting it out as a traceback — asserted below, since a crash is not a finding.
+    """
+
+    def test_it_propagates(self):
+        too_long = OSError(errno.ENAMETOOLONG, "File name too long")
+        with unittest.mock.patch.object(os, "stat", side_effect=too_long):
+            with self.assertRaises(OSError) as raised:
+                check_plan_tracker._mode_or_absent(Path("some-name"))
+        self.assertEqual(raised.exception.errno, errno.ENAMETOOLONG)
+
+    def test_the_link_inspection_propagates_it_too(self):
+        too_long = OSError(errno.ENAMETOOLONG, "File name too long")
+        with unittest.mock.patch.object(os, "lstat", side_effect=too_long):
+            with self.assertRaises(OSError):
+                check_plan_tracker._mode_or_absent(Path("some-name"), follow=False)
+
+    def test_a_genuinely_absent_name_is_still_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(check_plan_tracker._mode_or_absent(Path(tmp) / "nothing"))
+
+    def test_a_linked_name_that_cannot_be_examined_is_reported_not_raised(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = Path(tmp) / "p"
+            plan.mkdir()
+            tracker = plan / "execution.md"
+            tracker.write_text(T_HEAD + "- [ ] [Phase 1: A](./phase-01-a.md)\n",
+                               encoding="utf-8")
+            too_long = OSError(errno.ENAMETOOLONG, "File name too long")
+            with unittest.mock.patch.object(check_plan_tracker, "_is_symlink",
+                                            side_effect=too_long):
+                errors, notices = check_tracker(tracker)
+        self.assertEqual(notices, [])
+        self.assertTrue(any("could not be examined" in e for e in errors), errors)
+        self.assertFalse(any("is not a regular file here" in e for e in errors), errors)
 
 
 if __name__ == "__main__":

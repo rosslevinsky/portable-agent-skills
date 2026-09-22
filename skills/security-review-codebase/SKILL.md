@@ -9,7 +9,7 @@ _Classification: Degraded — the default single-pass review runs in any runtime
 
 _Progress: bounded — each per-component sub-agent returns its findings on completion; deep mode adds parallel fan-out, not a live progress channel, so no progress file is used._
 
-Perform a security-focused audit of the entire checked-in codebase to identify HIGH-CONFIDENCE security vulnerabilities with real exploitation potential. This is not a general code review — focus ONLY on concrete security vulnerabilities.
+Perform a security-focused audit of the entire checked-in codebase to identify HIGH-CONFIDENCE security vulnerabilities with real exploitation potential. This is not a general code review — focus ONLY on concrete security vulnerabilities; a whole-tree *correctness* sweep is the `review-panel` skill's job, and where that skill is not installed a correctness defect noticed on the way is still out of scope here — mention it to the user in one line, never as a finding.
 
 ## Objective
 

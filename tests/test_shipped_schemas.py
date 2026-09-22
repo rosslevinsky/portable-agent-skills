@@ -26,6 +26,11 @@ import validate_cross_runtime as vcr  # noqa: E402
 JUDGE_SCHEMA = _SKILLS / "plan-duel" / "judge-schema.json"
 REVIEW_SCHEMA = _SKILLS / "diff-review" / "review-schema.json"
 WORKER_SCHEMA = _SKILLS / "plan-run" / "references" / "phase-worker-schema.json"
+READER_SCHEMA = _SKILLS / "review-panel" / "reader-schema.json"
+VERIFIER_SCHEMA = _SKILLS / "review-panel" / "verifier-schema.json"
+PROBE_SCHEMA = _SKILLS / "review-panel" / "probe-schema.json"
+CLUSTERER_SCHEMA = _SKILLS / "review-panel" / "clusterer-schema.json"
+SYNTHESIZER_SCHEMA = _SKILLS / "review-panel" / "synthesizer-schema.json"
 
 _PY_TYPES = {
     "object": dict,
@@ -94,9 +99,14 @@ def _validate(instance, schema, path="$"):
             if key in instance:
                 errors.extend(_validate(instance[key], sub, f"{path}.{key}"))
 
-    if isinstance(instance, list) and "items" in schema:
-        for index, item in enumerate(instance):
-            errors.extend(_validate(item, schema["items"], f"{path}[{index}]"))
+    if isinstance(instance, list):
+        if "minItems" in schema and len(instance) < schema["minItems"]:
+            errors.append(
+                f"{path}: {len(instance)} items < minItems {schema['minItems']}"
+            )
+        if "items" in schema:
+            for index, item in enumerate(instance):
+                errors.extend(_validate(item, schema["items"], f"{path}[{index}]"))
 
     return errors
 
@@ -141,12 +151,20 @@ class ValidatorSelfTest(unittest.TestCase):
         self.assertEqual(_validate("x", schema), [])
         self.assertTrue(_validate("", schema))
 
+    def test_min_items_is_enforced(self):
+        schema = {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
+        self.assertEqual(_validate(["x"], schema), [])
+        self.assertTrue(_validate([], schema))        # below minItems
+        self.assertTrue(_validate([""], schema))      # an item below its own minLength
+        self.assertTrue(_validate([7], schema))       # an item of the wrong type
+
 
 class PortabilityInvariants(unittest.TestCase):
     """Rules every shipped schema must follow to be accepted by BOTH runtimes."""
 
     def _all(self):
-        return [JUDGE_SCHEMA, REVIEW_SCHEMA, WORKER_SCHEMA]
+        return [JUDGE_SCHEMA, REVIEW_SCHEMA, WORKER_SCHEMA, READER_SCHEMA, VERIFIER_SCHEMA,
+                PROBE_SCHEMA, CLUSTERER_SCHEMA, SYNTHESIZER_SCHEMA]
 
     def test_no_dollar_schema_key_anywhere(self):
         # A draft-2020-12 $schema ref is accepted by one runtime and REJECTED by the
@@ -274,6 +292,562 @@ class ReviewSchemaContract(unittest.TestCase):
             ),
             [],
         )
+
+
+class ReaderSchemaContract(unittest.TestCase):
+    """Locks what review-panel's merge stage reads from a blind reader, and what a reader
+    structurally cannot say."""
+
+    FINDING = {
+        "file": "install.py",
+        "line_start": 120,
+        "line_end": 131,
+        "severity": "major",
+        "failure": "A junction answers False to is_symlink() and True to is_dir(), so the "
+                   "recursive-delete branch runs on a link.",
+        "direction": "Test with the link helper before choosing a branch.",
+        "consequence": "Uninstalling deletes the directory the link pointed at, so a user "
+                       "loses files the installer never put there.",
+        "fix_size": "small",
+        "quote": "    if target.is_dir() and not target.is_symlink():\n"
+                 "        shutil.rmtree(target)",
+        "reproduction": None,
+    }
+
+    def test_declares_location_severity_failure_direction_and_reproduction(self):
+        document = _load(READER_SCHEMA)
+        self.assertEqual(set(document["required"]),
+                         {"finding_count", "findings", "summary"})
+        finding = document["properties"]["findings"]["items"]
+        self.assertEqual(
+            set(finding["required"]),
+            {"file", "line_start", "line_end", "severity", "consequence", "failure",
+             "direction", "fix_size", "quote", "reproduction"},
+        )
+        self.assertEqual(finding["properties"]["fix_size"]["enum"],
+                         ["1 line", "small", "medium", "large"])
+        self.assertEqual(finding["properties"]["line_start"]["minimum"], 1)
+        self.assertEqual(finding["properties"]["line_end"]["minimum"], 1)
+
+    def test_severity_reuses_diff_reviews_four_levels_verbatim(self):
+        # Severity has one owner in the pack; a second vocabulary forks what a gate keys on.
+        reader = _load(READER_SCHEMA)["properties"]["findings"]["items"]["properties"]
+        review = _load(REVIEW_SCHEMA)["properties"]["findings"]["items"]["properties"]
+        self.assertEqual(reader["severity"]["enum"], review["severity"]["enum"])
+        self.assertEqual(reader["severity"]["enum"], ["blocker", "major", "minor", "nit"])
+
+    def test_a_reader_cannot_express_established_by_or_evidence(self):
+        # Those are produced by verification; a blind reader able to emit them pre-claims
+        # the status the verify stage exists to assign. Structurally impossible, not
+        # stripped: no property anywhere in the schema carries either name, and a finding
+        # that adds one is rejected by the closed object.
+        def names(node):
+            if isinstance(node, dict):
+                for key, value in node.get("properties", {}).items():
+                    yield key
+                    yield from names(value)
+                for value in node.values():
+                    if isinstance(value, (dict, list)) and value is not node.get("properties"):
+                        yield from names(value)
+            elif isinstance(node, list):
+                for item in node:
+                    yield from names(item)
+
+        document = _load(READER_SCHEMA)
+        self.assertFalse({"established_by", "evidence"} & set(names(document)))
+        for forbidden in ("established_by", "evidence"):
+            with self.subTest(field=forbidden):
+                spiked = {"findings": [{**self.FINDING, forbidden: "reproduced"}], "summary": "s"}
+                self.assertTrue(_validate(spiked, document))
+
+    def test_the_source_a_reader_read_is_carried_as_quote_never_as_evidence(self):
+        # Spec section 6 asks a reader to quote what it actually read, so a wrong line range
+        # is detectable. That is a quotation, not evidence: `evidence` stays forbidden above,
+        # and the quotation gets its own name so both facts hold at once.
+        finding = _load(READER_SCHEMA)["properties"]["findings"]["items"]
+        self.assertIn("quote", finding["properties"])
+        self.assertEqual(finding["properties"]["quote"]["type"], "string")
+        self.assertNotIn("evidence", finding["properties"])
+
+    def test_a_real_result_validates_with_and_without_a_reproduction(self):
+        document = _load(READER_SCHEMA)
+        self.assertEqual(
+            _validate({"finding_count": 0, "findings": [], "summary": "nothing found"}, document), [])
+        self.assertEqual(
+            _validate({"finding_count": 1, "findings": [self.FINDING], "summary": "one"}, document), [])
+        # The count is required, so a result that omits it is refused by the schema even
+        # though the hand-parser tolerates the absence.
+        self.assertEqual(_validate({"findings": [], "summary": "nothing found"}, document),
+                         ["$: missing required 'finding_count'"])
+        runnable = {**self.FINDING, "reproduction": {
+            "argv": ["python3", "-m", "unittest", "tests.test_install"],
+            "cwd": ".",
+            "expect": "the junction test fails",
+        }}
+        self.assertEqual(
+            _validate({"finding_count": 1, "findings": [runnable], "summary": "one"}, document), [])
+
+    def test_an_unknown_severity_and_a_missing_field_are_rejected(self):
+        document = _load(READER_SCHEMA)
+        bogus = {"findings": [{**self.FINDING, "severity": "critical"}], "summary": "s"}
+        self.assertTrue(_validate(bogus, document))
+        for field in self.FINDING:
+            with self.subTest(missing=field):
+                thin = {k: v for k, v in self.FINDING.items() if k != field}
+                self.assertTrue(_validate({"findings": [thin], "summary": "s"}, document))
+
+    def test_a_reproduction_is_closed_and_fully_required(self):
+        # The nullable object is still a closed object: the mechanics rule reads
+        # ``type == "object"`` and would skip a ``["object", "null"]`` union silently.
+        repro = _load(READER_SCHEMA)["properties"]["findings"]["items"]["properties"]["reproduction"]
+        self.assertEqual(repro["type"], ["object", "null"])
+        self.assertIs(repro["additionalProperties"], False)
+        self.assertEqual(set(repro["required"]), set(repro["properties"]))
+        self.assertEqual(set(repro["properties"]), {"argv", "cwd", "expect"})
+
+
+class VerifierSchemaContract(unittest.TestCase):
+    """Locks what review-panel's report stage reads from a verifier: one verdict per
+    candidate in the four statuses, evidence where something ran, and a severity revision
+    that cannot exist without its rationale."""
+
+    EVIDENCE = {"argv": ["python3", "-m", "unittest", "tests.test_install"], "cwd": ".",
+                "exit_status": 1, "output": "FAIL: test_junction\n", "truncated": False,
+                "run_kind": "executed",
+                "shows": "Shows the junction test failing on this tree."}
+    VERDICT = {
+        "candidate": "cand-001",
+        "status": "confirmed_by_reading",
+        "evidence": None,
+        "rationale": "The branch on line 120 runs the recursive delete on a junction.",
+        "revision": None,
+        "test_first": "tests/test_install.py: point a junction at a directory outside the "
+                      "install root and assert uninstall leaves it standing.",
+        "unresolved_reason": None,
+        "needs_files": None,
+    }
+
+    def test_declares_one_verdict_per_candidate_with_the_four_statuses(self):
+        document = _load(VERIFIER_SCHEMA)
+        self.assertEqual(set(document["required"]), {"verdicts", "summary"})
+        verdict = document["properties"]["verdicts"]["items"]
+        self.assertEqual(set(verdict["required"]),
+                         {"candidate", "status", "evidence", "rationale", "revision",
+                          "test_first", "unresolved_reason", "needs_files"})
+        self.assertEqual(verdict["properties"]["status"]["enum"],
+                         ["reproduced", "confirmed_by_reading", "refuted", "unresolved"])
+
+    def test_evidence_is_a_closed_nullable_object_naming_argv_cwd_exit_status_and_bounded_output(self):
+        evidence = _load(VERIFIER_SCHEMA)["properties"]["verdicts"]["items"]["properties"]["evidence"]
+        self.assertEqual(evidence["type"], ["object", "null"])
+        self.assertIs(evidence["additionalProperties"], False)
+        self.assertEqual(set(evidence["required"]), set(evidence["properties"]))
+        self.assertEqual(set(evidence["properties"]),
+                         {"argv", "cwd", "exit_status", "output", "truncated", "run_kind",
+                          "shows"})
+        # A command and its output never say why they were run, so the verifier says it
+        # here. The pattern matters as much as the type: `_parse_evidence` refuses
+        # whitespace, and a schema that accepted it would send a compliant worker to
+        # produce a verdict the engine then rejects.
+        self.assertEqual(evidence["properties"]["shows"]["type"], "string")
+        self.assertEqual(evidence["properties"]["shows"]["pattern"], "\\S")
+        # A text search and a run of the code are both evidence and neither is the other.
+        # The report counts and labels them apart, so the two words are locked here.
+        self.assertEqual(evidence["properties"]["run_kind"]["enum"], ["executed", "documentary"])
+        self.assertEqual(evidence["properties"]["argv"]["items"]["type"], "string")
+        self.assertEqual(evidence["properties"]["exit_status"]["type"], "integer")
+        self.assertEqual(evidence["properties"]["truncated"]["type"], "boolean")
+
+    def test_a_revision_is_closed_nullable_and_carries_the_four_levels_verbatim(self):
+        # Severity has one owner: the revision's enum is diff-review's, as the reader's is.
+        revision = _load(VERIFIER_SCHEMA)["properties"]["verdicts"]["items"]["properties"]["revision"]
+        review = _load(REVIEW_SCHEMA)["properties"]["findings"]["items"]["properties"]
+        self.assertEqual(revision["type"], ["object", "null"])
+        self.assertIs(revision["additionalProperties"], False)
+        self.assertEqual(set(revision["properties"]), {"severity", "rationale"})
+        self.assertEqual(set(revision["required"]), {"severity", "rationale"})
+        self.assertEqual(revision["properties"]["severity"]["enum"], review["severity"]["enum"])
+
+    def test_a_real_result_validates_in_every_status(self):
+        document = _load(VERIFIER_SCHEMA)
+        self.assertEqual(_validate({"verdicts": [], "summary": "nothing to verify"}, document), [])
+        reproduced = {**self.VERDICT, "status": "reproduced", "evidence": self.EVIDENCE}
+        refuted = {**self.VERDICT, "candidate": "cand-002", "status": "refuted", "evidence": self.EVIDENCE,
+                   "revision": {"severity": "nit", "rationale": "The branch is unreachable."},
+                   "test_first": None}
+        unresolved = {**self.VERDICT, "candidate": "cand-003", "status": "unresolved",
+                      "test_first": None, "unresolved_reason": "needs_a_run"}
+        self.assertEqual(_validate({"verdicts": [self.VERDICT, reproduced, refuted, unresolved],
+                                    "summary": "four"}, document), [])
+
+    def test_an_unknown_status_a_missing_field_and_an_open_revision_are_rejected(self):
+        document = _load(VERIFIER_SCHEMA)
+        self.assertTrue(_validate({"verdicts": [{**self.VERDICT, "status": "confirmed"}], "summary": "s"}, document))
+        for field in self.VERDICT:
+            with self.subTest(missing=field):
+                thin = {k: v for k, v in self.VERDICT.items() if k != field}
+                self.assertTrue(_validate({"verdicts": [thin], "summary": "s"}, document))
+        no_rationale = {**self.VERDICT, "revision": {"severity": "minor"}}
+        self.assertTrue(_validate({"verdicts": [no_rationale], "summary": "s"}, document))
+        for field in self.EVIDENCE:
+            with self.subTest(missing=f"evidence.{field}"):
+                thin = {k: v for k, v in self.EVIDENCE.items() if k != field}
+                spiked = {**self.VERDICT, "status": "reproduced", "evidence": thin}
+                self.assertTrue(_validate({"verdicts": [spiked], "summary": "s"}, document))
+
+    def test_test_first_is_nullable_so_a_refuted_finding_can_carry_none(self):
+        # Required on every verdict, nullable in value: a refuted finding has nothing to
+        # fix and so no test to write, and the engine refuses one that carries a test anyway.
+        test_first = _load(VERIFIER_SCHEMA)["properties"]["verdicts"]["items"]["properties"]["test_first"]
+        self.assertEqual(test_first["type"], ["string", "null"])
+
+    def test_a_file_outside_the_scope_is_named_as_a_path_and_not_only_in_prose(self):
+        # The commonest unresolved reason there is, and the brief has always asked for the
+        # file in the rationale — where nothing can add it up. The list is what lets the
+        # report count how many open claims one file would settle.
+        document = _load(VERIFIER_SCHEMA)
+        needs = document["properties"]["verdicts"]["items"]["properties"]["needs_files"]
+        self.assertEqual(needs["type"], ["array", "null"])
+        self.assertEqual(needs["items"]["type"], "string")
+        verdict = {**self.VERDICT, "status": "unresolved", "test_first": None,
+                   "unresolved_reason": "needs_a_file_outside_the_scope",
+                   "needs_files": ["src/TransactionService.java"]}
+        self.assertEqual(_validate({"verdicts": [verdict], "summary": "s"}, document), [])
+        # And the reason's own words send the verifier to both places.
+        reason = document["properties"]["verdicts"]["items"]["properties"]["unresolved_reason"]
+        self.assertIn("needs_files", reason["description"])
+
+    def test_unresolved_reason_is_the_four_values_the_report_groups_by(self):
+        # Spec section 9 groups the unresolved set by what would settle each, and section 7
+        # reports an environment failure as its own thing rather than as an open question
+        # about the code. Both read this enum, so its values are locked here.
+        reason = _load(VERIFIER_SCHEMA)["properties"]["verdicts"]["items"]["properties"]["unresolved_reason"]
+        self.assertEqual(reason["type"], ["string", "null"])
+        self.assertEqual(reason["enum"],
+                         ["needs_a_run", "needs_a_file_outside_the_scope",
+                          "needs_a_product_decision", "blocked_by_the_environment", None])
+        document = _load(VERIFIER_SCHEMA)
+        for value in reason["enum"][:-1]:
+            with self.subTest(reason=value):
+                verdict = {**self.VERDICT, "status": "unresolved", "test_first": None,
+                           "unresolved_reason": value}
+                self.assertEqual(_validate({"verdicts": [verdict], "summary": "s"}, document), [])
+        bogus = {**self.VERDICT, "status": "unresolved", "unresolved_reason": "needs_more_thought"}
+        self.assertTrue(_validate({"verdicts": [bogus], "summary": "s"}, document))
+
+    def test_the_verifier_cannot_name_a_finder(self):
+        # There is no rebuttal round and no arbitration: the verifier answers per
+        # candidate id, and nothing in its result can address a reader, a slot or a lens.
+        def names(node):
+            if isinstance(node, dict):
+                for key, value in node.get("properties", {}).items():
+                    yield key
+                    yield from names(value)
+                for value in node.values():
+                    if isinstance(value, (dict, list)) and value is not node.get("properties"):
+                        yield from names(value)
+            elif isinstance(node, list):
+                for item in node:
+                    yield from names(item)
+
+        self.assertFalse({"unit", "slot", "lens", "finder", "raised_by"} & set(names(_load(VERIFIER_SCHEMA))))
+
+
+class ProbeSchemaContract(unittest.TestCase):
+    """Locks what the capability probe returns. The report header reads these two answers to
+    say what the run could execute, so `unknown` has to be expressible: a probe forced to
+    answer yes or no would make a tree nobody could build look like one whose tests passed."""
+
+    ATTEMPT = {"answer": "yes", "argv": ["python3", "-m", "compileall", "-q", "."], "cwd": ".",
+               "exit_status": 0, "output": "", "truncated": False}
+    NOTHING_RAN = {"answer": "unknown", "argv": [], "cwd": ".", "exit_status": None,
+                   "output": "", "truncated": False}
+
+    def test_declares_a_build_answer_a_tests_answer_and_a_summary(self):
+        document = _load(PROBE_SCHEMA)
+        self.assertEqual(set(document["required"]), {"build", "tests", "summary"})
+        for name in ("build", "tests"):
+            with self.subTest(attempt=name):
+                attempt = document["properties"][name]
+                self.assertEqual(set(attempt["required"]),
+                                 {"answer", "argv", "cwd", "exit_status", "output", "truncated"})
+
+    def test_every_answer_can_be_unknown(self):
+        # The whole point of the probe: a tree it could not build and a tree it never tried
+        # to build are different facts, and neither is `no`.
+        document = _load(PROBE_SCHEMA)
+        for name in ("build", "tests"):
+            with self.subTest(attempt=name):
+                self.assertEqual(document["properties"][name]["properties"]["answer"]["enum"],
+                                 ["yes", "no", "unknown"])
+
+    def test_an_attempt_that_ran_nothing_has_no_exit_status(self):
+        document = _load(PROBE_SCHEMA)
+        for name in ("build", "tests"):
+            with self.subTest(attempt=name):
+                status = document["properties"][name]["properties"]["exit_status"]
+                self.assertEqual(status["type"], ["integer", "null"])
+
+    def test_a_real_probe_result_validates_in_every_shape(self):
+        document = _load(PROBE_SCHEMA)
+        self.assertEqual(_validate({"build": self.ATTEMPT, "tests": self.ATTEMPT,
+                                    "summary": "builds and tests."}, document), [])
+        self.assertEqual(_validate({"build": self.NOTHING_RAN, "tests": self.NOTHING_RAN,
+                                    "summary": "nothing here says how to build it."}, document), [])
+        failed = {**self.ATTEMPT, "answer": "no", "exit_status": 1, "output": "error: no such module\n"}
+        self.assertEqual(_validate({"build": failed, "tests": self.NOTHING_RAN,
+                                    "summary": "the build fails."}, document), [])
+
+    def test_an_unknown_answer_word_and_a_missing_field_are_rejected(self):
+        document = _load(PROBE_SCHEMA)
+        bogus = {"build": {**self.ATTEMPT, "answer": "maybe"}, "tests": self.ATTEMPT, "summary": "s"}
+        self.assertTrue(_validate(bogus, document))
+        for field in self.ATTEMPT:
+            with self.subTest(missing=field):
+                thin = {k: v for k, v in self.ATTEMPT.items() if k != field}
+                self.assertTrue(_validate({"build": thin, "tests": self.ATTEMPT, "summary": "s"}, document))
+        for field in ("build", "tests", "summary"):
+            with self.subTest(missing=field):
+                whole = {"build": self.ATTEMPT, "tests": self.ATTEMPT, "summary": "s"}
+                self.assertTrue(_validate({k: v for k, v in whole.items() if k != field}, document))
+
+    def test_the_probe_cannot_report_a_finding(self):
+        # It establishes capability and nothing else. A probe able to return findings would
+        # be a reader nobody routed, raising claims no stranger ever checks.
+        def names(node):
+            if isinstance(node, dict):
+                for key, value in node.get("properties", {}).items():
+                    yield key
+                    yield from names(value)
+                for value in node.values():
+                    if isinstance(value, (dict, list)) and value is not node.get("properties"):
+                        yield from names(value)
+            elif isinstance(node, list):
+                for item in node:
+                    yield from names(item)
+
+        self.assertFalse({"findings", "severity", "file", "line_start", "failure", "direction"}
+                         & set(names(_load(PROBE_SCHEMA))))
+
+
+class ClustererSchemaContract(unittest.TestCase):
+    """Locks what one clustering unit returns. The stage groups candidates and does nothing
+    else, so the schema has to make the two things it must not do inexpressible: there is no
+    way to say a candidate is wrong, and no way to say it should be dropped."""
+
+    ONE = {"members": ["cand-001", "cand-002"], "consequence": "The run stops half-way.",
+           "split_reason": None}
+    OTHER = {"members": ["cand-003"], "consequence": "The file is left truncated.",
+             "split_reason": "A different root cause at the same lines: the write, not the guard."}
+
+    def test_declares_clusters_and_a_summary(self):
+        document = _load(CLUSTERER_SCHEMA)
+        self.assertEqual(set(document["required"]), {"clusters", "summary"})
+        cluster = document["properties"]["clusters"]["items"]
+        self.assertEqual(set(cluster["required"]), {"members", "consequence", "split_reason"})
+
+    def test_a_split_reason_is_optional_in_value_and_required_in_shape(self):
+        # Nullable rather than absent: the strictest structured-output mode requires every
+        # declared property, so a cluster with nothing at its location says so with null.
+        document = _load(CLUSTERER_SCHEMA)
+        reason = document["properties"]["clusters"]["items"]["properties"]["split_reason"]
+        self.assertEqual(reason["type"], ["string", "null"])
+
+    def test_a_real_clustering_result_validates(self):
+        document = _load(CLUSTERER_SCHEMA)
+        self.assertEqual(_validate({"clusters": [self.ONE, self.OTHER],
+                                    "summary": "Two defects at one site."}, document), [])
+        self.assertEqual(_validate({"clusters": [], "summary": "nothing to group."}, document), [])
+
+    def test_a_missing_field_and_an_extra_one_are_rejected(self):
+        document = _load(CLUSTERER_SCHEMA)
+        for field in self.ONE:
+            with self.subTest(missing=field):
+                thin = {k: v for k, v in self.ONE.items() if k != field}
+                self.assertTrue(_validate({"clusters": [thin], "summary": "s"}, document))
+        self.assertTrue(_validate({"clusters": [{**self.ONE, "verdict": "refuted"}],
+                                   "summary": "s"}, document))
+        self.assertTrue(_validate({"clusters": [self.ONE]}, document))
+
+    def test_the_clusterer_cannot_judge_or_drop_a_candidate(self):
+        # Grouping is the whole of this stage. A field for a verdict, a severity or a
+        # dropped id would let one unit delete a defect that two others established.
+        def names(node):
+            if isinstance(node, dict):
+                for key, value in node.get("properties", {}).items():
+                    yield key
+                    yield from names(value)
+                for value in node.values():
+                    if isinstance(value, (dict, list)) and value is not node.get("properties"):
+                        yield from names(value)
+            elif isinstance(node, list):
+                for item in node:
+                    yield from names(item)
+
+        self.assertFalse({"status", "verdict", "severity", "dropped", "discarded", "spurious",
+                          "findings", "evidence"} & set(names(_load(CLUSTERER_SCHEMA))))
+
+
+class SynthesizerResultContract(unittest.TestCase):
+    """The fifth round's contract. It carries one vocabulary for the whole run and one
+    entry per defect, and it gives the unit no way to say a defect is wrong, no way to
+    re-rank it, and no way to leave it out."""
+
+    TIERS = ["Money can be taken twice", "A run stops instead of finishing"]
+    ONE = {"defect": "D1", "tier": "Money can be taken twice",
+           "what_goes_wrong": "A retry re-posts the charge because nothing keys the request.",
+           "fix": "Key the request and reject a repeat of the same key.",
+           "cross_references": ["D4"]}
+    OTHER = {"defect": "D2", "tier": "A run stops instead of finishing",
+             "what_goes_wrong": "An empty list is indexed and the call dies.",
+             "fix": "Return early on an empty input.",
+             "cross_references": []}
+
+    def test_declares_the_tiers_the_defects_and_a_summary(self):
+        document = _load(SYNTHESIZER_SCHEMA)
+        self.assertEqual(set(document["required"]), {"tiers", "defects", "summary"})
+        entry = document["properties"]["defects"]["items"]
+        self.assertEqual(set(entry["required"]),
+                         {"defect", "tier", "what_goes_wrong", "fix", "cross_references"})
+
+    def test_the_tier_list_belongs_to_the_run_and_not_to_a_defect(self):
+        # One vocabulary per run is the property this round exists for. A tier list nested
+        # under each defect would be a schema that invites every entry to name its own.
+        document = _load(SYNTHESIZER_SCHEMA)
+        self.assertEqual(document["properties"]["tiers"]["type"], "array")
+        self.assertEqual(document["properties"]["tiers"]["items"]["type"], "string")
+        entry = document["properties"]["defects"]["items"]["properties"]
+        self.assertEqual(entry["tier"]["type"], "string")
+        self.assertNotIn("tiers", entry)
+
+    def test_no_entry_field_may_be_null(self):
+        # The one "nothing to say" answer this round is allowed is an EMPTY cross-reference
+        # list. A nullable narrative or fix would make a shrug a valid reply, and a defect
+        # with no account of it is what the round exists to end; a nullable tier would take
+        # the defect out of the grouping the unit was asked to produce.
+        entry = _load(SYNTHESIZER_SCHEMA)["properties"]["defects"]["items"]["properties"]
+        for field in ("defect", "tier", "what_goes_wrong", "fix"):
+            with self.subTest(field=field):
+                self.assertEqual(entry[field]["type"], "string")
+        self.assertEqual(entry["cross_references"]["type"], "array")
+
+    def test_a_real_synthesis_result_validates(self):
+        document = _load(SYNTHESIZER_SCHEMA)
+        self.assertEqual(_validate({"tiers": self.TIERS, "defects": [self.ONE, self.OTHER],
+                                    "summary": "Two tiers."}, document), [])
+
+    def test_a_missing_field_and_an_extra_one_are_rejected(self):
+        document = _load(SYNTHESIZER_SCHEMA)
+        for field in self.ONE:
+            with self.subTest(missing=field):
+                thin = {k: v for k, v in self.ONE.items() if k != field}
+                self.assertTrue(_validate({"tiers": self.TIERS, "defects": [thin],
+                                           "summary": "s"}, document))
+        self.assertTrue(_validate({"tiers": self.TIERS,
+                                   "defects": [{**self.ONE, "severity": "blocker"}],
+                                   "summary": "s"}, document))
+        self.assertTrue(_validate({"tiers": self.TIERS, "defects": [self.ONE]}, document))
+        self.assertTrue(_validate({"tiers": "one", "defects": [self.ONE], "summary": "s"},
+                                  document))
+
+    def test_the_synthesizer_cannot_judge_rerank_or_drop_a_defect(self):
+        # The stage writes an account of defects other stages settled. A field for a
+        # verdict, a severity or a dropped id would let one unit undo work two rounds of
+        # strangers did, and this schema is what a runtime enforces.
+        def names(node):
+            if isinstance(node, dict):
+                for key, value in node.get("properties", {}).items():
+                    yield key
+                    yield from names(value)
+                for value in node.values():
+                    if isinstance(value, (dict, list)) and value is not node.get("properties"):
+                        yield from names(value)
+            elif isinstance(node, list):
+                for item in node:
+                    yield from names(item)
+
+        self.assertFalse({"status", "verdict", "severity", "dropped", "discarded", "spurious",
+                          "findings", "evidence", "members"} & set(names(_load(SYNTHESIZER_SCHEMA))))
+
+    def test_the_element_type_of_every_array_is_declared(self):
+        # A cross-reference is a defect id. Without `items` the schema accepts
+        # `cross_references: [{}]`, and the engine then refuses the whole entry for a
+        # reason the contract could have stated at the boundary. Removing either `items`
+        # left the contract tests green until this one existed.
+        document = _load(SYNTHESIZER_SCHEMA)
+        self.assertEqual(document["properties"]["tiers"]["items"]["type"], "string")
+        reference = document["properties"]["defects"]["items"]["properties"]["cross_references"]
+        self.assertIn("items", reference, "an array with no declared element type")
+        self.assertEqual(reference["items"]["type"], "string")
+        for bad in ({}, 7, None, ["D4"]):
+            with self.subTest(reference=bad):
+                self.assertTrue(_validate({"tiers": self.TIERS,
+                                           "defects": [{**self.ONE, "cross_references": [bad]}],
+                                           "summary": "s"}, document))
+        self.assertTrue(_validate({"tiers": [self.TIERS[0], 7], "defects": [self.ONE],
+                                   "summary": "s"}, document))
+
+    def test_empty_strings_and_an_empty_tier_list_are_refused_at_the_boundary(self):
+        # Constraints the parser enforces and the schema can state. An empty tier list
+        # fails the whole unit; an empty narrative, fix, tier or id costs that defect its
+        # assignment. Stated here they are refused before a reply is ever parsed.
+        document = _load(SYNTHESIZER_SCHEMA)
+        self.assertEqual(_validate({"tiers": self.TIERS, "defects": [self.ONE, self.OTHER],
+                                    "summary": "s"}, document), [])
+        self.assertTrue(_validate({"tiers": [], "defects": [self.ONE], "summary": "s"},
+                                  document))
+        self.assertTrue(_validate({"tiers": [""], "defects": [self.ONE], "summary": "s"},
+                                  document))
+        for field in ("defect", "tier", "what_goes_wrong", "fix"):
+            with self.subTest(empty=field):
+                self.assertTrue(_validate({"tiers": self.TIERS,
+                                           "defects": [{**self.ONE, field: ""}],
+                                           "summary": "s"}, document))
+        self.assertTrue(_validate({"tiers": self.TIERS,
+                                   "defects": [{**self.ONE, "cross_references": [""]}],
+                                   "summary": "s"}, document))
+        # `summary` is the one string the engine accepts empty, so the schema does too.
+        self.assertEqual(_validate({"tiers": self.TIERS, "defects": [self.ONE],
+                                    "summary": ""}, document), [])
+
+    def test_uniqueness_is_the_engines_because_the_keyword_is_not_portable(self):
+        """A repeated tier and a repeated cross-reference are both refused — by the
+        engine, not here, and deliberately.
+
+        `uniqueItems` is the keyword that would state it, and one of the two runtimes
+        rejects a structured-output schema carrying it before any model call. A contract
+        that 400s is worse than one that leaves a rule to the engine, so the rule stays
+        where it already is: `_parse_tiers` fails the unit on a repeated tier, and
+        `_parse_synthesis` costs a defect its assignment for a repeated reference. This
+        test is what stops the keyword being added later for tidiness.
+        """
+        def walk(node):
+            if isinstance(node, dict):
+                self.assertNotIn("uniqueItems", node)
+                for value in node.values():
+                    walk(value)
+            elif isinstance(node, list):
+                for item in node:
+                    walk(item)
+
+        document = _load(SYNTHESIZER_SCHEMA)
+        walk(document)
+        self.assertEqual(_validate({"tiers": [self.TIERS[0], self.TIERS[0]],
+                                    "defects": [self.ONE], "summary": "s"}, document), [])
+        self.assertEqual(_validate({"tiers": self.TIERS,
+                                    "defects": [{**self.ONE, "cross_references": ["D4", "D4"]}],
+                                    "summary": "s"}, document), [])
+
+    def test_the_partition_and_the_tier_membership_are_the_engines_to_enforce(self):
+        # Neither is expressible here: a schema cannot say "exactly these ids, each once"
+        # or "one of the strings in a sibling array". The engine checks both, and this
+        # records that a green schema is not a checked result.
+        document = _load(SYNTHESIZER_SCHEMA)
+        invented = {**self.ONE, "tier": "A tier nobody declared"}
+        self.assertEqual(_validate({"tiers": self.TIERS, "defects": [invented],
+                                    "summary": "s"}, document), [])
+        self.assertEqual(_validate({"tiers": self.TIERS, "defects": [self.ONE, self.ONE],
+                                    "summary": "s"}, document), [])
 
 
 class PhaseWorkerUnionContract(unittest.TestCase):
