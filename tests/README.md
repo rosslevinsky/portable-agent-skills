@@ -9,9 +9,9 @@ is added, and each suite below is discoverable by its own glob.
 - **Python suites** — every `test_*.py` below. `test_plan_duel_engine.py` also runs
   stub-CLI scenarios from `fixtures/plan-duel/`
 
-The table is kept honest by `test_skill_content.py`, which fails if a suite exists on
-disk and is not named here. It named only a handful of them for a long time, which is how a
-reader learned what this directory contains by running it instead of reading this.
+`test_skill_content.py` fails if a suite exists on disk and is not named in the table, so
+the table cannot fall behind the directory. For a long time it named only a few of them,
+and a reader learned what this directory contains by running it instead of reading this.
 
 | Suite | What it asserts |
 | --- | --- |
@@ -32,12 +32,12 @@ reader learned what this directory contains by running it instead of reading thi
 | `test_skill_traversal.py` | One answer to "which files belong to a skill" — the budget and the prose rules must name the same set |
 
 They all run in CI (`.github/workflows/validate.yml`), on Ubuntu, macOS and Windows
-alike — one job each, the same suites. There is no PowerShell suite and no
-two-interpreter Windows matrix, because there is no PowerShell left: `install.ps1`,
-`install.Tests.ps1` and `ci-windows.ps1` went with the shell installers, and one
-Python installer needs no parity harness. Every suite here is picked up by the
-existing `python -m unittest discover -s tests -p 'test_*.py'` step, so adding one
-needs no workflow change.
+alike, the same suites split into four shards per platform, plus a Linux pass under the C
+locale. There is no PowerShell suite and no two-interpreter Windows matrix, because there
+is no PowerShell left: `install.ps1`, `install.Tests.ps1` and `ci-windows.ps1` went with
+the shell installers, and one Python installer needs no parity harness. Every suite here
+is found by the same discovery `python -m unittest discover -s tests -p 'test_*.py'` uses,
+which `scripts/shard_tests.py` shares, so adding one needs no workflow change.
 
 ## Running locally
 
@@ -67,7 +67,7 @@ than its functions.
 | Verify establishes what it claims | A retired skill, a skill not yet installed, and a half-copied one are each a non-zero exit, not a remark |
 | Links are unlinked, never followed | Removing a linked skill leaves its target alone — the hazard that cost `install.ps1` a hand-written `Remove-SkillPath` |
 | Reads a legacy install | A manifest written by the shell installers is understood, updatable and removable |
-| The version travels | Read from `CHANGELOG.md`, `[Unreleased]` skipped, `unknown` as the honest last resort — verified from a copy with no git at all |
+| The version travels | Read from `CHANGELOG.md`, `[Unreleased]` skipped, `unknown` when no version can be read; verified from a copy with no git at all |
 | Both runtimes | The defaults name one directory per runtime, each with its own manifest |
 | Three gaps the old suite named | A manifest line cannot reach outside the target; a retired skill is pruned from disk, not only from the manifest; an unowned skill is not replaced without `--force` |
 
@@ -75,9 +75,9 @@ The last group exists because those three behaviors were covered by the bash sui
 dropped by the first draft of `install.py`, and found by **reading** the suite being
 deleted rather than deleting it. All three were reproduced before they were fixed.
 
-`MutationProofs` is the reason to trust the rest. These tests could not be written red
-first — the code was new — so the load-bearing ones were checked by breaking the
-implementation and confirming the right test noticed.
+`MutationProofs` is what makes the rest trustworthy. These tests could not be written red
+first, because the code was new, so the ones that matter most were checked by breaking
+the implementation and confirming the right test noticed.
 
 ## `test_validate_*.md` fixtures
 
@@ -138,7 +138,7 @@ widened. A **superseded `- phase:` tracker is printed by path and skipped**, not
 silently ignored — asserted through `run_tracker_check`'s captured output, because
 "reported" is the whole point. And a file carrying **both** shapes is an error, not a
 legacy record: "zero boxes is a hard error" and "no boxes means legacy" otherwise
-describe the same file, so a half-migrated tracker would be waved through.
+describe the same file, so a half-migrated tracker would pass.
 
 **Coverage here is proven by mutation, not by a green run.** Every branch of
 `check_tracker` and `run_tracker_check` has been individually disabled and the suite
@@ -146,7 +146,7 @@ confirmed to go red — eleven mutants, each killed by a named case. Six branche
 superseded grammar were found silently untested this way, after the suite had reported
 green for months. A new rule is not covered until its case has killed its own mutant.
 
-> **Run mutants with `PYTHONDONTWRITEBYTECODE=1`, or a green result may be a lie.**
+> **Run mutants with `PYTHONDONTWRITEBYTECODE=1`, or a green result may be wrong.**
 > Python validates a cached `.pyc` against the source's **mtime and size**, and the usual
 > mutant changes neither: flipping `==` to `!=` keeps the byte count identical, and
 > restoring the file with `cp` in the same second keeps the timestamp. Measured: a

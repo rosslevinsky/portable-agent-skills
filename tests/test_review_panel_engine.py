@@ -6312,6 +6312,37 @@ class VerificationResultsAreReadStrictly(_ReportCase):
                          "the report claimed every unit returned a valid result above the "
                          "list of the one that did not")
 
+    def test_an_unreadable_verdict_is_no_answer_and_not_the_checkers_answer(self):
+        """The stand-in the engine writes for a verdict it cannot read is engine text.
+        Counted as the checker's answer, the defect was filed under "Blocked by the
+        environment" — a settling reason no verifier gave — with the parse error printed
+        where the checker's rationale goes, so a reader believed somebody had looked and
+        found the environment in the way. It is a candidate no verdict came back for, and
+        the report says that in the words it uses for one; the parse error appears once,
+        under Coverage, against the unit's name."""
+        self.run_all(verify=VERIFY_TABLE_ONE_REJECTED)
+        text = self.text()
+        doc = json.loads((self.rundir / "findings.json").read_text(encoding="utf-8"))
+        record = next(r for r in doc["candidates"] if r["id"] == "cand-001")
+        self.assertEqual(record["status"], "unresolved")
+        self.assertFalse(record["answered"], "the engine's stand-in was counted as an answer")
+        self.assertIsNone(record["unresolved_reason"],
+                          "a settling reason was invented for a verdict nobody gave")
+        self.assertNotIn("Blocked by the environment", text)
+        # The engine's diagnostic is coverage's to print, and coverage prints it against
+        # the unit that broke the contract. Anywhere else it reads as a checker's words.
+        coverage = _section(text, "Coverage")
+        self.assertIn("banana", coverage)
+        self.assertIn("cand-001", coverage)
+        elsewhere = text.replace(coverage, "")
+        self.assertNotIn("the engine could not read this verdict", elsewhere)
+        self.assertNotIn("banana", elsewhere)
+        # And the report says what it is in the words used for a candidate whose unit never
+        # answered, which is the true description of it: on the member's own check line,
+        # and in the provenance row that names who was to answer it.
+        self.assertIn("no verdict came back", text)
+        self.assertIn("nothing usable", _section(text, "Provenance"))
+
     def test_a_field_the_status_determines_is_filled_in_rather_than_refused(self):
         """The case that cost the real run. `unresolved_reason` is null on anything but an
         unresolved verdict, so an omitted key there carries no information the engine does
@@ -14613,6 +14644,46 @@ class AGapWhoseCheckersDisagreeIsFiledAsADisagreement(_CoverageCase):
         self.assertIn(review_panel.MIXED_SETTLING, gaps)
         self.assertNotIn(review_panel.UNKNOWN_SETTLING, gaps,
                          "a disagreement was filed as no verdict received")
+
+
+class AGapWhoseVerdictCouldNotBeReadShowsNoCheckersWords(_CoverageCase):
+    """The stand-in the engine writes for a verdict it cannot read carries the parse error
+    as its rationale. Rendered under "What the check found" it reads as a checker's words
+    about the gap, which nobody said. The coverage section names the candidate and the
+    error; the gap entry prints nothing in that slot."""
+
+    def test_the_parse_error_is_not_printed_as_what_the_check_found(self):
+        self.plan_into(self.rundir)
+        stub_dispatch(self.rundir, self.READING, DISPATCH)
+        proc = _run("route", str(self.rundir))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        table = self.verify_table()
+        broken = None
+        for batch in self.batches("coverage"):
+            verdicts = []
+            for cid in batch["candidates"]:
+                if broken is None:
+                    broken = cid
+                    verdicts.append({**_gap_verdict(cid, "unresolved", unresolved_reason="needs_a_run"),
+                                     "unresolved_reason": "banana"})
+                else:
+                    verdicts.append(_gap_verdict(cid))
+            table[batch["id"]] = {"verdicts": verdicts, "summary": "s"}
+        self.assertIsNotNone(broken)
+        stub_dispatch(self.rundir, table, None)
+        self.cluster()
+        grouping = {u["id"]: {"clusters": [{"members": [cid], "consequence": "c",
+                                             "split_reason": None} for cid in u["candidates"]],
+                              "summary": "s"} for u in self.clusterers()}
+        stub_dispatch(self.rundir, grouping, None)
+        self.report()
+        text = (self.rundir / "report.md").read_text(encoding="utf-8")
+        coverage = _section(text, "Coverage")
+        self.assertIn("banana", coverage, "the coverage section did not name the parse error")
+        elsewhere = text.replace(coverage, "")
+        self.assertNotIn("the engine could not read this verdict", elsewhere,
+                         "the engine's diagnostic was printed as what a check found")
+        self.assertNotIn("banana", elsewhere)
 
 
 class TestsToWriteAreGroupedByTheTestClassThatOwesThem(_CoverageCase):

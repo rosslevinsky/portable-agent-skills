@@ -8,6 +8,64 @@ Versions use [Calendar Versioning](https://calver.org/) in the form
 A MICRO bump in the same month indicates a follow-up release; a new month
 starts from `.0` again.
 
+## [2026.09.4] - 2026-09-22
+
+### Changed
+
+- **`review_panel_run.py --extend` is an absolute grant.** The number is hours beyond
+  `--max-hours`. Running the same command again grants nothing more, and asking for more is a
+  larger number. The flag added its hours on every invocation, and the run's advice on a
+  spent budget was to raise it with `--extend` and run again, so a run restarted often
+  enough with that flag left in its command line had no limit.
+  A run started under the previous release with a grant already recorded keeps that grant
+  until its next restart passes `--extend`, which then replaces it, and `--extend 0` now
+  takes the grant back where it was ignored before: a restart command that carries
+  `--extend 0` from habit ends the run's extra hours. A negative number is refused.
+- **`review_panel_run.py resolve-unit --fail` asks for `--stopped-confirmed`** while the unit
+  has an attempt nobody can account for, and with it fails that attempt too, so the slot comes
+  free. Without the attestation the unit's error was published while the attempt kept
+  reserving the slot's capacity for the rest of the run. The command takes `--grace`, the
+  same number the run reads attempt states with, so which attempts count as unaccounted
+  for is judged the way the run judges it.
+- **The README and the contributor documents are written in plainer English.** Every rule,
+  number and reason in them is kept, with three deliberate exceptions. The README and
+  CONTRIBUTING no longer explain why an install is a copy rather than a link. Both gain
+  steps in their section on editing a skill from inside an agent session, which now says
+  which copy the agent edits and adds the word-budget step. And the README's decision guide
+  and skill inventory are one table, with its installer section no longer repeating itself.
+
+### Fixed
+
+- **`/diff-review`'s supervisor accepts a reply that is the verdict object alone.** Under a
+  schema flag, Claude sometimes answers with the validated object and no prose. Transcript
+  mode reported that completed review as "reviewer produced no text output". The object is
+  now published as the findings, and only a reply with neither prose nor an object is no
+  output.
+- **A line over `--max-capture-bytes` ends the diff-review supervisor's run as a capture
+  overflow, however its bytes arrived.** Whether an over-cap line was kept as its tail or
+  ended the run depended on where the pipe reads fell. One rule now: a single line larger
+  than the cap is an overflow, and the bound that kept an over-cap result or terminal event
+  as its tail is gone. A cap smaller than one line of the reviewer's output, which no
+  default sets, now ends the run where it once succeeded with a notice.
+- **The review-panel driver records a supervisor that exits without reporting a status.** It
+  keeps each supervisor's stderr beside the attempt, writes the exit code and the end of that
+  stderr as the attempt's status, and stops the run naming it. Such an attempt was read as a
+  worker still running until its deadline and grace had passed, about an hour at the
+  defaults, and a supervisor that crashed before printing it, such as one run under a Python
+  too old for it, did that to every attempt. Recorded only where the exit says the worker
+  is gone: on POSIX, for an ordinary exit code, by the driver process that started the
+  supervisor. A supervisor a signal killed, one started by a driver since restarted, and
+  any supervisor on Windows, where a terminated process reports an ordinary exit code, are
+  left to the deadline as before.
+- **A full disk while reserving or claiming a review-panel attempt is a resumable stop**,
+  exit 3, the same answer a full disk during the working-copy preparation gets. It was a
+  refusal, exit 2, or a traceback.
+- **An unreadable checker verdict is reported as no answer.** When one verdict in a batch
+  could not be parsed, the report filed that defect as blocked by the environment and showed
+  the engine's parse error where the checker's rationale goes. It now lands in the same words
+  the report uses for a candidate whose unit never answered, and the parse error appears once,
+  under Coverage.
+
 ## [2026.09.3] - 2026-09-22
 
 ### Added
@@ -519,6 +577,7 @@ release](README.md#installing-a-previous-release) to return to it.
 
 Initial release.
 
+[2026.09.4]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.4
 [2026.09.3]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.3
 [2026.09.2]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.2
 [2026.09.1]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.1

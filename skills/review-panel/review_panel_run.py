@@ -1192,6 +1192,13 @@ def _engine_stage(*argv: str) -> tuple[int, str, str]:
 # --------------------------------------------------------------------------- #
 ARGV_NAME = "argv.json"
 STATUS_NAME = "status.txt"
+# The supervisor's stderr, kept per attempt. Its one status line goes to stdout; what it
+# says when it cannot get that far -- a usage error from a flag it does not know, a
+# traceback -- goes here, and is the only account of a supervisor that ended silently.
+STDERR_NAME = "stderr.txt"
+# How much of that stderr an ended-silently status carries. A tail, because the reason
+# is at the end of a traceback and a usage error is short.
+STDERR_TAIL_BYTES = 2000
 TRANSCRIPT_NAME = "transcript.md"
 DISPLAY_NAME = "display.log"
 REPLY_NAME = "reply.json"
@@ -1592,6 +1599,29 @@ def _is_supervisor_refusal(status: dict) -> bool:
     return isinstance(reason, str) and any(mark in reason for mark in _SUPERVISOR_REFUSALS)
 
 
+def _is_supervisor_exit(status: dict) -> bool:
+    """Whether this record was written by the driver for a supervisor that exited without
+    one. The field is the driver's, never the supervisor's, so its presence is the test."""
+    return "supervisor_exit" in status
+
+
+def _stderr_tail(path: Path) -> str:
+    """The last ``STDERR_TAIL_BYTES`` of a supervisor's stderr, or an empty string.
+
+    Tolerant of a refused read, like :func:`read_status` and for the same reason: this
+    decides nothing, it only explains, and an explanation that could not be read is an
+    empty one rather than a stop.
+    """
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - STDERR_TAIL_BYTES))
+            return handle.read().decode("utf-8", "replace").strip()
+    except OSError:
+        return ""
+
+
 def _terminal_detail(status: dict) -> str | None:
     """The terminal event's own error text, or ``None`` where the failure named nothing.
 
@@ -1688,6 +1718,24 @@ def adjudicate(ctx: "Run", attempt: Attempt) -> dict:
                     f"slot {slot}'s supervisor could not start a worker for {attempt.unit}: "
                     f"{status.get('reason')}. Nothing was charged. Fix that slot's command in "
                     "the adapter file, then run the same command again")
+            elif _is_supervisor_exit(status):
+                # The supervisor ended without saying what happened to its worker, which
+                # is nobody's answer: not the worker's, which may have finished or never
+                # started, and not the provider's. Charged to nobody, and the run stops,
+                # because the one way this happens in practice -- a supervisor that
+                # crashes before its status line -- happens to every attempt alike,
+                # and a run that carried on would spend every unit's launches on it. The
+                # stderr tail is the whole account there is, so it is in the reason.
+                record["outcome"] = INFRASTRUCTURE
+                record["supervisor_exit"] = status.get("supervisor_exit")
+                slot = attempt.slot if getattr(attempt, "slot", None) else \
+                    ctx.unit_row(attempt.unit).get("slot", "?")
+                tail = str(status.get("stderr_tail") or "").strip()
+                ctx.request_pause(
+                    f"slot {slot}'s supervisor exited {status.get('supervisor_exit')} for "
+                    f"{attempt.unit} {attempt.name} without reporting a status. Nothing was "
+                    f"charged. Its stderr ends: {tail or '(nothing)'}. Fix what it names, "
+                    f"then run the same command again")
             elif _is_provider_fault(status, ctx.fault_patterns(attempt)):
                 record["outcome"] = PROVIDER_UNAVAILABLE
             else:
@@ -2457,6 +2505,22 @@ def _new_token() -> str:
     return secrets.token_hex(8)
 
 
+def _spawn_refused(path: Path, exc: OSError, action: str, message: str) -> DriverError:
+    """What a write that a spawn makes BEFORE its claim raises when the host refuses it.
+
+    Two answers, the same two the working-copy preparation gives: the volume's failure is
+    a resumable stop that names the path, and everything else is a refusal. Every write a
+    spawn makes before claiming an attempt — the token directory, the unit's dispatch
+    directory, the claim itself — is one an operator fixes by freeing space and running the
+    same command again, and a full disk raised as a plain refusal exits 2, which reads as
+    "do not retry", over exactly that failure. Raised bare it is a traceback, which reads as
+    a defect in this program.
+    """
+    if _is_storage_exception(exc):
+        return StorageFault(path, exc, action=action)
+    return DriverError(message)
+
+
 def reserve_token(rundir: Path) -> str:
     """A token no other attempt can be given, reserved by creating its input directory.
 
@@ -2470,7 +2534,7 @@ def reserve_token(rundir: Path) -> str:
     try:
         base.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        raise DriverError(f"cannot create {base}: {exc}") from exc
+        raise _spawn_refused(base, exc, "created", f"cannot create {base}: {exc}") from exc
     for _ in range(64):
         token = _new_token()
         try:
@@ -2478,7 +2542,9 @@ def reserve_token(rundir: Path) -> str:
         except FileExistsError:
             continue
         except OSError as exc:
-            raise DriverError(f"cannot reserve a worker directory in {base}: {exc}") from exc
+            raise _spawn_refused(
+                base / token, exc, "reserved",
+                f"cannot reserve a worker directory in {base}: {exc}") from exc
         return token
     raise DriverError(  # pragma: no cover - 64 collisions in a row is not reachable
         f"cannot find an unused worker token under {base}")
@@ -2797,7 +2863,9 @@ class Run:
         self._swept_for_room = False
         self._paused_said: set[str] = set()
         self._unreadable_said: set[str] = set()
-        self._children: list[subprocess.Popen] = []
+        # Each supervisor this process started, with the attempt it was started for: the
+        # exit of a child is a fact only its parent can read, and it is read in `reap`.
+        self._children: list[tuple[subprocess.Popen, Path, str]] = []
         self._units_cache: list[dict] | None = None
         # **A per-pass cache, and the reason is scale.** Eligibility, the capacity count,
         # the quarantine test and the drain test each walk a unit's attempts, so an
@@ -2903,10 +2971,20 @@ class Run:
                          "extended": round(self._extended, 3)})
 
     def extend(self, hours: float) -> None:
-        """Grant this run more time. The grant is kept as its own number and persisted, so
-        every hour asked for is an hour given — including on a run that has barely spent
-        anything, where taking the grant off the spend would throw most of it away."""
-        self._extended += max(0.0, hours) * 3600.0
+        """Let this run use ``hours`` beyond ``--max-hours``, as an absolute figure.
+
+        The grant is kept as its own number and persisted, so every hour asked for is an
+        hour given — including on a run that has barely spent anything, where taking the
+        grant off the spend would throw most of it away.
+
+        **Set, never added.** The run's own advice on a spent budget is to run the same
+        command again, and an operator who does that has `--extend` in the command line
+        every time — on every restart after a crash, a pause or a drain, not only the one
+        that asked for more time. Added on each invocation, the same flag granted a fresh
+        extension per restart, and a run restarted enough times had no limit at all. Asking
+        for more is a larger number.
+        """
+        self._extended = max(0.0, hours) * 3600.0
         self.save_budget(force=True)
 
     def over_budget(self) -> bool:
@@ -3051,7 +3129,12 @@ class Run:
         mode = WRITE_CAPABLE if unit.get("kind") in WRITE_CAPABLE_KINDS else READ_ONLY
         spec = slot.modes[mode]
         base = self.rundir / engine.DISPATCH_DIR / unit_id
-        base.mkdir(parents=True, exist_ok=True)
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise _spawn_refused(
+                base, exc, "created",
+                f"cannot create the dispatch directory for {unit_id}: {exc}") from exc
         # **Everything slow happens BEFORE the claim.** A write-capable unit's working
         # directory is a copy of the whole snapshot, and preparing it after the claim puts
         # a directory copy inside the window between claiming an attempt and describing it
@@ -3065,13 +3148,12 @@ class Run:
             inbox, outbox, cwd = prepare_worker_paths(self.rundir, unit, token)
         except OSError as exc:
             # The volume's failure is resumable -- free space, run the same command again --
-            # and exits as a stop, not a refusal, so the operator is told which it is. A
-            # DriverError here reported a full disk as exit 2, which reads as "do not retry".
-            if _is_storage_exception(exc):
-                raise StorageFault(self.rundir, exc, action="copied") from exc
-            # Refused by name with nothing claimed, so the run stops where an operator can
-            # see why rather than ending in a traceback with a half-made copy behind it.
-            raise DriverError(
+            # and exits as a stop, not a refusal, so the operator is told which it is.
+            # Anything else is refused by name with nothing claimed, so the run stops where
+            # an operator can see why rather than in a traceback with a half-made copy
+            # behind it.
+            raise _spawn_refused(
+                self.rundir, exc, "copied",
                 f"cannot prepare a working directory for {unit_id}: {exc}") from exc
         transcript = outbox / TRANSCRIPT_NAME
         # **Asked AGAIN, here, with the preparation done and the claim one line away.**
@@ -3103,7 +3185,8 @@ class Run:
                 index += 1
                 continue
             except OSError as exc:
-                raise DriverError(f"cannot claim {candidate}: {exc}") from exc
+                raise _spawn_refused(candidate, exc, "claimed",
+                                     f"cannot claim {candidate}: {exc}") from exc
             attempt_path = candidate
         values = {
             "input": str(inbox),
@@ -3153,7 +3236,15 @@ class Run:
             # stdout is redirected into the attempt's own `status.txt`, inherited by the
             # child. The supervisor prints its one status line last and flushes it, so the
             # outcome record lands even when this driver is gone by the time it does.
+            # stderr goes to a file of its own beside it: a supervisor that exits before
+            # that line has said why on stderr and nowhere else, and discarded, its death
+            # read as a worker still running until its deadline and grace had passed.
             handle = open(attempt_path / STATUS_NAME, "wb")
+            try:
+                errors = open(attempt_path / STDERR_NAME, "wb")
+            except OSError:
+                handle.close()
+                raise
         except OSError as exc:
             # **The same outcome as a failed spawn, because that is what this is.** The
             # attempt directory and a complete `argv.json` are already on disk when this
@@ -3163,16 +3254,95 @@ class Run:
             # existed.
             return self._record_no_launch(unit_id, attempt_path, index, exc)
         try:
-            with handle:
+            with handle, errors:
                 child = subprocess.Popen(
-                    argv, stdout=handle, stderr=subprocess.DEVNULL,
+                    argv, stdout=handle, stderr=errors,
                     stdin=subprocess.DEVNULL, cwd=str(self.rundir),
                     **_own_process_group())
         except (OSError, ValueError) as exc:
             return self._record_no_launch(unit_id, attempt_path, index, exc)
-        self._children.append(child)
+        self._children.append((child, attempt_path, unit_id))
         self.invalidate(unit_id)
         return True
+
+    def reap_children(self) -> None:
+        """Forget the supervisors that have exited, and record the ones that said nothing.
+
+        **An exit with no status is an ended execution, and it is written down here
+        because nothing else can see it.** The attempt's state is read from disk, where a
+        supervisor that died before printing its status line is indistinguishable from one
+        still working: it stays `running` until its deadline and grace pass, an hour at the
+        defaults, and every attempt after it on that slot waits its turn behind a process
+        that is not there. A supervisor that crashes before printing it -- one run under a
+        Python too old for it, for instance -- does that to every attempt.
+
+        Only the process that spawned the supervisor can know it exited, so this is the
+        one place the driver writes a status record, and only over an empty one: the
+        child has exited, so nothing else will write there, and a record that is already
+        complete stands. A resumed driver never spawned the child and cannot tell; for it
+        the deadline is still the answer, which is what the deadline is for. So is the
+        deadline on Windows, and for a supervisor a signal killed anywhere, because those
+        exits say nothing about whether the worker is still running.
+        """
+        still = []
+        for child, attempt_path, unit_id in self._children:
+            code = child.poll()
+            if code is None:
+                still.append((child, attempt_path, unit_id))
+                continue
+            try:
+                # Read as bytes first, so a file the host refuses to hand over is told apart
+                # from one holding no record. `read_status` answers None for both, and
+                # writing over a file this program could not read would put a record on top
+                # of one that may already be there.
+                (attempt_path / STATUS_NAME).read_bytes()
+            except OSError as exc:
+                self.say(f"{unit_id} {attempt_path.name}: the supervisor exited {code} and "
+                         f"its status file could not be read: {exc}")
+                continue
+            if read_status(attempt_path / STATUS_NAME) is not None:
+                continue
+            if os.name != "posix" or code < 0:
+                # **Killed from outside, and its worker may be alive.** The supervisor starts
+                # its reviewer in a session of its own, so a kill of the supervisor -- the
+                # memory killer, an operator's kill -9 -- leaves that reviewer running with
+                # nothing to stop it. A record here would count as proof the execution ended
+                # and release the slot, and the resumed run would start a second worker
+                # beside the live one, which is the exact thing the `--stopped-confirmed`
+                # attestation exists to prevent. Left unrecorded, the attempt reaches
+                # `uncertain` at its deadline and waits for that attestation. On POSIX a
+                # death by signal is a negative code and an exit on the supervisor's own
+                # path, which has stopped its reviewer or never started one, is not. Windows
+                # reports a terminated process with an ordinary exit code, so there the two
+                # cannot be told apart and nothing is recorded: the deadline is the answer,
+                # as it is for a resumed driver.
+                _progress(self.rundir, f"{unit_id} {attempt_path.name} supervisor exited "
+                                       f"{code} without a status; its worker may still be "
+                                       f"running, so the attempt keeps its slot until its "
+                                       f"deadline")
+                continue
+            record = {
+                "status": "error",
+                "reason": f"the supervisor exited {code} without reporting a status",
+                "supervisor_exit": code,
+                "stderr_tail": _stderr_tail(attempt_path / STDERR_NAME),
+            }
+            try:
+                with open(attempt_path / STATUS_NAME, "ab") as handle:
+                    # On its own line: whatever partial line the supervisor left is not
+                    # a record, and the reader takes the last line that is one.
+                    handle.write(b"\n" + json.dumps(record).encode("utf-8") + b"\n")
+            except OSError as exc:
+                # Left unrecorded rather than raised: the attempt then reads as running
+                # and reaches `uncertain` at its deadline, which is the cautious answer,
+                # and a refused write is reported where the operator reads.
+                self.say(f"{unit_id} {attempt_path.name}: the supervisor exited {code} "
+                         f"without a status and the record could not be written: {exc}")
+                continue
+            _progress(self.rundir, f"{unit_id} {attempt_path.name} supervisor exited "
+                                   f"{code} without a status")
+            self.invalidate(unit_id)
+        self._children = still
 
     def _record_no_launch(self, unit_id: str, attempt_path: Path, index: int,
                           exc: BaseException) -> bool:
@@ -3740,6 +3910,9 @@ class Run:
         provably finished. Every step is idempotent, because every one of them is what a
         resumed run performs before it does anything else.
         """
+        # First, so a supervisor that exited without a status is adjudicated in this pass
+        # rather than the next: the record it gets is what step 2 reads.
+        self.reap_children()
         self.invalidate()
         for unit in (self.units() if only is None else only):
             unit_id = unit["id"]
@@ -3778,9 +3951,6 @@ class Run:
                 self.say(f"removed {name}, which a kill during preparation left behind")
                 _progress(self.rundir, f"reclaimed the leaked directory {name}")
             self.sweep_copies()
-        # Reap whatever finished, so a long round does not accumulate zombies. Nothing is
-        # decided from this: the decision is the status record on disk.
-        self._children = [child for child in self._children if child.poll() is None]
 
     # -- 4. one round -------------------------------------------------------- #
     def dispatch_round(self, kinds: Sequence[str]) -> None:
@@ -4069,8 +4239,9 @@ class Run:
                           (f"drained: {self.drain_reason}; the run is resumable"
                            if self.drain_reason else
                            "drained on request; the run is resumable")) if self.draining
-                         else f"the time budget of {self.max_hours} h is spent; raise it "
-                              f"with --extend and run again")
+                         else f"the time budget of {self.max_hours} h is spent; run again "
+                              f"with --extend <hours beyond the limit>, larger than "
+                              f"{self._extended / 3600.0:g}")
                 for unit_id, why in self.unfinished(kinds):
                     self.say(f"  not finished: {unit_id} — {why}")
                 self.save_budget(force=True)
@@ -4199,13 +4370,21 @@ def resolve_attempt(rundir: Path, unit: str, attempt_name: str, *, action: str,
 
 
 def resolve_unit(rundir: Path, unit: str, *, grant: int | None,
-                 fail: bool, reason: str) -> str:
+                 fail: bool, reason: str, stopped_confirmed: bool = False,
+                 grace: float = GRACE_DEFAULT) -> str:
     """The way out of the launch-limit quarantine.
 
     ``--grant-launches`` raises this unit's hard ceiling by a stated amount and is itself a
     durable record, so a replay reaches the same ceiling every time. ``--fail`` publishes
     the terminal error **without rewriting any historical disposition**: the record of what
     happened is never edited, only added to.
+
+    ``--fail`` on a unit with an attempt nobody can account for needs the same attestation
+    ``resolve-attempt`` needs, and for the same reason one level up: the unit's error is
+    published either way, but an ``uncertain`` or ``orphan-claim`` attempt keeps its
+    capacity reservation until something says its worker is gone, and a failed unit whose
+    attempt still held its slot held it for the rest of the run. With the attestation those
+    attempts are failed too, each with its own record, so the reservation ends.
     """
     base = rundir / engine.DISPATCH_DIR / unit
     if not _is_directory(base):
@@ -4240,6 +4419,34 @@ def resolve_unit(rundir: Path, unit: str, *, grant: int | None,
                 )
         if unit_resolution(rundir, unit) is not None:
             raise DriverError(f"{unit} already carries an operator decision")
+        # **An attempt nobody can account for outlives the unit's failure unless the
+        # operator attests its worker is gone.** The capacity predicate reads the attempt,
+        # never the unit: a unit-level decision says nothing about whether a detached worker
+        # is still running, so releasing the slot on it would start a second worker beside
+        # a live one. Asked here, before anything is written, with the same refusal
+        # `resolve-attempt --fail` gives, because the operator has the same two answers.
+        unproven = [attempt for attempt in read_attempts(rundir, unit, grace=grace)
+                    if attempt.state in (UNCERTAIN, ORPHAN_CLAIM)]
+        if unproven and not stopped_confirmed:
+            names = ", ".join(attempt.name for attempt in unproven)
+            raise DriverError(
+                f"--fail on {unit} needs --stopped-confirmed: {names} cannot be accounted "
+                f"for, and without the attestation its capacity reservation is never "
+                f"released, which at one worker per slot holds the slot for the rest of "
+                f"the run. Its deadline has already passed, so waiting releases nothing; "
+                f"confirm the worker has stopped and pass --stopped-confirmed")
+        # **The attempts' records before the unit's.** Each record on its own moves the unit
+        # to the same end: an attested operator failure on an attempt is adjudicated on the
+        # next adoption pass and publishes the unit's error, and the unit record below is
+        # replayed the same way. Written in this order, a kill anywhere between leaves no
+        # attempt still reserving its slot for a unit whose failure is already decided.
+        for attempt in unproven:
+            _write_json(attempt.path / RESOLUTION_NAME, {
+                "action": "fail", "reason": reason.strip(), "stopped_confirmed": True,
+                "at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+            })
+            _progress(rundir, f"{unit} {attempt.name} resolved by operator: fail, with "
+                              f"the unit")
         # **The record first, the publication second.** Publishing straight from here left
         # an `error.txt` no adoption pass could attribute to anything: a kill before
         # `landed.json` and the unit is not terminal, while at the launch ceiling it stays
@@ -4363,8 +4570,9 @@ def build_parser() -> argparse.ArgumentParser:
                      help="stop claiming once this much driver uptime has accumulated "
                           "across restarts")
     run.add_argument("--extend", type=float, default=None,
-                     help="give the run this many more hours by taking them off the "
-                          "recorded spend, then continue")
+                     help="let the run use this many hours beyond --max-hours. Absolute, "
+                          "not added per invocation: the same command run again grants "
+                          "nothing more, and asking for more is a larger number")
     run.add_argument("--supervisor", default=None,
                      help="path to review_runner.py (default: the sibling skill's)")
     run.add_argument("--probe-backoff", type=float, default=PROBE_BACKOFF_DEFAULT,
@@ -4415,6 +4623,12 @@ def build_parser() -> argparse.ArgumentParser:
     what.add_argument("--grant-launches", type=int, default=None)
     what.add_argument("--fail", action="store_true")
     ru.add_argument("--reason", required=True)
+    ru.add_argument("--grace", type=float, default=GRACE_DEFAULT,
+                    help="the same grace the run reads attempt states with (default 120)")
+    ru.add_argument("--stopped-confirmed", action="store_true",
+                    help="your attestation that the old supervisor and its worker are "
+                         "gone. --fail requires it while the unit has an attempt nobody "
+                         "can account for, and then fails that attempt too")
     return parser
 
 
@@ -4501,7 +4715,9 @@ def _dispatch(args: argparse.Namespace) -> int:
                 stopped_confirmed=args.stopped_confirmed, grace=args.grace) + "\n")
             return EXIT_OK
         sys.stdout.write(resolve_unit(rundir, args.unit, grant=args.grant_launches,
-                                      fail=args.fail, reason=args.reason) + "\n")
+                                      fail=args.fail, reason=args.reason,
+                                      stopped_confirmed=args.stopped_confirmed,
+                                      grace=args.grace) + "\n")
         return EXIT_OK
 
 
@@ -4583,7 +4799,14 @@ def _command_run(args: argparse.Namespace, rundir: Path, lock: RunLock) -> int:
                   keep_repro_bytes=args.keep_repro_bytes,
                   disk_floor=args.disk_floor_bytes,
                   build_margin=args.build_margin_bytes)
-        if args.extend:
+        # `is not None`, not truth: `--extend 0` is how an operator takes an earlier grant
+        # back, and read as "not given" it was silently ignored. A negative number is
+        # refused rather than clamped, because clamped to zero it revoked a grant nobody
+        # meant to revoke.
+        if args.extend is not None and args.extend < 0:
+            raise DriverError("--extend must be zero or more hours; zero takes an earlier "
+                              "grant back")
+        if args.extend is not None:
             run.extend(args.extend)
         previous = _arm_drain(run)
         try:

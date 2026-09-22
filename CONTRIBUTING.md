@@ -83,22 +83,24 @@ separate proposal. If you rename or remove a companion-skill reference (`cyw`, `
 **US spelling, everywhere.** Prose, comments, docstrings, identifiers: `behavior`, not
 `behaviour`; `normalize`, not `normalise`; `catalog`, not `catalogue`. This covers every
 tracked file except `LICENSE` and `NOTICE`, which are legal text and stay as they are.
-Nothing enforces it — a spelling check would guard none of the three things this project's
-checks exist for, so adding one would earn it deletion rather than a place in the gate.
+Nothing enforces it. A spelling check would guard none of the three things this project's
+checks exist for, so one would be removed rather than added to the gate.
 
 ### Editing a skill from inside an agent session
 
-Asking an agent to improve its own skill edits the **installed copy** under
-`~/.claude/skills/<name>/` or `~/.agents/skills/<name>/`, which git does not track. Carry it
-back deliberately:
+Ask an agent to improve its own skill and which file it edits depends on where the session
+is. In any other project the only copy it can see is the installed one, under
+`~/.claude/skills/<name>/` or `~/.agents/skills/<name>/`, which git does not track. In a
+session opened inside this checkout it may edit `skills/<name>/SKILL.md` here instead. Ask
+it which, or diff both. Then carry the change back deliberately:
 
-1. Diff that file against `skills/<name>/SKILL.md` here and port the change over.
-2. Run the gate (below).
-3. `python3 install.py` to put the reviewed version back on your machine.
+1. Diff the installed copy against `skills/<name>/SKILL.md` here and port the change over.
+2. Move the skill's word budget in `scripts/skill-budgets.json` to the new measurement,
+   which the README's Development Setup section shows how to take.
+3. Run the gate (below).
+4. `python3 install.py` to put the reviewed version back on your machine.
 
-There is no symlink install, so this is manual on purpose: a linked install would make the
-installed path the repo file, and an agent asked to improve a skill would be rewriting the
-instructions it is executing. An edit an agent made to its own instructions is worth reading
+This is manual on purpose. An edit an agent made to its own instructions is worth reading
 before it becomes the instructions.
 
 ## The two planning generations
@@ -108,14 +110,14 @@ ships alongside as `plan-init-v1` / `plan-phase-v1` / `plan-run-v1`.
 
 They **coexist without collision**: the current skills act only on a `plan.md` stamped
 `| Format | v2 |` and use an `execution.md` tracker, never `phases.md`; the `-v1` skills
-track state in `phases.md` and never touch `execution.md`. There is no migration path — the
+track state in `phases.md` and never touch `execution.md`. There is no migration path. The
 marker plus the distinct filename is the whole mechanism.
 
 `execution.md` is a **checkbox list**: one box per phase, each linking that phase's document.
 No status values, no scheduling keys, no marker of its own. The **phase document is the
-durable state** — its Work, Tests and Gate boxes are ticked as work proceeds — and the
+durable state**, since its Work, Tests and Gate boxes are ticked as work proceeds, and the
 tracker is a derived index. That is what lets `plan-run` resume from the first unticked box
-and self-heal after a crash.
+and recover from a crash on its own.
 
 One rule about the two generations is a *skill-text* rule rather than a procedure, and
 lives in the contract instead: inside a `-v1` skill, references to siblings must be
@@ -126,17 +128,18 @@ lives in the contract instead: inside a `-v1` skill, references to siblings must
 `skills/plan-phase/references/v2-templates.md`, which ships with the pack. **Change the
 tracker shape and you change the schema, the checker and its fixtures in one commit.** Its
 cases build throwaway plan directories in `tests/test_plan_tracker.py` rather than committed
-`.md` files, because several rules are about the *directory* — a link must resolve to a real
+`.md` files, because several rules are about the *directory*: a link must resolve to a real
 phase document, and every phase document must be listed.
 
-**Two properties of that checker are what keep it honest. Do not trade either away.**
+**Two properties of that checker make it trustworthy. Keep both; do not trade either away
+for some other benefit.**
 
 - **Scope is decided by filename.** A directory scan inspects only files named
   `execution.md`. Deciding it from a file's *contents* makes every parsing bug present as
   silently skipped validation: a green run that checked nothing.
 - **Nothing is parsed around.** Fences and HTML comments are rejected outright, and the file
   is split only on CommonMark line endings. If a new rule seems to need a Markdown model,
-  ban the construct instead — and check first whether the rule earns its keep. The threat
+  ban the construct instead, and check first whether the rule is worth having. The threat
   model is a **typo**, not an adversary: `plan-phase` writes the tracker, `plan-run` reads
   it, and a human reviews the diff.
 
@@ -148,7 +151,7 @@ installed. **A fix to one side of a mirrored block lands in its mirror in the sa
 - **The v1/v2 skill pairs** — `plan-init-v1` ↔ `plan-init`, `plan-phase-v1` ↔ `plan-phase`,
   `plan-run-v1` ↔ `plan-run`. A correctness fix that applies to both generations is
   backported, adapted to the other side's vocabulary: v1 knows only `phases.md`, and no
-  v2-marker awareness may enter a v1 skill — **except** a read-only refuse-and-redirect
+  v2-marker awareness may enter a v1 skill, **except** a read-only refuse-and-redirect
   guard, where a v1 skill detects a `Format: v2` plan solely to stop and point at the v2
   skill, never to act on it.
 - **The TDD red/green block** — duplicated by design across the plan-execution skills. Do
@@ -156,7 +159,7 @@ installed. **A fix to one side of a mirrored block lands in its mirror in the sa
 - **Execution policy does not cross.** The v2 skills use a batched test cadence (filtered
   tests while iterating; the phase's scoped tests once; the full suite only at a reconciling
   or final phase), a **single-pass** embedded `cyw` at the gate, and **at most one commit per
-  phase** — none when the phase stages nothing, and one extra only for a CI fix, which is an
+  phase**: none when the phase stages nothing, and one extra only for a CI fix, which is an
   exception to the count and never to the gate. Both review axes are skipped together, and
   only when the phase has no reviewable diff. v1 keeps its original heavier gate. Do not
   backport this to v1, and do not re-sync v2's gate to match v1's.
@@ -165,14 +168,14 @@ installed. **A fix to one side of a mirrored block lands in its mirror in the sa
   reasoning. v1's gate has only the first, so a v1 phase commits on the author reviewing
   their own work. That asymmetry is **not** a defect: v1 is the superseded suite, and adding
   a review axis to a deprecated path is feature work on the thing users are meant to leave.
-  Note that v1's gate is heavier in *test cadence* and lighter in *independence* — two
-  separate axes, and only the first is a policy divergence.
+  Note that v1's gate is heavier in *test cadence* and lighter in *independence*. Those are
+  two separate axes, and only the first is a policy divergence.
 - **Shape does not cross.** v2's `plan-run` runs a phase as four transitions (**Select,
   Satisfy, Gate, Publish**) and v2's `plan-phase` emits a six-section phase document
   (**Goal / Work / Tests / Verification / Gate / Evidence**). v1 keeps its lettered sub-steps
   and its **Goal / Entry Criteria / Tasks / Tests / Verification / Exit Criteria / Commit**
   document. These are the same lifecycle written differently, so porting one into the other
-  is a rewrite. A correctness fix *inside* one of those sections is still backported — check
+  is a rewrite. A correctness fix *inside* one of those sections is still backported; check
   first that it is a correctness fix and not a piece of the execution policy above.
 - **Plan document and index.** v2's `plan.md` carries only `Format` and `Suite` rows, because
   nothing edits it after `plan-init` writes it; v1 keeps `Phase` / `State` / `Blocker` /
@@ -186,7 +189,7 @@ installed. **A fix to one side of a mirrored block lands in its mirror in the sa
   content-model change to either is reflected in the other.
 
 **SKILL.md-standard conformance is done by hand.** New skills conform to the open Agent
-Skills format manually — `name` matches the directory, `description` is at most 1024
+Skills format manually: `name` matches the directory, `description` is at most 1024
 characters, a lean `SKILL.md` with detail pushed to `references/`. Do not add a hard
 dependency on an external validator or packager without confirming its specifics first.
 
@@ -198,17 +201,20 @@ python3 scripts/validate_cross_runtime.py --test-fixtures tests   # Fixture corp
 python3 -m unittest discover -s tests -p 'test_*.py'              # Every Python suite
 ```
 
-All three must pass before a PR is eligible to merge. CI runs exactly these on **Ubuntu,
-macOS and Windows** — one job each. No command path is PowerShell, so there is no PowerShell
-driver — though one skill ships a PowerShell 5.1 block that nothing statically checks; see
-`README.md`'s Validation section. A fixture that creates a symlink needs a platform guard, since creating one
-needs elevation on Windows; those cases live in `tests/test_plan_tracker.py` behind a
-symlink probe rather than in the corpus.
+All three must pass before a PR is eligible to merge. `python3 scripts/shard_tests.py
+--total 4 --parallel` runs the same suites as the third line, split across your cores. CI
+runs exactly these on **Ubuntu, macOS and Windows**, the suites in four shards per platform,
+plus a Linux pass under the C locale, which is the closest stand-in for the Windows console
+encoding. No command path is PowerShell, so there is no PowerShell driver, though one skill
+ships a PowerShell 5.1 block that nothing statically checks; see `README.md`'s Validation
+section. A fixture that creates a symlink needs a platform guard, since creating one needs
+elevation on Windows; those cases live in `tests/test_plan_tracker.py` behind a symlink
+probe rather than in the corpus.
 
 **A change to the release machinery is reviewed on its own pull request.** `scripts/promote_*`
 and `scripts/release_driver.py` get the same independent review a skill change gets, on the
 PR that changes them. A release does not re-review them: it reviews the projected diff, and
-the tool that produced that diff earned its trust on the PR that changed it, not on the one
+the tool that produced that diff was reviewed on the PR that changed it, not on the one
 that ran it.
 
 **Two programs are not in that list and should not be added to it.**
@@ -232,14 +238,14 @@ With several targets, `1` outranks `2`.
 
 ## Writing test fixtures
 
-Validator fixtures live in `tests/` as `test_validate_<scenario>.md` — one positive or
+Validator fixtures live in `tests/` as `test_validate_<scenario>.md`, one positive or
 negative fixture per check. A positive fixture must pass its check in isolation; a negative
 one must fail it.
 
 After adding a fixture, register it in `run_test_fixtures()` in
 `scripts/validate_cross_runtime.py` and add a row to the fixture table in `tests/README.md`
 with its expected outcome. A companion-fallback fixture only fires once its skill name is in
-`COMPANION_SKILLS`. Tracker cases do **not** belong in `run_test_fixtures()` — they live in
+`COMPANION_SKILLS`. Tracker cases do **not** belong in `run_test_fixtures()`; they live in
 `tests/test_plan_tracker.py`.
 
 Confirm the fixture is genuinely exercised with

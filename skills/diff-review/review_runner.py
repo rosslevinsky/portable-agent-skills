@@ -431,29 +431,10 @@ def _capture_result(line, state, lock):
         return
     if not isinstance(event, dict) or event.get("type") != "result":
         return
+    # No bound of its own: the reader refuses any line over `--max-capture-bytes` before
+    # it reaches here, so an event this holds is one the cap allowed whole.
     with lock:
-        cap = state.get("capture_cap")
-        if cap and len(stripped.encode("utf-8", "replace")) > cap:
-            # **This mode's result event is the reply, so the cap has to reach it too.**
-            # The event is the whole of what this mode publishes: `--findings` is written
-            # from its `result` payload and nothing else is kept. An event that arrived on
-            # one complete line is already past the pending-line bound — that one measures
-            # what has no end yet — so without this it is held whole, and the reviewer's
-            # entire output sits in this process's memory, four hundred attempts at a time,
-            # while the flag that asked for a bound reports nothing dropped.
-            #
-            # Bounded by the same rule as the assistant text: the payload's TAIL is what is
-            # kept, because the closing object a caller extracts the answer from is its last
-            # non-whitespace content and a head would never hold one.
-            bounded, dropped = _bounded_result(event, cap)
-            # Set rather than added: only the last result event is retained, so what the
-            # notice names is what was cut from THAT one. A running total would describe an
-            # event this program is no longer holding.
-            state["capture_dropped"] = dropped
-            state["capture_truncated"] = True
-            state["last_result"] = bounded
-        else:
-            state["last_result"] = event
+        state["last_result"] = event
 
 
 def _valid_verdict(event):
@@ -586,55 +567,6 @@ def _terminal_detail(event, limit=TERMINAL_DETAIL_MAX_BYTES):
     return _terminal_detail_parts(event, limit)[0]
 
 
-def _reduced_event(event, cap):
-    """What is kept of a terminal event larger than the cap: its head, and nothing else.
-
-    The head is what ``terminal_detail`` is extracted from, so the reason the run failed
-    survives. Everything else — a ``structured_output`` object among it — does not, which is
-    the point of a cap: the verdict then falls back to the scan of the reviewer's own text
-    rather than being read out of a payload this program refused to hold.
-    """
-    text, source = _terminal_detail_parts(event, min(cap, TERMINAL_DETAIL_MAX_BYTES))
-    kept = {"type": event.get("type")}
-    # **Only real error text becomes a message.** The last extraction rule answers with the
-    # event's own type, and writing that into `message` would make what is kept claim the
-    # failure explained itself — a claim the original event never made, and one a caller
-    # classifying failures then cannot see through.
-    if source in ("message", "error"):
-        kept["message"] = text
-    for key in ("subtype", "is_error"):
-        if key in event:
-            kept[key] = event[key]
-    return kept
-
-
-def _bounded_result(event, cap):
-    """What is kept of a ``result`` event larger than the cap, and how many bytes went.
-
-    ``(event, dropped)``. The fields that decide the outcome survive by
-    :func:`_reduced_event` — the type, the success flags, and the error text
-    ``terminal_detail`` is read from — and the payload keeps its **tail**, since the answer
-    a caller extracts is the last object in it.
-
-    Everything else the runtime put on the event is gone, ``structured_output`` included,
-    which is the same trade :func:`_reduced_event` makes and for the same reason: a cap that
-    kept a field because it was useful would not be a cap. The verdict then falls back to
-    the scan of the text that was kept.
-    """
-    kept = _reduced_event(event, cap)
-    payload = event.get("result")
-    dropped = 0
-    if isinstance(payload, str):
-        raw = payload.encode("utf-8", "replace")
-        if len(raw) > cap:
-            dropped = len(raw) - cap
-            # "ignore", so the kept tail is never LONGER than what was cut from it — the
-            # same reason the transcript bound gives.
-            payload = raw[dropped:].decode("utf-8", "ignore")
-        kept["result"] = payload
-    return kept, dropped
-
-
 def _noticed(text, state):
     """``text`` with the truncation notice in front of it where anything was dropped.
 
@@ -725,18 +657,12 @@ def _capture_terminal(line, state, lock):
     if verdict is not None:
         with lock:
             state["terminal"] = verdict
-            cap = state.get("capture_cap")
-            if cap and len(stripped.encode("utf-8", "replace")) > cap:
-                # Over the cap: its head is kept for `terminal_detail` and the transcript is
-                # marked truncated, because a caller told nothing about this would read a
-                # reply assembled from a stream this program declined to hold whole.
-                state["terminal_event"] = _reduced_event(event, cap)
-                state["capture_truncated"] = True
-            else:
-                # Keep the event itself, not just its ok/failed verdict: a runtime that
-                # honors an inline schema flag returns the validated object on THIS event
-                # (``structured_output``) while its assistant text stays prose.
-                state["terminal_event"] = event
+            # Keep the event itself, not just its ok/failed verdict: a runtime that honors
+            # an inline schema flag returns the validated object on THIS event
+            # (``structured_output``) while its assistant text stays prose. Held whole
+            # without a bound of its own, because the reader refuses any line over the cap
+            # before it reaches here.
+            state["terminal_event"] = event
 
 
 def _capture_transcript(line, state, lock):
@@ -1341,21 +1267,28 @@ class _Stream:
                 buf += data
                 while b"\n" in buf:
                     raw, buf = buf.split(b"\n", 1)
+                    # **One rule for a line, wherever the read boundaries fell.** A line is
+                    # over the cap or it is not, and the answer cannot depend on whether its
+                    # newline arrived in the same read as its first byte. Judged only while
+                    # pending, a line over the cap that arrived whole in one read was parsed
+                    # and kept, while the same bytes split across two reads ended the run —
+                    # two outcomes for one reviewer output, decided by pipe timing. A JSON
+                    # line cannot be reframed: dropping part of it leaves a document that
+                    # parses as something its author did not write, so a line this program
+                    # will not hold whole is an overflow whether it has ended or not.
+                    if self.cap is not None and len(raw) > self.cap:
+                        overflowed = True
+                        break
                     _consume_jsonl(raw.decode("utf-8", "replace"), self.mode,
                                    self.state, self.lock)
-                # Measured on what is still PENDING, which is what "cannot be reframed"
-                # means: a line that arrived whole has been reframed already, and the
-                # transcript and terminal-event bounds are what hold it from there. A line
-                # that keeps growing with no end to it is the one this cannot do, and
-                # dropping part of it would leave a JSON document that parses as something
-                # its author did not write.
-                if self.cap is not None and len(buf) > self.cap:
+                if not overflowed and self.cap is not None and len(buf) > self.cap:
                     overflowed = True
+                if overflowed:
                     buf = b""
                     with self.lock:
                         self.state["capture_overflow"] = (
-                            f"one output line exceeded --max-capture-bytes ({self.cap}) "
-                            f"before it ended, so it cannot be reframed")
+                            f"one output line exceeded --max-capture-bytes ({self.cap}), "
+                            f"and a line cannot be reframed")
             if (not overflowed and buf.strip()
                     and self.mode in ("stream-json-result-event", "stream-transcript")):
                 _consume_jsonl(buf.decode("utf-8", "replace"), self.mode, self.state, self.lock)
@@ -1620,10 +1553,27 @@ def _route_outcome(args, status, reason, drained, exit_code, state, lock):
                 with lock:
                     transcript = _retained_transcript(state)
                     terminal = state["terminal"]
+                    terminal_event = state["terminal_event"] or state["last_result"]
                 if terminal != "ok":
                     status, reason = "error", "no successful terminal event — review incomplete or failed"
                 elif not transcript:
-                    status, reason = "error", "reviewer produced no text output"
+                    # **An empty transcript with a verdict on the terminal event is a
+                    # reply.** A runtime honoring an inline schema flag puts the validated
+                    # object on that event and writes prose beside it only sometimes. The
+                    # object is then the whole of the reviewer's output, and refusing it
+                    # for the missing prose fails a run that answered — the same answer
+                    # passes when a line of prose happens to come with it. So the object
+                    # is what this mode publishes as the findings, and only its absence
+                    # is "no text output".
+                    enforced = _extract_verdict("", terminal_event)
+                    if enforced is None:
+                        status, reason = "error", "reviewer produced no text output"
+                    else:
+                        with lock:
+                            payload = _noticed(json.dumps(enforced, indent=2), state)
+                        Path(args.findings).write_text(
+                            payload + "\n", encoding="utf-8", errors="replace")
+                        findings_text = payload
                 else:
                     # The FULL transcript stays the findings payload. The structured
                     # verdict is written alongside it, never in place of it: the
@@ -1649,11 +1599,14 @@ def _route_outcome(args, status, reason, drained, exit_code, state, lock):
                 else:
                     findings_text = _read_verdict_file(fp, size,
                                                        args.max_capture_bytes or None)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
         # ValueError alongside OSError: `UnicodeEncodeError` and `UnicodeDecodeError` are
         # ValueErrors. The `errors="replace"` above should mean nothing here can raise one,
         # but a decoding surprise landing in the module-level `except BaseException` is what
-        # turned a completed review into `status: error` once already.
+        # turned a completed review into `status: error` once already. RecursionError for
+        # the same reason: the verdict-only path serializes an object the decoder accepted,
+        # and `json.dumps` recurses once per nesting level, so an object nested past the
+        # encoder's limit is a routing failure with a name rather than an unexpected exit.
         status, reason = "error", f"routing failed: {exc}"
     # Whatever went wrong, the reviewer's own words are the expensive part. Kept for every
     # transcript-mode failure, not just a failed terminal event: an idle timeout and a
@@ -1935,12 +1888,13 @@ def main(argv=None):
                          "is not read as an explanation. Opt-in: without it the status line "
                          "is exactly what it has always been")
     ap.add_argument("--max-capture-bytes", type=int, default=None,
-                    help="cap each retained representation separately: the pending raw "
-                         "line, the decoded reviewer text, the retained terminal event and "
-                         "the display log. Reviewer text over the cap is dropped from the "
-                         "FRONT with a notice prepended, and a line too large to reframe "
-                         "ends the run rather than shortening the transcript in silence. "
-                         "Opt-in: without it nothing is bounded and nothing is counted")
+                    help="cap each retained representation separately: any one output "
+                         "line, the decoded reviewer text and the display log. Reviewer "
+                         "text over the cap is dropped from the FRONT with a notice "
+                         "prepended, and a single line over the cap ends the run rather "
+                         "than shortening the transcript in silence, whether or not it had "
+                         "ended. Opt-in: without it nothing is bounded and nothing is "
+                         "counted")
     ap.add_argument("cmd", nargs=argparse.REMAINDER, help="-- <reviewer argv ...>")
     try:
         args = ap.parse_args(argv)

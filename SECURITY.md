@@ -45,7 +45,7 @@ This repository contains:
   invokes `ffmpeg` over a video path you supply and writes into an output
   directory you supply.
 - The project's own test suites and CI, which are published rather than kept
-  back: twelve Python suites under `tests/`, two stub CLIs under
+  back: the Python suites under `tests/`, two stub CLIs under
   `tests/fixtures/plan-duel/` that stand in for a real runtime, and
   `.github/workflows/validate.yml`. They are not part of an install and a
   user never runs them, but they are executable code in the published tree

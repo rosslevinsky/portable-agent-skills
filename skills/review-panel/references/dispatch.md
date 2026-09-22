@@ -103,7 +103,10 @@ the supervisor's opt-in flags**, and neither is optional here:
   worker's runaway output is held whole in the supervisor's memory, four hundred times over.
   Over the cap, assistant text is dropped **from the front** with the marker prepended, so a
   capped reply still ends in its closing object; a reply whose closing object was itself cut
-  is infrastructure, never an older object promoted in its place.
+  is infrastructure, never an older object promoted in its place. A single output line
+  larger than the cap cannot be cut without changing what it says, so it ends the attempt
+  as a capture overflow, which the driver also files as infrastructure and charges to
+  nobody.
 
 ### Choosing a result mode
 
@@ -134,7 +137,8 @@ be alive and writing.
 ```
 review_panel_run.py resolve-attempt <rundir> <unit> <attempt> --retry|--fail \
     --reason "…" [--stopped-confirmed]
-review_panel_run.py resolve-unit <rundir> <unit> --grant-launches <n>|--fail --reason "…"
+review_panel_run.py resolve-unit <rundir> <unit> --grant-launches <n>|--fail --reason "…" \
+    [--stopped-confirmed]
 ```
 
 - Both **require `--stopped-confirmed`**, your attestation that the old supervisor and its
@@ -144,12 +148,20 @@ review_panel_run.py resolve-unit <rundir> <unit> --grant-launches <n>|--fail --r
   reservation would never be released, which at one worker per slot holds the slot for the
   rest of the run. With it, `--fail` publishes the unit's error, releases the reservation,
   and that attempt's working copy becomes deletable.
+- `resolve-unit --fail` asks for the same attestation while the unit has an attempt nobody
+  can account for, and with it fails that attempt too, each with its own record. The
+  reservation belongs to the attempt, not the unit, so a unit failed over one released
+  nothing and held the slot for the rest of the run. At the launch ceiling, where every
+  attempt is adjudicated, it asks for nothing.
 - `resolve-unit --grant-launches` is the way out of the launch-limit quarantine, which a
   unit reaches when repeated infrastructure faults — not its own answers — used up its
   launches. The grant is itself a durable record, so replaying the run reaches the same
   ceiling every time.
 - Every resolution is written once and takes precedence over a status arriving later, which
-  is recorded as superseded. Nothing ever fabricates a supervisor status.
+  is recorded as superseded. Nothing ever fabricates a supervisor status. The one record the
+  driver writes itself is for a supervisor it started and saw exit without one: marked as
+  the driver's, carrying the exit code and the end of stderr, written only over an empty
+  file, and adjudicated as infrastructure that stops the run.
 
 A **paused** run is not a quarantined unit and needs no resolution: a storage fault, a host
 refusal or a provider outage stops the run having adjudicated nothing. Free the space,

@@ -119,16 +119,16 @@ of the skill — it is a different and misleading one.
 `review-panel` is the case. Its whole claim is that a finding was raised by one reader and
 judged by a stranger; at rung 3 one context does both, so the run cannot say the only thing
 it exists to say. It therefore requires two spawnable workers and **refuses** a host that
-cannot supply them, naming the slot that landed nothing. That is the honest answer: a
-refusal a caller can act on, rather than a document whose own text has to disclaim it.
+cannot supply them, naming the slot that landed nothing. A refusal a caller can act on is
+the truthful answer; a document whose own text has to disclaim it is not.
 
 The test is whether the degraded output is *the same kind of thing*, weaker. A review with
 one less pair of eyes is. A review with no second pair of eyes at all is not a review.
 
-Independence buys the one thing prose cannot: a verifier who is not the finder. Prose can
-ask a context to refute its own finding; it cannot make that a second opinion. What prose
-*can* carry is the burden of proof, and that half belongs in the skill whatever rung it
-reaches — a finding stands on a stated mechanism (for code, the input that produces the
+Independence provides the one thing prose cannot: a verifier who is not the finder. Prose
+can ask a context to refute its own finding; it cannot make that a second opinion. What
+prose *can* carry is the burden of proof, and that half belongs in the skill whatever rung
+it reaches. A finding stands on a stated mechanism (for code, the input that produces the
 wrong result; for prose, the reader who is misled and what they do next), not on the
 reviewer's confidence.
 
@@ -140,7 +140,7 @@ against the controller's own agent, rung 1 against the other runtime's.
 `security-review-codebase`'s deep mode deliberately does **not**, and it is the useful
 counter-example. It fans out per-component sub-agents and then synthesizes their reports;
 no verifier stands between a finding and the final document. That is breadth, not
-independence — a skill that fans out is not thereby verified.
+independence: a skill that fans out is not thereby verified.
 
 ## Autonomous Fallback
 
@@ -200,7 +200,8 @@ specified. Two accelerator shapes recur:
   execute sequentially"). This improves wall-clock only.
 - **Context hygiene (fresh-context-per-phase delegation)** — an orchestrator hands each
   unit of work to a *fresh* sub-agent so context doesn't accumulate across units and later
-  work isn't colored by earlier-unit rationalization. For this to be sound the durable
+  work isn't influenced by earlier units' after-the-fact justifications. For this to be
+  sound the durable
   state must live on disk (so the fresh worker needs no conversation memory), and the
   orchestrator must keep shared-state writes, the independent review, and the commit for
   itself — never delegating them to the worker.
@@ -227,14 +228,14 @@ live progress channel. Two postures are allowed:
   runs a single bounded task and returns its result, so there is nothing long-running to
   observe and no progress file is used (`security-review-codebase`).
 
-Reach for `observable` only when the dispatched job is long-running **and** otherwise
-opaque to the dispatcher until it returns. A bounded job that returns its result in one
-shot gains nothing from a progress file — and a file added "for consistency" only costs
-overhead, an artifact to clean up, and a false sense of live monitoring. Likewise skip it
-where the runtime already streams the worker's output.
+Use `observable` only when the dispatched job is long-running **and** otherwise opaque to
+the dispatcher until it returns. A bounded job that returns its result in one shot gains
+nothing from a progress file, and a file added "for consistency" only costs overhead, an
+artifact to clean up, and a false sense of live monitoring. Likewise skip it where the
+runtime already streams the worker's output.
 
-**Invariants for an `observable` progress file.** It is a comfort feature and must never
-become a new way for the run to fail:
+**Invariants for an `observable` progress file.** It exists for the reader's convenience
+and must never become a new way for the run to fail:
 
 1. **Append-only** — writers only ever append; nothing truncates or rewrites. This makes
    it safe when several workers share one log, and a crash leaves a readable partial trail.
@@ -283,7 +284,8 @@ A skill MAY ship an executable helper (for example a Python engine) alongside it
   spawn with an argv list (no `shell=True`, no `$(...)` / redirects / heredocs), so
   the same call works under `cmd`, PowerShell, and `sh`. Locate the interpreter and
   the injected CLIs by name (e.g. `shutil.which`), build paths with `pathlib`, and
-  pin `encoding="utf-8"` on file I/O so Windows console code pages and CRLF don't bite.
+  pin `encoding="utf-8"` on file I/O so Windows console code pages and CRLF do not
+  corrupt the text.
 
 If the helper needs a language runtime the host may lack (e.g. Python 3.10+), the
 `SKILL.md` must declare that prerequisite in its `_Classification:` line and report a
@@ -319,7 +321,7 @@ code.
   because `is_symlink()` answers False for one while `is_dir()` answers True. `rmtree` does
   not then destroy what the junction points at — it reads the reparse tag before descending
   and raises `Cannot call rmtree on a symbolic link`. So the failure is loud rather than
-  destructive, and that is the whole of the good news: it names a symbolic link on a path
+  destructive, and that is the only good part of it: it names a symbolic link on a path
   nobody linked, it arrives only after the caller's retry loop has run out, and the skill is
   still installed when it does. Use the link test above, detach the link itself (`unlink`,
   falling back to `rmdir` for a directory reparse point, which refuses `unlink`), and reach
@@ -397,8 +399,8 @@ so parsing a raw transcript could match the *instruction* instead of the answer.
   every `.json` under `skills/`, so a stray comma fails CI instead of failing inside a
   spawned CLI's flag parser mid-run.
 
-**Enforcement is a property of the dispatch path, not of the contract — state the
-asymmetry rather than papering over it.** A worker spawned as a CLI subprocess can be
+**Enforcement is a property of the dispatch path, not of the contract, so state the
+asymmetry rather than hiding it.** A worker spawned as a CLI subprocess can be
 given the schema flag; the same worker dispatched **in-harness as a sub-agent** cannot,
 because there is no flag to pass. Both return the same object because the contract asks
 for it; only one is guaranteed. Say which is which, and never fail completed work over
@@ -406,7 +408,7 @@ its result formatting.
 
 **Check what enforcement does to the narrative before enabling it.** Where a skill
 returns a reviewer's or judge's *reasoning* as well as a verdict, a schema flag can
-destroy the reasoning instead of structuring it — this is measurable, so measure it. In
+destroy the reasoning instead of structuring it. This is measurable, so measure it. In
 this pack, one runtime returns the validated object on its terminal result event while
 its assistant messages stay prose (two channels; enforcement is free), while another
 coerces **every** message to the schema, replacing running narration with a series of
@@ -484,10 +486,9 @@ any line containing it:
 re.compile(r"/home/[^/\s]+"),  # hygiene-exempt: this IS the pattern
 ```
 
-The marker is **per line**, and that is the shape to reach for: exempting a whole file is
-how coverage shrinks without anyone noticing. Reach for it only when the string must be
-present for the file to do its job; the fix for an ordinary private path is to remove the
-path.
+The marker is **per line**, and that is the form to use: exempting a whole file is how
+coverage shrinks without anyone noticing. Use it only when the string must be present for
+the file to do its job; the fix for an ordinary private path is to remove the path.
 
 **Three files are exempt whole, and they are the complete list**, held in
 `HYGIENE_ALLOWLIST` in the validator: `tests/test_validate_private_paths.md` and
@@ -515,7 +516,7 @@ Every skill artifact receives one of three classifications:
 |---|---|
 | **Full** | Works in both runtimes with equivalent user-visible outcomes |
 | **Degraded** | Works in both runtimes, but one loses non-essential capabilities (e.g., parallelism) |
-| **Runtime-limited** | Cannot honestly provide equivalent behavior; must declare the limitation |
+| **Runtime-limited** | Cannot provide equivalent behavior in both runtimes; must declare the limitation |
 
 Skills classified as **Degraded** or **Runtime-limited** must include a
 classification declaration near the top of their SKILL.md.
@@ -565,7 +566,7 @@ hand, so treat it as the known set rather than a proof**: adding a rule here wit
 - **Autonomous fallbacks** (above) — the rule binds an author and is real, but no
   validator pattern matches it: a user-prompting step with no fallback passes. Note the
   contrast with **companion** fallbacks, which appear in the enforced list above and are
-  genuinely checked. Read for this one in review.
+  checked. Read for this one in review.
 - **Instruction-file references** (above) — naming both `CLAUDE.md` and `AGENTS.md` is
   unchecked too; a skill that mentions only one passes.
 - **Shell assumptions** (above) — guidance only, by the note in that section.
