@@ -620,6 +620,35 @@ class VerdictExtraction(unittest.TestCase):
             self.assertEqual(Path(f).read_text().strip(), "I read every hunk. Nothing is wrong.")
             self.assertEqual(json.loads(Path(v).read_text())["overall"], "clean")
 
+    def test_an_object_alone_with_no_prose_is_still_a_completed_review(self):
+        """Under an inline schema flag the runtime sometimes answers with the validated
+        object and no text block at all. The transcript is then empty, and refusing it as
+        "no text output" reports a completed review as a failure while the verdict sits on
+        the terminal event. The object is the whole reply, so it is what gets published;
+        only a run with neither prose nor an object produced no output."""
+        with tempfile.TemporaryDirectory() as d:
+            f, v = str(Path(d) / "findings.txt"), str(Path(d) / "verdict.json")
+            child = (
+                "import json; "
+                "print(json.dumps({'type':'result','subtype':'success','is_error':False,"
+                "'result':'',"
+                "'structured_output':{'findings':[],'overall':'clean','blocking_count':0}}))"
+            )
+            res = _run("--idle", "5", "--deadline", "10", "--findings", f,
+                       "--result-mode", "stream-transcript", "--verdict-json", v,
+                       "--", PY, "-c", child)
+            self.assertEqual(res["status"], "ok", res)
+            self.assertEqual(json.loads(Path(f).read_text())["overall"], "clean")
+            self.assertEqual(json.loads(Path(v).read_text())["overall"], "clean")
+            bare = ("import json; print(json.dumps({'type':'result','subtype':'success',"
+                    "'is_error':False,'result':''}))")
+            f2, v2 = str(Path(d) / "findings2.txt"), str(Path(d) / "verdict2.json")
+            res = _run("--idle", "5", "--deadline", "10", "--findings", f2,
+                       "--result-mode", "stream-transcript", "--verdict-json", v2,
+                       "--", PY, "-c", bare)
+            self.assertEqual(res["status"], "error")
+            self.assertEqual(res["reason"], "reviewer produced no text output")
+
     def test_terminal_result_payload_is_used_when_structured_output_is_absent(self):
         with tempfile.TemporaryDirectory() as d:
             f, v = str(Path(d) / "findings.txt"), str(Path(d) / "verdict.json")
@@ -3216,19 +3245,6 @@ class TheTerminalEventsOwnErrorText(unittest.TestCase):
         self.assertEqual(parts({}), (None, None))
         self.assertEqual(parts(None), (None, None))
 
-    def test_an_oversized_event_that_named_nothing_still_names_nothing(self):
-        """An event too large to hold is reduced to its head, and the head of one that
-        carried no error text has none either. Keeping the event's TYPE as the reduction's
-        `message` would make what is kept claim an explanation the original never gave —
-        and the cap would decide whether a caller can see an unexplained failure."""
-        kept = review_runner._reduced_event({"type": "turn.failed", "pad": "q" * 6000}, 2000)
-        self.assertEqual(review_runner._terminal_detail_parts(kept),
-                         ("turn.failed", "event-type"))
-        kept = review_runner._reduced_event(
-            {"type": "turn.failed", "message": "quota exhausted", "pad": "q" * 6000}, 2000)
-        self.assertEqual(review_runner._terminal_detail_parts(kept),
-                         ("quota exhausted", "message"))
-
     def test_an_event_with_no_error_text_says_on_the_wire_that_it_is_a_name(self):
         """End to end, because this is the pair a caller's breaker reads: an outage whose
         CLI wrote its reason to stderr leaves a bare terminal event, and the status line has
@@ -3297,9 +3313,12 @@ class WhatIsRetainedIsBounded(unittest.TestCase):
         return None
 
     def test_an_oversized_reply_keeps_its_closing_object_and_says_it_was_cut(self):
+        """Several lines, each inside the cap, whose text together is over it: the bound
+        that applies is the transcript's, and it drops from the front. (A single line over
+        the cap is a different case — refused whole, below.)"""
         with tempfile.TemporaryDirectory() as d:
             child = _child_printing(
-                _transcript_event("x" * 5000),
+                *(_transcript_event("x" * 800) for _ in range(4)),
                 _transcript_event(json.dumps({"findings": [], "summary": "done"})),
                 json.dumps({"type": "turn.completed"}))
             line, text = self._run_capped(d, child, 2000)
@@ -3312,10 +3331,10 @@ class WhatIsRetainedIsBounded(unittest.TestCase):
             self.assertTrue(text.startswith("[review_runner]"),
                             "the retained tail does not say it is only a tail")
 
-    def test_a_closing_object_larger_than_the_retained_tail_leaves_no_object(self):
-        """Losing later content must never promote an earlier one. The caller reads
-        "truncated, and no closing object" as infrastructure, so what this has to establish
-        is that the two facts are BOTH on the wire."""
+    def test_a_closing_object_over_the_cap_is_refused_and_never_promotes_an_earlier_one(self):
+        """Losing later content must never promote an earlier one. The real answer is one
+        line over the cap, so the run ends as an overflow: no findings are published, and
+        in particular the earlier example object is never left on disk as the reply."""
         with tempfile.TemporaryDirectory() as d:
             earlier = json.dumps({"findings": [], "summary": "an example, not the answer"})
             child = _child_printing(
@@ -3323,12 +3342,12 @@ class WhatIsRetainedIsBounded(unittest.TestCase):
                 _transcript_event(json.dumps({"findings": ["y" * 4000], "summary": "real"})),
                 json.dumps({"type": "turn.completed"}))
             line, text = self._run_capped(d, child, 1000)
-            self.assertEqual(line["status"], "ok", line)
-            self.assertTrue(line["capture_truncated"])
-            self.assertIsNone(self._closing_object(text),
-                              "a fragment of the real answer parsed as an answer")
-            self.assertNotIn("an example, not the answer", text,
-                             "an earlier object survived to be landed as the reply")
+            self.assertEqual(line["status"], "error", line)
+            self.assertIn("capture overflow", line["reason"])
+            self.assertIsNone(text, "an earlier object was published as the reply")
+            partial = Path(line["partial_findings"]).read_text(encoding="utf-8")
+            self.assertIn("an example, not the answer", partial,
+                          "the text that fit was not preserved beside the failure")
 
     def test_a_line_that_never_ends_is_an_overflow_not_a_shorter_transcript(self):
         with tempfile.TemporaryDirectory() as d:
@@ -3340,20 +3359,42 @@ class WhatIsRetainedIsBounded(unittest.TestCase):
             self.assertEqual(line["status"], "error")
             self.assertIn("capture overflow", line["reason"])
 
-    def test_an_oversized_terminal_event_keeps_its_head_and_marks_the_transcript(self):
+    def test_an_oversized_terminal_event_is_an_overflow_like_any_other_line(self):
+        """The terminal event is one JSONL line, and a line over the cap is refused whole:
+        keeping a head of it would report a run as complete out of an event this program
+        declined to hold."""
         with tempfile.TemporaryDirectory() as d:
             child = _child_printing(
                 _transcript_event(json.dumps({"findings": [], "summary": "done"})),
                 json.dumps({"type": "result", "subtype": "success", "is_error": False,
                             "message": "the model stopped early",
                             "structured_output": {"padding": "q" * 6000}}))
-            line, text = self._run_capped(d, child, 2500)
-            self.assertEqual(line["status"], "ok", line)
-            self.assertEqual(line["terminal_detail"], "the model stopped early")
-            self.assertTrue(line["capture_truncated"],
-                            "an event this program declined to hold whole was not reported")
-            self.assertEqual(self._closing_object(text),
-                             {"findings": [], "summary": "done"})
+            line, _text = self._run_capped(d, child, 2500)
+            self.assertEqual(line["status"], "error", line)
+            self.assertIn("capture overflow", line["reason"])
+
+    def test_a_line_over_the_cap_ends_the_run_however_its_bytes_arrived(self):
+        """The rule is about the LINE, not about the read that delivered it. A pipe hands
+        the reader whatever bytes are there, so the same over-cap line can arrive whole in
+        one read or split across two — and a bound judged only on the pending fragment
+        answers differently to the two, keeping the line as a trimmed tail in the first case
+        and ending the run in the second. One reviewer output, one outcome."""
+        payload = "x" * 3000 + json.dumps({"findings": [], "summary": "done"})
+        event = _transcript_event(payload)
+        whole = _child_printing(event, json.dumps({"type": "turn.completed"}))
+        split = ("import sys, time\n"
+                 f"sys.stdout.write({event[:1500]!r})\n"
+                 "sys.stdout.flush()\n"
+                 "time.sleep(1.0)\n"
+                 f"sys.stdout.write({event[1500:]!r} + chr(10))\n"
+                 f"sys.stdout.write({json.dumps({'type': 'turn.completed'})!r} + chr(10))\n"
+                 "sys.stdout.flush()\n")
+        for delivery, child in (("one write", whole), ("two writes", split)):
+            with self.subTest(delivery=delivery), tempfile.TemporaryDirectory() as d:
+                line, _text = self._run_capped(d, child, 1000)
+                self.assertEqual(line["status"], "error",
+                                 f"delivered in {delivery}, an over-cap line was kept: {line}")
+                self.assertIn("capture overflow", line["reason"])
 
     def test_trailing_malformed_output_does_not_take_the_capture_with_it(self):
         with tempfile.TemporaryDirectory() as d:
@@ -3389,12 +3430,12 @@ class WhatIsRetainedIsBounded(unittest.TestCase):
         text = findings.read_text(encoding="utf-8") if findings.exists() else None
         return line, text
 
-    def test_an_oversized_result_event_is_bounded_like_the_transcript_is(self):
+    def test_an_oversized_result_event_is_an_overflow_in_this_mode_too(self):
         """The bound has to reach every mode that retains something, and this mode retains
         the whole terminal event: `--findings` is written from its payload, so an event held
         whole is the reviewer's entire output in this process's memory while the flag that
-        asked for a bound reports nothing dropped. Bounded the same way as assistant text —
-        the tail, and the notice in front of it — so a capped-but-intact reply still lands.
+        asked for a bound reports nothing dropped. The event is one line, and the reader
+        refuses a line over the cap before any mode sees it.
         """
         with tempfile.TemporaryDirectory() as d:
             payload = "x" * 5000 + json.dumps({"findings": [], "summary": "done"})
@@ -3403,17 +3444,9 @@ class WhatIsRetainedIsBounded(unittest.TestCase):
                  "result": payload}))
             line, text = self._run_capped_mode(d, child, 2000,
                                                "stream-json-result-event")
-            self.assertEqual(line["status"], "ok", line)
-            self.assertTrue(line["capture_truncated"],
-                            "an event held whole was reported as nothing dropped")
-            self.assertLess(len(text.encode("utf-8")), 5000,
-                            "the cap did not reach what this mode publishes")
-            self.assertEqual(self._closing_object(text),
-                             {"findings": [], "summary": "done"},
-                             "the payload was cut from the end, so the reply no longer "
-                             "lands")
-            self.assertTrue(text.startswith("[review_runner]"),
-                            "the retained tail does not say it is only a tail")
+            self.assertEqual(line["status"], "error", line)
+            self.assertIn("capture overflow", line["reason"])
+            self.assertIsNone(text, "a payload this program refused to hold was published")
 
     def test_a_result_event_inside_the_cap_is_retained_exactly_as_it_arrived(self):
         """The other half: the bound is a bound and not a rewrite. A reply that fits keeps
@@ -3489,7 +3522,7 @@ class WhatIsRetainedIsBounded(unittest.TestCase):
     def test_the_notice_is_prepended_to_a_failed_runs_preserved_text_too(self):
         with tempfile.TemporaryDirectory() as d:
             child = _child_printing(
-                _transcript_event("x" * 5000),
+                *(_transcript_event("x" * 800) for _ in range(4)),
                 json.dumps({"type": "turn.failed", "message": "gave up"}))
             line, _text = self._run_capped(d, child, 2000)
             self.assertEqual(line["status"], "error")

@@ -1338,6 +1338,43 @@ class OperatorReconciliation(_Case):
         self.assertIn("move that file aside", str(ctx.exception))
         self.assertIsNone(driver.unit_resolution(self.rundir, "u1"))
 
+    def test_resolve_unit_fail_needs_the_attestation_while_an_attempt_is_unaccounted_for(self):
+        """The reservation belongs to the attempt, not the unit. A unit failed over an
+        `uncertain` attempt published its error and left that attempt holding the slot's
+        capacity for the rest of the run, because nothing said its worker was gone. The
+        command asks for the same attestation `resolve-attempt --fail` asks for, and with
+        it fails the attempt as well, so the slot comes free."""
+        path = self.attempt("u1", 0, spawn_time=time.time() - 10_000)
+        with self.assertRaises(driver.DriverError) as ctx:
+            driver.resolve_unit(self.rundir, "u1", grant=None, fail=True, reason="give up")
+        self.assertIn("--stopped-confirmed", str(ctx.exception))
+        self.assertIn("a0", str(ctx.exception))
+        # The attempt is past its deadline already, or has no spawn record at all; waiting
+        # releases neither, so the refusal must not offer it.
+        self.assertNotIn("wait out", str(ctx.exception))
+        self.assertIsNone(driver.unit_resolution(self.rundir, "u1"),
+                          "a refusal wrote a record")
+        self.assertFalse((path / driver.RESOLUTION_NAME).exists(), "a refusal wrote a record")
+        driver.resolve_unit(self.rundir, "u1", grant=None, fail=True,
+                            reason="I killed it myself", stopped_confirmed=True)
+        resolution = json.loads((path / driver.RESOLUTION_NAME).read_text(encoding="utf-8"))
+        self.assertTrue(resolution["stopped_confirmed"])
+        self.assertEqual(resolution["reason"], "I killed it myself")
+        run = self.run_object()
+        run.adopt()
+        self.assertTrue(run.terminal("u1"))
+        self.assertEqual(run.reserving()["A"], 0, "the reservation outlived the unit's failure")
+        self.assertIn("I killed it myself",
+                      (self.rundir / "units" / "u1" / "error.txt").read_text(encoding="utf-8"))
+
+    def test_resolve_unit_fail_at_the_ceiling_asks_for_no_attestation(self):
+        """Every attempt there is adjudicated and holds nothing, so there is nothing to
+        attest to; asking would send an operator to confirm a worker that has already been
+        accounted for."""
+        self.dispositions_at_ceiling()
+        driver.resolve_unit(self.rundir, "u1", grant=None, fail=True, reason="give up")
+        self.assertTrue(self.run_object().terminal("u1"))
+
     def test_an_operator_decision_is_written_once(self):
         self.dispositions_at_ceiling()
         driver.resolve_unit(self.rundir, "u1", grant=None, fail=True, reason="give up")
@@ -2001,6 +2038,52 @@ class TheLoopAndItsStops(_Case):
         obj._budget_base = 1.0 + 3600.0 + 7300.0
         self.assertTrue(obj.over_budget())
 
+    def test_the_same_extend_on_a_rerun_grants_nothing_more(self):
+        """The run's advice on a spent budget is to run the same command again, and the
+        operator who does so has `--extend` in that command on every later restart too.
+        Added per invocation it is a fresh extension each time the run comes back, so a run
+        restarted often enough has no limit; the number is absolute, and asking for more is
+        a larger one."""
+        self.plan_only()
+        import io
+        config = driver.load_adapter_config(self.adapter_path)
+        obj = driver.Run(self.rundir, config, _SUPERVISOR, out=io.StringIO(), max_hours=1.0)
+        obj.extend(1.0)
+        obj.extend(1.0)
+        self.assertAlmostEqual(obj._extended, 3600.0, places=1)
+        # And across the restart, which is where the same command line is actually run.
+        again = driver.Run(self.rundir, config, _SUPERVISOR, out=io.StringIO(), max_hours=1.0)
+        self.assertAlmostEqual(again._extended, 3600.0, places=1,
+                               msg="the grant did not survive the restart")
+        again.extend(1.0)
+        self.assertAlmostEqual(again._extended, 3600.0, places=1)
+        again.extend(2.0)
+        self.assertAlmostEqual(again._extended, 7200.0, places=1,
+                               msg="a larger number did not grant more")
+
+    def test_extend_zero_takes_an_earlier_grant_back(self):
+        """Zero is a number an operator passes on purpose, to return to `--max-hours`. Read
+        for truth rather than presence, the flag was ignored and nothing said so."""
+        self.drive("--go", "--max-hours", "0", "--extend", "1")
+        budget = json.loads((self.rundir / "budget.json").read_text(encoding="utf-8"))
+        self.assertAlmostEqual(budget["extended"], 3600.0, places=1)
+        # The run is already reported, so this pass has nothing to claim and exits clean;
+        # the grant is still re-read from the command line before that is decided.
+        self.drive("--go", "--max-hours", "0", "--extend", "0")
+        budget = json.loads((self.rundir / "budget.json").read_text(encoding="utf-8"))
+        self.assertAlmostEqual(budget["extended"], 0.0, places=1,
+                               msg="--extend 0 was read as no --extend at all")
+
+    def test_a_negative_extend_is_refused_not_clamped(self):
+        """Clamped to zero, `--extend -1` revoked an earlier grant that nobody meant to
+        revoke, and nothing said so."""
+        self.drive("--go", "--max-hours", "0", "--extend", "1")
+        proc = self.drive("--go", "--max-hours", "0", "--extend", "-1", expect=driver.EXIT_REFUSED)
+        self.assertIn("--extend", proc.stdout + proc.stderr)
+        budget = json.loads((self.rundir / "budget.json").read_text(encoding="utf-8"))
+        self.assertAlmostEqual(budget["extended"], 3600.0, places=1,
+                               msg="a refused --extend still changed the recorded grant")
+
     def test_a_quarantined_unit_stops_the_run_and_is_named(self):
         """An attempt whose outcome cannot be proven is never re-spawned and never landed,
         so the round cannot complete and the run stops for reconciliation. Built as a claim
@@ -2128,7 +2211,7 @@ class TheLoopAndItsStops(_Case):
         # A real kill takes this process down and the workers' exit statuses with it. Here
         # the loop is cut inside a live interpreter, so its finished children are collected
         # by hand rather than left for the garbage collector to warn about.
-        for child in killed._children:
+        for child, _attempt, _unit in killed._children:
             child.wait()
         doc = json.loads((self.rundir / "units.json").read_text(encoding="utf-8"))
         self.assertEqual(doc["stage"], review_panel.READING_STAGE,
@@ -2623,6 +2706,124 @@ class WhatTheSupervisorCouldNotHold(_Case):
         self.assertIn("--max-capture-bytes", recorded["argv"])
 
 
+class ASupervisorThatExitsWithoutAStatusIsAnEndedExecution(_Case):
+    """The attempt's state is read from disk, where a supervisor that died before printing
+    its status line looks exactly like one still working: `running` until its deadline
+    and grace pass, an hour at the defaults, with every later attempt on the slot waiting
+    behind a process that is not there. A supervisor that rejects a flag the driver passes
+    does that to every attempt. The driver is the one process that can see the exit, so it
+    is the one that writes the record, with the exit code and the end of stderr."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake_units(("u1", "A"))
+        (self.rundir / "units" / "u1").mkdir(parents=True, exist_ok=True)
+        self.fake_snapshot()
+
+    def supervisor(self, body):
+        path = self.tmp / "supervisor.py"
+        path.write_text("import sys\n" + body, encoding="utf-8")
+        return path
+
+    def spawn_and_wait(self, supervisor):
+        import io
+        run = driver.Run(self.rundir, driver.load_adapter_config(self.adapter_path),
+                         supervisor, out=io.StringIO())
+        self.assertTrue(run.spawn(run.unit_row("u1")))
+        for entry in list(run._children):
+            (entry[0] if isinstance(entry, tuple) else entry).wait(timeout=60)
+        run.adopt()
+        return run, self.rundir / "dispatch" / "u1" / "a0"
+
+    @unittest.skipIf(os.name != "posix", "recorded on POSIX only; Windows leaves it to the deadline")
+    def test_an_exit_with_no_status_is_recorded_charged_to_nobody_and_stops_the_run(self):
+        run, path = self.spawn_and_wait(self.supervisor(
+            "sys.stderr.write('usage: review_runner.py [-h]\\nreview_runner.py: error: "
+            "unrecognized arguments: --status-detail\\n')\nsys.exit(2)\n"))
+        status = driver.read_status(path / driver.STATUS_NAME)
+        self.assertIsNotNone(status, "a supervisor that exited without a status was still "
+                                     "read as a worker that is running")
+        self.assertEqual(status["supervisor_exit"], 2)
+        self.assertIn("--status-detail", status["stderr_tail"])
+        attempt = driver.read_attempt(self.rundir, "u1", path, grace=120.0)
+        self.assertEqual(attempt.disposition["outcome"], driver.INFRASTRUCTURE)
+        self.assertEqual(driver.replay([attempt.disposition], 0).charging, 0)
+        self.assertIn("exited 2", run.pause_reason)
+        self.assertIn("--status-detail", run.pause_reason)
+        self.assertEqual(run.reserving()["A"], 0, "an ended execution still held the slot")
+
+    @unittest.skipIf(os.name != "posix", "a negative exit code is how POSIX reports a signal")
+    def test_a_supervisor_killed_by_a_signal_keeps_its_slot_until_its_deadline(self):
+        """The supervisor starts its reviewer in a session of its own, so a SIGKILL to the
+        supervisor leaves that reviewer running with nothing to stop it. A record written
+        here would count as proof the execution ended, release the slot, and let the
+        resumed run start a second worker beside the live one, which is the case the
+        `--stopped-confirmed` attestation exists for. So a death by signal is left to the
+        deadline, where the attempt becomes uncertain and waits for that attestation."""
+        run, path = self.spawn_and_wait(self.supervisor(
+            "import os, signal\nos.kill(os.getpid(), signal.SIGKILL)\n"))
+        self.assertIsNone(driver.read_status(path / driver.STATUS_NAME),
+                          "a signal death was recorded as an ended execution")
+        attempt = driver.read_attempt(self.rundir, "u1", path, grace=120.0)
+        self.assertEqual(attempt.state, driver.RUNNING)
+        self.assertEqual(run.reserving()["A"], 1, "the slot was released under a live worker")
+        self.assertEqual(run.pause_reason, "")
+
+    def test_on_windows_no_exit_code_is_an_ended_execution(self):
+        """A terminated process there reports an ordinary exit code, so a supervisor killed
+        with its worker alive and one that rejected its flags read alike. Recording either
+        would release a slot a live worker may hold, so nothing is recorded and the deadline
+        decides, as it does for a resumed driver."""
+        import io
+        dead = self.supervisor("sys.stderr.write('usage error\\n')\nsys.exit(2)\n")
+        run = driver.Run(self.rundir, driver.load_adapter_config(self.adapter_path),
+                         dead, out=io.StringIO())
+        self.assertTrue(run.spawn(run.unit_row("u1")))
+        for child, _path, _unit in list(run._children):
+            child.wait(timeout=60)
+        with mock.patch.object(driver.os, "name", "nt"):
+            run.reap_children()
+        path = self.rundir / "dispatch" / "u1" / "a0"
+        self.assertIsNone(driver.read_status(path / driver.STATUS_NAME),
+                          "an exit code was read as an ended execution on Windows")
+        self.assertEqual(run._children, [], "an exited child was kept")
+
+    @unittest.skipIf(os.name != "posix" or os.geteuid() == 0,
+                     "a permission bit is the refusal here, and root is not refused")
+    def test_a_status_file_that_cannot_be_read_is_not_written_over(self):
+        """The reader answers None for a file the host refuses to hand over as well as for
+        one holding no record. A record appended over the first would sit on top of one that
+        may already be there, and two records in one file is a file with no reading."""
+        import io
+        dead = self.supervisor("sys.exit(2)\n")
+        run = driver.Run(self.rundir, driver.load_adapter_config(self.adapter_path),
+                         dead, out=io.StringIO())
+        self.assertTrue(run.spawn(run.unit_row("u1")))
+        for child, _path, _unit in list(run._children):
+            child.wait(timeout=60)
+        status = self.rundir / "dispatch" / "u1" / "a0" / driver.STATUS_NAME
+        # Write-only: the read is refused and the append is not, which is the case that
+        # matters. A mode refusing both proves nothing, since the append fails on its own.
+        os.chmod(status, 0o200)
+        self.addCleanup(os.chmod, status, 0o644)
+        run.reap_children()
+        os.chmod(status, 0o644)
+        self.assertEqual(status.read_bytes(), b"", "a record was written over an unreadable file")
+        self.assertEqual(run._children, [])
+
+    def test_a_status_the_supervisor_did_write_stands_whatever_its_exit_code(self):
+        """The record is only ever written over an empty one. A supervisor that reported
+        and then exited non-zero has said what happened, and its account is the one that
+        counts."""
+        run, path = self.spawn_and_wait(self.supervisor(
+            "sys.stdout.write('{\"status\": \"error\", \"reason\": \"reviewer exited 1\"}\\n')\n"
+            "sys.stdout.flush()\nsys.exit(1)\n"))
+        status = driver.read_status(path / driver.STATUS_NAME)
+        self.assertEqual(status["reason"], "reviewer exited 1")
+        self.assertNotIn("supervisor_exit", status)
+        self.assertEqual(run.pause_reason, "")
+
+
 class AnOutageInARealRound(_Case):
     """The loop, the real supervisor and a provider that stops answering.
 
@@ -3101,6 +3302,46 @@ class AStorageFaultNeverAdjudicatesAUnit(_Case):
         with mock.patch.object(driver, "_engine_write_json", fake):
             with self.assertRaises(review_panel.InventoryError):
                 self.run_object().adopt()
+
+    # -- the writes a spawn makes before its claim --------------------------- #
+    def failing_mkdir(self, leaf, error):
+        """Every directory creation whose leaf name is ``leaf`` fails with ``error``."""
+        real = Path.mkdir
+
+        def fake(path, *args, **kw):
+            if path.name == leaf:
+                raise OSError(error, os.strerror(error))
+            return real(path, *args, **kw)
+
+        return mock.patch.object(Path, "mkdir", fake)
+
+    def test_a_full_disk_while_reserving_or_claiming_is_a_resumable_stop(self):
+        """The token directory, the unit's dispatch directory and the claim are the writes
+        a spawn makes before anything is recorded. A full volume at any of them is the same
+        failure as one inside the working-copy preparation and gets the same answer: a stop
+        that names the path, non-zero and resumable. Raised bare it is a traceback, and as a
+        plain refusal it exits 2, which reads as "do not retry"."""
+        with self.failing_mkdir("in", errno.ENOSPC):
+            with self.assertRaises(driver.StorageFault):
+                driver.reserve_token(self.rundir)
+        run = self.run_object()
+        unit = run.unit_row("u1")
+        with self.failing_mkdir("u1", errno.ENOSPC):
+            with self.assertRaises(driver.StorageFault):
+                run.spawn(unit)
+        # The claim itself, with the reservation and the preparation already made.
+        with self.failing_mkdir("a0", errno.ENOSPC):
+            with self.assertRaises(driver.StorageFault) as ctx:
+                run.spawn(unit)
+        self.assertEqual(ctx.exception.path.name, "a0")
+
+    def test_a_permission_refused_while_reserving_keeps_its_refusal(self):
+        """Only the volume's failure is resumable; a permission the host withholds is a
+        refusal, as it is at the working-copy preparation and everywhere else."""
+        with self.failing_mkdir("in", errno.EACCES):
+            with self.assertRaises(driver.DriverError) as ctx:
+                driver.reserve_token(self.rundir)
+        self.assertNotIsInstance(ctx.exception, driver.RunPaused)
 
 
 # --------------------------------------------------------------------------- #

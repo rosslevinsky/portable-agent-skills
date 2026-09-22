@@ -4971,9 +4971,10 @@ def parse_verifier_result(obj: object, unit_id: str, batch: dict[str, bool],
     nothing about the twenty beside it — a verifier that omits a field on one candidate
     still answered the rest. Failing the unit over it turned every one of those answers
     into ``unresolved``, which reads to a person as "nobody checked this" when somebody
-    did. The rejected candidate resolves ``unresolved`` with the parse error as its
-    rationale, and the coverage section names it, so nothing is quietly upgraded and the
-    reader can see exactly what was thrown away.
+    did. The rejected candidate resolves ``unresolved`` as a candidate NO verdict came back
+    for — the stand-in written for it is not an answer and :func:`resolve` does not count
+    it as one — and the coverage section names it with the parse error, so nothing is
+    quietly upgraded and the reader can see exactly what was thrown away.
 
     What still fails the unit is a result whose SHAPE cannot be trusted: not an object,
     ``verdicts`` not a list, an unknown top-level key, a candidate answered twice, or one
@@ -5001,11 +5002,19 @@ def parse_verifier_result(obj: object, unit_id: str, batch: dict[str, bool],
                 if named is None or named not in batch:
                     raise
                 rejected.append(f"{named}: {exc}")
+                # **A stand-in is "no answer", not an answer.** It carries no settling
+                # reason: a reason is what a verifier who looked at the candidate says
+                # would settle it, and nothing readable came back from this one. Given one
+                # here, the defect was filed under that reason's heading with the parse
+                # error printed as the checker's rationale — a verdict nobody gave. The
+                # rationale is kept, because ``findings.json`` is the record and the
+                # diagnostic is the true reason; ``from_verifier`` is what keeps it out of
+                # every payload and every rendering that speaks for a checker.
                 verdicts.append(Verdict(
                     candidate=named, status="unresolved", evidence=None,
                     rationale=f"the engine could not read this verdict — {exc}",
                     revision=None, test_first=None,
-                    unresolved_reason="blocked_by_the_environment",
+                    unresolved_reason=None,
                     from_verifier=False))
         seen: set[str] = set()
         for verdict in verdicts:
@@ -7266,7 +7275,9 @@ class Resolved:
     # Whether a verdict actually came back. An unresolved candidate a verifier answered for
     # and one whose unit never landed are both unresolved, and only this tells them apart —
     # which is what lets the report say the second in plain words instead of printing the
-    # id of the unit that failed into the material somebody reads to fix something.
+    # id of the unit that failed into the material somebody reads to fix something. False
+    # as well for a candidate whose unit came back and whose verdict could not be read:
+    # what stands in for that verdict is the engine's, and nobody answered.
     answered: bool
 
 
@@ -7357,10 +7368,14 @@ def resolve(candidates: Sequence[dict], holder: dict[str, dict],
         state = by_unit[batch["id"]]
         if state.state == UNIT_COMPLETE:
             verdict = next(v for v in state.verdicts if v.candidate == cid)
+            # Answered only where a VERIFIER answered. The stand-in the parser writes for a
+            # verdict it could not read is engine text, and counting it as an answer put
+            # the parse error on the page as the checker's own words; the coverage section
+            # is where that text belongs, and it is there by name.
             out[cid] = Resolved(cid, batch["id"], batch["slot"], verdict.status, verdict.evidence,
                                 verdict.rationale, verdict.revision, verdict.test_first,
                                 verdict.unresolved_reason, verdict.covered_by,
-                                verdict.needs_files, True)
+                                verdict.needs_files, verdict.from_verifier)
         else:
             out[cid] = Resolved(
                 cid, batch["id"], batch["slot"], "unresolved", None,
@@ -9485,7 +9500,11 @@ def _gap_entry(cluster: dict, by_id: dict, names: PathNames) -> list[str]:
     out += _item("  - The auditor proposed: ", primary["direction"])
     if primary["test_first"]:
         out += _item(f"  - {TEST_FIRST_LABEL} ", primary["test_first"])
-    if primary["rationale"]:
+    # Only a checker's words are printed as what the check found. A record nobody answered
+    # carries the engine's own diagnostic in this field -- the stand-in for a verdict it
+    # could not read -- and printed here it reads as a checker's rationale; the coverage
+    # section names that candidate and the parse error, and is the one place they belong.
+    if primary["rationale"] and primary.get("answered", True):
         out += _item("  - What the check found: ", primary["rationale"])
     if primary["quote_check"] == QUOTE_DIFFERS:
         out.append(f"  - {QUOTE_FLAG}\n")
