@@ -8,7 +8,7 @@ Versions use [Calendar Versioning](https://calver.org/) in the form
 A MICRO bump in the same month indicates a follow-up release; a new month
 starts from `.0` again.
 
-## [2026.09.3] - 2026-09-21
+## [2026.09.3] - 2026-09-22
 
 ### Added
 
