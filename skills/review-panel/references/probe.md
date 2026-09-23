@@ -20,9 +20,13 @@ that finding.
 1. **Look for what the tree says about itself first**: a build file, a package manifest, a
    makefile, a contributing document, a continuous-integration configuration. The command
    that tree uses is the one to try, not the one you would use elsewhere.
-2. **Run it, from the directory it belongs in.** One attempt each is enough, and keep it
+2. **Install what the tree pins.** Where it has a lockfile, use the command that installs
+   exactly that (`npm ci`, `pnpm install --frozen-lockfile`, `cargo build --locked`), not
+   one that resolves versions afresh, and say in the summary which lockfile you used or
+   that there was none. A build against different versions describes a tree nobody has.
+3. **Run it, from the directory it belongs in.** One attempt each is enough, and keep it
    short: if a command has not finished in a few minutes, stop it and report what you saw.
-3. **Report the argv you actually ran**, the working directory relative to the copy's root,
+4. **Report the argv you actually ran**, the working directory relative to the copy's root,
    the exit status, and the output.
 
 **Whether the tree builds.** `yes` when the command succeeded, `no` when it ran and the

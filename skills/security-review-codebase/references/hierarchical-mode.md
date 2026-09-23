@@ -93,17 +93,17 @@ project at all, so there is nothing to ignore.
    # An EMPTY root is still not a harmless default: the containment test below would
    # compare against nothing and never discard $env:TEMP, so a temp path inside the
    # audited tree would be accepted.
-   if (-not $root) { throw "project root not resolved — see step 1" }
+   if (-not $root) { throw "project root not resolved -- see step 1" }
    $root = $root.Trim()
    $name = Split-Path -Leaf $root
 
    # Compare on ONE separator. `git rev-parse` prints the root with forward slashes even
    # on Windows, while %TEMP% comes back with backslashes, so a raw StartsWith between the
-   # two never matches — the containment check would be inert on the platform it targets.
+   # two never matches -- the containment check would be inert on the platform it targets.
    function ConvertTo-Comparable($p) { ($p -replace '/', '\').TrimEnd('\') + '\' }
 
    # WHERE IT LEADS, not how it is spelled. GetFullPath collapses a `..` segment, and then
-   # EVERY component is followed to its target — not just the leaf. A junction above the
+   # EVERY component is followed to its target -- not just the leaf. A junction above the
    # candidate moves everything below it: `C:\work` linked to `D:\repo` leaves `C:\work\tmp`
    # looking unrelated to the root it sits inside, and the textual comparison this replaced
    # caught exactly that. Bounded, so a cycle cannot spin; a relative target resolves
@@ -126,7 +126,7 @@ project at all, so there is nothing to ignore.
                        # Combine, not string concatenation: it joins with the platform's
                        # separator, and GetFullPath collapses a `..` only across one it
                        # recognises. The parent of a top-level entry is the ROOT, which
-                       # `Split-Path` reports as nothing — and combining a relative target
+                       # `Split-Path` reports as nothing -- and combining a relative target
                        # with nothing yields a relative path, which then resolves against
                        # whatever directory the caller happened to be in. On macOS the
                        # top-level `var` entry is a relative link to `private/var`, so this
@@ -147,7 +147,7 @@ project at all, so there is nothing to ignore.
        return $null   # sixteen swaps and still a link: unresolvable, so not a safe base
    }
 
-   # Absolute, and outside the repository being audited — a TEMP redirected inside it
+   # Absolute, and outside the repository being audited -- a TEMP redirected inside it
    # would put the whole report in the user's tree, which this skill must never do.
    #
    # The fallback is NOT GetTempPath(): on Windows that reads %TMP% then %TEMP%, so a
@@ -155,15 +155,15 @@ project at all, so there is nothing to ignore.
    # Fall back to a path that cannot be the one just rejected, and re-check it.
    function Test-SafeBase($candidate, $repoRoot) {
        if (-not $candidate) { return $false }
-       # Fully qualified — drive-qualified or UNC. NOT IsPathRooted, which accepts a
+       # Fully qualified -- drive-qualified or UNC. NOT IsPathRooted, which accepts a
        # drive-relative '\foo' that resolves against the current drive's working
        # directory and so names no fixed location. NOT IsPathFullyQualified either:
        # that is .NET Core only, and Windows PowerShell 5.1 is in the support matrix.
        if ($candidate -notmatch '^([A-Za-z]:[\\/]|\\\\)') { return $false }
        $candidate = Resolve-Physical $candidate
        if (-not $candidate) { return $false }
-       # A root that cannot be resolved — a link chain past the bound, a path that cannot be
-       # read — is a REFUSAL. Falling back to its spelling hands the decision to the text
+       # A root that cannot be resolved -- a link chain past the bound, a path that cannot be
+       # read -- is a REFUSAL. Falling back to its spelling hands the decision to the text
        # this function exists to distrust.
        $rootReal = Resolve-Physical $repoRoot
        if (-not $rootReal) { return $false }
@@ -173,7 +173,7 @@ project at all, so there is nothing to ignore.
    # Built by interpolation, not Join-Path, and each rung guarded on its variable being
    # set. Join-Path resolves through the PowerShell drive provider: given an unset
    # variable it raises a terminating parameter-binding error, so a machine with no
-   # LOCALAPPDATA aborts here instead of falling through to the next rung — failing
+   # LOCALAPPDATA aborts here instead of falling through to the next rung -- failing
    # hardest in the stripped-down environment the chain exists to survive.
    $base = $env:TEMP
    if (-not (Test-SafeBase $base $root) -and $env:LOCALAPPDATA) {
@@ -189,7 +189,7 @@ project at all, so there is nothing to ignore.
    # -ErrorAction Stop is what makes this behave like the bash `mkdir ... || exit 1`.
    # Omitting -Force is necessary but NOT sufficient: an existing directory is a
    # non-terminating error, so by default PowerShell prints it, carries on, and the run
-   # adopts the colliding directory — the exact outcome dropping -Force is meant to
+   # adopts the colliding directory -- the exact outcome dropping -Force is meant to
    # prevent. `New-Item` does not throw on its own; `-ErrorAction Stop` is what makes it.
    New-Item -Path $run -ItemType Directory -ErrorAction Stop | Out-Null
    $run

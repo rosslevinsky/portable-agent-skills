@@ -27,7 +27,7 @@ shape of this program:
   run, held for this process's lifetime. Nothing here reads a clock to decide who owns a
   run directory; clocks are read only to decide whether an attempt is still *within its
   own deadline*.
-* **A worker is handed opaque paths.** A verification unit's name spells the slot that
+* **A worker is handed opaque paths.** A verification unit's name spells the lane that
   raised its candidates, so neither its payload path nor its working directory may be the
   unit's directory.
 
@@ -689,9 +689,9 @@ class RunLock:
 # --------------------------------------------------------------------------- #
 # the adapter config — every spawn's argv arrives here as DATA
 # --------------------------------------------------------------------------- #
-# The driver names no product anywhere. Each slot's command line is supplied by the
+# The driver names no product anywhere. Each lane's command line is supplied by the
 # caller, exactly as plan-duel takes its participants' commands, and this module only
-# renders and runs it. A permission mode is per unit rather than per slot, so each slot
+# renders and runs it. A permission mode is per unit rather than per lane, so each lane
 # declares two commands: the read-only one its readers and clusterers run under, and the
 # write-capable one its verifiers, its synthesizers and the capability probe need.
 PLACEHOLDER_OPEN, PLACEHOLDER_CLOSE = "⟪", "⟫"
@@ -711,9 +711,13 @@ READ_ONLY, WRITE_CAPABLE = "read_only", "write_capable"
 MODES = (READ_ONLY, WRITE_CAPABLE)
 RESULT_MODES = frozenset({"external-file", "stream-json-result-event", "stream-transcript"})
 
-_SLOT_KEYS = frozenset({"runtime", "model", "account", "adapter", "provider_fault_patterns",
-                        READ_ONLY, WRITE_CAPABLE})
-_SLOT_REQUIRED = ("runtime", "model", "adapter", READ_ONLY, WRITE_CAPABLE)
+_LANE_KEYS = frozenset({"runtime", "model", "account", "adapter", "slots",
+                        "provider_fault_patterns", READ_ONLY, WRITE_CAPABLE})
+_LANE_REQUIRED = ("runtime", "model", "adapter", READ_ONLY, WRITE_CAPABLE)
+# How many of a lane's workers run at once when the config does not say. The number sets how
+# long a run takes and the right one is the account's rate limit, so a defaulted lane is
+# SAID to be defaulted in the preview: a default nobody sees is a run length nobody chose.
+SLOTS_DEFAULT = 2
 _MODE_KEYS = frozenset({"command", "permission", "result_mode", "idle", "deadline"})
 _MODE_REQUIRED = ("command", "permission")
 
@@ -724,9 +728,11 @@ _MODE_REQUIRED = ("command", "permission")
 # by its brief that its working directory is its own to write in.
 #
 # **A copy is containment, not scratch space, so what belongs here is every kind whose
-# brief PERMITS writing — not only the kinds expected to write something useful.** A slot's
-# read-only mode is not uniformly enforced: one runtime blocks its edit tools and leaves a
-# shell command the worker runs free to write. Given the snapshot as its working directory,
+# brief PERMITS writing — not only the kinds expected to write something useful.** A lane's
+# read-only mode is not uniformly enforced: one runtime bounds the whole process in the
+# kernel, another refuses the edit tools and every shell command it judges would change a
+# file — a permission check, so an incidental write by a command judged read-only (a Python
+# import dropping bytecode) still lands. Given the snapshot as its working directory,
 # such a worker does what its brief says and rewrites the pinned tree every other unit of
 # the run was measured against, and the next snapshot check refuses the whole run after the
 # reading and verification rounds have already been paid for.
@@ -744,12 +750,16 @@ class ModeSpec:
 
 
 @dataclass(frozen=True)
-class SlotSpec:
+class LaneSpec:
     runtime: str
     model: str
     account: str
     adapter: str
     modes: dict[str, ModeSpec]
+    # How many of this lane's attempts may run at once. Write-capable units are further
+    # limited to one at a time across both lanes, whatever this says.
+    slots: int = SLOTS_DEFAULT
+    slots_stated: bool = True
     # **The wording of a provider's refusal is the provider's to change**, so what counts as
     # one lives in the configuration and never in this file. Compiled at parse time, so a
     # pattern that cannot be compiled is refused before a run is planned rather than raising
@@ -757,8 +767,8 @@ class SlotSpec:
     fault_patterns: tuple[re.Pattern, ...] = ()
 
 
-def _parse_mode(slot: str, mode: str, raw: object) -> ModeSpec:
-    where = f"slots.{slot}.{mode}"
+def _parse_mode(lane: str, mode: str, raw: object) -> ModeSpec:
+    where = f"lanes.{lane}.{mode}"
     if not isinstance(raw, dict):
         raise DriverError(f"{where} must be a JSON object")
     unknown = sorted(set(raw) - _MODE_KEYS)
@@ -807,8 +817,8 @@ def _parse_mode(slot: str, mode: str, raw: object) -> ModeSpec:
                     deadline=_seconds("deadline", 3600.0))
 
 
-def parse_adapter_config(data: str | dict) -> dict[str, SlotSpec]:
-    """Parse the per-slot adapter configuration into ``{slot: SlotSpec}``.
+def parse_adapter_config(data: str | dict) -> dict[str, LaneSpec]:
+    """Parse the per-lane adapter configuration into ``{lane: LaneSpec}``.
 
     Never scraped out of prose: the input is a structured document, so a command line
     reaches this program the way data does and not the way a screenshot does.
@@ -820,53 +830,58 @@ def parse_adapter_config(data: str | dict) -> dict[str, SlotSpec]:
             raise DriverError(f"adapter config is not valid JSON: {exc}") from exc
     else:
         obj = data
-    if not isinstance(obj, dict) or not isinstance(obj.get("slots"), dict):
-        raise DriverError("adapter config must be a JSON object with a 'slots' object")
-    unknown = sorted(set(obj) - {"slots"})
+    if not isinstance(obj, dict) or not isinstance(obj.get("lanes"), dict):
+        raise DriverError("adapter config must be a JSON object with a 'lanes' object")
+    unknown = sorted(set(obj) - {"lanes"})
     if unknown:
         raise DriverError(f"adapter config has unknown key(s): {', '.join(unknown)}")
-    raw_slots = obj["slots"]
-    missing = [slot for slot in engine.SLOTS if slot not in raw_slots]
+    raw_lanes = obj["lanes"]
+    missing = [lane for lane in engine.LANES if lane not in raw_lanes]
     if missing:
-        raise DriverError(f"adapter config is missing slot(s): {', '.join(missing)}")
-    extra = sorted(set(raw_slots) - set(engine.SLOTS))
+        raise DriverError(f"adapter config is missing lane(s): {', '.join(missing)}")
+    extra = sorted(set(raw_lanes) - set(engine.LANES))
     if extra:
-        raise DriverError(f"adapter config has unknown slot(s): {', '.join(extra)}")
-    slots: dict[str, SlotSpec] = {}
-    for slot in engine.SLOTS:
-        raw = raw_slots[slot]
+        raise DriverError(f"adapter config has unknown lane(s): {', '.join(extra)}")
+    lanes: dict[str, LaneSpec] = {}
+    for lane in engine.LANES:
+        raw = raw_lanes[lane]
         if not isinstance(raw, dict):
-            raise DriverError(f"slots.{slot} must be a JSON object")
-        unknown = sorted(set(raw) - _SLOT_KEYS)
+            raise DriverError(f"lanes.{lane} must be a JSON object")
+        unknown = sorted(set(raw) - _LANE_KEYS)
         if unknown:
-            raise DriverError(f"slots.{slot} has unknown key(s): {', '.join(unknown)}")
-        for key in _SLOT_REQUIRED:
+            raise DriverError(f"lanes.{lane} has unknown key(s): {', '.join(unknown)}")
+        for key in _LANE_REQUIRED:
             if key not in raw:
-                raise DriverError(f"slots.{slot} is missing required key {key!r}")
+                raise DriverError(f"lanes.{lane} is missing required key {key!r}")
         for key in ("runtime", "model", "adapter"):
             if not isinstance(raw[key], str) or not raw[key].strip():
-                raise DriverError(f"slots.{slot}.{key} must be a non-empty string")
+                raise DriverError(f"lanes.{lane}.{key} must be a non-empty string")
         account = raw.get("account", raw["runtime"])
         if not isinstance(account, str) or not account.strip():
-            raise DriverError(f"slots.{slot}.account must be a non-empty string")
-        slots[slot] = SlotSpec(
+            raise DriverError(f"lanes.{lane}.account must be a non-empty string")
+        slots = raw.get("slots", SLOTS_DEFAULT)
+        if not isinstance(slots, int) or isinstance(slots, bool) or slots < 1:
+            raise DriverError(f"lanes.{lane}.slots must be a whole number of at least 1: "
+                              f"how many of this lane's workers may run at once")
+        lanes[lane] = LaneSpec(
             runtime=raw["runtime"].strip(), model=raw["model"].strip(),
-            account=account.strip(), adapter=raw["adapter"].strip(),
-            modes={mode: _parse_mode(slot, mode, raw[mode]) for mode in MODES},
-            fault_patterns=_parse_fault_patterns(slot, raw.get("provider_fault_patterns")),
+            account=account.strip(), adapter=raw["adapter"].strip(), slots=slots,
+            slots_stated="slots" in raw,
+            modes={mode: _parse_mode(lane, mode, raw[mode]) for mode in MODES},
+            fault_patterns=_parse_fault_patterns(lane, raw.get("provider_fault_patterns")),
         )
-    _refuse_a_configuration_the_report_could_not_describe(slots)
-    return slots
+    _refuse_a_configuration_the_report_could_not_describe(lanes)
+    return lanes
 
 
-def _parse_fault_patterns(slot: str, raw: object) -> tuple[re.Pattern, ...]:
+def _parse_fault_patterns(lane: str, raw: object) -> tuple[re.Pattern, ...]:
     """The patterns that make a terminal failure this account's outage rather than a bad
     answer. Case-insensitive regular expressions, and an empty list is a valid answer: a
     caller who declares none has said that every failure here is the worker's until two of
     them explain nothing, which is the rule that still holds without any configuration."""
     if raw is None:
         return ()
-    where = f"slots.{slot}.provider_fault_patterns"
+    where = f"lanes.{lane}.provider_fault_patterns"
     if not isinstance(raw, list) or not all(isinstance(part, str) for part in raw):
         raise DriverError(f"{where} must be a list of strings")
     compiled = []
@@ -882,8 +897,8 @@ def _parse_fault_patterns(slot: str, raw: object) -> tuple[re.Pattern, ...]:
 
 
 def _refuse_a_configuration_the_report_could_not_describe(
-        slots: dict[str, SlotSpec]) -> None:
-    """Refuse two slots on one runtime with **different models**, before anything is planned.
+        lanes: dict[str, LaneSpec]) -> None:
+    """Refuse two lanes on one runtime with **different models**, before anything is planned.
 
     The report has one sentence for a one-runtime run and it says the candidates were
     checked by the same model, calling any disagreement a difference of context. That
@@ -893,19 +908,19 @@ def _refuse_a_configuration_the_report_could_not_describe(
     because a run that discovered it later would have already spent a whole reading round.
     """
     by_runtime: dict[str, set[str]] = {}
-    for spec in slots.values():
+    for spec in lanes.values():
         by_runtime.setdefault(spec.runtime, set()).add(spec.model)
     for runtime, models in sorted(by_runtime.items()):
         if len(models) > 1:
             raise DriverError(
-                f"both slots run on {runtime!r} but name different models "
+                f"both lanes run on {runtime!r} but name different models "
                 f"({', '.join(sorted(models))}); the report describes a one-runtime run as "
                 f"checked by the same model, which that is not, and it is not a two-runtime "
-                f"run either. Give the two slots one model, or two runtimes"
+                f"run either. Give the two lanes one model, or two runtimes"
             )
 
 
-def load_adapter_config(path: str | Path) -> dict[str, SlotSpec]:
+def load_adapter_config(path: str | Path) -> dict[str, LaneSpec]:
     try:
         text = Path(path).read_text(encoding="utf-8")
     except OSError as exc:
@@ -913,31 +928,31 @@ def load_adapter_config(path: str | Path) -> dict[str, SlotSpec]:
     return parse_adapter_config(text)
 
 
-def slot_descriptions(slots: dict[str, SlotSpec],
-                      executed: "dict[str, SlotExecution] | None" = None) -> dict[str, dict]:
-    """One adapter line and one permission line per slot, for the record and the refusal.
+def lane_descriptions(lanes: dict[str, LaneSpec],
+                      executed: "dict[str, LaneExecution] | None" = None) -> dict[str, dict]:
+    """One adapter line and one permission line per lane, for the record and the refusal.
 
     **Configured, not observed — and then observed as well.** The adapter, runtime and model
-    come from the pinned configuration, so a slot whose every attempt failed to launch still
+    come from the pinned configuration, so a lane whose every attempt failed to launch still
     has a truthful record rather than an empty one; what actually ran is derived from the
     attempts and said beside it, so "configured, never executed" reads as what it is. The
     engine renders both strings verbatim.
 
     Both permission modes are stated, because readers run read-only and write-capable units
-    run in a writable copy, and one winner's permission cannot stand for the slot.
+    run in a writable copy, and one winner's permission cannot stand for the lane.
 
-    Separate from :func:`dispatch_record` because the refusal a stranded slot raises quotes
+    Separate from :func:`dispatch_record` because the refusal a stranded lane raises quotes
     these same strings, and it is raised at a round boundary where there is no record to
-    write: what became of that slot's attempts is the whole of what an operator needs, and
+    write: what became of that lane's attempts is the whole of what an operator needs, and
     it must read the same both times.
     """
     described: dict[str, dict] = {}
-    for slot, spec in slots.items():
-        ran = None if executed is None else executed.get(slot)
+    for lane, spec in lanes.items():
+        ran = None if executed is None else executed.get(lane)
         if ran is None:
             did = ""
         elif not ran.executed:
-            # **Prepared is not executed.** A slot every one of whose launches raised has a
+            # **Prepared is not executed.** A lane every one of whose launches raised has a
             # spawn record per attempt and no supervisor ever ran, so the count of prepared
             # launches is said as what it is rather than standing in for work done.
             did = " — configured, never executed"
@@ -953,11 +968,11 @@ def slot_descriptions(slots: dict[str, SlotSpec],
             did = (f" — {ran.executed} attempt(s) executed, "
                    f"{ran.landed} unit(s) landed")
             if ran.unknown:
-                # Said, not folded into either count: a reader weighing what a slot
+                # Said, not folded into either count: a reader weighing what a lane
                 # contributed needs to know how much of it is unaccounted for.
                 did += (f", {ran.unknown} attempt(s) with no record of whether the "
                         f"supervisor started")
-        described[slot] = {
+        described[lane] = {
             "adapter": f"{spec.adapter} ({spec.runtime}, {spec.model}){did}",
             "permission": "; ".join(
                 f"{'read-only units' if mode == READ_ONLY else 'write-capable units'}: "
@@ -968,37 +983,37 @@ def slot_descriptions(slots: dict[str, SlotSpec],
     return described
 
 
-def dispatch_record(slots: dict[str, SlotSpec],
-                    executed: "dict[str, SlotExecution] | None" = None) -> dict:
+def dispatch_record(lanes: dict[str, LaneSpec],
+                    executed: "dict[str, LaneExecution] | None" = None) -> dict:
     """``dispatch.json``: the configuration always, and what executed where there is any.
 
-    The slots are described before the rung is derived, because deriving it is what refuses
+    The lanes are described before the rung is derived, because deriving it is what refuses
     a run that reached only one of them, and that refusal quotes the descriptions.
     """
-    described = slot_descriptions(slots, executed)
-    return {"rung": _derived_rung(slots, executed, described), "slots": described}
+    described = lane_descriptions(lanes, executed)
+    return {"rung": _derived_rung(lanes, executed, described), "lanes": described}
 
 
 def no_landing_refusal(stranded: Sequence[str], described: dict[str, dict]) -> str:
-    """The message a slot that landed nothing ends the run with, written once.
+    """The message a lane that landed nothing ends the run with, written once.
 
     Once, because it is raised from two places — the round boundary that finds it first and
     the record that would otherwise have to name a rung for it — and a user meeting the
     second should not be told something different from the first.
 
     **It says what happened and explains nothing further.** The true statement is narrow
-    and is enough: no unit answered on this slot, so nothing it was asked to read reached
+    and is enough: no unit answered on this lane, so nothing it was asked to read reached
     the run and nothing it was asked to check was checked. What must never be said here is
     that the findings were checked where they were raised — routing addresses a candidate
-    to the slot that did not raise it and keeps doing so, and a candidate whose verifier
+    to the lane that did not raise it and keeps doing so, and a candidate whose verifier
     never answered is recorded unresolved rather than handed back to its finder. A message
     a user meets at the moment a run fails is the worst place in the program to explain it
     with a mechanism the program does not have.
     """
-    named = "; ".join(f"slot {slot} landed no unit — {described[slot]['adapter']}"
-                      for slot in stranded)
+    named = "; ".join(f"lane {lane} landed no unit — {described[lane]['adapter']}"
+                      for lane in stranded)
     return (
-        f"{named}. A slot that lands nothing answered none of the units it was given: what "
+        f"{named}. A lane that lands nothing answered none of the units it was given: what "
         f"it was asked to read never reached this run, and every candidate addressed to it "
         f"is unresolved — so no report of this run could say a finding was checked by a "
         f"unit that did not raise it. Why each attempt ended as it did is recorded beside "
@@ -1416,7 +1431,7 @@ def read_status(path: Path) -> dict | None:
     **One of the two places that tolerates an unreadable file, and here is why.** Everywhere
     else a refused read raises, because answering it as an absence authorizes something —
     a deletion, a charge, a second attempt. This authorizes nothing: no status is what an
-    attempt still running looks like, so the attempt stays counted against its slot, drifts
+    attempt still running looks like, so the attempt stays counted against its lane, drifts
     to `uncertain` when its window passes, and quarantines its unit for an operator. Every
     outcome of not knowing is the cautious one.
     """
@@ -1461,7 +1476,7 @@ def _argv_complete(raw: object) -> bool:
     which is an ``orphan-claim`` and never something to adjudicate."""
     if not isinstance(raw, dict):
         return False
-    required = ("argv", "adapter", "slot", "account", "generation", "permission",
+    required = ("argv", "adapter", "lane", "account", "generation", "permission",
                 "cwd", "kind", "probe", "spawn_time", "deadline", "token", "transcript")
     return all(key in raw for key in required)
 
@@ -1703,20 +1718,20 @@ def adjudicate(ctx: "Run", attempt: Attempt) -> dict:
             elif _is_capture_overflow(status):
                 record["outcome"] = INFRASTRUCTURE
             elif _is_supervisor_refusal(status):
-                # The supervisor never launched a worker: the slot's command names a program
+                # The supervisor never launched a worker: the lane's command names a program
                 # that is not on PATH, or one that could not be started. That is the
                 # adapter's mistake, not the unit's, and filing it as a worker failure spent
-                # every unit's launch allowance on that slot and ended the run in the one
-                # refusal that cannot be resumed -- taking the other slot's finished work
+                # every unit's launch allowance on that lane and ended the run in the one
+                # refusal that cannot be resumed -- taking the other lane's finished work
                 # with it, over a typo. Infrastructure, charged to nobody, and the run stops
                 # where the operator can fix the adapter and run the same command again.
                 record["outcome"] = INFRASTRUCTURE
                 record["supervisor_refusal"] = True
-                slot = attempt.slot if getattr(attempt, "slot", None) else \
-                    ctx.unit_row(attempt.unit).get("slot", "?")
+                lane = attempt.lane if getattr(attempt, "lane", None) else \
+                    ctx.unit_row(attempt.unit).get("lane", "?")
                 ctx.request_pause(
-                    f"slot {slot}'s supervisor could not start a worker for {attempt.unit}: "
-                    f"{status.get('reason')}. Nothing was charged. Fix that slot's command in "
+                    f"lane {lane}'s supervisor could not start a worker for {attempt.unit}: "
+                    f"{status.get('reason')}. Nothing was charged. Fix that lane's command in "
                     "the adapter file, then run the same command again")
             elif _is_supervisor_exit(status):
                 # The supervisor ended without saying what happened to its worker, which
@@ -1728,11 +1743,11 @@ def adjudicate(ctx: "Run", attempt: Attempt) -> dict:
                 # stderr tail is the whole account there is, so it is in the reason.
                 record["outcome"] = INFRASTRUCTURE
                 record["supervisor_exit"] = status.get("supervisor_exit")
-                slot = attempt.slot if getattr(attempt, "slot", None) else \
-                    ctx.unit_row(attempt.unit).get("slot", "?")
+                lane = attempt.lane if getattr(attempt, "lane", None) else \
+                    ctx.unit_row(attempt.unit).get("lane", "?")
                 tail = str(status.get("stderr_tail") or "").strip()
                 ctx.request_pause(
-                    f"slot {slot}'s supervisor exited {status.get('supervisor_exit')} for "
+                    f"lane {lane}'s supervisor exited {status.get('supervisor_exit')} for "
                     f"{attempt.unit} {attempt.name} without reporting a status. Nothing was "
                     f"charged. Its stderr ends: {tail or '(nothing)'}. Fix what it names, "
                     f"then run the same command again")
@@ -2044,7 +2059,7 @@ def _exhaustion_reason(dispositions: Sequence[dict]) -> str:
 # attempt in flight when an outage begins carries the same one and is the same incident by
 # construction — including the ones that report minutes later.
 GENERATIONS_PREFIX = "generations-"
-# Two unexplained terminal failures in one generation, on one slot, pause the provider. Two
+# Two unexplained terminal failures in one generation, on one lane, pause the provider. Two
 # failures that say nothing are far likelier to be an outage than two bad answers.
 UNEXPLAINED_PAUSES_AT = 2
 # Probes that completed and said nothing either way. After this many, the run stops rather
@@ -2115,8 +2130,8 @@ def provider_state(account: str, generation: int,
     unexplained: dict[str, int] = {}
     for attempt in current:
         if (attempt.disposition or {}).get("unexplained"):
-            slot = str((attempt.argv or {}).get("slot"))
-            unexplained[slot] = unexplained.get(slot, 0) + 1
+            lane = str((attempt.argv or {}).get("lane"))
+            unexplained[lane] = unexplained.get(lane, 0) + 1
 
     drain = ""
     if probe_refused:
@@ -2136,9 +2151,9 @@ def provider_state(account: str, generation: int,
         paused = (f"{len(unavailable)} attempt(s) launched in generation {generation} "
                   f"reported this provider unavailable")
     else:
-        for slot in sorted(unexplained):
-            if unexplained[slot] >= UNEXPLAINED_PAUSES_AT:
-                paused = (f"{unexplained[slot]} terminal failures on slot {slot} in "
+        for lane in sorted(unexplained):
+            if unexplained[lane] >= UNEXPLAINED_PAUSES_AT:
+                paused = (f"{unexplained[lane]} terminal failures on lane {lane} in "
                           f"generation {generation} explained nothing")
                 break
     return ProviderState(paused=paused, drain=drain, close_generation=False, **common)
@@ -2167,13 +2182,13 @@ def probe_due(state: ProviderState, now: float, backoff: float) -> bool:
 # 6.4 dispatch.json — configured always, executed where there is anything to say
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
-class SlotExecution:
-    """What one slot actually did, derived from its attempts.
+class LaneExecution:
+    """What one lane actually did, derived from its attempts.
 
     ``prepared`` and ``executed`` are two different facts and the record keeps them apart: a
     spawn writes its ``argv.json`` before it launches, so a launch that raised leaves a full
-    spawn record behind and nothing ever ran. Counting those as executions is how a slot
-    whose supervisor never started once reads as a slot that worked.
+    spawn record behind and nothing ever ran. Counting those as executions is how a lane
+    whose supervisor never started once reads as a lane that worked.
 
     ``unknown`` is the third: an attempt prepared, never shown to have started, and never
     shown not to have. A kill between the spawn record and the launch leaves exactly that,
@@ -2189,31 +2204,31 @@ class SlotExecution:
     modes: frozenset
 
 
-def executed_provenance(run: "Run") -> dict[str, SlotExecution]:
-    """Per slot, what executed — counted from the attempts and from nothing else.
+def executed_provenance(run: "Run") -> dict[str, LaneExecution]:
+    """Per lane, what executed — counted from the attempts and from nothing else.
 
     **Proven execution, not a prepared launch, and a landed result, not a published
     error.** An attempt is an execution unless its own disposition says the supervisor could
-    not be started; a unit landed on this slot only where what it published is a result. A
+    not be started; a unit landed on this lane only where what it published is a result. A
     unit whose every attempt failed publishes ``error.txt``, which names the attempt that
     produced it — read as a landing it would raise the rung, and the report would claim an
     independence no answer in it came from.
     """
-    prepared = {slot: 0 for slot in run.slots}
-    executed = {slot: 0 for slot in run.slots}
-    unknown = {slot: 0 for slot in run.slots}
-    landings = {slot: 0 for slot in run.slots}
-    modes: dict[str, set] = {slot: set() for slot in run.slots}
+    prepared = {lane: 0 for lane in run.lanes}
+    executed = {lane: 0 for lane in run.lanes}
+    unknown = {lane: 0 for lane in run.lanes}
+    landings = {lane: 0 for lane in run.lanes}
+    modes: dict[str, set] = {lane: set() for lane in run.lanes}
     for unit in run.units():
-        slot = unit.get("slot")
-        if slot not in prepared:
+        lane = unit.get("lane")
+        if lane not in prepared:
             continue
         record = landed(run.rundir, unit["id"]) or {}
         answered = record.get("attempt") if record.get("publication") == "result" else None
         for attempt in run.attempts(unit["id"]):
             if attempt.argv is None:
                 continue
-            prepared[slot] += 1
+            prepared[lane] += 1
             disposition = attempt.disposition or {}
             if (disposition.get("launched") is False
                     or disposition.get("outcome") == LAUNCH_FAILED):
@@ -2224,47 +2239,47 @@ def executed_provenance(run: "Run") -> dict[str, SlotExecution]:
             # record and the launch, fail the attempt, and counting it as an execution has
             # the run report a supervisor that started nothing as one that ran.
             if attempt.status is None and disposition.get("outcome") not in _FROM_A_STATUS:
-                unknown[slot] += 1
+                unknown[lane] += 1
                 continue
-            executed[slot] += 1
-            modes[slot].add(WRITE_CAPABLE if unit.get("kind") in WRITE_CAPABLE_KINDS
+            executed[lane] += 1
+            modes[lane].add(WRITE_CAPABLE if unit.get("kind") in WRITE_CAPABLE_KINDS
                             else READ_ONLY)
             if attempt.name == answered:
-                landings[slot] += 1
-    return {slot: SlotExecution(prepared=prepared[slot], executed=executed[slot],
-                                unknown=unknown[slot], landed=landings[slot],
-                                modes=frozenset(modes[slot]))
-            for slot in run.slots}
+                landings[lane] += 1
+    return {lane: LaneExecution(prepared=prepared[lane], executed=executed[lane],
+                                unknown=unknown[lane], landed=landings[lane],
+                                modes=frozenset(modes[lane]))
+            for lane in run.lanes}
 
 
-def _derived_rung(slots: dict[str, SlotSpec],
-                  executed: dict[str, SlotExecution] | None,
+def _derived_rung(lanes: dict[str, LaneSpec],
+                  executed: dict[str, LaneExecution] | None,
                   described: dict[str, dict]) -> str:
     """The rung, as **the lowest any landed unit ran at** — or a refusal where there is no
     rung to name.
 
-    Configured is the ceiling and what landed is the floor: a run whose second slot never
+    Configured is the ceiling and what landed is the floor: a run whose second lane never
     landed a unit did not get two of anything, whatever it was set up to do, and the report
     would otherwise claim an independence the run did not have.
 
-    **A slot that landed nothing ends the run rather than lowering it.** Rule 3 is that a
-    finding goes to a unit that did not raise it, and a slot that answered nothing checked
+    **A lane that landed nothing ends the run rather than lowering it.** Rule 3 is that a
+    finding goes to a unit that did not raise it, and a lane that answered nothing checked
     nothing it was given. There is no status on the page that survives that, so the engine
     accepts no rung for it and this refuses rather than naming one. By the time a record is
-    written the run has usually been stopped already — :meth:`Run.refuse_a_stranded_slot`
+    written the run has usually been stopped already — :meth:`Run.refuse_a_stranded_lane`
     asks the same question at each round boundary — and this is the backstop for the callers
     that reach here by another path.
     """
     configured = (engine.RUNG_TWO_RUNTIMES
-                  if len({spec.runtime for spec in slots.values()}) > 1
+                  if len({spec.runtime for spec in lanes.values()}) > 1
                   else engine.RUNG_ONE_RUNTIME)
     if executed is None:
         return configured
-    working = [slot for slot, record in executed.items() if record.landed]
+    working = [lane for lane, record in executed.items() if record.landed]
     if len(working) < 2:
         raise DriverError(no_landing_refusal(
-            [slot for slot in sorted(slots) if slot not in working], described))
-    if len({slots[slot].runtime for slot in working}) > 1:
+            [lane for lane in sorted(lanes) if lane not in working], described))
+    if len({lanes[lane].runtime for lane in working}) > 1:
         return engine.RUNG_TWO_RUNTIMES
     return engine.RUNG_ONE_RUNTIME
 
@@ -2360,8 +2375,12 @@ def verify_snapshot(rundir: Path) -> list[str]:
     if not isinstance(inventory, dict) or not isinstance(inventory.get("files"), list):
         return [f"{rundir / INVENTORY_NAME} is not the engine's inventory, so the snapshot "
                 f"cannot be checked against what was measured"]
+    # ``context`` is what the snapshot carries for a build and nobody reads; it is checked
+    # like the rest, because a rewritten lockfile changes what every later build installs.
+    context = inventory.get("context", [])
     expected = {str(entry.get("path")): str(entry.get("sha256"))
-                for entry in inventory["files"] if isinstance(entry, dict)}
+                for entry in [*inventory["files"], *(context if isinstance(context, list) else [])]
+                if isinstance(entry, dict)}
     present = snapshot_files(rundir / SNAPSHOT_DIR)
     problems = []
     for rel in sorted(set(expected) - set(present)):
@@ -2588,7 +2607,7 @@ def prepare_worker_paths(rundir: Path, unit: dict,
     """The opaque input directory and working directory for one attempt.
 
     **Every path a worker is given is opaque, not just its payload.** A verification unit
-    is named for the area and the slot that *raised* its candidates, so handing a worker
+    is named for the area and the lane that *raised* its candidates, so handing a worker
     ``dispatch/verify-area-01-A/a0/copy`` as its working directory tells it exactly what the
     payload is built to withhold. A token names both, and the token-to-unit mapping stays
     on this side of the line.
@@ -2744,7 +2763,7 @@ def _execution_ended(attempt: Attempt) -> bool:
 
     **One predicate, used by everything that asks the question** — the capacity reservation,
     the write-capable serialization and the copy cleanup — because two spellings of it
-    disagreed: a slot stayed reserved for an operator-failed attempt that a late status had
+    disagreed: a lane stayed reserved for an operator-failed attempt that a late status had
     since proved finished, while the count of running writers ignored that same attempt and
     let a second write-capable worker start beside one that might still be live.
 
@@ -2822,8 +2841,8 @@ def _most_severe_rank(levels: Sequence[str]) -> int:
 class Run:
     """One owned run directory, its configuration, and the loop over its rounds."""
 
-    def __init__(self, rundir: Path, slots: dict[str, SlotSpec], supervisor: Path, *,
-                 grace: float = GRACE_DEFAULT, capacity: int = 1, poll: float = 2.0,
+    def __init__(self, rundir: Path, lanes: dict[str, LaneSpec], supervisor: Path, *,
+                 grace: float = GRACE_DEFAULT, poll: float = 2.0,
                  max_hours: float | None = None, out=None, given: Path | None = None,
                  probe_backoff: float = PROBE_BACKOFF_DEFAULT,
                  max_capture_bytes: int = MAX_CAPTURE_BYTES_DEFAULT,
@@ -2834,10 +2853,9 @@ class Run:
         # The spelling the operator typed, when it is not the canonical one. Carried only so
         # the drain request works at the path the documentation names for them.
         self.given = given
-        self.slots = slots
+        self.lanes = lanes
         self.supervisor = supervisor
         self.grace = grace
-        self.capacity = max(1, capacity)
         self.poll = poll
         self.max_hours = max_hours
         self.out = out if out is not None else sys.stdout
@@ -3072,24 +3090,24 @@ class Run:
         return not budget.exhausted and not budget.at_ceiling
 
     def reserving(self) -> dict[str, int]:
-        """How much of each slot's capacity is spoken for.
+        """How many of each lane's slots are spoken for.
 
         ``uncertain`` and ``orphan-claim`` **keep their reservation** — the worker may
         still be alive — and so does an operator-failed attempt with no attestation. A
         reservation released on a guess is a second worker started beside a live one.
         """
-        counts = {slot: 0 for slot in engine.SLOTS}
+        counts = {lane: 0 for lane in engine.LANES}
         for unit in self.units():
-            slot = unit.get("slot", engine.SLOTS[0])
+            lane = unit.get("lane", engine.LANES[0])
             for attempt in self.attempts(unit["id"]):
                 if _reserves_capacity(attempt):
-                    counts[slot] = counts.get(slot, 0) + 1
+                    counts[lane] = counts.get(lane, 0) + 1
         return counts
 
     def writers_running(self) -> int:
         """Write-capable attempts in flight, run-wide.
 
-        Serialized across both slots, not per slot: separate directories are not separate
+        Serialized across both lanes, not per lane: separate directories are not separate
         ports, caches or credentials, so two reproductions at once can fail each other for
         environmental reasons and the verdict would read as the code's fault.
         """
@@ -3098,7 +3116,7 @@ class Run:
             if unit.get("kind") not in WRITE_CAPABLE_KINDS:
                 continue
             for attempt in self.attempts(unit["id"]):
-                # The SAME predicate the slot reservation uses. Two spellings of "may still
+                # The SAME predicate the lane reservation uses. Two spellings of "may still
                 # be running" let an unattested operator-failed writer hold a slot while
                 # this count ignored it, so a second reproduction started beside a worker
                 # that may still have had the ports, caches and credentials they share.
@@ -3120,14 +3138,14 @@ class Run:
         it was launched into.
         """
         unit_id = unit["id"]
-        named = unit.get("slot")
-        if named not in self.slots:
+        named = unit.get("lane")
+        if named not in self.lanes:
             raise DriverError(
-                f"{unit_id} is listed against slot {named!r}, which the adapter config "
+                f"{unit_id} is listed against lane {named!r}, which the adapter config "
                 f"does not describe; the listing and the configuration disagree")
-        slot = self.slots[named]
+        lane = self.lanes[named]
         mode = WRITE_CAPABLE if unit.get("kind") in WRITE_CAPABLE_KINDS else READ_ONLY
-        spec = slot.modes[mode]
+        spec = lane.modes[mode]
         base = self.rundir / engine.DISPATCH_DIR / unit_id
         try:
             base.mkdir(parents=True, exist_ok=True)
@@ -3212,8 +3230,8 @@ class Run:
                 "--max-capture-bytes", str(self.max_capture_bytes),
                 "--", *rendered]
         record = {
-            "argv": argv, "adapter": slot.adapter, "slot": unit.get("slot"),
-            "account": slot.account, "generation": self.generation(slot.account),
+            "argv": argv, "adapter": lane.adapter, "lane": unit.get("lane"),
+            "account": lane.account, "generation": self.generation(lane.account),
             "permission": spec.permission, "cwd": str(cwd), "kind": unit.get("kind"),
             # The PROVIDER probe of the breaker, which is a different thing from the
             # engine's capability-probe unit kind. Recorded at spawn because an incident is
@@ -3230,7 +3248,7 @@ class Run:
         _write_json(attempt_path / ARGV_NAME, record)
         _index(self.rundir, token, unit_id, attempt_path.name)
         _progress(self.rundir, f"{unit_id} {attempt_path.name} spawning "
-                               f"(slot {unit.get('slot')}, {mode}"
+                               f"(lane {unit.get('lane')}, {mode}"
                                f"{', provider probe' if probe else ''})")
         try:
             # stdout is redirected into the attempt's own `status.txt`, inherited by the
@@ -3272,7 +3290,7 @@ class Run:
         because nothing else can see it.** The attempt's state is read from disk, where a
         supervisor that died before printing its status line is indistinguishable from one
         still working: it stays `running` until its deadline and grace pass, an hour at the
-        defaults, and every attempt after it on that slot waits its turn behind a process
+        defaults, and every attempt after it on that lane waits its turn behind a process
         that is not there. A supervisor that crashes before printing it -- one run under a
         Python too old for it, for instance -- does that to every attempt.
 
@@ -3412,16 +3430,16 @@ class Run:
         return 0
 
     def accounts(self) -> dict[str, list[str]]:
-        """Each provider account, and the slots configured against it. Two slots on one
+        """Each provider account, and the lanes configured against it. Two lanes on one
         account pause together, because it is the account that is refusing."""
         found: dict[str, list[str]] = {}
-        for slot, spec in self.slots.items():
-            found.setdefault(spec.account, []).append(slot)
+        for lane, spec in self.lanes.items():
+            found.setdefault(spec.account, []).append(lane)
         return found
 
     def fault_patterns(self, attempt: Attempt) -> tuple:
         """What counts as this attempt's provider refusing, from the configuration."""
-        spec = self.slots.get((attempt.argv or {}).get("slot"))
+        spec = self.lanes.get((attempt.argv or {}).get("lane"))
         return spec.fault_patterns if spec is not None else ()
 
     def providers(self) -> dict[str, ProviderState]:
@@ -3979,7 +3997,7 @@ class Run:
                     # said that nothing more will be claimed.
                     if self.stop_requested() or self.over_budget():
                         break
-                    slot = unit.get("slot", engine.SLOTS[0])
+                    lane = unit.get("lane", engine.LANES[0])
                     claim, probe = self.claim_decision(unit, reserved, writers,
                                                        providers, probed)
                     if not claim:
@@ -3990,14 +4008,14 @@ class Run:
                         # the batch is not started either.
                         break
                     if probe:
-                        probed.add(self.slots[slot].account)
-                    reserved[slot] = reserved.get(slot, 0) + 1
+                        probed.add(self.lanes[lane].account)
+                    reserved[lane] = reserved.get(lane, 0) + 1
                     if unit.get("kind") in WRITE_CAPABLE_KINDS:
                         writers += 1
                     claimed += 1
             # **The test is "nothing is in flight and nothing was claimed", not "nothing is
             # eligible".** A unit can be eligible and permanently unable to start — its
-            # slot's capacity held by an `uncertain` attempt whose worker may still be
+            # lane's slot held by an `uncertain` attempt whose worker may still be
             # alive, which is a reservation nothing releases without an operator. Asking
             # about eligibility instead spins here for ever on a run that should have
             # stopped and named the attempt nobody can account for.
@@ -4029,8 +4047,8 @@ class Run:
         waiting costs nothing; what is never done is moving them to the other runtime, since
         a mixed run is one the report cannot describe truthfully.
         """
-        slot = unit.get("slot", engine.SLOTS[0])
-        if reserved.get(slot, 0) >= self.capacity:
+        lane = unit.get("lane", engine.LANES[0])
+        if reserved.get(lane, 0) >= self.lanes[lane].slots:
             return False, False
         if unit.get("kind") in WRITE_CAPABLE_KINDS and writers > 0:
             return False, False
@@ -4063,7 +4081,7 @@ class Run:
             if short:
                 self._blocked_on_disk = short
                 return False, False
-        spec = self.slots.get(slot)
+        spec = self.lanes.get(lane)
         state = providers.get(spec.account) if spec is not None else None
         if state is not None and state.paused:
             if spec.account in probed or not probe_due(
@@ -4099,8 +4117,8 @@ class Run:
                 continue
             if now >= state.last_probe_at + self.probe_backoff:
                 continue  # due now, so the pass above found nothing eligible to send
-            slots = set(self.accounts().get(account, ()))
-            if any(unit.get("slot") in slots and self.eligible(unit["id"])
+            lanes = set(self.accounts().get(account, ()))
+            if any(unit.get("lane") in lanes and self.eligible(unit["id"])
                    for unit in units):
                 return True
         return False
@@ -4114,11 +4132,11 @@ class Run:
             out.append((unit["id"], self.quarantined(unit["id"]) or "no answer landed"))
         return out
 
-    def refuse_a_stranded_slot(self, kinds: Sequence[str]) -> None:
-        """Refuse at this boundary if a slot has landed nothing and has no unit left that
+    def refuse_a_stranded_lane(self, kinds: Sequence[str]) -> None:
+        """Refuse at this boundary if a lane has landed nothing and has no unit left that
         could change that.
 
-        The same refusal the record makes at the end, made as soon as it is true. A slot is
+        The same refusal the record makes at the end, made as soon as it is true. A lane is
         stranded when it has answered no unit **and** every unit addressed to it is already
         terminal: no later round re-addresses a unit that has published, so what it has
         landed at this boundary is what it will have landed at the report. Clustering and
@@ -4126,16 +4144,16 @@ class Run:
         the operator nothing but the wait.
 
         **Pending is what keeps the recovery case, and it is the whole of this rule.** A
-        slot whose readers all failed has landed nothing at the end of the reading round and
-        is NOT refused here: routing addresses every candidate the other slot raised to the
-        slot that did not raise it, so its verification units are where it answers, and it
+        lane whose readers all failed has landed nothing at the end of the reading round and
+        is NOT refused here: routing addresses every candidate the other lane raised to the
+        lane that did not raise it, so its verification units are where it answers, and it
         is stranded only once those are terminal too. Asked on "landed nothing" alone this
         would end the run one round before the round that rescues it.
 
         **And the units to ask about are the ones that will exist, which is why a round with
         nothing left to finish is not asked at all.** A stage transition is what creates the
         next round's units, and a round whose own units are all terminal is a round whose
-        transition has not run yet: the verification unit that answers for a silent slot is
+        transition has not run yet: the verification unit that answers for a silent lane is
         the thing `route` is about to write. Only a RESUMED run is ever at a boundary in that
         state — an uninterrupted one runs the stage and moves on within the same pass — so a
         question asked there is answered from a listing that is one stage out of date, and it
@@ -4145,23 +4163,23 @@ class Run:
         and what this exists to prevent is a spawn.
 
         The check runs at every boundary rather than at a chosen one, because which round
-        leaves a slot with nothing pending depends on what the run found: a run that raised
+        leaves a lane with nothing pending depends on what the run found: a run that raised
         no candidate at all addresses no verifier anywhere. Where that leaves nothing to ask
         at any boundary, the record at the end is the backstop and it refuses the same way.
         """
         if not self.unfinished(kinds):
             return
         executed = executed_provenance(self)
-        pending = {slot: 0 for slot in self.slots}
+        pending = {lane: 0 for lane in self.lanes}
         for unit in self.units():
-            slot = unit.get("slot")
-            if slot in pending and not self.terminal(unit["id"]):
-                pending[slot] += 1
-        stranded = [slot for slot in sorted(self.slots)
-                    if not executed[slot].landed and not pending[slot]]
+            lane = unit.get("lane")
+            if lane in pending and not self.terminal(unit["id"]):
+                pending[lane] += 1
+        stranded = [lane for lane in sorted(self.lanes)
+                    if not executed[lane].landed and not pending[lane]]
         if stranded:
             raise DriverError(no_landing_refusal(
-                stranded, slot_descriptions(self.slots, executed)))
+                stranded, lane_descriptions(self.lanes, executed)))
 
     # -- 4. the loop --------------------------------------------------------- #
     def loop(self) -> int:
@@ -4217,7 +4235,7 @@ class Run:
             self.adopt()
             # Between adopting and spawning, which is the last moment before this round
             # costs anything.
-            self.refuse_a_stranded_slot(kinds)
+            self.refuse_a_stranded_lane(kinds)
             self.dispatch_round(kinds)
             # **And again now the round's workers have run, before anything consumes what
             # they produced.** The check above is the boundary this round STARTED at; a
@@ -4261,7 +4279,7 @@ class Run:
                 # `dispatch.json` is committed first, because `report` loads it before it
                 # renders anything.
                 _write_json(self.rundir / engine.DISPATCH_FILE_NAME,
-                            dispatch_record(self.slots, executed_provenance(self)))
+                            dispatch_record(self.lanes, executed_provenance(self)))
             # Under this driver's lock, so a claim on disk is one nobody holds.
             for name in clear_engine_claims(self.rundir):
                 self.say(f"cleared {name}, which a killed {name.split('.')[0]} left behind")
@@ -4311,7 +4329,7 @@ def resolve_attempt(rundir: Path, unit: str, attempt_name: str, *, action: str,
 
     ``--fail`` requires it too. Without the attestation the attempt's capacity reservation
     was kept, because execution may continue -- and nothing ever released it, which at one
-    worker per slot held the slot for the rest of the run.
+    slot per lane stopped the lane for the rest of the run.
     """
     if action == "retry" and not stopped_confirmed:
         raise DriverError(
@@ -4321,16 +4339,16 @@ def resolve_attempt(rundir: Path, unit: str, attempt_name: str, *, action: str,
     if action == "fail" and not stopped_confirmed:
         # The same rule as `--retry`, and for the same reason taken one step further. A
         # `--fail` without the attestation kept the capacity reservation on purpose, because
-        # execution may continue -- and nothing ever released it. At the default capacity of
-        # one worker per slot, that is the slot held for the rest of the run: every later
+        # execution may continue -- and nothing ever released it. At one slot per lane,
+        # that is the lane stopped for the rest of the run: every later
         # unit on it refused on every resume, and the only way out failing each of them by
         # hand and discarding its work. For a write-capable unit it was the run's one writer
-        # slot and so every write-capable unit. Either way the operator has the same two
+        # lane and so every write-capable unit. Either way the operator has the same two
         # answers -- confirm the worker has stopped, or wait out its deadline -- and asking
         # for one of them here is what keeps the run from needing a third.
         raise DriverError(
             f"--fail on {unit} needs --stopped-confirmed: without it the attempt's capacity "
-            "reservation is never released, and at one worker per slot that holds the slot "
+            "reservation is never released, and at one slot per lane that stops the lane "
             "for the rest of the run. Confirm the worker has stopped, or wait out its "
             "deadline; the run then continues past it")
     if not reason.strip():
@@ -4432,7 +4450,7 @@ def resolve_unit(rundir: Path, unit: str, *, grant: int | None,
             raise DriverError(
                 f"--fail on {unit} needs --stopped-confirmed: {names} cannot be accounted "
                 f"for, and without the attestation its capacity reservation is never "
-                f"released, which at one worker per slot holds the slot for the rest of "
+                f"released, which at one slot per lane stops the lane for the rest of "
                 f"the run. Its deadline has already passed, so waiting releases nothing; "
                 f"confirm the worker has stopped and pass --stopped-confirmed")
         # **The attempts' records before the unit's.** Each record on its own moves the unit
@@ -4496,7 +4514,7 @@ def status_report(run: Run) -> str:
         record = landed(run.rundir, unit_id)
         where = (f"landed {record['publication']} from {record['attempt']}" if record
                  else (run.quarantined(unit_id) or "open"))
-        lines.append(f"  {unit_id} [{unit.get('kind')}/{unit.get('slot')}] {where}")
+        lines.append(f"  {unit_id} [{unit.get('kind')}/{unit.get('lane')}] {where}")
         for attempt in attempts:
             outcome = (attempt.disposition or {}).get("outcome", "")
             lines.append(f"    {attempt.name}: {attempt.state}"
@@ -4563,8 +4581,6 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--grace", type=float, default=GRACE_DEFAULT,
                      help="seconds past an attempt's own deadline before its outcome is "
                           "called unprovable (default 120). It authorizes nothing")
-    run.add_argument("--capacity", type=int, default=1,
-                     help="concurrent attempts per slot (default 1)")
     run.add_argument("--poll", type=float, default=2.0, help=argparse.SUPPRESS)
     run.add_argument("--max-hours", type=float, default=None,
                      help="stop claiming once this much driver uptime has accumulated "
@@ -4703,7 +4719,7 @@ def _dispatch(args: argparse.Namespace) -> int:
         # driver is writing into it, so a line or two may be a moment stale; every other
         # command here takes the lock, because every other command writes.
         run = Run(rundir, load_adapter_config(args.adapter) if args.adapter
-                  else _placeholder_slots(), default_supervisor(), grace=args.grace,
+                  else _placeholder_lanes(), default_supervisor(), grace=args.grace,
                   given=Path(args.rundir).absolute())
         sys.stdout.write(status_report(run))
         return EXIT_OK
@@ -4721,22 +4737,22 @@ def _dispatch(args: argparse.Namespace) -> int:
         return EXIT_OK
 
 
-def _placeholder_slots() -> dict[str, SlotSpec]:
+def _placeholder_lanes() -> dict[str, LaneSpec]:
     """A configuration `status` can be constructed with. It reads the run directory and
     spawns nothing, so the commands it would have rendered are not its business."""
     mode = ModeSpec(command=("⟪prompt⟫",), permission="not read here",
                     result_mode="stream-transcript", idle=900.0, deadline=3600.0)
-    return {slot: SlotSpec(runtime="", model="", account="", adapter="",
+    return {lane: LaneSpec(runtime="", model="", account="", adapter="",
                            modes={READ_ONLY: mode, WRITE_CAPABLE: mode})
-            for slot in engine.SLOTS}
+            for lane in engine.LANES}
 
 
 def _command_run(args: argparse.Namespace, rundir: Path, lock: RunLock) -> int:
-    slots = load_adapter_config(args.adapter)
+    lanes = load_adapter_config(args.adapter)
     # Resolved before it is checked, because it is checked HERE and run THERE: every
     # supervisor is launched with the run directory as its working directory, so a relative
     # spelling that exists beside the caller names nothing beside the run. The attempts then
-    # produce no status at all and drift to `uncertain` while holding their slots.
+    # produce no status at all and drift to `uncertain` while holding their lanes.
     supervisor = _canonical(Path(args.supervisor) if args.supervisor
                             else default_supervisor(), "supervisor")
     # A refusal here is not an absence, and the difference is what the operator is told:
@@ -4787,12 +4803,16 @@ def _command_run(args: argparse.Namespace, rundir: Path, lock: RunLock) -> int:
             sys.stdout.flush()
         bootstrap(rundir, job)
         # Pinned at plan time and refused on a resume with a different one: a run whose
-        # slots changed part-way cannot be described truthfully by one record.
-        _pin_adapter(rundir, slots)
+        # lanes changed part-way cannot be described truthfully by one record.
+        _pin_adapter(rundir, lanes)
         if not args.go:
-            sys.stdout.write(_preview(rundir))
+            sys.stdout.write(_preview(rundir, lanes))
             return EXIT_OK
-        run = Run(rundir, slots, supervisor, grace=args.grace, capacity=args.capacity,
+        # A run started with `--go` shows no preview, and this is the one line of it that
+        # is about what leaves the machine rather than how long the run takes.
+        sys.stdout.write(_copied_outside_scope(rundir))
+        sys.stdout.flush()
+        run = Run(rundir, lanes, supervisor, grace=args.grace,
                   poll=args.poll, max_hours=args.max_hours, given=given,
                   probe_backoff=args.probe_backoff,
                   max_capture_bytes=args.max_capture_bytes,
@@ -4821,13 +4841,13 @@ def _command_run(args: argparse.Namespace, rundir: Path, lock: RunLock) -> int:
                     signal.signal(signum, handler)
 
 
-def _pin_adapter(rundir: Path, slots: dict[str, SlotSpec]) -> None:
+def _pin_adapter(rundir: Path, lanes: dict[str, LaneSpec]) -> None:
     """Record the configuration this run is planned against, and refuse a resume with a
-    different one. A run whose slots changed half way through has no honest provenance:
+    different one. A run whose lanes changed half way through has no honest provenance:
     the report would name one adapter for work two of them did."""
-    fingerprint = {slot: {"runtime": spec.runtime, "model": spec.model,
+    fingerprint = {lane: {"runtime": spec.runtime, "model": spec.model,
                           "account": spec.account, "adapter": spec.adapter}
-                   for slot, spec in slots.items()}
+                   for lane, spec in lanes.items()}
     path = rundir / "adapter-pin.json"
     existing = _read_json(path)
     if existing is None:
@@ -4836,10 +4856,25 @@ def _pin_adapter(rundir: Path, slots: dict[str, SlotSpec]) -> None:
     if existing != fingerprint:
         raise DriverError(
             f"{path} pins a different adapter configuration than the one given; a run "
-            f"cannot change the slots it is described by half way through")
+            f"cannot change the lanes it is described by half way through")
 
 
-def _preview(rundir: Path) -> str:
+def _copied_outside_scope(rundir: Path) -> str:
+    """The line saying how many lockfiles outside the review the snapshot carries for the
+    build, or nothing where it carries none."""
+    inventory = _read_json(rundir / INVENTORY_NAME)
+    context = inventory.get("context") if isinstance(inventory, dict) else None
+    if not isinstance(context, list) or not context:
+        return ""
+    line = engine.copied_outside_scope_line(
+        [e["path"] for e in context if isinstance(e, dict) and isinstance(e.get("path"), str)])
+    return line + "\n" if line else ""
+
+
+def _preview(rundir: Path, lanes: dict[str, LaneSpec]) -> str:
+    """What ``--go`` would start, and **how it would be spread**. A unit count alone cannot
+    say how long a run will take, so the shape of the run is printed per lane: how many
+    units, how many at once, and which ones queue behind each other run-wide."""
     units = _units(rundir)
     kinds: dict[str, int] = {}
     for unit in units:
@@ -4847,8 +4882,25 @@ def _preview(rundir: Path) -> str:
     lines = [f"{engine.RUNDIR_LINE}{rundir}", "",
              f"stage: {_marker(rundir)}",
              f"units: {len(units)}"]
+    copied = _copied_outside_scope(rundir)
+    if copied:
+        lines.append(copied.rstrip("\n"))
     for kind in sorted(kinds):
         lines.append(f"  {kind}: {kinds[kind]}")
+    lines.append("")
+    for lane, spec in lanes.items():
+        mine = [u for u in units if u.get("lane", engine.LANES[0]) == lane]
+        shared = sum(1 for u in mine if u.get("kind") in WRITE_CAPABLE_KINDS)
+        free = len(mine) - shared
+        lines.append(f"lane {lane}: {spec.slots} slot(s)"
+                     f"{'' if spec.slots_stated else ' (the default; set slots to change it)'}; "
+                     f"{free} unit(s) run up to "
+                     f"{spec.slots} at a time, in about {-(-free // spec.slots)} "
+                     f"wave(s)" + (f"; {shared} write-capable unit(s) run one at a time"
+                                   if shared else ""))
+    lines.append(f"Write-capable units ({', '.join(sorted(WRITE_CAPABLE_KINDS))}) run one at "
+                 f"a time across both lanes, whatever the slots say: they build and run the "
+                 f"tree, and separate copies still share ports, caches and credentials.")
     lines.append("")
     lines.append("Nothing was dispatched: pass --go to run it.")
     return "\n".join(lines) + "\n"

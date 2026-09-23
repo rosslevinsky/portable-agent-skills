@@ -23,7 +23,7 @@ there are two rungs. Stronger is **two runtimes**: two models read every area bl
 each finding is verified by the *other* model, so the report may claim model divergence.
 Weaker is **one runtime**: two fresh contexts of the same model, and the report says context
 divergence and nothing stronger. Coverage is the same at both; only what the report may
-claim varies, and the rung follows the configuration, which is pinned for the run. A slot
+claim varies, and the rung follows the configuration, which is pinned for the run. A lane
 that lands no unit ends the run with a refusal naming it — not a third rung. The
 run is two bundled stdlib-only **Python 3.10+** programs — the stage engine
 `review_panel.py` and the driver `review_panel_run.py` that owns the loop — a prerequisite
@@ -81,8 +81,9 @@ version at startup and exit with the same `Python 3.10+ required` message.
    is `documentary` rather than `executed` — and it is the file the verifier is handed.
 
 No worker is handed the source path, and none is handed a path that spells whose claim it
-holds: planning copies the files in scope to a snapshot under the run directory, and each
-attempt gets an opaque token naming its input directory and its working directory both.
+holds: planning copies the files under review, and the lockfiles, to a snapshot under the
+run directory, and each attempt gets an opaque token naming its input directory and its
+working directory both.
 
 **Most files under `references/` are those briefs, not instructions to you.** The engine
 loads one per unit kind at plan time and copies it into that unit's payload — which is what
@@ -108,11 +109,12 @@ somebody changing them, and no step of a run sends you there.
    command line; the driver creates it, and a directory already sitting there that holds no
    committed run is refused by name rather than deleted.
 
-2. **Run it.** Write the adapter config first — one JSON file naming, per slot, the
-   runtime, the model, and the command line to launch a worker with in each of the two
-   permission modes. `references/dispatch.md` gives its shape and a worked example. Slots A
+2. **Run it.** Write the adapter config first — one JSON file naming, per lane, the
+   runtime, the model, how many workers run at once (`slots`, two unless the owner picks
+   another number when you ask), and the command line to launch a worker with in each of the two permission
+   modes. `references/dispatch.md` gives its shape and a worked example. Lanes A
    and B are what makes rule 3 true, so give them **two runtimes** where the host has two
-   and one runtime with **one model** where it has one; two slots on one runtime naming
+   and one runtime with **one model** where it has one; two lanes on one runtime naming
    different models is refused before anything is planned, because no sentence the report
    can write about it is true. Then:
 
@@ -139,27 +141,27 @@ somebody changing them, and no step of a run sends you there.
    readers is the one to expect, and nothing read against it can be trusted, so that run
    ends there and a new one is planned.
 
-3. **Summarize for the owner** from `report.md`, as `references/report-format.md` closes:
-   the rung and what it lets the run claim, the counts by status, each established finding
-   in one line, what was refuted or left unresolved and why, and every coverage gap by
-   name. Point at `report.md` by path for the rest; never inline a snapshot file, an
-   evidence block or a payload.
+3. **Hand the report to the owner**, as `references/report-format.md` closes. Answers to
+   the owner's questions, whether in the job or asked since, corrections to findings you
+   can show are wrong, and caveats about the run go in `report-notes.json`, not in the
+   conversation; `report --rerender` puts them in the report. Then point the owner at
+   `report.md` by path; never inline a snapshot file, an evidence block or a payload.
 
 ## What the run claims
 
 Every worker is a fresh process that was supplied no peer's answer, and nothing it is
 handed names the unit that raised what it is checking. Workers are **not** prevented from
 reading the run directory: blindness is a property of what each one is given, not of what it
-could reach. Reproductions are serialized, one at a time across both slots, because separate
+could reach. Reproductions are serialized, one at a time across both lanes, because separate
 directories are not separate ports, caches or credentials — and a failure that is the
 environment's stays `unresolved` rather than becoming a verdict.
 
 The rung the report names follows **the configuration, which is pinned for the life of the
-run**: a resume naming a different runtime or model is refused by name, so no slot quietly
+run**: a resume naming a different runtime or model is refused by name, so no lane quietly
 becomes a second context of the other's runtime and no rung drops below the one configured.
-What a run can do instead is end without one. A slot that lands no unit answered nothing it
+What a run can do instead is end without one. A lane that lands no unit answered nothing it
 was given, so no finding in the run was checked by a unit that did not raise it — rule 3,
 which every status on the page rests on. The driver stops at the first round boundary where
-that is settled, names the slot, and writes no report. Otherwise the report states the rung,
-both slots' adapters and both permission modes, so what the run was allowed to claim is
+that is settled, names the lane, and writes no report. Otherwise the report states the rung,
+both lanes' adapters and both permission modes, so what the run was allowed to claim is
 readable months later from the report alone.

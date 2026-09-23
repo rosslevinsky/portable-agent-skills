@@ -3773,5 +3773,53 @@ class APartialNeverOverwritesWhatIsAlreadyThere(unittest.TestCase):
             self.assertIn("half a review", Path(kept).read_text(encoding="utf-8"))
 
 
+@unittest.skipIf(os.name != "posix", "the reviewer's own session and os.kill(pid, 0) are POSIX")
+class AnExceptionNobodyHandledStillStopsTheReviewer(unittest.TestCase):
+    """The reviewer runs in a session of its own. An exception that escapes `run` with the
+    child alive ends the supervisor and leaves the reviewer running, governed by no clock,
+    while the status the catch-all prints tells the caller the execution ended; a driver
+    then frees the slot and can start a second reviewer beside the live one. The child is
+    stopped before the exception goes any further, and the claimed files are released as
+    they are for any failed run."""
+
+    def test_the_child_is_dead_and_the_claim_released_before_the_exception_escapes(self):
+        with tempfile.TemporaryDirectory() as d:
+            pidfile = Path(d) / "pid"
+            findings = Path(d) / "findings.md"
+            child = ("import os, sys, time; open(sys.argv[1], 'w').write(str(os.getpid())); "
+                     "sys.stdout.flush(); time.sleep(60)")
+            argv = ["--idle", "30", "--deadline", "60", "--findings", str(findings),
+                    "--result-mode", "stream-transcript", "--", PY, "-c", child, str(pidfile)]
+
+            def failing_watch(self_stream, idle, deadline):
+                for _ in range(200):
+                    if pidfile.exists() and pidfile.read_text():
+                        break
+                    time.sleep(0.05)
+                raise RuntimeError("the supervisor's own bookkeeping failed")
+
+            with unittest.mock.patch.object(review_runner._Stream, "watch", failing_watch), \
+                    contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(RuntimeError):
+                    review_runner.main(argv)
+            pid = int(pidfile.read_text())
+
+            def kill_leftover():
+                with contextlib.suppress(OSError):
+                    os.kill(pid, signal.SIGKILL)
+            self.addCleanup(kill_leftover)
+            alive = True
+            for _ in range(100):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    alive = False
+                    break
+                time.sleep(0.05)
+            self.assertFalse(alive, "the reviewer outlived the supervisor's unexpected exit")
+            self.assertFalse(findings.exists(), "the claimed findings file was not released")
+
+
 if __name__ == "__main__":
     unittest.main()

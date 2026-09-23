@@ -537,7 +537,7 @@ class VerifierSchemaContract(unittest.TestCase):
 
     def test_the_verifier_cannot_name_a_finder(self):
         # There is no rebuttal round and no arbitration: the verifier answers per
-        # candidate id, and nothing in its result can address a reader, a slot or a lens.
+        # candidate id, and nothing in its result can address a reader, a lane or a lens.
         def names(node):
             if isinstance(node, dict):
                 for key, value in node.get("properties", {}).items():
@@ -550,7 +550,7 @@ class VerifierSchemaContract(unittest.TestCase):
                 for item in node:
                     yield from names(item)
 
-        self.assertFalse({"unit", "slot", "lens", "finder", "raised_by"} & set(names(_load(VERIFIER_SCHEMA))))
+        self.assertFalse({"unit", "lane", "lens", "finder", "raised_by"} & set(names(_load(VERIFIER_SCHEMA))))
 
 
 class ProbeSchemaContract(unittest.TestCase):

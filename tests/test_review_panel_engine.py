@@ -269,6 +269,22 @@ class AnOptionalKeyPresentWithTheWrongShapeIsRefused(_JobCase):
         self.refuse(data, "areas[0].lenses")
 
 
+class TheJobMayCarryQuestionsForTheOperator(_JobCase):
+    """``questions`` is free text for whoever runs the panel. It is carried as written and
+    refused when it is not text, like every other optional key."""
+
+    def test_questions_load_as_written(self):
+        asked = "Is the cache keyed right?\n\nWhy two lock files?"
+        job = review_panel.load_job(self.write(dict(FILE_JOB, questions=asked)))
+        self.assertEqual(job.questions, asked)
+        self.assertIsNone(review_panel.load_job(self.write(FILE_JOB)).questions)
+
+    def test_questions_that_are_not_text_are_refused(self):
+        for bad in ("", "   ", 3, ["a question"]):
+            with self.subTest(questions=bad):
+                self.refuse(dict(FILE_JOB, questions=bad), "'questions'", "non-empty text")
+
+
 class RemainderAndAreaShape(_JobCase):
 
     def test_two_remainder_areas(self):
@@ -793,6 +809,141 @@ class MeasuringAndSnapshotting(_TreeCase):
         self.assertFalse((snap / "vendor").exists())
         self.assertFalse((snap / ".git").exists())
 
+    LOCK = "vendor/package-lock.json"
+
+    def repo_with_lockfile(self):
+        (self.root / self.LOCK).write_text("{}\n", encoding="utf-8")
+        self.make_repo()
+
+    def test_the_snapshot_holds_the_review_and_the_lockfiles_and_nothing_else(self):
+        """Any worker may open anything in the snapshot, so it holds what the job chose to
+        review and nothing more — except a lockfile, which names versions and nothing else,
+        and without which a build installs versions the repository never pinned and every
+        build result describes a tree nobody has."""
+        self.repo_with_lockfile()
+        (self.root / ".gitignore").write_text("*.log\n", encoding="utf-8")
+        (self.root / "debug.log").write_text("noise\n", encoding="utf-8")
+        job, inv = self.measured(exclude=["vendor/"])
+        self.assertIn("vendor/lib.py", inv.excluded)
+        self.assertEqual([f.path for f in inv.context], [self.LOCK])
+        review_panel.write_snapshot(job, inv, self.rundir)
+        snap = self.rundir / "snapshot"
+        self.assertFalse((snap / "vendor" / "lib.py").exists())
+        self.assertEqual((snap / self.LOCK).read_text(encoding="utf-8"), "{}\n")
+        # What git ignores is never copied: that is where secrets and build output live.
+        self.assertFalse((snap / "debug.log").exists())
+        data = json.loads((self.rundir / "inventory.json").read_text(encoding="utf-8"))
+        self.assertEqual([e["path"] for e in data["context"]], [self.LOCK])
+        self.assertNotIn("vendor/lib.py", [e["path"] for e in data["files"]])
+
+    def test_a_files_list_gets_the_lockfiles_beside_it_and_no_other_file(self):
+        self.repo_with_lockfile()
+        job, inv = self.measured(files=["run.py"])
+        self.assertEqual([f.path for f in inv.context], [self.LOCK])
+        review_panel.write_snapshot(job, inv, self.rundir)
+        present = sorted(p.relative_to(self.rundir / "snapshot").as_posix()
+                         for p in (self.rundir / "snapshot").rglob("*") if p.is_file())
+        self.assertEqual(present, sorted(["run.py", self.LOCK]))
+
+    def test_an_untracked_lockfile_outside_the_review_is_not_copied(self):
+        self.repo_with_lockfile()
+        (self.root / "yarn.lock").write_text("# local\n", encoding="utf-8")
+        job, inv = self.measured(files=["run.py"])
+        self.assertNotIn("yarn.lock", [f.path for f in inv.context])
+
+    def left_out_when(self, move):
+        """Nobody reads a lockfile outside the review, so one that moved since it was
+        measured costs the build that file rather than refusing the plan; the record lists
+        only what was copied, which is what the snapshot check compares against."""
+        self.repo_with_lockfile()
+        job, inv = self.measured(files=["run.py"])
+        move(self.root / self.LOCK)
+        review_panel.write_snapshot(job, inv, self.rundir)
+        self.assertFalse((self.rundir / "snapshot" / self.LOCK).exists())
+        self.assertTrue((self.rundir / "snapshot" / "run.py").exists())
+        data = json.loads((self.rundir / "inventory.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["context"], [])
+        self.assertEqual(list((self.rundir / "snapshot").rglob("*.tmp")), [])
+
+    def test_a_lockfile_that_changes_before_the_copy_is_left_out(self):
+        self.left_out_when(lambda path: path.write_text('{"changed": 1}\n', encoding="utf-8"))
+
+    def test_a_lockfile_that_goes_before_the_copy_is_left_out(self):
+        self.left_out_when(lambda path: path.unlink())
+
+    def test_an_in_scope_file_that_changes_before_the_copy_is_still_refused(self):
+        self.make_repo()
+        job, inv = self.measured(exclude=["vendor/"])
+        (self.root / "run.py").write_text("changed = 1\n", encoding="utf-8")
+        with self.assertRaises(review_panel.InventoryError) as ctx:
+            review_panel.write_snapshot(job, inv, self.rundir)
+        self.assertIn("changed while the snapshot was being taken", str(ctx.exception))
+
+    def test_a_run_directory_that_cannot_take_a_lockfile_is_refused(self):
+        """Only the source failing leaves a lockfile out. A write that fails on the run
+        directory's side refuses the plan, or a full disk would drop the lockfile the copy
+        exists for and the plan would go on as if it held one."""
+        self.repo_with_lockfile()
+        job, inv = self.measured(files=["run.py"])
+        real = review_panel._create_scratch
+
+        class Full:
+            def __init__(self, inner):
+                self.inner = inner
+            def __enter__(self):
+                self.inner.__enter__()
+                return self
+            def __exit__(self, *exc):
+                return self.inner.__exit__(*exc)
+            def write(self, _chunk):
+                raise OSError(errno.ENOSPC, "No space left on device")
+
+        def scratch(path, rel, **kw):
+            sink = real(path, rel, **kw)
+            return Full(sink) if rel == self.LOCK else sink
+
+        with mock.patch.object(review_panel, "_create_scratch", side_effect=scratch):
+            with self.assertRaises(review_panel.InventoryError) as ctx:
+                review_panel.write_snapshot(job, inv, self.rundir)
+        self.assertIn(self.LOCK, str(ctx.exception))
+
+    def test_the_preview_says_how_many_lockfiles_it_copies_beside_the_review(self):
+        self.repo_with_lockfile()
+
+        def said(**over):
+            job, inv = self.measured(**over)
+            return review_panel.preview(job, inv, review_panel.partition(job, inv))
+
+        line = review_panel.COPIED_OUTSIDE_SCOPE_LINE.format(n=1)
+        self.assertIn(line, said(exclude=["vendor/"]))
+        self.assertIn(line, said(files=["run.py"]))
+        self.assertNotIn("outside the review", said())
+
+    def test_an_exclusion_in_a_files_job_still_has_to_match_a_listed_file(self):
+        self.make_repo()
+        with self.assertRaises(review_panel.InventoryError) as ctx:
+            self.measured(files=["run.py"], exclude=["vendor/"])
+        self.assertIn("matches nothing", str(ctx.exception))
+
+    def test_a_files_list_still_plans_where_git_cannot_answer(self):
+        """A list names its own scope and never needed git; git only adds the files a build
+        needs beside it, so a host where git fails still plans, with the listed files
+        alone in the snapshot."""
+        refused = review_panel.InventoryError("git cannot be run")
+        with mock.patch.object(review_panel, "_git_entries", side_effect=refused):
+            _job, inv = self.measured(files=["run.py"])
+        self.assertEqual([f.path for f in inv.files], ["run.py"])
+        self.assertEqual(inv.context, ())
+
+    def test_a_context_file_that_clashes_by_case_is_left_out_not_refused(self):
+        if (self.root / "RUN.PY").exists():
+            self.skipTest("the file system folds case, so the clash cannot be made")
+        self.make_repo()
+        (self.root / "Run.py").write_text("x = 1\n", encoding="utf-8")
+        self.git("add", "Run.py")
+        job, inv = self.measured(files=["run.py"])
+        self.assertNotIn("Run.py", [f.path for f in inv.context])
+
     def test_inventory_json_records_the_listing_the_digest_the_commit_and_what_it_missed(self):
         outside = self.tmp / "outside"
         outside.mkdir()
@@ -801,7 +952,10 @@ class MeasuringAndSnapshotting(_TreeCase):
         review_panel.write_snapshot(job, inv, self.rundir)
         data = json.loads((self.rundir / "inventory.json").read_text(encoding="utf-8"))
         self.assertEqual(set(data), {"source", "files", "skipped", "excluded", "tree_sha256",
-                                     "taken", "commit", "coverage"})
+                                     "context", "taken", "commit", "coverage"})
+        # A walk has no ignore rules to keep secrets and build output out, so an exclusion
+        # there still keeps the path out of the copy.
+        self.assertEqual(data["context"], [])
         # The one field here that is about the MOMENT rather than about the tree, and the
         # only reason two runs over one tree no longer write identical run directories.
         # Empty where the caller stated no clock, which is every call but `plan`'s.
@@ -1550,7 +1704,7 @@ class PlanWritesTheRunDirectory(_TreeCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("4 areas", proc.stdout)
         self.assertIn("4 readers", proc.stdout)
-        # Ten readers, and one auditor per slot for each of the two areas that own a test
+        # Ten readers, and one auditor per lane for each of the two areas that own a test
         # file — `tests/big.py` alone in the oversize part, `tests/test_engine.py` in the
         # other. The two areas that hold no test say so by name.
         self.assertIn("reading units: 14 = 10 readers + 4 auditors", proc.stdout)
@@ -1633,7 +1787,7 @@ def _units_on_disk(rundir):
 
 class UnitAssignment(_TreeCase):
     """Reader count is derived, never declared: one unit per (area, lens), the lenses dealt
-    to the two slots in turn, plus one auditor per slot."""
+    to the two lanes in turn, plus one auditor per lane."""
 
     def units_for(self, lenses, sizes, subjects=None):
         job = self.job(lenses=lenses)
@@ -1641,7 +1795,7 @@ class UnitAssignment(_TreeCase):
         return areas, review_panel.assign_units(areas)
 
     def auditors_for(self, areas):
-        """How many auditor units those areas earn: one per slot for each area the plan
+        """How many auditor units those areas earn: one per lane for each area the plan
         marked audited. Derived from the same rule the engine uses rather than a constant,
         so a fixture whose paths are all code nothing tests expects none — which is the
         point of bounding the auditor to an area."""
@@ -1660,23 +1814,23 @@ class UnitAssignment(_TreeCase):
         self.assertEqual(len(areas), 2)
         self.assertEqual(len(units), 4 * 2 + self.auditors_for(areas) + review_panel.PROBES)
 
-    def test_a_lens_list_of_two_gives_each_slot_one_lens_and_four_gives_each_two(self):
+    def test_a_lens_list_of_two_gives_each_lane_one_lens_and_four_gives_each_two(self):
         _, units = self.units_for(FILE_JOB["lenses"], {"a/x.py": 10})
-        readers = [(u.slot, u.lens) for u in units if u.kind == "reader"]
+        readers = [(u.lane, u.lens) for u in units if u.kind == "reader"]
         self.assertEqual(readers, [("A", "bottom-up from the code"), ("B", "top-down from the contract")])
         _, units = self.units_for(["a", "b", "c", "d"], {"a/x.py": 10})
-        readers = [(u.slot, u.lens) for u in units if u.kind == "reader"]
+        readers = [(u.lane, u.lens) for u in units if u.kind == "reader"]
         self.assertEqual(readers, [("A", "a"), ("B", "b"), ("A", "c"), ("B", "d")])
 
-    def test_every_area_is_read_by_both_slots_whatever_its_lenses(self):
+    def test_every_area_is_read_by_both_lanes_whatever_its_lenses(self):
         job = self.job(SUBJECT_JOB)  # docs carries four lenses, the others inherit two
         areas = review_panel.partition(job, _inv({p: 10 for p in _TREE_FILES if p != "vendor/lib.py"},
                                                  excluded=("vendor/lib.py",)), SMALL)
         units = review_panel.assign_units(areas)
         for area in areas:
             with self.subTest(area=area.id):
-                slots = {u.slot for u in units if u.area == area.id}
-                self.assertEqual(slots, {"A", "B"})
+                lanes = {u.lane for u in units if u.area == area.id}
+                self.assertEqual(lanes, {"A", "B"})
         self.assertEqual(len(units),
                          2 + 4 + 2 + self.auditors_for(areas) + review_panel.PROBES)
 
@@ -1687,13 +1841,13 @@ class UnitAssignment(_TreeCase):
             with self.subTest(areas=len(sizes)):
                 _, units = self.units_for(FILE_JOB["lenses"], sizes)
                 probes = [u for u in units if u.kind == "probe"]
-                self.assertEqual([(u.id, u.slot, u.area, u.lens) for u in probes],
+                self.assertEqual([(u.id, u.lane, u.area, u.lens) for u in probes],
                                  [(review_panel.PROBE_UNIT_ID, "A", None, None)])
 
-    def test_the_auditors_are_one_per_slot_for_each_area_holding_tested_code(self):
+    def test_the_auditors_are_one_per_lane_for_each_area_holding_tested_code(self):
         """Bounded like every other reader, and only where the question can be put. An area
         of code no test in scope is about earns no auditor; the area holding the file the
-        tests ARE about earns two, one per slot, so the two answers are comparable.
+        tests ARE about earns two, one per lane, so the two answers are comparable.
 
         It is the area with the subject in it, not the one with the test file. Those are
         different areas here and in nearly every real tree: a test and the code it covers
@@ -1708,11 +1862,11 @@ class UnitAssignment(_TreeCase):
         subject = next(a.id for a in areas if "a/x.py" in a.files)
         holder = next(a.id for a in areas if "tests/test_x.py" in a.files)
         self.assertNotEqual(subject, holder, "the premise of this test")
-        self.assertEqual([(u.id, u.slot, u.area, u.lens) for u in auditors],
+        self.assertEqual([(u.id, u.lane, u.area, u.lens) for u in auditors],
                          [(f"audit-{subject}-A", "A", subject, None),
                           (f"audit-{subject}-B", "B", subject, None)])
 
-    def test_unit_ids_are_distinct_and_name_the_area_and_slot(self):
+    def test_unit_ids_are_distinct_and_name_the_area_and_lane(self):
         areas, units = self.units_for(["a", "b", "c", "d"], {"a/x.py": 60, "b/y.py": 60})
         ids = [u.id for u in units]
         self.assertEqual(len(ids), len(set(ids)))
@@ -1720,7 +1874,7 @@ class UnitAssignment(_TreeCase):
             with self.subTest(unit=unit.id):
                 if unit.kind == "reader":
                     self.assertIn(unit.area, unit.id)
-                self.assertIn(unit.slot, unit.id)
+                self.assertIn(unit.lane, unit.id)
 
 
 class TheAuditorGetsADefinedAnswerOrDoesNotRun(_TreeCase):
@@ -2019,7 +2173,7 @@ An area that HOLDS a test file is not the same thing as an area holding tested c
         `@Mock private PaymentService paymentService` and never builds one, so it exercises
         `LeaseService` and says nothing whatever about `PaymentService`. Handed that link,
         an auditor either answers nothing — the brief tells it a mocking test is evidence of
-        nothing — or answers at length in the negative, which is what one slot did: 30
+        nothing — or answers at length in the negative, which is what one lane did: 30
         findings, every one resting on "the test never instantiates or executes
         PaymentService"."""
         text = ("class LeaseServiceAutoPayTest {\n"
@@ -2844,25 +2998,25 @@ class PlanWritesTheUnits(_TreeCase):
     def test_every_unit_directory_holds_exactly_a_payload_and_a_schema(self):
         rundir = self.plan()
         listing = json.loads((rundir / "units.json").read_text(encoding="utf-8"))
-        self.assertEqual(set(listing), {"stage", "slots", "units"})
+        self.assertEqual(set(listing), {"stage", "lanes", "units"})
         self.assertEqual(listing["stage"], "reading")
-        self.assertEqual(listing["slots"], ["A", "B"])
+        self.assertEqual(listing["lanes"], ["A", "B"])
         ids = [u["id"] for u in listing["units"]]
         self.assertEqual(sorted(p.name for p in (rundir / "units").iterdir()), sorted(ids))
         for unit in listing["units"]:
             with self.subTest(unit=unit["id"]):
-                self.assertEqual(set(unit), {"id", "kind", "area", "slot", "lens", "payload",
+                self.assertEqual(set(unit), {"id", "kind", "area", "lane", "lens", "payload",
                                              "schema", "payload_lines", "payload_bytes"})
                 self.assertEqual(unit["payload"], f"units/{unit['id']}/payload.md")
                 self.assertEqual(unit["schema"], f"units/{unit['id']}/schema.json")
                 self.assertEqual(sorted(p.name for p in (rundir / "units" / unit["id"]).iterdir()),
                                  ["payload.md", "schema.json"])
 
-    def test_units_json_lists_slot_lens_and_area_per_unit(self):
+    def test_units_json_lists_lane_lens_and_area_per_unit(self):
         rundir = self.plan()
         units = json.loads((rundir / "units.json").read_text(encoding="utf-8"))["units"]
         self.assertEqual(
-            [(u["kind"], u["area"], u["slot"], u["lens"]) for u in units],
+            [(u["kind"], u["area"], u["lane"], u["lens"]) for u in units],
             [("reader", "area-01", "A", "bottom-up from the code"),
              ("reader", "area-01", "B", "top-down from the contract"),
              ("auditor", "area-01", "A", None), ("auditor", "area-01", "B", None),
@@ -2935,7 +3089,7 @@ class PlanWritesTheUnits(_TreeCase):
         # carries one. A reader told the other lens's question drifts toward it, and a
         # payload holding it is a hint about the other reader — so the other lens's text
         # is absent as bytes, and the catalog heading with it.
-        rundir = self.plan()  # the two default lenses, one per slot
+        rundir = self.plan()  # the two default lenses, one per lane
         body, catalog = review_panel.split_reader_brief(review_panel.load_brief("reader"))
         self.assertEqual(set(catalog), {"bottom-up from the code", "top-down from the contract"})
         self.assertNotIn(review_panel.LENSES_HEADING, body)
@@ -2955,11 +3109,11 @@ class PlanWritesTheUnits(_TreeCase):
                     if name != unit["lens"]:
                         self.assertNotIn(text, payload, f"{unit['id']} carries the {name} lens")
         # The distinctive wording, named: a rewrite of the catalog must keep this true.
-        by_slot = {u["slot"]: (rundir / u["payload"]).read_text(encoding="utf-8") for u in readers}
-        self.assertIn("start from the bytes", by_slot["A"].lower())
-        self.assertNotIn("cites as proof", by_slot["A"].lower())
-        self.assertIn("cites as proof", by_slot["B"].lower())
-        self.assertNotIn("start from the bytes", by_slot["B"].lower())
+        by_lane = {u["lane"]: (rundir / u["payload"]).read_text(encoding="utf-8") for u in readers}
+        self.assertIn("start from the bytes", by_lane["A"].lower())
+        self.assertNotIn("cites as proof", by_lane["A"].lower())
+        self.assertIn("cites as proof", by_lane["B"].lower())
+        self.assertNotIn("start from the bytes", by_lane["B"].lower())
 
     def test_a_lens_the_brief_does_not_describe_is_rendered_by_name_alone(self):
         rundir = self.plan(lenses=["a", "b"])
@@ -3126,7 +3280,7 @@ class PlanWritesTheUnits(_TreeCase):
     def test_the_area_assignment_is_snapshot_relative_with_also_read_marked(self):
         rundir = self.plan(SUBJECT_JOB)
         units = json.loads((rundir / "units.json").read_text(encoding="utf-8"))["units"]
-        engine = next(u for u in units if u["area"] == "area-01" and u["slot"] == "A")
+        engine = next(u for u in units if u["area"] == "area-01" and u["lane"] == "A")
         text = (rundir / engine["payload"]).read_text(encoding="utf-8")
         head = text.partition(LENS_HEADING)[0]
         own, sep, also = head.partition(review_panel.ALSO_READ_HEADING)
@@ -3136,7 +3290,7 @@ class PlanWritesTheUnits(_TreeCase):
             self.assertNotIn(rel, also)
         self.assertIn("\n- tests/test_engine.py\n", also)
         self.assertNotIn("tests/test_engine.py", own)
-        docs = next(u for u in units if u["area"] == "area-02" and u["slot"] == "A")
+        docs = next(u for u in units if u["area"] == "area-02" and u["lane"] == "A")
         self.assertNotIn(review_panel.ALSO_READ_HEADING,
                          (rundir / docs["payload"]).read_text(encoding="utf-8"))
         self.assertNotIn(str(rundir), text)
@@ -3500,7 +3654,7 @@ class ReadingResultsAreParsedStrictly(_RouteCase):
 
     def parse(self, obj, files=FILES):
         """The findings alone, for the cases that are about what a good result becomes."""
-        findings, _rejected = review_panel.parse_reader_result(obj, "area-01-A1", files)
+        findings, _rejected, _dropped = review_panel.parse_reader_result(obj, "area-01-A1", files)
         return findings
 
     def refuse(self, obj, *fragments, files=FILES):
@@ -3512,7 +3666,7 @@ class ReadingResultsAreParsedStrictly(_RouteCase):
         rule still bites and still says why, which is the thing that must not be relaxed.
         """
         try:
-            findings, rejected = review_panel.parse_reader_result(obj, "area-01-A1", files)
+            findings, rejected, _dropped = review_panel.parse_reader_result(obj, "area-01-A1", files)
         except review_panel.ResultError as exc:
             message = str(exc)
         else:
@@ -3522,6 +3676,18 @@ class ReadingResultsAreParsedStrictly(_RouteCase):
         for fragment in fragments:
             self.assertIn(fragment, message, message)
         return message
+
+    def test_a_finding_in_an_out_of_scope_snapshot_file_is_counted_not_rejected(self):
+        context = frozenset({"vendor/lib.py"})
+        for spelling in ("vendor/lib.py", "./vendor\\lib.py"):
+            with self.subTest(spelling=spelling):
+                # Broken in another way too: the scope question is asked first, so a
+                # rejection never prints where an excluded finding was.
+                bad = {**FINDING, "file": spelling, "severity": "catastrophic"}
+                findings, rejected, dropped = review_panel.parse_reader_result(
+                    {"findings": [FINDING, bad], "summary": "s"}, "area-01-A1", self.FILES,
+                    context=context)
+                self.assertEqual((len(findings), rejected, dropped), (1, (), 1))
 
     def test_a_well_formed_result_parses_to_findings(self):
         findings = self.parse({"findings": [FINDING, {**FINDING, "reproduction": REPRO}], "summary": "two"})
@@ -3834,7 +4000,7 @@ class RoutingKeepsEveryFinding(_RouteCase):
         self.assertEqual(cand["failure"], FINDING["failure"])
         self.assertEqual(len(cand["raised_by"]), 1)
         raiser = cand["raised_by"][0]
-        self.assertEqual((raiser["unit"], raiser["slot"], raiser["lens"], raiser["kind"], raiser["area"]),
+        self.assertEqual((raiser["unit"], raiser["lane"], raiser["lens"], raiser["kind"], raiser["area"]),
                          ("area-01-A1", "A", "bottom-up from the code", "reader", "area-01"))
         self.assertEqual((raiser["severity"], raiser["direction"], raiser["reproduction"]),
                          ("major", FINDING["direction"], None))
@@ -3842,7 +4008,7 @@ class RoutingKeepsEveryFinding(_RouteCase):
     def test_byte_identical_findings_stay_separate_candidates_one_raiser_each(self):
         # The case a pre-verification merge would collapse. Three readers writing the same
         # location and the same failure text are three candidates, each verified from its own
-        # description by the slot that did not raise it. Verifying duplicates is the cost; two independent
+        # description by the lane that did not raise it. Verifying duplicates is the cost; two independent
         # cross-model checks of one defect is what it buys.
         self.plan()
         self.land("area-01-A1", [FINDING])
@@ -3867,13 +4033,13 @@ class RoutingKeepsEveryFinding(_RouteCase):
                           by_unit["audit-area-01-A"]["direction"]),
                          ("major", None, ""))
 
-    def test_a_candidate_carries_no_slots_field(self):
+    def test_a_candidate_carries_no_lanes_field(self):
         # It served only the shared batch and is now always one element. `write_route`
         # serializes with asdict, so leaving it would put a dead field in candidates.json.
         self.plan()
         self.land("area-01-A1", [FINDING])
         self.route()
-        self.assertNotIn("slots", self.candidates()["candidates"][0])
+        self.assertNotIn("lanes", self.candidates()["candidates"][0])
 
     def test_a_near_duplicate_stays_separate(self):
         self.plan()
@@ -3956,14 +4122,14 @@ class RoutingKeepsEveryFinding(_RouteCase):
 
 
 class RoutingSendsEveryCandidateToAStranger(_RouteCase):
-    """A batch is keyed by (area, finder slot) and addressed to the other slot; a
-    candidate has exactly one finder, so there is no shared batch and no slot-choosing rule.
+    """A batch is keyed by (area, finder lane) and addressed to the other lane; a
+    candidate has exactly one finder, so there is no shared batch and no lane-choosing rule.
     Each candidate is in exactly one batch."""
 
     def batches(self):
         return {u["id"]: u for u in self.verifiers()}
 
-    def test_a_single_slot_batch_goes_to_the_other_slot(self):
+    def test_a_single_lane_batch_goes_to_the_other_lane(self):
         self.plan(SUBJECT_JOB)
         self.land("area-01-A1", [FINDING])
         self.land("area-02-B1", [{**FINDING, "file": "README.md", "line_start": 1, "line_end": 1}])
@@ -3972,10 +4138,10 @@ class RoutingSendsEveryCandidateToAStranger(_RouteCase):
         self.assertEqual(set(batches), {"verify-area-01-A", "verify-area-02-B"})
         by_file = {c["file"]: c["id"] for c in self.candidates()["candidates"]}
         a = batches["verify-area-01-A"]
-        self.assertEqual((a["area"], a["finder"], a["slot"], a["candidates"]),
+        self.assertEqual((a["area"], a["finder"], a["lane"], a["candidates"]),
                          ("area-01", "A", "B", [by_file["engine/core.py"]]))
         b = batches["verify-area-02-B"]
-        self.assertEqual((b["area"], b["finder"], b["slot"], b["candidates"]),
+        self.assertEqual((b["area"], b["finder"], b["lane"], b["candidates"]),
                          ("area-02", "B", "A", [by_file["README.md"]]))
         for unit in batches.values():
             self.assertEqual(unit["kind"], "verifier")
@@ -3983,7 +4149,7 @@ class RoutingSendsEveryCandidateToAStranger(_RouteCase):
             self.assertEqual(unit["payload"], f"units/{unit['id']}/payload.md")
             self.assertEqual(unit["schema"], f"units/{unit['id']}/schema.json")
 
-    def test_a_batch_is_never_addressed_to_a_slot_that_raised_any_of_its_candidates(self):
+    def test_a_batch_is_never_addressed_to_a_lane_that_raised_any_of_its_candidates(self):
         self.plan(SUBJECT_JOB)
         self.land("area-01-A1", [FINDING, {**FINDING, "line_start": 5, "line_end": 5}])
         self.land("area-01-B1", [FINDING, {**FINDING, "line_start": 7, "line_end": 7}])
@@ -3996,17 +4162,17 @@ class RoutingSendsEveryCandidateToAStranger(_RouteCase):
         for unit in self.verifiers():
             for cid in unit["candidates"]:
                 with self.subTest(batch=unit["id"], candidate=cid):
-                    # Spec §0's rule, read off the routing record: the slot a batch is
+                    # Spec §0's rule, read off the routing record: the lane a batch is
                     # addressed to raised none of the candidates in it. This holds at every
                     # rung, because routing is the engine's and who answers is the
                     # dispatcher's.
-                    raisers = {r["slot"] for r in by_id[cid]["raised_by"]}
+                    raisers = {r["lane"] for r in by_id[cid]["raised_by"]}
                     self.assertEqual(raisers, {unit["finder"]})
-                    self.assertNotIn(unit["slot"], raisers)
+                    self.assertNotIn(unit["lane"], raisers)
 
-    def test_identical_findings_from_both_slots_are_two_batches_each_to_the_other_slot(self):
-        # The case the deleted shared batch existed to handle. Two slots reporting the same
-        # defect produce two candidates, and each goes to the slot that did not raise it —
+    def test_identical_findings_from_both_lanes_are_two_batches_each_to_the_other_lane(self):
+        # The case the deleted shared batch existed to handle. Two lanes reporting the same
+        # defect produce two candidates, and each goes to the lane that did not raise it —
         # two independent cross-model checks of one defect rather than one.
         self.plan(SUBJECT_JOB)
         self.land("area-01-A1", [FINDING, {**FINDING, "line_start": 5, "line_end": 5}])
@@ -4014,21 +4180,21 @@ class RoutingSendsEveryCandidateToAStranger(_RouteCase):
         self.route()
         batches = self.batches()
         self.assertEqual(set(batches), {"verify-area-01-A", "verify-area-01-B"})
-        self.assertEqual(batches["verify-area-01-A"]["slot"], "B")
-        self.assertEqual(batches["verify-area-01-B"]["slot"], "A")
+        self.assertEqual(batches["verify-area-01-A"]["lane"], "B")
+        self.assertEqual(batches["verify-area-01-B"]["lane"], "A")
         # Exact lists: lengths alone would accept [cand-001, cand-002] to B and [cand-003]
-        # to A, which sends each finding straight back to the slot that raised it.
+        # to A, which sends each finding straight back to the lane that raised it.
         self.assertEqual(batches["verify-area-01-A"]["candidates"], ["cand-001", "cand-003"])
         self.assertEqual(batches["verify-area-01-B"]["candidates"], ["cand-002"])
         for unit in batches.values():
-            self.assertIn("other slot", unit["routing"])
+            self.assertIn("other lane", unit["routing"])
             self.assertNotIn("both", unit["routing"])
 
     def test_no_shared_batch_machinery_survives(self):
         # The branch existed only to patch merge-first: once two readers' findings are one
         # candidate, there is no stranger left among two models. Verify-first makes it
         # unreachable, so it is gone rather than dead.
-        for name in ("BOTH_SLOTS", "choose_slot"):
+        for name in ("BOTH_LANES", "choose_lane"):
             with self.subTest(name=name):
                 self.assertFalse(hasattr(review_panel, name), f"{name} should be deleted")
 
@@ -4105,13 +4271,13 @@ class RouteWritesTheRunDirectory(_RouteCase):
         shipped = json.loads((_ENGINE_DIR / "verifier-schema.json").read_text(encoding="utf-8"))
         units = self.units()
         self.assertEqual(units["stage"], "verification")
-        self.assertEqual(units["slots"], ["A", "B"])
+        self.assertEqual(units["lanes"], ["A", "B"])
         kinds = [u["kind"] for u in units["units"]]
         self.assertEqual(kinds, ["reader", "reader", "auditor", "auditor", "probe",
                                  "verifier", "verifier"])
         for unit in self.verifiers():
             with self.subTest(unit=unit["id"]):
-                self.assertEqual(set(unit), {"id", "kind", "area", "slot", "lens", "finder", "candidates",
+                self.assertEqual(set(unit), {"id", "kind", "area", "lane", "lens", "finder", "candidates",
                                              "routing", "asks", "payload", "schema", "payload_lines",
                                              "payload_bytes"})
                 self.assertEqual(sorted(p.name for p in self.unit_dir(unit["id"]).iterdir()),
@@ -4158,7 +4324,7 @@ class RouteWritesTheRunDirectory(_RouteCase):
                 for body in contents:
                     self.assertNotIn(body, payload, "file contents leaked")
         # Each batch holds only its own finder's candidates, so neither payload can show a
-        # verifier what the other slot was handed.
+        # verifier what the other lane was handed.
         a_text = (self.rundir / next(u for u in self.verifiers() if u["finder"] == "A")["payload"]
                   ).read_text(encoding="utf-8")
         b_text = (self.rundir / next(u for u in self.verifiers() if u["finder"] == "B")["payload"]
@@ -4314,7 +4480,7 @@ class RouteWritesTheRunDirectory(_RouteCase):
         self.assertIn("units.json", proc.stderr)
         self.assertNotIn("Traceback", proc.stderr)
         self.plan()
-        (self.rundir / "units.json").write_text(json.dumps({"stage": "other", "slots": ["A", "B"], "units": []}),
+        (self.rundir / "units.json").write_text(json.dumps({"stage": "other", "lanes": ["A", "B"], "units": []}),
                                                 encoding="utf-8")
         proc = _run("route", str(self.rundir))
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
@@ -4615,11 +4781,11 @@ class VerdictsAreAcceptedByRule(unittest.TestCase):
 # The stub dispatcher IS the dispatch protocol with no runtime behind it: a loop over
 # ``units/*/`` that writes a canned ``result.json`` (or ``error.txt``) from a table keyed
 # by unit id, skipping any unit that already landed, and writes ``dispatch.json`` the way a
-# real dispatcher records which adapter ran each slot. It spawns nothing; the only
+# real dispatcher records which adapter ran each lane. It spawns nothing; the only
 # subprocesses the suite starts are the engine itself and git.
 DISPATCH = {
     "rung": "two-runtimes",
-    "slots": {
+    "lanes": {
         "A": {"adapter": "runtime-one sub-agent", "permission": "read-only"},
         "B": {"adapter": "runtime-two command line", "permission": "read-only sandbox"},
     },
@@ -4628,8 +4794,8 @@ FINDING_REPRO = {**FINDING, "line_start": 5, "line_end": 5, "severity": "major",
                  "failure": "run.py exits 1 on an empty argv.", "reproduction": REPRO}
 FINDING_B = {**FINDING, "line_start": 8, "line_end": 8, "severity": "minor",
              "failure": "helper doubles a None."}
-# Reading round: both slots report FINDING, which stays two candidates (cand-001 from A,
-# cand-002 from B) checked separately by the other slot; A also reports one with a
+# Reading round: both lanes report FINDING, which stays two candidates (cand-001 from A,
+# cand-002 from B) checked separately by the other lane; A also reports one with a
 # reproduction (cand-003) and B one of its own (cand-004); one auditor clean, one failed.
 # Candidate order is (file, line range, failure, unit, position), so it does not depend on
 # which result landed first.
@@ -4685,8 +4851,8 @@ def _verdict(candidate, status, evidence=None, rationale="Lines 2-3 index withou
 
 
 VERIFY_TABLE = {
-    # Slot A raised cand-001 and cand-003, so slot B checks both; slot B raised cand-002 and
-    # cand-004, so slot A checks those. cand-001 and cand-002 are one defect described twice
+    # Lane A raised cand-001 and cand-003, so lane B checks both; lane B raised cand-002 and
+    # cand-004, so lane A checks those. cand-001 and cand-002 are one defect described twice
     # and are confirmed independently — which is the evidence merge-first destroyed.
     "verify-area-01-A": {"verdicts": [_verdict("cand-001", "confirmed_by_reading"),
                                       _verdict("cand-003", "reproduced", EVIDENCE,
@@ -4718,7 +4884,7 @@ VERIFY_TABLE_ONE_REJECTED = {
 
 
 # Clustering round: one unit per area that raised anything. cand-001 and cand-002 are the
-# same defect written up by both slots and merge; cand-003 and cand-004 are defects of their
+# same defect written up by both lanes and merge; cand-003 and cand-004 are defects of their
 # own. The engine believes this grouping only after proving it is a partition of exactly the
 # ids the unit was handed.
 CLUSTER_TABLE = {
@@ -5212,9 +5378,9 @@ class _ReportCase(_RouteCase):
         exactly that.
 
         The appendix is a table of TRACES, one row per report of a candidate, so a
-        candidate two slots raised has two rows and a candidate one slot raised has one.
+        candidate two lanes raised has two rows and a candidate one lane raised has one.
         The count is therefore read off the record rather than fixed at one — an
-        expectation of one row per candidate would fail on every ordinary two-slot run,
+        expectation of one row per candidate would fail on every ordinary two-lane run,
         and an expectation of "at least one" would pass a table that dropped a raiser.
         """
         rundir = rundir or self.rundir
@@ -5265,12 +5431,12 @@ class _ReportCase(_RouteCase):
 
 
 class OneDefectFoundTwiceGetsTwoVerdicts(_ReportCase):
-    """Spec §1, end to end: when both slots describe one defect, the run produces two
-    candidates, routes each to the slot that did not raise it, and renders two verdicts.
+    """Spec §1, end to end: when both lanes describe one defect, the run produces two
+    candidates, routes each to the lane that did not raise it, and renders two verdicts.
     Under merge-first this was one candidate, one verification, and the fact of independent
     co-discovery was unrecoverable from the artifacts."""
 
-    def test_both_slots_reporting_one_defect_produce_two_independently_checked_candidates(self):
+    def test_both_lanes_reporting_one_defect_produce_two_independently_checked_candidates(self):
         self.plan_into(self.rundir)
         stub_dispatch(self.rundir, {"area-01-A1": {"findings": [FINDING], "summary": "A read"},
                                     "area-01-B1": {"findings": [FINDING], "summary": "B read"},
@@ -5279,15 +5445,15 @@ class OneDefectFoundTwiceGetsTwoVerdicts(_ReportCase):
         proc = _run("route", str(self.rundir))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         cands = self.candidates()["candidates"]
-        self.assertEqual(len(cands), 2, "one defect described by both slots is two candidates")
+        self.assertEqual(len(cands), 2, "one defect described by both lanes is two candidates")
         self.assertEqual({c["file"] for c in cands}, {FINDING["file"]})
 
-        # Each candidate goes to the slot that did not raise it, and the two batches are
-        # addressed to different slots — which is what makes the checks independent.
+        # Each candidate goes to the lane that did not raise it, and the two batches are
+        # addressed to different lanes — which is what makes the checks independent.
         batches = {u["id"]: u for u in self.verifiers()}
         self.assertEqual(set(batches), {"verify-area-01-A", "verify-area-01-B"})
-        self.assertEqual(batches["verify-area-01-A"]["slot"], "B")
-        self.assertEqual(batches["verify-area-01-B"]["slot"], "A")
+        self.assertEqual(batches["verify-area-01-A"]["lane"], "B")
+        self.assertEqual(batches["verify-area-01-B"]["lane"], "A")
 
         stub_dispatch(self.rundir, {
             bid: {"verdicts": [_verdict(cid, "confirmed_by_reading") for cid in unit["candidates"]],
@@ -5633,7 +5799,7 @@ class TheClusteringRoundGroupsWhatVerificationSettled(_ReportCase):
         self.assertEqual(units[0]["area"], "area-01")
         self.assertEqual(units[0]["kind"], "clusterer")
         self.assertIsNone(units[0]["lens"])
-        self.assertIn(units[0]["slot"], review_panel.SLOTS)
+        self.assertIn(units[0]["lane"], review_panel.LANES)
         # Every candidate of that area, and no other area's.
         self.assertEqual(sorted(units[0]["candidates"]),
                          ["cand-001", "cand-002", "cand-003", "cand-004"])
@@ -5667,7 +5833,7 @@ class TheClusteringRoundGroupsWhatVerificationSettled(_ReportCase):
         self.assertIn("Lines 2-3 index without a guard.", text, "the check's rationale")
         self.assertIn("The run raised as claimed.", text)
 
-    def test_the_payload_names_no_unit_no_slot_and_no_lens(self):
+    def test_the_payload_names_no_unit_no_lane_and_no_lens(self):
         # The clusterer judges identity, and who raised or checked a candidate is not
         # evidence of identity. The same rule the verification payload follows.
         self.routed()
@@ -5680,7 +5846,7 @@ class TheClusteringRoundGroupsWhatVerificationSettled(_ReportCase):
         for lens in FILE_JOB["lenses"]:
             self.assertNotIn(lens, text, lens)
         for line in text.splitlines():
-            self.assertNotRegex(line, r"^Slot [AB]\b")
+            self.assertNotRegex(line, r"^Lane [AB]\b")
 
     def test_a_failed_verification_unit_reaches_the_payload_as_silence_not_as_its_name(self):
         # ``resolve`` writes "no verdict was received: verification unit verify-area-01-A
@@ -6382,7 +6548,7 @@ class VerificationResultsAreReadStrictly(_ReportCase):
         # Escaped, because the parser's message is not the engine's prose: it quotes a
         # field name the verifier wrote, and every such string crosses the boundary once.
         self.assertIn(r"test\_first", _section(text, "Coverage"))
-        self.assertIn("cost its own candidate alone", _section(text, "Coverage"))
+        self.assertIn("only its own candidate lost its verdict", _section(text, "Coverage"))
 
     def test_a_surrogate_in_a_diagnostic_lands_escaped_instead_of_crashing_the_write(self):
         # An unknown key spelled as a lone surrogate is quoted in the failed-unit reason,
@@ -6489,28 +6655,28 @@ class TheReportIsHonestAboutCoverage(_ReportCase):
         self.assertIn("symlink", coverage)
         self.assertIn("excluded", coverage.lower())
 
-    def test_the_rung_and_the_adapter_per_slot_are_stated_from_dispatch_json(self):
+    def test_the_rung_and_the_adapter_per_lane_are_stated_from_dispatch_json(self):
         self.run_all()
         text = self.text()
         self.assertIn("runtime-one sub-agent", text)
         self.assertIn("runtime-two command line", text)
         self.assertIn("read-only sandbox", text)
-        self.assertIn("model divergence", text.lower())
+        self.assertIn("the disagreement is between two different models", text.lower())
         self.assertIn("nothing stronger", text.lower())
         one = {**DISPATCH, "rung": "one-runtime",
-               "slots": {"A": {"adapter": "sub-agent", "permission": "read-only"},
+               "lanes": {"A": {"adapter": "sub-agent", "permission": "read-only"},
                          "B": {"adapter": "sub-agent", "permission": "read-only"}}}
         other = self.tmp / "run-one"
         self.run_all(other, dispatch=one)
         lower = self.text(other).lower()
-        self.assertIn("context divergence", lower)
-        self.assertNotIn("model divergence", lower)
+        self.assertIn("the disagreement is between two contexts of one model", lower)
+        self.assertNotIn("between two different models", lower)
 
     def test_defects_are_ordered_most_severe_first_with_the_revision_applied(self):
         self.run_all()
         text = self.text()
         # D2 holds cand-003, revised to blocker, so it ranks first; D1 is the
-        # defect both slots described. D3 was refuted and is not ranked at all — it
+        # defect both lanes described. D3 was refuted and is not ranked at all — it
         # is in the appendix, because nothing is to be done about it.
         self.assertEqual(_index_rows(text), ["D2", "D1"])
         self.assertIn("D3", _section(text, "Refuted"))
@@ -6523,7 +6689,7 @@ class TheReportIsHonestAboutCoverage(_ReportCase):
         self.assertIn("IndexError", first)
         self.assertIn("(exit 1", first)
         self.assertIn("core.py:5", first)
-        # Section 10: the units, slots and lenses that produced it are in the appendix and
+        # Section 10: the units, lanes and lenses that produced it are in the appendix and
         # not in the material somebody reads while fixing it.
         for machinery in ("area-01-A1", "verify-area-01-A", "cand-003"):
             self.assertNotIn(machinery, block, machinery)
@@ -6536,10 +6702,10 @@ class TheReportIsHonestAboutCoverage(_ReportCase):
         self.assertNotIn("bottom-up from the code", _section(text, "Provenance"))
         self.assertIn("bottom-up from the code",
                       _section(text, review_panel.SUBSECTION_THE_JOB))
-        self.assertIn("(slot A, L1)", _section(text, "Provenance"))
-        # cand-001 and cand-002 are one defect described by both slots. Which unit made
+        self.assertIn("(lane A, L1)", _section(text, "Provenance"))
+        # cand-001 and cand-002 are one defect described by both lanes. Which unit made
         # which report is the appendix's to say, and each line there names only its own
-        # raiser — a slice that swapped them would read as one slot finding it twice.
+        # raiser — a slice that swapped them would read as one lane finding it twice.
         appendix = _section(text, "Provenance")
         rows = {}
         for line in appendix.splitlines():
@@ -6582,7 +6748,7 @@ class TheReportIsHonestAboutCoverage(_ReportCase):
 # What a worker writes lands in the report as text, never as its structure: a rationale
 # ending in a newline and "- Status: reproduced" would otherwise give a finding two status
 # lines, and a "## Coverage" inside a reproduction's output would split the report.
-FORGED_STATUS = "\n- Status: reproduced, by nobody (addressed to slot A)\n"
+FORGED_STATUS = "\n- Status: reproduced, by nobody (addressed to lane A)\n"
 FORGED_HEADING = "\n## Coverage\n\nEvery unit returned a valid result.\n"
 # The reader's order: what the run found, then the work, then the record of the run.
 # Method before result — four adapter strings and a sha256 above the first finding — is
@@ -6634,7 +6800,7 @@ class WorkerTextCannotForgeReportStructure(_ReportCase):
         self.assertEqual(_h2s(text), REPORT_H2)
         self.assertIn("helper is never given None.", text)
         self.assertIn("by nobody", text)
-        # The forged line named a slot, which is machinery: it is quoted as the worker's
+        # The forged line named a lane, which is machinery: it is quoted as the worker's
         # text, so it must not read as the report's own status line anywhere.
         self.assertEqual(len(re.findall(r"(?m)^- Status: reproduced, by nobody", text)), 0)
 
@@ -6730,7 +6896,7 @@ class WorkerTextCannotForgeReportStructure(_ReportCase):
                       text)
 
     def test_a_dispatcher_string_cannot_forge_a_heading_either(self):
-        loose = {**DISPATCH, "slots": {**DISPATCH["slots"],
+        loose = {**DISPATCH, "lanes": {**DISPATCH["lanes"],
                                        "A": {"adapter": "sub-agent" + FORGED_HEADING, "permission": "read-only"}}}
         self.run_all(dispatch=loose)
         text = self.text()
@@ -6739,7 +6905,7 @@ class WorkerTextCannotForgeReportStructure(_ReportCase):
 
 
 class TheRungSentenceIsDerivedFromTheData(_ReportCase):
-    """The report never says every area was read by both slots or every finding verified
+    """The report never says every area was read by both lanes or every finding verified
     by the other model; it counts what landed and says that."""
 
     def rung(self, rundir=None):
@@ -6756,7 +6922,7 @@ class TheRungSentenceIsDerivedFromTheData(_ReportCase):
         self.assertIn("0 left unresolved", line)
         # No shared-batch clause survives: every candidate has exactly one raiser.
         self.assertNotIn("raised by both models", line)
-        self.assertIn("model divergence", line)
+        self.assertIn("the disagreement is between two different models", line)
         for claim in ("every area", "each finding", "every finding"):
             self.assertNotIn(claim, line)
 
@@ -6784,19 +6950,19 @@ class TheRungSentenceIsDerivedFromTheData(_ReportCase):
 
     def test_the_one_runtime_rung_says_same_model_fresh_context(self):
         one = {"rung": "one-runtime",
-               "slots": {"A": {"adapter": "sub-agent", "permission": "read-only"},
+               "lanes": {"A": {"adapter": "sub-agent", "permission": "read-only"},
                          "B": {"adapter": "sub-agent", "permission": "read-only"}}}
         self.run_all(dispatch=one)
         line = self.rung()
-        self.assertIn("same model, fresh context", line)
+        self.assertIn("a fresh context of the same model, not the one that raised them", line)
         self.assertIn("1 of 1 area read by both contexts", line)
-        self.assertIn("context divergence", line)
+        self.assertIn("the disagreement is between two contexts of one model", line)
         self.assertNotIn("other model", line)
-        self.assertNotIn("model divergence", line)
+        self.assertNotIn("between two different models", line)
 
     def test_a_reader_that_never_returned_costs_its_area_the_coverage_claim(self):
         """The counts are over the units the run listed, and an area counts as read by
-        both slots only where both its readers completed. A run missing one reader still
+        both lanes only where both its readers completed. A run missing one reader still
         states what it did read, and claims nothing about the area that lost one."""
         reading = {k: v for k, v in READING_TABLE.items() if k != "area-01-B1"}
         self.run_all(reading=reading,
@@ -6813,14 +6979,14 @@ class ContainmentIsWhatTheDispatcherRecorded(_ReportCase):
 
     def test_a_record_stating_unrestricted_access_renders_as_such(self):
         loose = {**DISPATCH,
-                 "slots": {"A": {"adapter": "runtime-one sub-agent",
+                 "lanes": {"A": {"adapter": "runtime-one sub-agent",
                                  "permission": "unrestricted: full write access to the host"},
-                           "B": DISPATCH["slots"]["B"]}}
+                           "B": DISPATCH["lanes"]["B"]}}
         self.run_all(dispatch=loose)
         ran = _section(self.text(), "How this ran")
         self.assertIn("unrestricted: full write access to the host", ran)
         self.assertIn("read-only sandbox", ran)
-        self.assertIn("as recorded by the dispatcher; the engine did not verify it", ran)
+        self.assertIn("as the dispatcher recorded them, and the engine did not verify them", ran)
         self.assertIn("snapshot paths", ran)
         for claim in ("disposable copy", "never the source tree", "every unit was given"):
             self.assertNotIn(claim, ran)
@@ -6829,7 +6995,7 @@ class TheAdapterLinesRenderAlikeWhateverTheDispatcherTyped(_ReportCase):
     """Four lines that sit together and are read as a set: two adapters and two
     permissions. They rendered three different ways depending on their own text — plain
     text inline, text holding `<` as a code block, text holding a backtick inline with the
-    backtick escaped — so which of two slots looked like a command line was decided by
+    backtick escaped — so which of two lanes looked like a command line was decided by
     what somebody happened to type into `dispatch.json`.
     """
 
@@ -6842,33 +7008,33 @@ class TheAdapterLinesRenderAlikeWhateverTheDispatcherTyped(_ReportCase):
 
     def ran(self, a, b):
         self.setUp()
-        self.run_all(dispatch={**DISPATCH, "slots": {
+        self.run_all(dispatch={**DISPATCH, "lanes": {
             "A": {"adapter": a, "permission": "read-only"},
             "B": {"adapter": b, "permission": "read-only sandbox"}}})
         return _section(self.text(), "How this ran")
 
     def test_every_adapter_text_renders_in_the_same_shape(self):
-        # Slot B is spelled differently in every case: the two-runtimes rung refuses a
-        # record whose two slots name one adapter, which is a guard about the RUN and not
+        # Lane B is spelled differently in every case: the two-runtimes rung refuses a
+        # record whose two lanes name one adapter, which is a guard about the RUN and not
         # about how a line renders.
         for label, text in self.SHAPES.items():
             with self.subTest(shape=label):
                 ran = self.ran(text, f"another runtime entirely ({label})")
                 lines = ran.splitlines()
-                at = next(n for n, line in enumerate(lines) if "Slot A adapter" in line)
+                at = next(n for n, line in enumerate(lines) if "Lane A adapter" in line)
                 # The label ends the line; the text is fenced beneath it, whatever it holds.
                 self.assertTrue(lines[at].rstrip().endswith("dispatcher:"), lines[at])
                 self.assertEqual(lines[at + 1].strip(), "```")
                 self.assertEqual(lines[at + 2].strip(), text.strip())
 
-    def test_the_two_slots_look_alike_when_only_one_holds_markup(self):
-        """The case that was reported: one slot a code block, the other inline, for no
+    def test_the_two_lanes_look_alike_when_only_one_holds_markup(self):
+        """The case that was reported: one lane a code block, the other inline, for no
         reason a reader of the report can see."""
         ran = self.ran(self.SHAPES["angle"], self.SHAPES["backtick"])
         lines = ran.splitlines()
         shapes = []
-        for slot in ("A", "B"):
-            at = next(n for n, line in enumerate(lines) if f"Slot {slot} adapter" in line)
+        for lane in ("A", "B"):
+            at = next(n for n, line in enumerate(lines) if f"Lane {lane} adapter" in line)
             shapes.append((lines[at].rstrip().endswith("dispatcher:"),
                            lines[at + 1].strip()))
         self.assertEqual(shapes[0], shapes[1])
@@ -6884,17 +7050,17 @@ class TheAdapterLinesRenderAlikeWhateverTheDispatcherTyped(_ReportCase):
 
     def test_a_permission_is_recorded_the_same_way_as_an_adapter(self):
         self.setUp()
-        self.run_all(dispatch={**DISPATCH, "slots": {
+        self.run_all(dispatch={**DISPATCH, "lanes": {
             "A": {"adapter": "a", "permission": "workspace-write under <copy>"},
             "B": {"adapter": "b", "permission": "read-only"}}})
         lines = _section(self.text(), "How this ran").splitlines()
-        at = next(n for n, line in enumerate(lines) if "Slot A permission" in line)
+        at = next(n for n, line in enumerate(lines) if "Lane A permission" in line)
         self.assertEqual(lines[at + 1].strip(), "```")
         self.assertEqual(lines[at + 2].strip(), "workspace-write under <copy>")
 
 
 class DispatchJsonIsParsedStrictly(_ReportCase):
-    """``dispatch.json`` is the dispatcher's record of what ran each slot; the report states
+    """``dispatch.json`` is the dispatcher's record of what ran each lane; the report states
     it and nothing stronger, so it is parsed by name like the job."""
 
     def refuse(self, obj, *fragments):
@@ -6907,8 +7073,8 @@ class DispatchJsonIsParsedStrictly(_ReportCase):
     def test_a_well_formed_record_loads(self):
         record = review_panel.parse_dispatch(DISPATCH)
         self.assertEqual(record.rung, "two-runtimes")
-        self.assertEqual(record.slots["A"].adapter, "runtime-one sub-agent")
-        self.assertEqual(record.slots["B"].permission, "read-only sandbox")
+        self.assertEqual(record.lanes["A"].adapter, "runtime-one sub-agent")
+        self.assertEqual(record.lanes["B"].permission, "read-only sandbox")
         self.assertEqual(set(review_panel.RUNGS), {"two-runtimes", "one-runtime"})
 
     def test_a_run_with_no_independent_check_is_not_a_rung_this_engine_accepts(self):
@@ -6920,19 +7086,19 @@ class DispatchJsonIsParsedStrictly(_ReportCase):
 
     def test_shape_errors_are_refused_by_name(self):
         self.refuse({**DISPATCH, "rung": "three"}, "'rung'", "two-runtimes, one-runtime")
-        self.refuse({"slots": DISPATCH["slots"]}, "missing", "'rung'")
+        self.refuse({"lanes": DISPATCH["lanes"]}, "missing", "'rung'")
         self.refuse({**DISPATCH, "extra": 1}, "unknown key", "'extra'")
-        self.refuse({**DISPATCH, "slots": {"A": DISPATCH["slots"]["A"]}}, "'slots'", "missing", "'B'")
-        self.refuse({**DISPATCH, "slots": {**DISPATCH["slots"], "C": DISPATCH["slots"]["A"]}}, "'C'")
-        self.refuse({**DISPATCH, "slots": {**DISPATCH["slots"], "A": {"adapter": "x"}}}, "slots.A", "'permission'")
-        self.refuse({**DISPATCH, "slots": {**DISPATCH["slots"], "A": {"adapter": "", "permission": "r"}}},
-                    "slots.A.adapter", "non-empty")
+        self.refuse({**DISPATCH, "lanes": {"A": DISPATCH["lanes"]["A"]}}, "'lanes'", "missing", "'B'")
+        self.refuse({**DISPATCH, "lanes": {**DISPATCH["lanes"], "C": DISPATCH["lanes"]["A"]}}, "'C'")
+        self.refuse({**DISPATCH, "lanes": {**DISPATCH["lanes"], "A": {"adapter": "x"}}}, "lanes.A", "'permission'")
+        self.refuse({**DISPATCH, "lanes": {**DISPATCH["lanes"], "A": {"adapter": "", "permission": "r"}}},
+                    "lanes.A.adapter", "non-empty")
 
-    def test_a_rung_the_slots_contradict_is_refused(self):
+    def test_a_rung_the_lanes_contradict_is_refused(self):
         same = {"A": {"adapter": "one", "permission": "r"}, "B": {"adapter": "one", "permission": "r"}}
-        self.refuse({"rung": "two-runtimes", "slots": same}, "two-runtimes", "same adapter")
-        review_panel.parse_dispatch({"rung": "one-runtime", "slots": same})
-        review_panel.parse_dispatch({"rung": "one-runtime", "slots": DISPATCH["slots"]})
+        self.refuse({"rung": "two-runtimes", "lanes": same}, "two-runtimes", "same adapter")
+        review_panel.parse_dispatch({"rung": "one-runtime", "lanes": same})
+        review_panel.parse_dispatch({"rung": "one-runtime", "lanes": DISPATCH["lanes"]})
 
     def landed(self):
         """A run directory ready for report in every way but ``dispatch.json``."""
@@ -6945,16 +7111,16 @@ class DispatchJsonIsParsedStrictly(_ReportCase):
     def test_a_string_the_report_cannot_write_in_utf8_is_refused_by_name(self):
         # The JSON escape \ud800 decodes to a lone surrogate the UTF-8 write refuses;
         # unchecked, report crashed in that write and left report.md.<pid>.tmp behind.
-        self.refuse({**DISPATCH, "slots": {**DISPATCH["slots"],
+        self.refuse({**DISPATCH, "lanes": {**DISPATCH["lanes"],
                                            "A": {"adapter": "x \ud800", "permission": "r"}}},
-                    "slots.A.adapter", "UTF-8")
-        self.refuse({**DISPATCH, "slots": {**DISPATCH["slots"],
+                    "lanes.A.adapter", "UTF-8")
+        self.refuse({**DISPATCH, "lanes": {**DISPATCH["lanes"],
                                            "B": {"adapter": "x", "permission": "r \udfff"}}},
-                    "slots.B.permission", "UTF-8")
-        bad = {**DISPATCH, "slots": {**DISPATCH["slots"],
+                    "lanes.B.permission", "UTF-8")
+        bad = {**DISPATCH, "lanes": {**DISPATCH["lanes"],
                                      "A": {"adapter": "x \ud800", "permission": "r"}}}
         proc = self.run_all(dispatch=bad, expect=2)
-        self.assertIn("slots.A.adapter", proc.stderr)
+        self.assertIn("lanes.A.adapter", proc.stderr)
         self.assertIn("UTF-8", proc.stderr)
         self.assertEqual([p.name for p in self.rundir.iterdir() if p.name.startswith("report.md")], [])
 
@@ -8166,6 +8332,8 @@ class _FindingsCase(_ReportCase):
             review_panel._read_inventory(rundir), areas, findings, routed["units"],
             batches, states, routed["probe"],
             job_notes=review_panel._read_job_notes(rundir),
+            report_notes=review_panel._read_report_notes(
+                rundir, [c["id"] for c in findings.clusters]),
             rundir=rundir, generated=generated)
 
 
@@ -8460,18 +8628,18 @@ class AClusterShowsItsAggregateWithoutHidingAMember(_FindingsCase):
 
 class TheTwoAxesAreStoredSeparatelyAndNeitherImpliesTheOther(_FindingsCase):
     """Spec section 3. Axis A is discovery breadth and Axis B is verification strength, and
-    a both-slots finding confirmed only by reading is still only read. Axis A is stored as
-    the slot fact — ``one`` or ``both`` — never as a rung's vocabulary, which is the
+    a both-lanes finding confirmed only by reading is still only read. Axis A is stored as
+    the lane fact — ``one`` or ``both`` — never as a rung's vocabulary, which is the
     renderer's and is what a run at a lower rung is not allowed to claim."""
 
-    def test_a_both_slots_candidate_confirmed_by_reading_carries_both_and_by_reading(self):
+    def test_a_both_lanes_candidate_confirmed_by_reading_carries_both_and_by_reading(self):
         self.run_all()
         records = self.records()
         for cid in ("cand-001", "cand-002"):
             self.assertEqual(records[cid]["axis_a"], "both", cid)
             self.assertEqual(records[cid]["axis_b"], "by reading", cid)
 
-    def test_a_one_slot_candidate_that_ran_carries_one_and_by_running(self):
+    def test_a_one_lane_candidate_that_ran_carries_one_and_by_running(self):
         self.run_all()
         record = self.records()["cand-003"]
         self.assertEqual(record["axis_a"], "one")
@@ -8685,7 +8853,7 @@ class TheDefectListHasExactlyThreeViews(_FindingsCase):
             "| Short name | Full path |",
             # The provenance appendix, which is a view of the RUN and not of the defect
             # list: a row is one report of one candidate by one unit, so a defect two
-            # slots raised has two of them. Its `Proposed` column is the severity a raiser
+            # lanes raised has two of them. Its `Proposed` column is the severity a raiser
             # asked for, which is what that unit said rather than what the defect is —
             # audit data, and the reason it is not spelled `Severity`.
             "| Defect | Candidate | Raised by | Proposed | Answered by |"],
@@ -8816,7 +8984,7 @@ class EveryPathIsSpelledTheOneWayThroughout(_FindingsCase):
         for args in (("init", "-q"), ("config", "user.email", "t@e.invalid"),
                      ("config", "user.name", "t"), ("add", "."), ("commit", "-q", "-m", "f")):
             subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
-        # Slot B's reader failed, so the coverage section renders its file list too. The
+        # Lane B's reader failed, so the coverage section renders its file list too. The
         # verdicts keep their DEFAULT prose, which spells `tests/test_engine.py` inside a
         # quoted sentence — the ordinary case, since naming a file is what a `test_first`
         # sentence is for. `assert_one_spelling` cuts quoted prose out of its full-path
@@ -10138,7 +10306,7 @@ class TheReportClaimsOnlyWhatItsRungAllows(_FindingsCase):
     contexts, which is not two models and must not be worded as one."""
 
     ONE_RUNTIME = {"rung": "one-runtime",
-                   "slots": {"A": {"adapter": "sub-agent", "permission": "read-only"},
+                   "lanes": {"A": {"adapter": "sub-agent", "permission": "read-only"},
                              "B": {"adapter": "sub-agent", "permission": "read-only"}}}
 
     def test_a_one_runtime_run_says_both_contexts_and_never_both_models(self):
@@ -10166,7 +10334,7 @@ class CapabilityAttemptsAndSuccessesAreThreeFacts(_FindingsCase):
         text = self.text()
         self.assertIn("**Nothing could be executed**", text)
         self.assertIn("this tree builds — unknown", text)
-        self.assertIn("a count of readings and not of validations", text)
+        self.assertIn("counts claims confirmed by reading, not claims confirmed by running the code", text)
 
     def test_a_working_probe_with_nothing_proposed_says_something_different(self):
         self.run_all(reading=READING_NO_REPRO, verify=VERIFY_NO_REPRO,
@@ -10177,7 +10345,7 @@ class CapabilityAttemptsAndSuccessesAreThreeFacts(_FindingsCase):
         self.assertIn("no candidate proposed a reproduction", text)
         self.assertIn("this tree builds — yes", text)
         self.assertIn("- Reproductions: 0 proposed, 0 run.", text)
-        self.assertIn("a count of readings and not of validations", text)
+        self.assertIn("counts claims confirmed by reading, not claims confirmed by running the code", text)
 
     def test_a_run_that_executed_something_claims_neither(self):
         """Including the case the plan names: a verdict that REFUTED a claim ran the code,
@@ -10220,8 +10388,8 @@ class AnUnresolvedDefectSaysWhatWouldSettleIt(_FindingsCase):
         Every candidate a batch owns has to be answered: a batch answered short leaves the
         whole batch unresolved, including the reports it did answer, so a fixture that
         named only the two under test produced four `no verdict came back` entries and
-        asserted nothing about this part at all. Slot A's unit owns cand-001 and cand-003;
-        slot B's owns cand-002 and cand-004.
+        asserted nothing about this part at all. Lane A's unit owns cand-001 and cand-003;
+        lane B's owns cand-002 and cand-004.
         """
         rundir = rundir or self.rundir
         # cand-003 proposes a reproduction, so `confirmed_by_reading` is refused for it:
@@ -10317,7 +10485,7 @@ class AnUnresolvedDefectSaysWhatWouldSettleIt(_FindingsCase):
                                  if f"**{review_panel.UNSETTLED_LABEL}**" in ln))
 
     def test_two_checkers_with_one_account_render_it_once(self):
-        """Two slots describing one site routinely give one account of what was missing,
+        """Two lanes describing one site routinely give one account of what was missing,
         word for word. Deduplicated on the RENDERED text, like the member blocks."""
         same = "EntityLockService is not in the snapshot."
         body = self.unresolved_run(
@@ -10455,7 +10623,7 @@ class AFindingThatBreaksARuleCostsItselfAndNoOther(_FindingsCase):
                                "summary": "A1 read"},
                 **over}
 
-    # Slot A's unit raises one candidate now, slot B's two — so the batches are one and
+    # Lane A's unit raises one candidate now, lane B's two — so the batches are one and
     # two, not two and two. Written out rather than derived, because a fixture that
     # computed the ids from the run could not notice the run renumbering them.
     THREE = {"verify-area-01-A": {"verdicts": [_verdict("cand-001", "confirmed_by_reading")],
@@ -10525,6 +10693,54 @@ class AFindingThatBreaksARuleCostsItselfAndNoOther(_FindingsCase):
         unit = next(u for u in self.findings_units() if u["id"] == "area-01-A1")
         self.assertEqual(unit["state"], review_panel.UNIT_COMPLETE, unit["reason"])
         self.assertEqual(len(unit["rejected"]), 1)
+
+
+class AFindingInAnExcludedFileIsDroppedAndOnlyCounted(_FindingsCase):
+    """The snapshot carries an excluded lockfile so a build installs what the repository
+    pins, and a reader following a call can land in it. The owner excluded it to hear
+    nothing about it: the finding raises no candidate, is not listed with the rejections —
+    it broke no rule — and leaves one counted line behind so the dropping is not silent."""
+
+    VENDOR = {**FINDING, "file": "vendor/lib.py", "line_start": 1, "line_end": 1,
+              "quote": "VENDORED = True"}
+    LOCK = {**FINDING, "file": "vendor/package-lock.json", "line_start": 1, "line_end": 1,
+            "quote": "VENDORED = True"}
+
+    def test_the_finding_is_dropped_counted_and_never_named(self):
+        (self.root / "vendor" / "package-lock.json").write_text("VENDORED = True\n",
+                                                                encoding="utf-8")
+        self.make_repo()
+        reading = {**READING_TABLE,
+                   "area-01-A1": {"findings": [FINDING, FINDING_REPRO, self.LOCK],
+                                  "summary": "A1 read"}}
+        self.run_all(reading=reading, exclude=["vendor/"])
+        unit = next(u for u in self.findings_units() if u["id"] == "area-01-A1")
+        self.assertEqual(unit["state"], review_panel.UNIT_COMPLETE, unit["reason"])
+        self.assertEqual((unit["findings"], unit["rejected"], unit["dropped"]), (2, [], 1))
+        self.assertNotIn("vendor/package-lock.json",
+                         [r["file"] for r in self.records().values()])
+        text = self.text()
+        self.assertIn("1 finding located in files outside the review's scope was dropped.",
+                      text)
+        self.assertNotIn("VENDORED", text)
+
+    def test_an_excluded_file_that_is_not_copied_is_a_location_nobody_may_use(self):
+        # An excluded file other than a lockfile is not in the snapshot, so the finding
+        # names no file a reader could open and is rejected by the rule it breaks.
+        self.make_repo()
+        self.rejected_where_not_copied()
+
+    def test_the_same_holds_outside_a_repository(self):
+        self.rejected_where_not_copied()
+
+    def rejected_where_not_copied(self):
+        reading = {**READING_TABLE,
+                   "area-01-A1": {"findings": [FINDING, FINDING_REPRO, self.VENDOR],
+                                  "summary": "A1 read"}}
+        self.run_all(reading=reading, exclude=["vendor/"])
+        unit = next(u for u in self.findings_units() if u["id"] == "area-01-A1")
+        self.assertEqual((unit["findings"], len(unit["rejected"]), unit["dropped"]), (2, 1, 0))
+        self.assertNotIn("outside the review's scope was dropped", self.text())
 
 
 class RefutedIsOneLineAndUnresolvedIsGroupedByWhatWouldSettleIt(_FindingsCase):
@@ -10738,7 +10954,7 @@ class TheReportWarnsWhenTrackedFilesWereNotReviewed(_FindingsCase):
         # The count is there, and so is the size of what WAS read, or the number means
         # nothing on its own.
         self.assertRegex(head, r"\*\*Reachability\*\*: \d+ tracked files? (is|are) not in "
-                               r"the reviewed set, against \d+ files? that (is|are)")
+                               r"the reviewed set, while \d+ files? (is|are)")
         self.assertNotIn("vendor/lib.py", head,
                          "the warning enumerated a file instead of counting it")
 
@@ -10810,7 +11026,7 @@ class TheReportWarnsWhenTrackedFilesWereNotReviewed(_FindingsCase):
 
     def test_a_tree_that_is_no_repository_says_the_comparison_was_not_made(self):
         self.run_all()
-        self.assertIn("the reviewed set was not compared against what the repository "
+        self.assertIn("the reviewed set was not compared with the files the repository "
                       "tracks", self.text())
 
 
@@ -11216,7 +11432,7 @@ class PriorityWithinASeverityIsFixSizeThenLocation(_FindingsCase):
         self.run_all(reading=reading, verify=verify, grouping=grouping)
         # Same severity, and the one-line fix is the UNRESOLVED one. It ranks first anyway.
         self.assertEqual(_index_rows(self.text()), ["D1", "D2"])
-        self.assertIn("cheapest fix first within a severity", self.text(),
+        self.assertIn("within a severity, cheapest fix first", self.text(),
                       "the table does not say what its order is")
 
     def test_within_one_severity_and_status_the_cheaper_fix_ranks_first(self):
@@ -11328,7 +11544,7 @@ class TheGroupedAndGatheredViewsPlaceEveryDefect(_FindingsCase):
         self.assertIn("D1 (cand-001)", kept)
         self.assertIn("D2 (cand-002)", kept)
         # Section 2 asks for the arithmetic in the report, not only in the code.
-        self.assertIn("4 candidates in 4 clusters, no drops and no double counting", notes)
+        self.assertIn("4 candidates in 4 clusters, none dropped and none counted twice", notes)
 
     def test_the_largest_clusters_are_listed_largest_first(self):
         """Two merged clusters of DIFFERENT sizes, or the ordering decides nothing and an
@@ -11343,8 +11559,8 @@ class TheGroupedAndGatheredViewsPlaceEveryDefect(_FindingsCase):
                    "area-01-B1": {"findings": [FINDING, FINDING_B, {**FINDING_B, "line_start": 9,
                                                                    "line_end": 9}],
                                   "summary": "B1"}}
-        # Slot A raised cand-001, cand-003 and cand-006; slot B raised the rest, so each
-        # batch is addressed to the slot that raised none of it.
+        # Lane A raised cand-001, cand-003 and cand-006; lane B raised the rest, so each
+        # batch is addressed to the lane that raised none of it.
         verify = {"verify-area-01-A": {"verdicts": [
             _verdict("cand-001", "confirmed_by_reading"),
             _verdict("cand-003", "reproduced", EVIDENCE,
@@ -11673,7 +11889,7 @@ class AQuotationThatDoesNotMatchIsFlaggedAndNeverRepaired(_FindingsCase):
         self.assertEqual(self.records()["cand-001"]["quote_check"], review_panel.QUOTE_DIFFERS)
         self.assertIn(review_panel.QUOTE_FLAG, self.text())
         page = (self.rundir / "report.html").read_text(encoding="utf-8")
-        self.assertIn("is not what the pinned tree holds", page)
+        self.assertIn("does not match what the pinned tree holds", page)
 
     def test_the_verifier_is_told_in_its_payload(self):
         self.run_wrong()
@@ -12036,7 +12252,7 @@ class EveryPathInEitherDocumentIsEscapedOnce(_FindingsCase):
         if os.name == "nt":
             self.skipTest("a Windows file name cannot hold < or >")
         (self.root / "engine" / "<h2>Coverage.py").write_text("x = 1\n", encoding="utf-8")
-        # Slot B's reader failed, so only slot A raised anything and its two candidates are
+        # Lane B's reader failed, so only lane A raised anything and its two candidates are
         # the whole of the one verification batch.
         self.run_all(reading={**READING_TABLE,
                               "area-01-B1": "the reply was not a JSON object\n"},
@@ -12961,7 +13177,7 @@ class TheDefectIdIsShortAndStable(_FindingsCase):
         section naming both. Read from the DOCUMENT rather than from ``findings.json``, so
         what is asserted is the mapping a reader would follow.
 
-        The appendix is a table of one row per REPORT, so a defect two slots raised has two
+        The appendix is a table of one row per REPORT, so a defect two lanes raised has two
         rows and the mapping is gathered across them rather than cut out of a per-defect
         heading. The id cell is a link where a heading defines the defect and bare where
         the row itself does, and both spellings are the same row.
@@ -13072,7 +13288,7 @@ class EveryFactInTheStructureReachesTheProse(_FindingsCase):
         "cluster_id", "members", "id",
         # Stated as a heading, a group name or a line number rather than as a value.
         "line_start", "line_end", "first_line", "cites_from", "cites_to", "truncated",
-        "state", "rung", "kind", "lens", "slot", "unit", "area",
+        "state", "rung", "kind", "lens", "lane", "unit", "area",
         # The quotation is what the source is CHECKED against, never printed: the report
         # shows the pinned tree's own lines instead, which is the point of having it.
         "quote", "quote_check", "dirty",
@@ -13308,20 +13524,20 @@ class TheThingsThatMustNotHaveBroken(_FindingsCase):
                 self.assertNotIn(summary, landed,
                                  f"a reader's summary reached {unit['id']}")
 
-    def test_every_finding_is_routed_to_a_slot_that_did_not_raise_it(self):
+    def test_every_finding_is_routed_to_a_lane_that_did_not_raise_it(self):
         """The assertion is on the ROUTING, not on the verdict: routing is what puts a
         candidate in front of a unit that did not raise it, whichever rung ran."""
         self.run_all()
         routed = review_panel._read_candidates(self.rundir)
-        raiser_of = {c["id"]: c["raised_by"][0]["slot"] for c in routed["candidates"]}
+        raiser_of = {c["id"]: c["raised_by"][0]["lane"] for c in routed["candidates"]}
         units = json.loads((self.rundir / "units.json").read_text(encoding="utf-8"))["units"]
         batches = [u for u in units if u["kind"] == "verifier"]
         self.assertTrue(batches)
         placed = []
         for batch in batches:
             for cid in batch["candidates"]:
-                self.assertNotEqual(batch["slot"], raiser_of[cid],
-                                    f"{cid} went back to the slot that raised it")
+                self.assertNotEqual(batch["lane"], raiser_of[cid],
+                                    f"{cid} went back to the lane that raised it")
                 placed.append(cid)
         self.assertEqual(sorted(placed), sorted(raiser_of),
                          "a candidate was routed twice or not at all")
@@ -13636,8 +13852,8 @@ _COUNTS_READING = {
     "probe-A": PROBE_RESULT,
 }
 _COUNTS_VERIFY = {
-    # Slot A raised cand-001 to cand-004, so slot B checks them; slot B raised the last two.
-    # The unit is named for the slot whose candidates it answers, not the slot it ran in.
+    # Lane A raised cand-001 to cand-004, so lane B checks them; lane B raised the last two.
+    # The unit is named for the lane whose candidates it answers, not the lane it ran in.
     "verify-area-01-A": {"verdicts": [
         _verdict("cand-001", "confirmed_by_reading"),
         _verdict("cand-002", "refuted", rationale="The guard two lines up covers it."),
@@ -13952,7 +14168,7 @@ class TheReportSaysWhatJobItAnswers(_ReportCase):
                              "the appendix still carries the only spelling of a lens")
         self.assertIn(f"**{review_panel.SUBSECTION_THE_JOB}**", appendix,
                       "the appendix cites tags and points nowhere for them")
-        self.assertRegex(appendix, r"\(slot [AB], L\d\)")
+        self.assertRegex(appendix, r"\(lane [AB], L\d\)")
 
     def test_an_area_with_its_own_lenses_lists_them_under_that_area(self):
         self.run_all(data=SUBJECT_JOB)
@@ -14041,7 +14257,7 @@ class TheDefectsBothModelsRaisedAreNamedTogether(_ReportCase):
     the facts.
     """
 
-    def test_the_section_names_every_defect_both_slots_raised_and_no_other(self):
+    def test_the_section_names_every_defect_both_lanes_raised_and_no_other(self):
         self.run_all()
         text = self.text()
         both = sorted((c["id"] for c in self.defects().values()
@@ -14097,7 +14313,7 @@ class TheDefectsBothModelsRaisedAreNamedTogether(_ReportCase):
         """At one runtime the claim is about contexts, not models, and the heading says so
         — the section's own words are the breadth claim, so the wrong pair of them is the
         claim the rung forbids."""
-        self.run_all(dispatch={"rung": "one-runtime", "slots": DISPATCH["slots"]})
+        self.run_all(dispatch={"rung": "one-runtime", "lanes": DISPATCH["lanes"]})
         text = self.text()
         self.assertNotIn(review_panel.SECTION_CORROBORATED + "both models", text)
         self.assertIn("5. Corroborated by both contexts", _h2s(text))
@@ -14248,7 +14464,7 @@ class TheAppendixPricesTheOpenWorkAndShowsTheVerifierSpread(_FindingsCase):
         self.assertEqual(len(rows["JournalEntryBuilder"]), 1)
         table = text.partition(review_panel.SUBSECTION_OUTSIDE)[2].partition("\n### ")[0]
         self.assertIn(self.OUTSIDE, review_panel._unescape(table))
-        self.assertIn("decision with a number against it", table)
+        self.assertIn("decision with a number attached", table)
         # Most claims first, so the file worth pulling in is the first row.
         self.assertLess(table.index("TransactionService"), table.index("JournalEntryBuilder"))
         self.assertEqual([row["class"] for row in doc["outside_scope"]],
@@ -14323,10 +14539,10 @@ class TheAppendixPricesTheOpenWorkAndShowsTheVerifierSpread(_FindingsCase):
         # Ordered by the unresolved share, so the unit that answered fewest questions is
         # the first row — no threshold decides what counts as a wide spread.
         self.assertLess(table.index("verify-area-01-A"), table.index("verify-area-01-B"))
-        self.assertIn("Unresolved runs from 0% (verify-area-01-B, 0 of 2) to "
+        self.assertIn("The share left unresolved ranges from 0% (verify-area-01-B, 0 of 2) to "
                       "100% (verify-area-01-A, 2 of 2).", table)
 
-    def test_the_per_unit_table_names_the_slot_whose_findings_each_unit_was_handed(self):
+    def test_the_per_unit_table_names_the_lane_whose_findings_each_unit_was_handed(self):
         """The unresolved share runs from 0% to 62% across the units of one run, and the
         question that invites is whether one model's findings are harder to settle. Routing
         keys a batch on its finder, so the answer is one column wide and was already in
@@ -14367,7 +14583,7 @@ class TheAppendixPricesTheOpenWorkAndShowsTheVerifierSpread(_FindingsCase):
         """A sentence naming a spread that is not there is a sentence to skip."""
         self.run_all()
         table = self.text().partition(review_panel.SUBSECTION_VERIFIERS)[2].partition("\n### ")[0]
-        self.assertNotIn("Unresolved runs from", table)
+        self.assertNotIn("The share left unresolved ranges from", table)
 
     def test_a_unit_that_never_answered_is_not_read_as_a_verifier_that_resolved_nothing(self):
         """Its candidates all resolve unresolved, which in a column of counts looks exactly
@@ -14382,7 +14598,7 @@ class TheAppendixPricesTheOpenWorkAndShowsTheVerifierSpread(_FindingsCase):
         table = self.text().partition(review_panel.SUBSECTION_VERIFIERS)[2].partition("\n### ")[0]
         self.assertIn("so nothing here is a verdict", table)
         # And a unit that did not answer is kept out of the range, which is about judgment.
-        self.assertNotIn("Unresolved runs from", table)
+        self.assertNotIn("The share left unresolved ranges from", table)
 
 
 class CoverageFindingsTravelTheirOwnPath(_CoverageCase):
@@ -14411,7 +14627,7 @@ class CoverageFindingsTravelTheirOwnPath(_CoverageCase):
         self.assertEqual(sorted(placed),
                          sorted(c["id"] for c in self.candidates()["candidates"]))
         self.assertEqual(len(placed), len(set(placed)))
-        self.assertEqual(coverage[0]["slot"], "B")
+        self.assertEqual(coverage[0]["lane"], "B")
         self.assertEqual(coverage[0]["finder"], "A")
 
     def test_a_coverage_batch_carries_its_own_brief_schema_and_the_tests_in_scope(self):
@@ -14512,9 +14728,9 @@ class CoverageFindingsTravelTheirOwnPath(_CoverageCase):
         self.assertEqual(by_asks["coverage"]["id"], "cluster-area-01-coverage")
         self.assertEqual(set(by_asks["coverage"]["candidates"]), set(self.gap_ids()))
         self.assertFalse(set(by_asks["defect"]["candidates"]) & set(self.gap_ids()))
-        # Both slots get work, as they do for two areas: neither model's sense of identity
+        # Both lanes get work, as they do for two areas: neither model's sense of identity
         # shapes the whole report.
-        self.assertEqual({u["slot"] for u in units}, {"A", "B"})
+        self.assertEqual({u["lane"] for u in units}, {"A", "B"})
 
 
 class CoverageFindingsLeaveTheDefectLadder(_CoverageCase):
@@ -14593,7 +14809,7 @@ class CoverageFindingsLeaveTheDefectLadder(_CoverageCase):
         self.assertIn(review_panel.SUBSECTION_COVERED, text)
         table = text.partition(review_panel.SUBSECTION_COVERED)[2].partition("\n### ")[0]
         self.assertIn(COVERED_TEST.replace("_", "\\_"), table)
-        self.assertIn("Nothing here is work", table)
+        self.assertIn("Nothing here needs work", table)
         # With every gap covered, the section above says so rather than listing nothing.
         self.assertIn("No coverage gap stood", text)
 
@@ -14650,7 +14866,7 @@ class AGapWhoseVerdictCouldNotBeReadShowsNoCheckersWords(_CoverageCase):
     """The stand-in the engine writes for a verdict it cannot read carries the parse error
     as its rationale. Rendered under "What the check found" it reads as a checker's words
     about the gap, which nobody said. The coverage section names the candidate and the
-    error; the gap entry prints nothing in that slot."""
+    error; the gap entry prints nothing in that lane."""
 
     def test_the_parse_error_is_not_printed_as_what_the_check_found(self):
         self.plan_into(self.rundir)
@@ -15463,7 +15679,7 @@ class TheSynthesisRoundIsOneUnitWithOneVocabulary(_ReportCase):
         self.assertEqual(units[0]["kind"], "synthesizer")
         self.assertIsNone(units[0]["area"])
         self.assertIsNone(units[0]["lens"])
-        self.assertIn(units[0]["slot"], review_panel.SLOTS)
+        self.assertIn(units[0]["lane"], review_panel.LANES)
         self.assertEqual(units[0]["defects"], ["D1", "D2", "D3"])
         self.assertEqual(self.units()["stage"], "synthesized")
 
@@ -15496,7 +15712,7 @@ class TheSynthesisRoundIsOneUnitWithOneVocabulary(_ReportCase):
         self.assertIn(FILE_JOB["problem"], text)
         self.assertIn('"what_goes_wrong"', text, "the schema travels inside the payload")
 
-    def test_the_payload_names_no_candidate_no_unit_no_slot_and_no_lens(self):
+    def test_the_payload_names_no_candidate_no_unit_no_lane_and_no_lens(self):
         # The same discipline the clustering payload keeps: a defect is judged on what it
         # is, and who raised or checked it is not part of that.
         self.clustered_only()
@@ -15509,7 +15725,7 @@ class TheSynthesisRoundIsOneUnitWithOneVocabulary(_ReportCase):
         for lens in FILE_JOB["lenses"]:
             self.assertNotIn(lens, text, lens)
         for line in text.splitlines():
-            self.assertNotRegex(line, r"^Slot [AB]\b")
+            self.assertNotRegex(line, r"^Lane [AB]\b")
 
     def test_a_rejected_verdict_reaches_no_payload_even_though_it_has_a_rationale(self):
         """The exclusion holds against the one verdict whose rationale the ENGINE wrote.
@@ -16103,9 +16319,12 @@ class TheSynthesisLandsInTheStructureAndInBothDocuments(_FindingsCase):
         prose = self.reads_as()
         page = (self.rundir / "report.html").read_text(encoding="utf-8")
         landed = SYNTH_TWO_TIERS[self.UNIT]
-        # The summary is the one field that does NOT render: it is the unit's note about
-        # its own run, not a fact about a defect, and no section is addressed to it.
-        self.assertNotIn(" ".join(landed["summary"].split()), prose)
+        # The summary is the one field that is not about a defect. It renders once, under
+        # its own heading near the top, and nowhere in a defect's entry.
+        overview = " ".join(review_panel._unescape(
+            _section(self.text(), review_panel.SUBSECTION_OVERVIEW)).split())
+        self.assertIn(" ".join(landed["summary"].split()), overview)
+        self.assertEqual(prose.count(" ".join(landed["summary"].split())), 1)
         # A refuted defect is one line in the appendix and renders no prose at all, so its
         # judgment is not among what the body carries.
         work = {c["id"] for c in self.findings()["clusters"] if c["status"] != "refuted"}
@@ -16887,8 +17106,8 @@ class NoFactLeftTheRunWhenTheAppendixStoppedReprintingThem(_FindingsCase):
                        "summary": "B1 read"},
     }
 
-    # What the fixture's readers wrote, keyed the way the candidates are numbered: slot A's
-    # unit raises cand-001 and cand-003, slot B's cand-002 and cand-004. Compared against
+    # What the fixture's readers wrote, keyed the way the candidates are numbered: lane A's
+    # unit raises cand-001 and cand-003, lane B's cand-002 and cand-004. Compared against
     # the RECORD, so what is asserted is that a candidate's own words survived under its
     # own id — a check for a non-empty string passes on somebody else's sentence, and the
     # field that went missing was one candidate's, not all of them.
@@ -16995,7 +17214,7 @@ class NoFactLeftTheRunWhenTheAppendixStoppedReprintingThem(_FindingsCase):
         The sentence has to name the file — "elsewhere" is not an answer a reader can act
         on — and it says EVERYTHING each unit wrote rather than listing fields, because a
         sentence that enumerates goes quietly false the next time one stops being printed.
-        Under it, one row per report of a candidate: a defect two slots raised has two.
+        Under it, one row per report of a candidate: a defect two lanes raised has two.
         That trace is the thing ``findings.json`` cannot be read for by eye, and it is why
         the section still exists.
         """
@@ -17096,14 +17315,14 @@ class TheReportSaysWhatItCannotTell(_ReportCase):
     def test_it_says_the_two_things_that_do_not_follow(self):
         self.run_all()
         block = _section(self.text(), review_panel.SUBSECTION_LIMITS)
-        self.assertIn("Yield is not recall", block)
+        self.assertIn("Reporting more defects is not the same as catching more of the bugs that are", block)
         self.assertIn("A clean sweep is not evidence this tree is sound", block)
         self.assertIn("A long report is not a thorough one", block)
 
     def test_every_rung_carries_it_word_for_word(self):
         """A run that could claim least is the run whose reader most needs this, so the
         weaker rung may not be the one that drops it."""
-        one_runtime = {"rung": "one-runtime", "slots": DISPATCH["slots"]}
+        one_runtime = {"rung": "one-runtime", "lanes": DISPATCH["lanes"]}
         blocks = []
         for n, dispatch in enumerate((DISPATCH, one_runtime)):
             rundir = self.tmp / f"run-rung-{n}"
@@ -18265,7 +18484,7 @@ class ARedoResetsARunWhoseStageMovedOnWithNothingToTakeBack(unittest.TestCase):
     resets to; anywhere else the reset is what the run needs, and it deletes nothing."""
 
     def _doc(self, stage):
-        return {"stage": stage, "slots": list(review_panel.SLOTS),
+        return {"stage": stage, "lanes": list(review_panel.LANES),
                 "units": [{"id": "area-01-A1", "kind": review_panel.READER_KIND}]}
 
     def test_a_zero_batch_run_at_the_verification_stage_is_reset_to_reading(self):
@@ -18301,7 +18520,7 @@ class AReproductionMayRunFromAnyDirectoryInTheSnapshot(unittest.TestCase):
                 "summary": "one finding, reproduced from the tests directory"}
 
     def test_the_cwd_is_checked_against_the_snapshot_not_the_narrowed_set(self):
-        findings, rejected = review_panel.parse_reader_result(
+        findings, rejected, _dropped = review_panel.parse_reader_result(
             self.obj(), "audit-area-01-A", self.NARROWED, cwd_files=self.SNAPSHOT)
         self.assertEqual(rejected, (), rejected)
         self.assertEqual(len(findings), 1)
@@ -18311,7 +18530,7 @@ class AReproductionMayRunFromAnyDirectoryInTheSnapshot(unittest.TestCase):
         """The positive control: with no wider set given, `files` is both the filing set and
         the cwd set, and `tests` is not among the narrowed sources -- so the refusal the
         wider set exists to lift is still made where nobody passes one."""
-        findings, rejected = review_panel.parse_reader_result(
+        findings, rejected, _dropped = review_panel.parse_reader_result(
             self.obj(), "audit-area-01-A", self.NARROWED)
         self.assertEqual(findings, (), "the finding was accepted against the narrowed set")
         self.assertTrue(any("not a directory in the snapshot" in r for r in rejected), rejected)
@@ -18378,6 +18597,256 @@ class AStampWrittenForARenderThatFailedIsTakenBack(_FindingsCase):
         self.report(rundir)
         self.assertTrue((rundir / "report.md").exists())
         self.assertTrue((rundir / review_panel.REPORT_STAMP_NAME).exists())
+
+
+class TheReportPrintsTheSummariesTheRunSaved(_FindingsCase):
+    """Two paragraphs a run keeps that a reader needs: the judgment round's overview,
+    under the counts, and the capability probe's account of itself, under the answer it
+    explains. Both are read off the run directory, so a re-render of an existing run
+    prints them."""
+
+    UNIT = "synth-A"
+    OVERVIEW = SYNTH_TABLE["synth-A"]["summary"]
+
+    def overview(self, text=None):
+        text = self.text() if text is None else text
+        heading = f"### {review_panel.SUBSECTION_OVERVIEW}"
+        return _section(text, review_panel.SUBSECTION_OVERVIEW) if heading in text else None
+
+    def test_a_completed_round_prints_its_paragraph_labeled_as_a_reading(self):
+        self.run_all(synthesis=SYNTH_TABLE)
+        text = self.text()
+        section = self.overview(text)
+        self.assertIsNotNone(section)
+        self.assertIn(review_panel.OVERVIEW_LEAD, section)
+        self.assertIn(self.OVERVIEW, review_panel._unescape(section))
+        # Under the opening counts, and above the first list of defects.
+        self.assertLess(text.index("- Rung: "), text.index(section))
+        self.assertLess(text.index(section), text.index(review_panel.SECTION_INDEX))
+        page = (self.rundir / "report.html").read_text(encoding="utf-8")
+        self.assertIn(f">{review_panel.SUBSECTION_OVERVIEW}</h3>", page)
+        self.assertIn(self.OVERVIEW, page)
+
+    def test_no_paragraph_is_printed_where_there_is_none_to_print(self):
+        for name, synthesis in (("none", None), ("missing", {}),
+                                ("failed", {self.UNIT: "no object\n"}),
+                                ("empty", {self.UNIT: {**SYNTH_TABLE[self.UNIT],
+                                                       "summary": "  "}})):
+            with self.subTest(round=name):
+                rundir = self.tmp / f"run-{name}"
+                self.run_all(rundir, synthesis=synthesis)
+                self.assertIsNone(self.overview(self.text(rundir)))
+                self.assertNotIn(review_panel.SUBSECTION_OVERVIEW,
+                                 (rundir / "report.html").read_text(encoding="utf-8"))
+
+    def test_a_record_with_no_summary_field_renders_without_one(self):
+        self.run_all(synthesis=SYNTH_TABLE)
+        text = self.rerender(lambda doc: doc["synthesis"].pop("summary"))
+        self.assertIsNone(self.overview(text))
+
+    def test_the_paragraph_cannot_open_a_block_of_its_own(self):
+        forged = "# 9. Forged section\n- D9 invented <b>bold</b>"
+        self.run_all(synthesis={self.UNIT: {**SYNTH_TABLE[self.UNIT], "summary": forged}})
+        section = self.overview()
+        self.assertNotIn("\n# 9.", section)
+        self.assertNotIn("\n- D9", section)
+        self.assertNotIn("<b>", section)
+
+    def test_the_probe_reports_why_beside_its_answer(self):
+        self.run_all()
+        text = self.text()
+        line = next(ln for ln in text.splitlines() if "this tree builds — " in ln)
+        after = text.split(line + "\n", 1)[1].splitlines()[0]
+        self.assertEqual(review_panel._unescape(after),
+                         f"  - What the probe reported: {PROBE_RESULT['summary']}")
+        self.assertIn(PROBE_RESULT["summary"],
+                      (self.rundir / "report.html").read_text(encoding="utf-8"))
+
+    def test_the_probe_line_is_left_out_when_there_is_nothing_to_say(self):
+        for name, probe in (("empty", {**PROBE_RESULT, "summary": ""}),
+                            ("failed", "the probe crashed\n")):
+            with self.subTest(probe=name):
+                rundir = self.tmp / f"run-{name}"
+                self.run_all(rundir, reading={**READING_TABLE, "probe-A": probe})
+                self.assertNotIn("What the probe reported", self.text(rundir))
+        text = self.rerender(None, self.tmp / "run-empty")
+        self.assertNotIn("What the probe reported", text)
+
+    def test_a_rerender_of_an_existing_run_picks_both_up(self):
+        self.run_all(synthesis=SYNTH_TABLE)
+        (self.rundir / "report.md").write_text("an older report\n", encoding="utf-8")
+        proc = _run("report", str(self.rundir), "--rerender")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        text = self.text()
+        self.assertIsNotNone(self.overview(text))
+        self.assertIn("What the probe reported", text)
+
+
+NOTES = {
+    "answers": [{"question": "Is an empty input handled?",
+                 "answer": "No. D1 is the crash.\n\nThe fix is one line.",
+                 "defects": ["D1"]}],
+    "corrections": [
+        {"target": "D2", "reason": "The helper is only reached from a test; nothing ships it."},
+        {"target": "D3", "reason": "The refutation read the wrong helper; None does reach it."},
+        {"target": "build", "reason": "It built only because the C extension was skipped."},
+    ],
+    "caveats": ["The tree was read two commits behind main."],
+}
+
+
+class OperatorNotesAreReadCheckedAndRendered(_FindingsCase):
+    """``report-notes.json`` is the operator's answer to the job's questions, its
+    corrections and its caveats. It is refused by name when malformed, rendered as the
+    operator's own reading, marks what it corrects, and changes no count and no finding."""
+
+    QUESTIONS = "Is an empty input handled?"
+
+    def setUp(self):
+        super().setUp()
+        self.run_all(questions=self.QUESTIONS)
+        self.bare = {name: (self.rundir / name).read_bytes()
+                     for name in ("report.md", "findings.json")}
+
+    def with_notes(self, notes, expect=0):
+        path = self.rundir / review_panel.REPORT_NOTES_FILE_NAME
+        path.write_text(notes if isinstance(notes, str) else json.dumps(notes),
+                        encoding="utf-8")
+        before = path.read_bytes()
+        proc = _run("report", str(self.rundir), "--rerender")
+        self.assertEqual(proc.returncode, expect, proc.stdout + proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertEqual(path.read_bytes(), before, "the engine wrote to the notes file")
+        return proc
+
+    def refuse(self, notes, *fragments):
+        proc = self.with_notes(notes, expect=2)
+        for fragment in (review_panel.REPORT_NOTES_FILE_NAME, *fragments):
+            self.assertIn(fragment, proc.stderr)
+        self.assertEqual((self.rundir / "report.md").read_bytes(), self.bare["report.md"],
+                         "a refused notes file still changed the report")
+
+    # -- refused ----------------------------------------------------------------
+    def test_each_malformed_file_is_refused_by_name(self):
+        answer = NOTES["answers"][0]
+        cases = {
+            "not an object": ("[]", "JSON object"),
+            "records nothing": ({}, "records nothing"),
+            "unknown top key": ({**NOTES, "summary": "x"}, "'summary'"),
+            "answers not a list": ({"answers": {}}, "'answers'", "list"),
+            "answer not an object": ({"answers": ["x"]}, "answers[0]", "object"),
+            "unknown answer key": ({"answers": [{**answer, "why": "x"}]}, "'why'"),
+            "answer missing": ({"answers": [{"question": "q"}]}, "'answer'"),
+            "empty answer": ({"answers": [{**answer, "answer": " "}]}, "answers[0].answer"),
+            "defects not a list": ({"answers": [{**answer, "defects": "D1"}]},
+                                   "answers[0].defects"),
+            "cited id unknown": ({"answers": [{**answer, "defects": ["D99"]}]},
+                                 "answers[0].defects[0]", "'D99'"),
+            "unknown correction key": ({"corrections": [{"target": "D1", "reason": "r",
+                                                         "status": "refuted"}]}, "'status'"),
+            "no reason": ({"corrections": [{"target": "D1"}]}, "'reason'"),
+            "empty reason": ({"corrections": [{"target": "D1", "reason": "  "}]},
+                             "corrections[0].reason"),
+            "target unknown": ({"corrections": [{"target": "D99", "reason": "r"}]},
+                               "corrections[0].target", "'D99'"),
+            "target twice": ({"corrections": [{"target": "tests", "reason": "r"},
+                                              {"target": "tests", "reason": "s"}]},
+                             "corrections[1].target", "second time"),
+            "empty caveat": ({"caveats": [""]}, "caveats[0]"),
+            "lone surrogate": ('{"caveats": ["\\ud800"]}', "caveats[0]", "UTF-8"),
+        }
+        for name, (notes, *fragments) in cases.items():
+            with self.subTest(case=name):
+                self.refuse(notes, *fragments)
+
+    # -- rendered ---------------------------------------------------------------
+    def test_the_notes_have_their_own_section_labeled_as_a_reading(self):
+        self.with_notes(NOTES)
+        text = self.text()
+        section = _section(text, review_panel.SECTION_OPERATOR)
+        self.assertIn(review_panel.OPERATOR_LEAD, section)
+        # Directly after the description and before the first list of defects.
+        self.assertLess(text.index(review_panel.SUBSECTION_LIMITS), text.index(section))
+        self.assertLess(text.index(section), text.index(review_panel.SECTION_INDEX))
+        prose = " ".join(review_panel._unescape(section).split())
+        self.assertIn(f"The job asked: > {self.QUESTIONS}", prose)
+        self.assertIn("#### Q1. Is an empty input handled?", section)
+        self.assertIn("No. D1 is the crash.\n\nThe fix is one line.", section)
+        self.assertIn("Cites [D1](#D1).", section)
+        self.assertIn("To [D2](#D2), marked established by the panel: "
+                      "The helper is only reached from a test", prose)
+        self.assertIn("To [D3](#D3), marked refuted by the panel", prose)
+        self.assertIn("on whether this tree builds, which was yes: It built only", prose)
+        self.assertIn("- The tree was read two commits behind main.", section)
+        self.assertIn("put to whoever ran the panel rather than to its readers, answered under",
+                      self.body(text, review_panel.SUBSECTION_THE_JOB))
+
+    def test_every_corrected_entry_carries_a_mark_and_nothing_else_does(self):
+        self.with_notes(NOTES)
+        text = self.text()
+        mark = review_panel.CORRECTED_MARK
+        self.assertIn(mark, self.defect_block(text, "D2"))
+        self.assertNotIn(mark, self.defect_block(text, "D1"))
+        refuted = _section(text, review_panel.SUBSECTION_REFUTED)
+        row = next(ln for ln in refuted.splitlines() if ln.startswith("| D3 |"))
+        self.assertIn(mark, row)
+        ranked = _section(text, review_panel.SUBSECTION_RANKED)
+        rows = {ln.split("|")[1].strip(): ln for ln in ranked.splitlines()
+                if ln.startswith("| [D")}
+        self.assertIn("corrected by the operator", rows["[D2](#D2)"])
+        self.assertNotIn("corrected by the operator", rows["[D1](#D1)"])
+        build = text.split("this tree builds — yes", 1)[1].split("- Reproductions:", 1)[0]
+        self.assertIn(f"**{mark}**, on whether it builds", build)
+
+    def test_no_count_and_no_finding_changes(self):
+        def status_lines(text):
+            return [ln for ln in text.splitlines() if ln.startswith(("- By status:",
+                    "- Candidates behind them:", "- Defects:"))]
+        self.with_notes(NOTES)
+        text = self.text()
+        self.assertEqual(status_lines(text),
+                         status_lines(self.bare["report.md"].decode("utf-8")))
+        self.assertIn("  - The operator corrected 2 of these: [D2](#D2), [D3](#D3).", text)
+        self.assertEqual((self.rundir / "findings.json").read_bytes(),
+                         self.bare["findings.json"])
+
+    def test_every_link_on_the_page_resolves(self):
+        self.with_notes(NOTES)
+        page = (self.rundir / "report.html").read_text(encoding="utf-8")
+        ids = set(re.findall(r'id="([^"]+)"', page))
+        for target in re.findall(r'href="#([^"]+)"', page):
+            self.assertIn(target, ids)
+        self.assertIn('id="the-operator-s-corrections"', page)
+
+    def test_operator_text_cannot_forge_structure(self):
+        self.with_notes({"answers": [{"question": "D1. Forged heading",
+                                      "answer": "# 9. Forged section\n- D9 — invented",
+                                      "defects": []}],
+                         "corrections": [{"target": "D1", "reason": "see <b>this</b>\n## x"}],
+                         "caveats": ["- nested\n# heading"]})
+        section = _section(self.text(), review_panel.SECTION_OPERATOR)
+        self.assertIn("#### Q1. D1. Forged heading", section)
+        for forged in ("\n# 9.", "\n- D9", "<b>", "\n## x", "\n# heading"):
+            self.assertNotIn(forged, section)
+
+    def test_without_notes_nothing_is_added(self):
+        text = self.bare["report.md"].decode("utf-8")
+        self.assertNotIn(review_panel.SECTION_OPERATOR, text)
+        self.assertNotIn(review_panel.CORRECTED_MARK, text)
+        self.assertIn(f"and no answer was recorded in `{review_panel.REPORT_NOTES_FILE_NAME}`",
+                      text)
+
+    def test_a_first_report_reads_notes_already_there(self):
+        rundir = self.tmp / "second"
+        self.run_all(rundir, after_plan=lambda d: (d / review_panel.REPORT_NOTES_FILE_NAME)
+                     .write_text(json.dumps({"caveats": ["early"]}), encoding="utf-8"))
+        self.assertIn("- early", _section(self.text(rundir), review_panel.SECTION_OPERATOR))
+
+    def test_questions_are_never_handed_to_a_unit(self):
+        payloads = list((self.rundir / "units").rglob("payload.md"))
+        self.assertGreater(len(payloads), 5)
+        for payload in payloads:
+            self.assertNotIn(self.QUESTIONS, payload.read_text(encoding="utf-8"), payload)
 
 
 if __name__ == "__main__":

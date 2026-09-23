@@ -8,6 +8,91 @@ Versions use [Calendar Versioning](https://calver.org/) in the form
 A MICRO bump in the same month indicates a follow-up release; a new month
 starts from `.0` again.
 
+## [2026.09.5] - 2026-09-23
+
+### Added
+
+- **`/review-panel` keeps what whoever ran it knows after the run.** Answers to the owner's
+  questions, corrections to findings that are wrong, and caveats about the run go in a
+  report-notes.json file in the run directory, and `report --rerender` prints them: in a
+  section of their own after the report's description, labeled as that person's reading,
+  with a mark on every corrected defect, and on the build line where whether the tree
+  builds or whether its tests run is corrected. The
+  counts do not change and no finding is edited. A job may carry `questions` beside what it
+  asks the panel to find; no reader is shown them.
+- **`/review-panel`'s report prints two summaries the run already saved.** The judgment
+  round's paragraph about the run appears under the opening counts, labeled as a reading
+  nobody checked, and the capability probe's own account appears under the line saying
+  whether the tree builds, so a failed build says why. `report --rerender` adds both to a
+  report from an earlier run of this release; a run directory from the previous release is
+  not read (see the lanes entry below).
+
+### Changed
+
+- **`/review-panel` hands over the report rather than summarizing it in the conversation.**
+  When a run finishes, the agent that ran it records its answers to your questions, any
+  finding it can show is wrong and any caveat about the run in the report itself, renders
+  the report again, and points you at report.md with a line or two: the rung, the counts by
+  status, and what its notes answer or correct. It no longer lists each established finding,
+  what was refuted or left unresolved, and every coverage gap in the conversation; all of
+  that is in the report.
+- **`/review-panel` calls its two configurations lanes, and a lane has slots.** A lane is
+  one runtime, model and account; its slots are how many of its workers run at once. The
+  adapter config's top-level key is now `lanes`, and each lane takes `slots`, which
+  replaces the driver's `--capacity` flag and its default of one worker per lane. The flag
+  is gone: drop it from a saved run command, which otherwise stops with an unrecognized
+  argument. `slots`
+  defaults to two; the skill tells you the default and asks whether you want another number,
+  and a resume may change it, for example after hitting a rate limit. The preview prints
+  each lane's slots, whether they were defaulted, and its share of the work before anything
+  runs. An adapter config or a run directory from the previous release is not read: rewrite
+  the config and start a new run.
+- **`/review-panel` builds with the versions the repository pins.** A lockfile the job
+  excluded, or left off a `files` list, was missing from the snapshot the capability probe
+  and the verifiers build in, so an install resolved newer dependencies and the build
+  results described a tree nobody has. Inside a repository the snapshot now holds every
+  lockfile git tracks as well as the files under review, and nothing else outside the
+  review; the preview, and a run started with `--go`, say how many lockfiles are copied
+  beside it. The probe installs exactly what a lockfile pins (`npm ci`,
+  `pnpm install --frozen-lockfile`, `cargo build --locked`) and names the lockfile it used,
+  so a stale lockfile can now fail a build that resolving afresh would have passed.
+- **The CI workflow runs Linux alone in a private repository.** A public repository still
+  runs the suite on Linux, macOS and Windows on every event. In a private one, where macOS
+  and Windows minutes are billed, `.github/workflows/validate.yml` runs Linux only; a manual
+  run with its new `all_platforms` input set to true runs all three. A private fork that
+  takes this workflow stops testing on macOS and Windows unless it asks.
+- **The test suite runs `/security-review-codebase`'s PowerShell block under every
+  PowerShell on the host.** It already parsed the block and ran its path resolver under one
+  PowerShell; it now does so under each it finds, which on a Windows runner includes Windows
+  PowerShell 5.1, and checks that the block is ASCII. An edit that breaks the block only
+  under 5.1 now fails the suite.
+
+### Fixed
+
+- **`/diff-review` no longer says plan mode lets a reviewer write through the shell, and
+  `/review-panel`'s example adapter config describes its permission to match.** Claude's
+  `--permission-mode plan` refuses any shell command it judges would change a file, as well
+  as its edit tools. It is a permission check rather than an
+  operating-system boundary: a command it judges read-only can still write, and hooks,
+  plugins and MCP servers run outside it, so a review that must not touch the tree still
+  wants a read-only mount or customizations disabled.
+- **`/security-review-codebase`'s Windows block parses under Windows PowerShell 5.1.** Its
+  comments and one error message carried em dashes, and 5.1 reads a script file without a
+  byte-order mark in the ANSI code page, where one of an em dash's bytes is a closing
+  quote: the string ended early and the block did not parse. The block is ASCII now.
+- **`/review-panel`'s report explains itself in plainer English.** The fixed sentences that
+  introduce each section and line are reworded; no heading, count, path, link or status
+  word changed. Four of them were wrong and now match the numbers beside them: the probe
+  line read "The capability probe missing" when the probe never landed, one refuted defect
+  was called "them", an empty corroboration line pointed "below" at defects above it, and
+  the capability line said "successes" where it counts reproductions that ran.
+- **`/diff-review`'s supervisor stops its reviewer before an unexpected exception ends
+  it.** The reviewer runs in a session of its own, so a supervisor that died of an error
+  nobody handled, with the reviewer still running, left it running with no clock over it,
+  while the status line printed on the way out told the caller the execution had ended. The
+  child is now stopped and the claimed output files released before the exception goes any
+  further.
+
 ## [2026.09.4] - 2026-09-22
 
 ### Changed
@@ -577,6 +662,7 @@ release](README.md#installing-a-previous-release) to return to it.
 
 Initial release.
 
+[2026.09.5]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.5
 [2026.09.4]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.4
 [2026.09.3]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.3
 [2026.09.2]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.2

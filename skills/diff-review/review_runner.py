@@ -994,6 +994,12 @@ def _preflight(args):
     return cmd, verdict_unavailable
 
 
+# The guard of the run in progress, for the one exit path that cannot reach it otherwise:
+# an exception escaping `run` lands in `main`, which holds no reference to the guard the
+# run armed. Set by `arm`, cleared by `restore`, read only there.
+_ARMED = None
+
+
 class _Interrupts:
     """Cancellation: the handlers, the files this run created, and the one status line.
 
@@ -1023,6 +1029,8 @@ class _Interrupts:
         `start_new_session` has detached its signal fate from ours, so nothing reaps it and
         neither the idle clock nor the deadline governs it any more.
         """
+        global _ARMED
+        _ARMED = self
         for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None)):
             if sig is not None:
                 try:
@@ -1032,11 +1040,30 @@ class _Interrupts:
 
     def restore(self):
         """Put back whatever was installed before `arm`."""
+        global _ARMED
+        _ARMED = None
         for sig, previous in self._previous:
             try:
                 signal.signal(sig, previous)
             except (ValueError, OSError):
                 pass
+
+    def abandon(self):
+        """What an exception nobody handled owes the child: stop it, then leave.
+
+        The reviewer runs in a session of its own, so an exception that escapes `run` with
+        the child alive — a status print that failed on a full disk, an error in routing —
+        ends this process and leaves the reviewer running, spending, and governed by no
+        clock. A caller then reads the exit as an ended execution, frees the slot, and can
+        start a second reviewer beside the live one. Both rungs go to the group, as the
+        signal path's cleanup does, and the files this run claimed are released the way any
+        failed run releases them. Safe on a child already gone: each step is a no-op then.
+        """
+        child = self.proc
+        if child is not None and child.poll() is None:
+            _terminate(child)
+            _reap_group(child)
+        self.release()
 
     def claimed(self, path):
         """Record a path this run created, which is what makes removing it legitimate."""
@@ -1903,7 +1930,15 @@ def main(argv=None):
             print(json.dumps({"status": "error", "reason": "invalid runner invocation"}))
             return 1
         raise
-    return run(args)
+    try:
+        return run(args)
+    except BaseException:
+        # The child first, whatever the exception was. The catch-all below prints a status
+        # and exits; done in that order the reviewer outlives this process in its own
+        # session, and the status just printed tells the caller the execution ended.
+        if _ARMED is not None:
+            _ARMED.abandon()
+        raise
 
 
 if __name__ == "__main__":
