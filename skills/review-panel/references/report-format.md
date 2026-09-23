@@ -10,8 +10,8 @@ except what the report already said, so the two cannot disagree about a **fact**
 carries one thing the prose does not — a contents list — and that is navigation rather than
 a fact, added by the conversion the way ids and back-links already are. All three land in
 the run directory, from what is already there: `job.json`, `job-notes.json` where the
-interview left one, `inventory.json`, `areas.json`,
-`units.json`, `candidates.json`, every verification, clustering and synthesis unit's
+interview left one, `report-notes.json` where the operator wrote one, `inventory.json`,
+`areas.json`, `units.json`, `candidates.json`, every verification, clustering and synthesis unit's
 `result.json` or `error.txt`, `dispatch.json`, and `snapshot/`, which is where the source
 quoted beside each established defect is read from. Nothing else: no clock, no absolute
 path, so two runs over one tree write byte-identical files whatever order their units landed
@@ -48,7 +48,7 @@ cannot carry out.
 
 ## `dispatch.json`
 
-The engine never spawns, so it cannot know which adapter ran a slot or under what
+The engine never spawns, so it cannot know which adapter ran a lane or under what
 permission. The driver writes that down, once, in the run directory, from what the run
 actually did, and `report` states it and nothing stronger. One JSON object, parsed by name like the job — an
 unknown key, a missing field, an empty value or a string the report could not write in UTF-8
@@ -57,7 +57,7 @@ is refused by name, and nothing is defaulted:
 ```json
 {
   "rung": "two-runtimes",
-  "slots": {
+  "lanes": {
     "A": {"adapter": "fresh sub-agents of the driving runtime", "permission": "read-only"},
     "B": {"adapter": "the other runtime's command line under the read-only supervisor",
           "permission": "read-only sandbox to read; verification in a disposable copy with write"}
@@ -70,12 +70,12 @@ is refused by name, and nothing is defaulted:
   and cannot change under it. There is no third: a run where one context was both finder
   and verifier satisfies none of what a status on the page means, and the driver refuses
   such a run rather than recording a weaker rung for it.
-- `slots` has exactly `A` and `B`; each records `adapter` (the runtime and the mechanism
-  that ran the slot's units, in the dispatcher's words) and `permission` (the containment
+- `lanes` has exactly `A` and `B`; each records `adapter` (the runtime and the mechanism
+  that ran the lane's units, in the dispatcher's words) and `permission` (the containment
   it actually applied). Both are free text on purpose: the engine cannot verify a sandbox,
   so it renders the claim verbatim rather than a vocabulary it could not check.
-- One cross-check ties the rung to the slots: `two-runtimes` claims two models, so both
-  slots naming one adapter is refused. `one-runtime` is checked no further, and a record
+- One cross-check ties the rung to the lanes: `two-runtimes` claims two models, so both
+  lanes naming one adapter is refused. `one-runtime` is checked no further, and a record
   naming it with two adapters is accepted: the engine renders what it is given and cannot
   know what ran. The report then claims only what that rung allows.
 
@@ -136,10 +136,59 @@ The driver copies it **after** `plan`, never before. `plan` refuses a run direct
 anything but the job being loaded, and widening that guard to admit this file would admit every
 other one too.
 
-## Summarizing for the owner
+## `report-notes.json`
 
-Read `report.md` and say, in a few lines: the rung and what it lets the run claim; the
-counts by status; each established finding in one line — location, failure, status; how
-many were refuted or left unresolved and why, when a whole batch was; and every coverage gap
-by name. Point at `report.md` by path for the rest. Never inline a snapshot file, an
-evidence block or a payload: the report is the record, and the summary is the pointer to it.
+What you, the operator, know after reading the report has nowhere else to go: the answer to a
+question the owner asked, a finding you can show is wrong, a caveat about the whole run. Said in
+the conversation, it is lost when the conversation ends. It goes in `report-notes.json` in the
+run directory, and `report --rerender` puts it in the report.
+
+```json
+{
+  "answers": [
+    {"question": "Is the loader safe to call twice?",
+     "answer": "No. D4 and D9 are the two ways a second call breaks it.",
+     "defects": ["D4", "D9"]}
+  ],
+  "corrections": [
+    {"target": "D12", "reason": "The loop exits at x.py:40 before the index is used."},
+    {"target": "build", "reason": "It failed only because the check had no network."}
+  ],
+  "caveats": ["The tree was read at a commit two weeks behind main."]
+}
+```
+
+- `answers`: a `question` and an `answer`, both non-empty, and optionally `defects`, the ids
+  the answer rests on.
+- `corrections`: a `target` and a `reason`. The target is a defect id, or `build` or `tests`
+  for the build check's two answers. One correction per target.
+- `caveats`: sentences about the run as a whole.
+
+Every key is optional, but the file has to record something. An unknown key, a missing field,
+empty text, an id no defect in `findings.json` carries, and a second correction for one target
+are refused by name, and nothing is published.
+
+The report gives the notes a section of their own, directly after the description, labeled as
+your reading: nothing in it was checked except the defects it cites. Each corrected defect, and
+the build check line where that is corrected, carries a mark pointing at the correction. **No
+count changes.** The counts are the panel's own, and a correction that moved them would
+leave two runs' counts incomparable; the corrected ids are named beside them instead.
+`findings.json` does not carry the notes, and no finding is edited.
+
+The engine only reads this file, and `--rerender` never replaces it. A correction names a
+defect by id, and ids come from clustering: after a re-clustered run, check each id still names
+the defect you meant before re-rendering.
+
+## Handing the report to the owner
+
+Read `report.md` against the job. Then, before saying anything to the owner:
+
+1. Answer every question the owner asked — the job's `questions`, and any asked since —
+   citing the defects each answer rests on.
+   Record a correction for every finding or build check answer you can show is wrong, with the
+   reason, and a caveat for anything the owner should know about the run as a whole. All of it
+   goes in `report-notes.json`, not in the conversation. With none of the three, write no file.
+2. Run `<python> <this skill's dir>/review_panel.py report <rundir> --rerender`.
+3. Point the owner at `report.md` by path, with a line or two: the rung, the counts by status,
+   and what the notes answer or correct. Never inline a snapshot file, an evidence block or a
+   payload: the report is the record, and what you say is the pointer to it.

@@ -154,7 +154,7 @@ else:
     } for did in ids(r"\bD\d+\b", "\n## Your defects\n")], "summary": "one tier"}
 
 # Refusing by KIND rather than by count, so which units come back unusable does not depend
-# on the order two slots happened to be launched in. The schema is what says which kind this
+# on the order two lanes happened to be launched in. The schema is what says which kind this
 # unit is, and a reply the engine refuses is charged to the unit rather than to the provider.
 mode = control.get("mode")
 if set(schema.get("properties", {})) & set(control.get("refuse_for", ())):
@@ -175,7 +175,7 @@ transcript.write_text(body, encoding="utf-8")
 
 def _stub_mode(stub: Path, control: Path, deadline: float = 60.0,
                result_mode: str = "external-file") -> dict:
-    """One slot's command. ``deadline`` is the supervisor's bound on a single attempt, and
+    """One lane's command. ``deadline`` is the supervisor's bound on a single attempt, and
     it is the lever a test reaches for when it wants an attempt that cannot report to be
     classified quickly — see `test_a_killed_driver_resumes_with_no_unit_run_twice_and_none_lost`.
 
@@ -231,27 +231,34 @@ class _Case(unittest.TestCase):
     # -- fixtures ----------------------------------------------------------- #
     def write_adapter(self, deadline=60.0, result_mode="external-file", **over):
         mode = _stub_mode(self.stub, self.control, deadline, result_mode)
-        slots = {slot: {"runtime": f"stub-{slot}", "model": f"stub-model-{slot}",
-                        "adapter": f"stub slot {slot}", "read_only": mode,
-                        "write_capable": mode} for slot in review_panel.SLOTS}
-        for slot, extra in over.items():
-            slots[slot].update(extra)
-        self.adapter_path.write_text(json.dumps({"slots": slots}), encoding="utf-8")
+        lanes = {lane: {"runtime": f"stub-{lane}", "model": f"stub-model-{lane}",
+                        "adapter": f"stub lane {lane}", "slots": 2, "read_only": mode,
+                        "write_capable": mode} for lane in review_panel.LANES}
+        for lane, extra in over.items():
+            lanes[lane].update(extra)
+        self.adapter_path.write_text(json.dumps({"lanes": lanes}), encoding="utf-8")
+
+    def set_slots(self, slots):
+        """Every lane of the adapter config on disk, at ``slots`` workers at once."""
+        raw = json.loads(self.adapter_path.read_text(encoding="utf-8"))
+        for lane in raw["lanes"].values():
+            lane["slots"] = slots
+        self.adapter_path.write_text(json.dumps(raw), encoding="utf-8")
 
     def write_control(self, **kw):
         self.control.write_text(json.dumps(kw), encoding="utf-8")
 
-    def failing_slot(self, **control):
-        """One slot's command, pointed at a control file **of its own**.
+    def failing_lane(self, **control):
+        """One lane's command, pointed at a control file **of its own**.
 
         Its own, because the stub counts its launches beside its control file: sharing one
-        with the working slot would count both slots' launches together and make which unit
+        with the working lane would count both lanes' launches together and make which unit
         died depend on the order the two were launched in. With no argument every reply
         comes back unusable, which is the shape that spends a unit's allowances on the unit
         rather than pausing the provider — a launch that exits non-zero instead trips the
         breaker, which is a pause and a different ending.
         """
-        where = self.tmp / "failing-slot"
+        where = self.tmp / "failing-lane"
         where.mkdir(exist_ok=True)
         path = where / "control.json"
         path.write_text(json.dumps(control or {"mode": "refused"}), encoding="utf-8")
@@ -273,7 +280,7 @@ class _Case(unittest.TestCase):
         proc = subprocess.run(
             [sys.executable, str(_DRIVER), "--job", str(self.job_path),
              "--rundir", str(self.rundir), "--adapter", str(self.adapter_path),
-             "--poll", "0.1", "--capacity", "2", *extra],
+             "--poll", "0.1", *extra],
             capture_output=True, encoding="utf-8", errors="replace", timeout=timeout)
         if expect is not None:
             self.assertEqual(proc.returncode, expect, proc.stdout + proc.stderr)
@@ -285,7 +292,7 @@ class _Case(unittest.TestCase):
         proc = subprocess.Popen(
             [sys.executable, str(_DRIVER), "--job", str(self.job_path),
              "--rundir", str(self.rundir), "--adapter", str(self.adapter_path),
-             "--poll", "0.1", "--capacity", "2", *extra],
+             "--poll", "0.1", *extra],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             encoding="utf-8", errors="replace")
         self.addCleanup(self._reap, proc)
@@ -308,6 +315,8 @@ class _Case(unittest.TestCase):
     def run_object(self, **kw):
         """A :class:`Run` over this case's run directory, writing nowhere anyone reads."""
         import io
+        if "slots" in kw:
+            self.set_slots(kw.pop("slots"))
         return driver.Run(self.rundir, driver.load_adapter_config(self.adapter_path),
                           _SUPERVISOR, out=io.StringIO(), **kw)
 
@@ -327,7 +336,7 @@ class _Case(unittest.TestCase):
         path = self.rundir / "dispatch" / unit / f"a{index}"
         path.mkdir(parents=True, exist_ok=True)
         if argv:
-            record = {"argv": ["x"], "adapter": "stub", "slot": "A", "account": "stub",
+            record = {"argv": ["x"], "adapter": "stub", "lane": "A", "account": "stub",
                       "generation": 0, "permission": "none", "cwd": str(self.rundir),
                       "kind": "reader", "probe": False,
                       "spawn_time": time.time() if spawn_time is None else spawn_time,
@@ -376,11 +385,11 @@ class _Case(unittest.TestCase):
         """
         self.rundir.mkdir(parents=True, exist_ok=True)
         (self.rundir / "units.json").write_text(json.dumps({
-            "stage": stage, "slots": list(review_panel.SLOTS),
-            "units": [{"id": uid, "kind": "reader", "slot": slot, "area": "area-01",
-                       "lens": "a lens"} for uid, slot in units],
+            "stage": stage, "lanes": list(review_panel.LANES),
+            "units": [{"id": uid, "kind": "reader", "lane": lane, "area": "area-01",
+                       "lens": "a lens"} for uid, lane in units],
         }), encoding="utf-8")
-        for uid, _slot in units:
+        for uid, _lane in units:
             unit_dir = self.rundir / "units" / uid
             unit_dir.mkdir(parents=True, exist_ok=True)
             (unit_dir / review_panel.PAYLOAD_NAME).write_text(
@@ -524,7 +533,7 @@ class TheRunHasOneOwner(_Case):
             return real(argv)
 
         run = driver.Run(self.rundir, driver.load_adapter_config(self.adapter_path),
-                         _SUPERVISOR, out=io.StringIO(), poll=0.05, capacity=2)
+                         _SUPERVISOR, out=io.StringIO(), poll=0.05)
         with driver.RunLock(Path(str(self.rundir) + driver.LOCK_SUFFIX)):
             with mock.patch.object(review_panel, "main", watching):
                 run.loop()
@@ -685,22 +694,80 @@ class TheAdapterConfigIsData(_Case):
 
     def test_a_command_carrying_no_task_is_refused(self):
         def mutate(raw):
-            raw["slots"]["A"]["read_only"]["command"] = ["prog", "--schema", "⟪schema⟫"]
+            raw["lanes"]["A"]["read_only"]["command"] = ["prog", "--schema", "⟪schema⟫"]
         self.assertIn("carries no task", self.parse(mutate))
 
     def test_a_marker_the_driver_never_fills_is_refused_naming_it(self):
         def mutate(raw):
-            raw["slots"]["B"]["write_capable"]["command"] = ["prog", "⟪prompt⟫", "⟪nonsense⟫"]
+            raw["lanes"]["B"]["write_capable"]["command"] = ["prog", "⟪prompt⟫", "⟪nonsense⟫"]
         message = self.parse(mutate)
         self.assertIn("⟪nonsense⟫", message)
 
-    def test_a_missing_slot_is_refused(self):
-        self.assertIn("missing slot", self.parse(lambda raw: raw["slots"].pop("B")))
+    def test_a_missing_lane_is_refused(self):
+        self.assertIn("missing lane", self.parse(lambda raw: raw["lanes"].pop("B")))
 
     def test_a_missing_permission_mode_is_refused(self):
         def mutate(raw):
-            raw["slots"]["A"].pop("write_capable")
+            raw["lanes"]["A"].pop("write_capable")
         self.assertIn("write_capable", self.parse(mutate))
+
+    def test_slots_defaults_to_two_and_must_be_a_whole_number_of_at_least_one(self):
+        raw = json.loads(self.adapter_path.read_text(encoding="utf-8"))
+        del raw["lanes"]["A"]["slots"]
+        lanes = driver.parse_adapter_config(raw)
+        self.assertEqual((lanes["A"].slots, lanes["A"].slots_stated), (2, False))
+        self.assertTrue(lanes["B"].slots_stated)
+        for bad in (0, -1, 1.5, True, "4"):
+            with self.subTest(slots=bad):
+                message = self.parse(lambda raw: raw["lanes"]["B"].update(slots=bad))
+                self.assertIn("lanes.B.slots", message)
+
+    def test_a_resume_may_change_the_slots(self):
+        """The slots are the account's rate limit, not a fact the report describes, so a
+        run that hit a quota can be resumed with fewer."""
+        self.plan_only()
+        self.set_slots(1)
+        self.drive()
+
+    def test_the_preview_shows_each_lanes_slots_and_the_run_wide_writer_limit(self):
+        """A defaulted lane says so, because a default nobody sees decides how long the run
+        takes without anybody choosing it."""
+        self.set_slots(3)
+        raw = json.loads(self.adapter_path.read_text(encoding="utf-8"))
+        del raw["lanes"]["B"]["slots"]
+        self.adapter_path.write_text(json.dumps(raw), encoding="utf-8")
+        proc = self.drive()
+        self.assertIn("lane A: 3 slot(s);", proc.stdout)
+        self.assertIn("lane B: 2 slot(s) (the default; set slots to change it);", proc.stdout)
+        self.assertIn("run one at a time across both lanes", proc.stdout)
+
+    def test_the_preview_says_how_many_files_outside_the_scope_are_copied(self):
+        """Any worker may open anything in the snapshot, so a lockfile outside the review
+        that is copied for the build is said before anything runs."""
+        self.plan_only()
+        lanes = driver.load_adapter_config(self.adapter_path)
+        self.assertNotIn("outside the review's scope", driver._preview(self.rundir, lanes))
+        path = self.rundir / "inventory.json"
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        doc["context"] = [{"path": "vendor/a.lock"}, {"path": "vendor/b.py"}]
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        self.assertIn(review_panel.COPIED_OUTSIDE_SCOPE_LINE.format(n=2),
+                      driver._preview(self.rundir, lanes))
+
+    def test_a_run_started_with_go_says_it_too(self):
+        """`--go` prints no preview, so the one line of it about what leaves the machine is
+        printed on that path as well."""
+        if shutil.which("git") is None:
+            self.skipTest("git is not installed")
+        (self.root / "package-lock.json").write_text("{}\n", encoding="utf-8")
+        git = ["git", "-C", str(self.root), "-c", "user.name=t", "-c", "user.email=t@e.invalid"]
+        for argv in (["init", "-q"], ["add", "."], ["commit", "-q", "-m", "fixture"]):
+            subprocess.run(git + argv, check=True, capture_output=True)
+        job = json.loads(self.job_path.read_text(encoding="utf-8"))
+        job["exclude"] = ["package-lock.json"]
+        self.job_path.write_text(json.dumps(job), encoding="utf-8")
+        proc = self.drive("--go")
+        self.assertIn(review_panel.COPIED_OUTSIDE_SCOPE_LINE.format(n=1), proc.stdout)
 
     def test_a_resume_with_a_different_configuration_is_refused(self):
         self.plan_only()
@@ -709,20 +776,20 @@ class TheAdapterConfigIsData(_Case):
         self.assertIn("pins a different adapter configuration", proc.stderr)
 
     def test_the_dispatch_record_states_both_permission_modes_and_the_model(self):
-        slots = driver.load_adapter_config(self.adapter_path)
-        record = driver.dispatch_record(slots)
+        lanes = driver.load_adapter_config(self.adapter_path)
+        record = driver.dispatch_record(lanes)
         self.assertEqual(record["rung"], review_panel.RUNG_TWO_RUNTIMES)
-        self.assertIn("stub-model-A", record["slots"]["A"]["adapter"])
-        self.assertIn("read-only units", record["slots"]["A"]["permission"])
-        self.assertIn("write-capable units", record["slots"]["A"]["permission"])
+        self.assertIn("stub-model-A", record["lanes"]["A"]["adapter"])
+        self.assertIn("read-only units", record["lanes"]["A"]["permission"])
+        self.assertIn("write-capable units", record["lanes"]["A"]["permission"])
         review_panel.parse_dispatch(record)   # the engine's own strict parse
 
-    def test_one_runtime_on_both_slots_is_a_one_runtime_rung(self):
-        slots = driver.load_adapter_config(self.adapter_path)
-        slots["B"] = type(slots["B"])(runtime=slots["A"].runtime, model=slots["A"].model,
-                                      account=slots["A"].account, adapter="a second context",
-                                      modes=slots["B"].modes)
-        self.assertEqual(driver.dispatch_record(slots)["rung"],
+    def test_one_runtime_on_both_lanes_is_a_one_runtime_rung(self):
+        lanes = driver.load_adapter_config(self.adapter_path)
+        lanes["B"] = type(lanes["B"])(runtime=lanes["A"].runtime, model=lanes["A"].model,
+                                      account=lanes["A"].account, adapter="a second context",
+                                      modes=lanes["B"].modes)
+        self.assertEqual(driver.dispatch_record(lanes)["rung"],
                          review_panel.RUNG_ONE_RUNTIME)
 
 
@@ -828,7 +895,7 @@ class OneAuthorizedActiveAttemptPerUnit(_Case):
         """Capacity is not authorization. A retry is authorized by the preceding attempt's
         disposition and by nothing else, so another unit finishing must never start one."""
         self.attempt("u1", 0)
-        run = self.run_object(capacity=4)
+        run = self.run_object(slots=4)
         self.assertFalse(run.eligible("u1"))
         self.assertEqual(run.reserving()["A"], 1)
 
@@ -854,11 +921,11 @@ class OneAuthorizedActiveAttemptPerUnit(_Case):
         self.assertFalse(self.run_object().eligible("u1"))
 
     def test_an_uncertain_attempt_keeps_its_capacity_reservation(self):
-        """The worker may still be alive, so the slot it is using is still spoken for."""
+        """The worker may still be alive, so the lane it is using is still spoken for."""
         self.attempt("u1", 0, spawn_time=time.time() - 10_000)
         self.assertEqual(self.run_object().reserving()["A"], 1)
 
-    def test_the_slot_and_the_writer_count_never_disagree(self):
+    def test_the_lane_and_the_writer_count_never_disagree(self):
         """One predicate, asked by both. Two spellings of "may still be running" let an
         operator-failed writer with no attestation hold a slot while the count of running
         writers ignored it — so a second reproduction could start beside a worker that may
@@ -877,7 +944,7 @@ class OneAuthorizedActiveAttemptPerUnit(_Case):
         run = self.run_object()
         self.assertEqual(run.reserving()["A"], 1)
         self.assertEqual(run.writers_running(), 1,
-                         "a slot was reserved for a writer the writer count ignored")
+                         "a lane was reserved for a writer the writer count ignored")
         # A late status proves that worker finished, and BOTH have to let go of it.
         (path / "status.txt").write_text('{"status": "ok"}\n', encoding="utf-8")
         run = self.run_object()
@@ -1194,7 +1261,7 @@ class OperatorReconciliation(_Case):
     def test_fail_requires_the_attestation_like_retry_and_then_releases_the_reservation(self):
         """A `--fail` that keeps the capacity reservation without the attestation -- because
         execution may continue -- is a reservation nothing can release. At the default of
-        one worker per slot that holds the slot for the rest of the run: every later unit
+        one slot per lane that stops the lane for the rest of the run: every later unit
         on it refused on every resume, the only way out failing each by hand. The operator
         has the same two answers either way, so the command asks for one of them up front."""
         self.attempt("u1", 0, spawn_time=time.time() - 10_000)
@@ -1340,7 +1407,7 @@ class OperatorReconciliation(_Case):
 
     def test_resolve_unit_fail_needs_the_attestation_while_an_attempt_is_unaccounted_for(self):
         """The reservation belongs to the attempt, not the unit. A unit failed over an
-        `uncertain` attempt published its error and left that attempt holding the slot's
+        `uncertain` attempt published its error and left that attempt holding the lane's
         capacity for the rest of the run, because nothing said its worker was gone. The
         command asks for the same attestation `resolve-attempt --fail` asks for, and with
         it fails the attempt as well, so the slot comes free."""
@@ -1544,7 +1611,7 @@ class AFullRun(_Case):
                          "a reported run dispatched something")
 
     def test_no_worker_visible_argument_carries_the_unit_name(self):
-        """A verification unit is named for the area and the slot that RAISED its
+        """A verification unit is named for the area and the lane that RAISED its
         candidates, so the finder's identity is in the unit's own directory name. Every
         path a worker is handed — its payload, its schema and its working directory — is an
         opaque token instead."""
@@ -1648,7 +1715,7 @@ class RecoveryTheOwnerIsTheOnlyOneThatCanDo(_Case):
             [sys.executable, str(_DRIVER), "--job", str(self.job_path),
              "--rundir", str(self.rundir), "--adapter", str(self.adapter_path),
              "--supervisor", "sup/review_runner.py", "--go",
-             "--poll", "0.1", "--capacity", "2", "--grace", "0"],
+             "--poll", "0.1", "--grace", "0"],
             cwd=str(self.tmp), capture_output=True, encoding="utf-8", errors="replace",
             timeout=300)
         self.assertEqual(proc.returncode, driver.EXIT_OK, proc.stdout + proc.stderr)
@@ -1765,7 +1832,7 @@ class TheLoopAndItsStops(_Case):
         once before iterating, this program announces that nothing more will be claimed and
         then fills the whole configured capacity anyway."""
         self.drive()
-        run = self.run_object(capacity=8, poll=0.01)
+        run = self.run_object(slots=8, poll=0.01)
         started = []
 
         def spawning(self_run, unit, probe=False):
@@ -1789,7 +1856,7 @@ class TheLoopAndItsStops(_Case):
         preparation runs here — a test that replaces `spawn()` wholesale cannot see this
         window at all, which is why the batch test missed it."""
         self.drive()
-        run = self.run_object(capacity=4, poll=0.01)
+        run = self.run_object(slots=4, poll=0.01)
         prepared = []
         real = driver.prepare_worker_paths
 
@@ -1940,7 +2007,7 @@ class TheLoopAndItsStops(_Case):
         proc = subprocess.Popen(
             [sys.executable, str(_DRIVER), "--job", str(self.job_path),
              "--rundir", str(alias), "--adapter", str(self.adapter_path), "--go",
-             "--poll", "0.1", "--capacity", "2"],
+             "--poll", "0.1"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             encoding="utf-8", errors="replace")
         self.addCleanup(self._reap, proc)
@@ -1968,7 +2035,7 @@ class TheLoopAndItsStops(_Case):
         resumed = subprocess.run(
             [sys.executable, str(_DRIVER), "--job", str(self.job_path),
              "--rundir", str(alias), "--adapter", str(self.adapter_path), "--go",
-             "--poll", "0.1", "--capacity", "2"],
+             "--poll", "0.1"],
             capture_output=True, encoding="utf-8", errors="replace", timeout=300)
         self.assertEqual(resumed.returncode, driver.EXIT_OK,
                          resumed.stdout + resumed.stderr)
@@ -2129,15 +2196,16 @@ class TheLoopAndItsStops(_Case):
 
     def test_a_slot_held_by_an_unaccountable_attempt_stops_rather_than_spinning(self):
         """The reservation an `uncertain` or `orphan-claim` attempt keeps is one nothing
-        releases without an operator. At a capacity of one that leaves other units of the
-        same slot eligible and permanently unable to start — so a loop that waits for "no
+        releases without an operator. At one slot per lane that leaves other units of the
+        same lane eligible and permanently unable to start — so a loop that waits for "no
         unit is eligible" waits for ever, on a run that should stop and name the attempt
         nobody can account for."""
         self.drive()
         (self.rundir / "dispatch" / "area-01-A1" / "a0").mkdir(parents=True)
-        proc = self.drive("--go", "--capacity", "1", expect=driver.EXIT_STOPPED, timeout=90)
+        self.set_slots(1)
+        proc = self.drive("--go", expect=driver.EXIT_STOPPED, timeout=90)
         self.assertIn("stopped: area-01-A1", proc.stdout)
-        # The other slot-A units are open, not failed: nothing was landed for them.
+        # The other lane-A units are open, not failed: nothing was landed for them.
         for unit_id in ("audit-area-01-A", "probe-A"):
             self.assertIsNone(driver.landed(self.rundir, unit_id), unit_id)
 
@@ -2165,21 +2233,21 @@ class TheLoopAndItsStops(_Case):
                        - reading),
             "a unit outside the reading round was spawned after it failed whole")
 
-    def test_a_dead_slot_is_refused_before_the_rounds_that_cannot_rescue_it(self):
-        """**The refusal costs what it has to and nothing more.** A slot whose every unit
+    def test_a_dead_lane_is_refused_before_the_rounds_that_cannot_rescue_it(self):
+        """**The refusal costs what it has to and nothing more.** A lane whose every unit
         failed cannot be brought back by clustering or synthesis — neither round is
         addressed to it, and neither changes what it landed — so spending two more rounds
         of model time before saying so buys the operator nothing.
 
-        Slot A answers throughout and every one of slot B's replies is refused, so each of
+        Lane A answers throughout and every one of lane B's replies is refused, so each of
         its units spends its allowances and publishes an error. The verification round still
         runs, because every candidate A raised is addressed to B and B is where a recovery
         would show: that is the case the next test pins.
         """
-        mode = self.failing_slot()
+        mode = self.failing_lane()
         self.write_adapter(B={"read_only": mode, "write_capable": mode})
         proc = self.drive("--go", expect=driver.EXIT_REFUSED)
-        self.assertIn("slot B landed no unit", proc.stderr)
+        self.assertIn("lane B landed no unit", proc.stderr)
         self.assertEqual(
             [], list(self.rundir.glob(f"dispatch/{review_panel.CLUSTER_UNIT_PREFIX}*/*/argv.json")),
             "a clustering unit was dispatched after the run could no longer be reported")
@@ -2193,12 +2261,12 @@ class TheLoopAndItsStops(_Case):
     def test_a_run_killed_between_reading_and_routing_resumes_to_a_report(self):
         """**The same recovery, across a kill.** A resumed run enters the loop at the
         boundary the kill left it on, and at that boundary the reading round is finished and
-        `route` has not run — so the verification unit that answers for the silent slot does
-        not exist yet. A guard that reads the units as they stand there sees a slot with
+        `route` has not run — so the verification unit that answers for the silent lane does
+        not exist yet. A guard that reads the units as they stand there sees a lane with
         nothing landed and nothing pending and strands a run one step from the round that
         rescues it, which no uninterrupted run ever reveals.
         """
-        mode = self.failing_slot(refuse_for=["findings"])
+        mode = self.failing_lane(refuse_for=["findings"])
         self.write_adapter(B={"read_only": mode, "write_capable": mode})
         self.plan_only()
         killed = self.run_object(poll=0.05)
@@ -2222,26 +2290,26 @@ class TheLoopAndItsStops(_Case):
             "the kill landed before the reading round finished, which is a different case")
         self.assertEqual(
             [], [unit["id"] for unit in doc["units"]
-                 if unit["slot"] == "B"
+                 if unit["lane"] == "B"
                  and (driver.landed(self.rundir, unit["id"]) or {}).get("publication")
                  == "result"],
-            "slot B answered a reading unit, so this run is not the case being pinned")
+            "lane B answered a reading unit, so this run is not the case being pinned")
         # Resumed, with nothing patched: the same run directory has to reach its report.
         self.assertEqual(self.run_object(poll=0.05).loop(), driver.EXIT_OK)
         self.assertEqual(
             json.loads((self.rundir / "units.json").read_text(encoding="utf-8"))["stage"],
             review_panel.REPORTED_STAGE)
 
-    def test_a_slot_silent_in_reading_is_not_refused_while_a_verifier_could_land(self):
-        """The other half, and the one that decides where the check goes. A slot whose
+    def test_a_lane_silent_in_reading_is_not_refused_while_a_verifier_could_land(self):
+        """The other half, and the one that decides where the check goes. A lane whose
         readers all failed has landed nothing at the end of the reading round — and the
         verification round is exactly where it gets another unit, because every candidate
-        the other slot raised is addressed to it. Refusing on "landed nothing" alone would
+        the other lane raised is addressed to it. Refusing on "landed nothing" alone would
         end that run before the round that rescues it.
         """
         # Every unit answering `findings` — B's readers and its auditors — comes back
         # unusable; its verifiers, which answer `verdicts`, come back clean.
-        mode = self.failing_slot(refuse_for=["findings"])
+        mode = self.failing_lane(refuse_for=["findings"])
         self.write_adapter(B={"read_only": mode, "write_capable": mode})
         proc = self.drive("--go")
         self.assertIn("reported:", proc.stdout)
@@ -2257,9 +2325,9 @@ OUTAGE = "usage limit reached for this account"
 
 
 class _Providers(_Case):
-    """Two slots on one account, both declaring what that provider's refusal looks like.
+    """Two lanes on one account, both declaring what that provider's refusal looks like.
 
-    One account on purpose: a provider is what refuses, not a slot, so the two have to pause
+    One account on purpose: a provider is what refuses, not a lane, so the two have to pause
     together and these are the tests that would notice if they did not.
     """
 
@@ -2274,7 +2342,7 @@ class _Providers(_Case):
         for unit in ("u1", "u2", "u3"):
             (self.rundir / "units" / unit).mkdir(parents=True, exist_ok=True)
 
-    def failing(self, unit, index, *, detail=OUTAGE, generation=0, probe=False, slot="A",
+    def failing(self, unit, index, *, detail=OUTAGE, generation=0, probe=False, lane="A",
                 reason="reviewer exited 1", spawn_time=None, source="message"):
         """One attempt that reported a terminal failure, described the way the supervisor
         describes one: `reason` is the supervisor's own account of what it saw,
@@ -2283,7 +2351,7 @@ class _Providers(_Case):
         status = {"status": "error", "reason": reason, "terminal_detail": detail,
                   "terminal_detail_source": None if detail is None else source}
         return self.attempt(unit, index, spawn_time=spawn_time,
-                            argv={"generation": generation, "probe": probe, "slot": slot,
+                            argv={"generation": generation, "probe": probe, "lane": lane,
                                   "account": self.ACCOUNT},
                             status=json.dumps(status))
 
@@ -2311,7 +2379,7 @@ class OneIncidentHoweverManyAttemptsReportIt(_Providers):
 
     def test_every_attempt_in_flight_when_an_outage_begins_is_one_incident(self):
         for index, unit in enumerate(("u1", "u2", "u3")):
-            self.failing(unit, 0, slot="A" if unit != "u3" else "B")
+            self.failing(unit, 0, lane="A" if unit != "u3" else "B")
         run = self.adopted()
         state = self.state(run)
         self.assertTrue(state.paused, "three provider refusals paused nothing")
@@ -2332,11 +2400,11 @@ class OneIncidentHoweverManyAttemptsReportIt(_Providers):
         self.assertTrue(run.eligible("u1"),
                         "a unit the provider never answered spent an allowance")
 
-    def test_both_slots_of_one_account_pause_together(self):
-        self.failing("u1", 0, slot="A")
-        # Capacity 2, so slot A's own limit is not what stops the second unit of this
+    def test_both_lanes_of_one_account_pause_together(self):
+        self.failing("u1", 0, lane="A")
+        # Capacity 2, so lane A's own limit is not what stops the second unit of this
         # account and the pause is the only thing left that can.
-        run = self.adopted(capacity=2)
+        run = self.adopted(slots=2)
         reserved, probed, claims = run.reserving(), set(), []
         for unit in run.units():          # exactly what the round's pass does, in order
             claim, probe = run.claim_decision(unit, reserved, 0, run.providers(), probed)
@@ -2345,9 +2413,9 @@ class OneIncidentHoweverManyAttemptsReportIt(_Providers):
             claims.append((unit["id"], probe))
             if probe:
                 probed.add(self.ACCOUNT)
-            reserved[unit["slot"]] = reserved.get(unit["slot"], 0) + 1
-        # One claim across BOTH slots, and it is the probe: the account is what refused, so
-        # a unit on the other slot is no more claimable than the one that met the outage.
+            reserved[unit["lane"]] = reserved.get(unit["lane"], 0) + 1
+        # One claim across BOTH lanes, and it is the probe: the account is what refused, so
+        # a unit on the other lane is no more claimable than the one that met the outage.
         self.assertEqual(claims, [("u1", True)], f"the pause let {claims} through")
 
     def test_a_late_old_generation_failure_is_not_a_recurrence(self):
@@ -2382,7 +2450,7 @@ class ProbesAskOneQuestionAtATime(_Providers):
               status=True):
         path = self.attempt(
             unit, index, spawn_time=spawn_time, deadline=1.0,
-            argv={"generation": generation, "probe": True, "slot": "A",
+            argv={"generation": generation, "probe": True, "lane": "A",
                   "account": self.ACCOUNT},
             status='{"status": "ok"}' if status else None,
             disposition=None if outcome is None else
@@ -2481,7 +2549,7 @@ class UnexplainedFailuresPauseAProviderOnce(_Providers):
                          driver.WORKER_FAILED)
         self.assertEqual(self.state(run).paused, "")
 
-    def test_two_on_one_slot_pause_the_provider(self):
+    def test_two_on_one_lane_pause_the_provider(self):
         self.unexplained("u1", 0)
         self.unexplained("u2", 0)
         run = self.adopted()
@@ -2503,7 +2571,7 @@ class UnexplainedFailuresPauseAProviderOnce(_Providers):
         a flag nobody passed."""
         for index, unit in enumerate(("u1", "u2")):
             self.attempt(unit, 0,
-                         argv={"generation": 0, "probe": False, "slot": "A",
+                         argv={"generation": 0, "probe": False, "lane": "A",
                                "account": self.ACCOUNT},
                          status='{"status": "error", "reason": "reviewer exited 1"}')
         run = self.adopted()
@@ -2559,7 +2627,7 @@ class ADrainedProviderIsRetriedWhenTheRunIsStartedAgain(_Providers):
     def drained(self):
         """A paused provider whose probe found it still refusing: the run stops."""
         self.failing("u1", 0)
-        self.attempt("u2", 0, argv={"generation": 0, "probe": True, "slot": "A",
+        self.attempt("u2", 0, argv={"generation": 0, "probe": True, "lane": "A",
                                     "account": self.ACCOUNT},
                      status='{"status": "ok"}',
                      disposition={"attempt": "a0", "outcome": driver.PROVIDER_UNAVAILABLE,
@@ -2606,7 +2674,7 @@ class ADrainedProviderIsRetriedWhenTheRunIsStartedAgain(_Providers):
         self.drained()
         run = self.run_object(probe_backoff=0.0)
         run.reset_drained_providers()
-        self.failing("u3", 0, generation=1, slot="B")
+        self.failing("u3", 0, generation=1, lane="B")
         run.adopt()
         self.assertIn("recurrence", run.providers()[self.ACCOUNT].drain)
         self.assertTrue(run.draining)
@@ -2656,10 +2724,10 @@ class WhatTheSupervisorCouldNotHold(_Case):
         self.assertEqual(record["outcome"], driver.INFRASTRUCTURE)
 
     def test_a_supervisor_that_could_not_start_a_worker_is_infrastructure_and_stops_the_run(self):
-        """The slot's command names a program that is not there. The supervisor says so in
+        """The lane's command names a program that is not there. The supervisor says so in
         its own words before any worker ran; filed as a worker failure that spent every
-        unit's launch allowance on the slot and ended the run in the one refusal that cannot
-        be resumed, taking the other slot's finished work with it. Nobody's answer: charged
+        unit's launch allowance on the lane and ended the run in the one refusal that cannot
+        be resumed, taking the other lane's finished work with it. Nobody's answer: charged
         to nobody, and the run stops where the adapter can be fixed and the run continued."""
         path = self.attempt("u1", 0, status=json.dumps(
             {"status": "error", "reason": "reviewer CLI not found on PATH: codx"}))
@@ -2699,7 +2767,7 @@ class WhatTheSupervisorCouldNotHold(_Case):
         recorded = {}
         with mock.patch.object(driver.subprocess, "Popen",
                                side_effect=OSError("not today")):
-            run.spawn({"id": "u1", "kind": "reader", "slot": "A"})
+            run.spawn({"id": "u1", "kind": "reader", "lane": "A"})
         recorded = json.loads(
             (self.rundir / "dispatch" / "u1" / "a0" / "argv.json").read_text("utf-8"))
         self.assertIn("--status-detail", recorded["argv"])
@@ -2709,7 +2777,7 @@ class WhatTheSupervisorCouldNotHold(_Case):
 class ASupervisorThatExitsWithoutAStatusIsAnEndedExecution(_Case):
     """The attempt's state is read from disk, where a supervisor that died before printing
     its status line looks exactly like one still working: `running` until its deadline
-    and grace pass, an hour at the defaults, with every later attempt on the slot waiting
+    and grace pass, an hour at the defaults, with every later attempt on the lane waiting
     behind a process that is not there. A supervisor that rejects a flag the driver passes
     does that to every attempt. The driver is the one process that can see the exit, so it
     is the one that writes the record, with the exit code and the end of stderr."""
@@ -2836,11 +2904,12 @@ class AnOutageInARealRound(_Case):
     def test_a_provider_that_refuses_pauses_rather_than_failing_every_unit(self):
         self.write_adapter(result_mode="stream-transcript")
         self.write_control(outage="usage limit reached for this account")
-        for slot in review_panel.SLOTS:
+        for lane in review_panel.LANES:
             raw = json.loads(self.adapter_path.read_text(encoding="utf-8"))
-            raw["slots"][slot]["provider_fault_patterns"] = ["usage limit"]
+            raw["lanes"][lane]["provider_fault_patterns"] = ["usage limit"]
             self.adapter_path.write_text(json.dumps(raw), encoding="utf-8")
-        proc = self.drive("--go", "--probe-backoff", "0", "--capacity", "1",
+        self.set_slots(1)
+        proc = self.drive("--go", "--probe-backoff", "0",
                           expect=driver.EXIT_OK, timeout=300)
         self.assertIn("is paused", proc.stdout, proc.stdout + proc.stderr)
         self.assertIn("draining", proc.stdout)
@@ -2884,24 +2953,24 @@ class ThePathSaysWhatRanIt(_Case):
 
     def record(self):
         run = self.run_object()
-        return driver.dispatch_record(run.slots, driver.executed_provenance(run))
+        return driver.dispatch_record(run.lanes, driver.executed_provenance(run))
 
     def refusal(self):
-        """The message a run that reached one slot is refused with. It carries the same
-        provenance a record would have carried, because that is what says WHICH slot and
+        """The message a run that reached one lane is refused with. It carries the same
+        provenance a record would have carried, because that is what says WHICH lane and
         what became of it."""
         with self.assertRaises(driver.DriverError) as ctx:
             self.record()
         return str(ctx.exception)
 
-    def test_a_slot_that_never_executed_says_so_rather_than_saying_nothing(self):
+    def test_a_lane_that_never_executed_says_so_rather_than_saying_nothing(self):
         self.land("u1")
         message = self.refusal()
         self.assertIn("configured, never executed", message)
         self.assertIn("stub-model-B", message,
                       "the configured model went missing with the attempts")
 
-    def test_a_slot_whose_every_attempt_failed_is_not_a_slot_that_landed(self):
+    def test_a_lane_whose_every_attempt_failed_is_not_a_lane_that_landed(self):
         self.land("u1")
         for index in range(3):
             self.attempt("u2", index, status='{"status": "error"}',
@@ -2911,9 +2980,9 @@ class ThePathSaysWhatRanIt(_Case):
         message = self.refusal()
         self.assertIn("3 attempt(s) executed, 0 unit(s) landed", message)
 
-    def test_a_run_that_reached_one_slot_is_refused_and_names_the_slot(self):
-        """**One usable slot is a refusal, not a rung.** Rule 3 is that a finding goes to a
-        unit that did not raise it; a run whose second slot landed nothing checked every
+    def test_a_run_that_reached_one_lane_is_refused_and_names_the_lane(self):
+        """**One usable lane is a refusal, not a rung.** Rule 3 is that a finding goes to a
+        unit that did not raise it; a run whose second lane landed nothing checked every
         finding where it was raised. There is no sentence a report could write about that
         which is worth reading, so the run is refused by name and nothing is rendered."""
         self.land("u1")
@@ -2923,9 +2992,9 @@ class ThePathSaysWhatRanIt(_Case):
         self.assertNotIn("rung", message.lower(),
                          "the refusal offered a rung for the thing that has none")
 
-    def test_both_slots_landing_is_what_a_record_needs(self):
+    def test_both_lanes_landing_is_what_a_record_needs(self):
         """The other half of the same rule: the refusal is keyed to what LANDED, so a run
-        where both slots answered a unit still gets its record."""
+        where both lanes answered a unit still gets its record."""
         self.land("u1")
         self.land("u2")
         review_panel.parse_dispatch(self.record())
@@ -2933,8 +3002,8 @@ class ThePathSaysWhatRanIt(_Case):
     def test_a_launch_that_never_started_is_not_an_execution(self):
         """`argv.json` is written BEFORE the launch, so an attempt whose supervisor could
         not be started leaves a complete spawn record and ran nothing. Counted as an
-        execution, a slot whose every launch raised reads as a slot that worked — and §6.4
-        asks that exact slot to read as configured and never executed."""
+        execution, a lane whose every launch raised reads as a lane that worked — and §6.4
+        asks that exact lane to read as configured and never executed."""
         self.land("u1")
         for index in range(2):
             self.attempt("u2", index,
@@ -2982,8 +3051,8 @@ class ThePathSaysWhatRanIt(_Case):
 
     def test_a_published_error_is_not_a_unit_that_landed(self):
         """`error.txt` is a publication and it names the attempt that produced it. Read as a
-        landing it says this slot answered a unit, and the run would be reported as two
-        independent readings where one slot produced no answer at all."""
+        landing it says this lane answered a unit, and the run would be reported as two
+        independent readings where one lane produced no answer at all."""
         self.land("u1")
         self.attempt("u2", 0, status='{"status": "error"}',
                      disposition={"attempt": "a0", "unit": "u2",
@@ -2997,7 +3066,7 @@ class ThePathSaysWhatRanIt(_Case):
         self.assertIn("1 attempt(s) executed, 0 unit(s) landed", message)
         self.assertIn("landed no unit", message)
 
-    def test_two_slots_that_landed_keep_the_rung_they_were_configured_at(self):
+    def test_two_lanes_that_landed_keep_the_rung_they_were_configured_at(self):
         self.land("u1")
         self.land("u2")
         record = self.record()
@@ -3006,14 +3075,14 @@ class ThePathSaysWhatRanIt(_Case):
 
     def test_both_permission_modes_are_stated_and_the_unused_one_says_so(self):
         """Readers run read-only and a verifier runs in a writable copy, so one winner's
-        permission cannot stand for the slot."""
+        permission cannot stand for the lane."""
         self.land("u1")
         self.land("u2")
-        permission = self.record()["slots"]["A"]["permission"]
+        permission = self.record()["lanes"]["A"]["permission"]
         self.assertIn("read-only units", permission)
         self.assertIn("write-capable units", permission)
         self.assertIn("(none ran)", permission,
-                      "a slot that never ran a write-capable unit claimed it had")
+                      "a lane that never ran a write-capable unit claimed it had")
 
     def test_two_models_on_one_runtime_are_refused_before_anything_is_planned(self):
         """The report describes a one-runtime run as checked by the same model, and that
@@ -3104,7 +3173,7 @@ class AStorageFaultNeverAdjudicatesAUnit(_Case):
         self.write_adapter(
             A={"account": "acct", "provider_fault_patterns": ["usage limit"]},
             B={"account": "acct", "provider_fault_patterns": ["usage limit"]})
-        self.attempt("u1", 0, argv={"account": "acct", "slot": "A"}, status=json.dumps({
+        self.attempt("u1", 0, argv={"account": "acct", "lane": "A"}, status=json.dumps({
             "status": "error", "reason": "reviewer exited 1",
             "terminal_detail": f"usage limit note while writing: {ENOSPC_TEXT}"}))
         run = self.run_object()
@@ -3419,6 +3488,21 @@ class TheSnapshotIsEvidenceOnlyWhileItIsUnchanged(_Case):
             self.run_object().check_snapshot()
         self.assertIn(rel, str(ctx.exception))
 
+    def test_a_file_carried_only_for_the_build_is_checked_like_the_rest(self):
+        """A rewritten lockfile changes what every later build installs, so the files the
+        snapshot carries for the build and nobody reviews are held to the same digests."""
+        path = self.rundir / "inventory.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        moved = data["files"].pop()
+        data["context"].append(moved)
+        path.write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(driver.verify_snapshot(self.rundir), [])
+        target = self.snapshot / moved["path"]
+        self.unlock(target)
+        target.write_text("resolved to another version\n", encoding="utf-8")
+        self.assertIn(f"{moved['path']} was rewritten after it was measured",
+                      driver.verify_snapshot(self.rundir))
+
     def test_a_file_added_beside_the_measured_ones_is_caught(self):
         self.unlock(self.snapshot)
         (self.snapshot / "extra.py").write_text("import os\n", encoding="utf-8")
@@ -3695,8 +3779,8 @@ class TheRoundThatPublishesIsVerifiedToo(_Case):
         super().setUp()
         # One synthesizer round away from the report, with its unit already landed, so the
         # round dispatches nothing and the only thing between here and `report` is the
-        # check this asks about. A verifier landed on the other slot beside it, because a
-        # run that reached only one slot is refused before `report` and this class is about
+        # check this asks about. A verifier landed on the other lane beside it, because a
+        # run that reached only one lane is refused before `report` and this class is about
         # the snapshot check rather than about that refusal.
         self.fake_units(("s1", "A"), ("v1", "B"), stage=review_panel.SYNTHESIZED_STAGE)
         doc = json.loads((self.rundir / "units.json").read_text(encoding="utf-8"))
@@ -3820,7 +3904,7 @@ class TheCopyIsTheArchive(_Case):
         path = self.attempt(unit, 0, status=status, disposition=record,
                             resolution=resolution,
                             argv={"token": token, "kind": review_panel.VERIFIER_KIND,
-                                  "slot": "B"})
+                                  "lane": "B"})
         (path / "reply.json").write_text(json.dumps({
             "verdicts": [{"candidate": f"cand-{self.UNITS.index(unit) + 1:03d}",
                           "status": "reproduced", "evidence": evidence}],
@@ -4110,7 +4194,7 @@ class TheSynthesizerGetsACopyLikeEveryOtherWriter(_Case):
     is only true if this driver gives it a copy.
 
     Given the snapshot instead, the worker does what its brief says and the writes land in
-    the tree every other unit of the run was measured against — and one slot's read-only
+    the tree every other unit of the run was measured against — and one lane's read-only
     mode does not stop it, because `references/dispatch.md` records that it blocks the edit
     tools and not a shell command the worker runs. The next snapshot check then refuses the
     whole run, after every reading and verification round has been paid for. The probe and
@@ -4148,7 +4232,7 @@ class TheSynthesizerGetsACopyLikeEveryOtherWriter(_Case):
         path = self.attempt(unit, 0, status=over.pop("status", '{"status": "ok"}'),
                             disposition=record,
                             argv={"token": token, "kind": review_panel.SYNTHESIZER_KIND,
-                                  "slot": "A"}, **over)
+                                  "lane": "A"}, **over)
         (path / "reply.json").write_text(reply, encoding="utf-8")
         (self.rundir / "units" / unit / review_panel.RESULT_NAME).write_text(
             '{"tiers": [], "defects": [], "summary": "x"}', encoding="utf-8")
@@ -4181,7 +4265,7 @@ class TheSynthesizerGetsACopyLikeEveryOtherWriter(_Case):
                          "a synthesis worker's writes reached the snapshot, which refuses "
                          "the run at the next check")
 
-    def test_the_synthesis_unit_is_launched_with_the_slots_write_capable_command(self):
+    def test_the_synthesis_unit_is_launched_with_the_lanes_write_capable_command(self):
         """The copy is half of it. A worker launched under the read-only command line is
         one whose runtime refuses the writes its brief told it to make, so the round fails
         on a permission rather than on anything about the defects."""
@@ -4199,7 +4283,7 @@ class TheSynthesizerGetsACopyLikeEveryOtherWriter(_Case):
         record = json.loads((self.rundir / "dispatch" / "s1" / "a0" / "argv.json")
                             .read_text(encoding="utf-8"))
         self.assertEqual(record["permission"], "the write-capable permission",
-                         "the synthesis unit ran under the slot's read-only permission")
+                         "the synthesis unit ran under the lane's read-only permission")
         self.assertIn(marker, record["argv"])
         self.assertEqual(driver._resolved(Path(record["cwd"]).parent),
                          driver._resolved(self.rundir / "work"),
@@ -4214,7 +4298,7 @@ class TheSynthesizerGetsACopyLikeEveryOtherWriter(_Case):
         self.assertFalse(held, "a synthesis unit was claimed beside a running writer")
         free, _probe = run.claim_decision(run.unit_row("s1"), {}, 0, run.providers(), set())
         self.assertTrue(free, "the writer count, and not something else, held it back")
-        self.attempt("s2", 0, argv={"token": "0" * 16, "slot": "A",
+        self.attempt("s2", 0, argv={"token": "0" * 16, "lane": "A",
                                     "kind": review_panel.SYNTHESIZER_KIND})
         self.assertEqual(self.run_object().writers_running(), 1,
                          "a synthesis attempt in flight was not counted as a writer")
@@ -4238,7 +4322,7 @@ class TheSynthesizerGetsACopyLikeEveryOtherWriter(_Case):
         token, work = self.prepared("s1")
         self.attempt("s1", 0, status=None,
                      argv={"token": token, "kind": review_panel.SYNTHESIZER_KIND,
-                           "slot": "A"},
+                           "lane": "A"},
                      resolution={"action": "fail", "reason": "nobody could account for it",
                                  "stopped_confirmed": False},
                      disposition={"attempt": "a0", "unit": "s1",
@@ -4453,7 +4537,7 @@ class AStageReadThatFailedIsNotAFailedUnit(_Case):
 
         **The attempt record goes in beside the landing**, because that is the only shape a
         real run produces: `landed.json` names the disposition that published the answer,
-        and a run whose slots have no proven execution anywhere is one the driver refuses at
+        and a run whose lanes have no proven execution anywhere is one the driver refuses at
         the boundary before it dispatches. Landing without one would be testing the storage
         fault against a run directory no run could have left.
         """
@@ -4584,6 +4668,8 @@ class AnUnreadableThingIsNotAnAbsentThing(_Case):
         """
         (self.rundir / "areas.json").write_text(json.dumps(
             {"areas": [{"id": "area-01", "files": ["a.py"]}]}), encoding="utf-8")
+        (self.rundir / "inventory.json").write_text(json.dumps({"context": []}),
+                                                    encoding="utf-8")
         reply = '{"findings": [], "summary": "read the area"}'
         self.attempt("u1", 0, status='{"status": "ok"}', transcript=reply)
         with _refusing("read_text", "areas.json",
@@ -4690,7 +4776,7 @@ class AnUnreadableThingIsNotAnAbsentThing(_Case):
 
     def test_a_launch_that_never_happened_holds_no_slot_and_protects_no_copy(self):
         """Whatever it is adjudicated as, nothing started — so the attempt must not reserve
-        its slot or carry a protected working directory to the end of the run, waiting on a
+        its lane or carry a protected working directory to the end of the run, waiting on a
         worker that does not exist."""
         for exc, outcome in ((OSError(errno.EIO, "Input/output error"),
                               driver.INFRASTRUCTURE),

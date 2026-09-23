@@ -304,7 +304,7 @@ it has nothing to signal and no list of children to signal it with. A worker the
 spawned belongs to the harness and is the harness's to end. A worker launched through the
 supervising program is bounded by that program's deadline, which collects it eventually
 rather than promptly — and only while that program is itself alive, which the rung decides:
-where both slots are contexts of the host, no supervisor is in the picture at all and no
+where both lanes are contexts of the host, no supervisor is in the picture at all and no
 deadline applies to either. And the instruction that would do the collecting would have to
 run after the thing that would execute it has been stopped, which is the one moment no prose
 in a skill file runs. Writing a clean-up step anyway would be a promise the run cannot keep,
@@ -594,3 +594,46 @@ to the appendix to find out is reading numbers they cannot interpret where they 
 **What would change it.** A reader who cannot follow a pointer, which is a different document
 from this one. Shortening the pointer to a bare "see the appendix" is what would undo it, and
 that is the change to refuse.
+
+## The snapshot holds the review and the lockfiles, and not the whole tree
+
+**Proposed.** Copy every file git tracks into the snapshot, excluded or unlisted. The snapshot
+is also the tree the probe and the verifiers build in, and a build needs the whole tree:
+without the lockfile an install resolves newer versions than the repository pins, and every
+build error and failing suite it reports is a fact about a tree nobody has; without the rest
+of the project a build over a `files` list cannot run at all.
+
+**Declined, except for lockfiles.** Any worker may open anything in the snapshot. An owner
+excludes a file, or leaves it off a `files` list, as often to keep it from the models as to
+spare the readers, and copying the whole tree would hand the same job more of the repository
+than it chose, with nothing in the job saying so. So the snapshot holds the files under
+review and, inside a repository, every lockfile git tracks: a lockfile names package versions
+and where to fetch them, it is what an owner most often excludes because nobody wants it
+read, and it is the one file an ordinary review is missing when its install goes wrong. The
+run says before it starts how many lockfiles it copies beside the review.
+
+What this costs is buildability where the review is small. A `files` job over a few files, or
+a job that excludes code the build compiles against, gets a build that cannot run, and the
+report says so rather than reporting a result for a tree it did not have. A finding a reader
+locates in a file that is not in the snapshot names no file it could open and is rejected.
+
+**What would change it.** An owner who wants the whole tree built and accepts that the models
+may read all of it. That is an opt-in on the job, not the default.
+
+## A correction sits beside a count and never changes it
+
+**Proposed.** When the operator records in `report-notes.json` that an established defect is
+wrong, move it: count it as refuted, or drop it from the ranked list. The operator has read
+the code and the report together, and the report should say what is true.
+
+**Declined.** The counts are the panel's result, and that is the one thing about them two
+runs can be compared on. A count the operator can move measures the operator as well as the
+panel, and nothing records which runs were corrected by how much. The operator's reading is
+also the one thing in the report nothing checks: a verdict is a claim a second agent settled,
+and a correction is one person's claim with a reason. So a correction is a mark on the entry,
+a line beside the counts naming what was corrected, and a section labeled as the operator's
+reading. The defect keeps its status, `findings.json` does not carry the notes, and the engine
+never writes to the notes file.
+
+**What would change it.** A correction that is itself checked — sent to a verifier the way a
+finding is, and settled by one. That would be a verdict, and it would belong in the counts.

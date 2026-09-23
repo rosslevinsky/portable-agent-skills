@@ -69,7 +69,7 @@ area's candidates are the same defect. ``report`` reads every verification and c
 result strictly, gives every candidate exactly one status and puts it in exactly one
 cluster — proving the clusterer's grouping is a partition first, and falling back to one
 candidate per cluster for an area whose unit it cannot believe — reads the rung and the
-adapter per slot from the ``dispatch.json`` the dispatcher wrote, and writes three files:
+adapter per lane from the ``dispatch.json`` the dispatcher wrote, and writes three files:
 ``findings.json``, ``report.md``, and ``report.html`` converted from it. The document
 separates established defects from unresolved ones and groups each by the tiers the
 synthesis round named where that round returned an answer, most severe and cheapest-fix
@@ -172,7 +172,10 @@ _JOB_REQUIRED_KEYS = ("problem", "root", "exclude", "partition", "lenses")
 # defects and not 348 missing-test entries beside them, and no tuning of where an auditor
 # goes gets that to zero for a job that never wanted the question asked. Absent means the
 # engine decides, as it always has.
-_JOB_OPTIONAL_KEYS = ("files", "coverage")
+# `questions` is what the owner wants answered beyond the defects: free text, carried as
+# written, and never put in a payload. The readers answer the problem statement with
+# findings; the operator answers the questions afterwards, in `report-notes.json`.
+_JOB_OPTIONAL_KEYS = ("files", "coverage", "questions")
 _JOB_KEYS_FILE = frozenset((*_JOB_REQUIRED_KEYS, *_JOB_OPTIONAL_KEYS))
 _JOB_KEYS_SUBJECT = frozenset((*_JOB_REQUIRED_KEYS, *_JOB_OPTIONAL_KEYS, "areas"))
 _AREA_REQUIRED_KEYS = ("name", "paths")
@@ -219,6 +222,8 @@ class Job:
     # ``None`` where the job said nothing, which is not the same as ``True``: the record
     # has to be able to say the round was decided rather than asked for.
     coverage: bool | None = None
+    # ``None`` where the job asked none. Never handed to a unit: see :data:`_JOB_OPTIONAL_KEYS`.
+    questions: str | None = None
 
 
 def is_prefix(entry: str) -> bool:
@@ -531,6 +536,7 @@ def load_job(path: str | Path) -> Job:
             f"it says whether to ask which inputs no test constructs, and leaving it out "
             f"lets the engine decide from the tree"
         )
+    questions = _parse_text(obj["questions"], "questions") if "questions" in obj else None
 
     areas: tuple[Area, ...] = ()
     if partition == "subject":
@@ -550,7 +556,7 @@ def load_job(path: str | Path) -> Job:
     return Job(
         path=job_path, problem=problem, root=root, exclude=exclude,
         partition=partition, lenses=lenses, areas=areas, files=files,
-        coverage=coverage,
+        coverage=coverage, questions=questions,
     )
 
 
@@ -576,6 +582,17 @@ JOB_NOTE_ORIGINS = ("stated", "defaulted", "interview")
 # is not among them: it is the one field with no default, so a note about it could only ever
 # say ``stated``.
 JOB_NOTE_FIELDS = ("root", "exclude", "partition", "lenses", "files", "coverage")
+# What the operator — whoever ran the panel — wrote after reading the report: answers to the
+# job's questions, corrections to what the panel concluded, and caveats about the run. An
+# INPUT to `report`, written by a person or an agent after the first report exists, and never
+# one of the files `--rerender` replaces: the engine reads it and writes nothing to it.
+REPORT_NOTES_FILE_NAME = "report-notes.json"
+REPORT_NOTES_KEYS = ("answers", "corrections", "caveats")
+REPORT_NOTE_ANSWER_KEYS = ("question", "answer", "defects")
+REPORT_NOTE_CORRECTION_KEYS = ("target", "reason")
+# The build check's two answers, which a correction may name in place of a defect. "This
+# tree builds: no" is not a defect and is still something an operator can know is wrong.
+BUILD_CHECK_TARGETS = ("build", "tests")
 
 
 def mint_rundir(job_path: str | Path) -> Path:
@@ -795,12 +812,22 @@ class Coverage:
 class Listing:
     """The enumerated tree before anything is read. ``source`` is ``git`` for a tracked
     plus non-ignored-untracked listing, ``walk`` for a sorted directory walk, ``list``
-    for the job's own explicit file list."""
+    for the job's own explicit file list.
+
+    ``context`` is the LOCKFILES git tracks under root that are outside the review —
+    excluded, or not named in a ``files`` list. They are copied into the snapshot and
+    assigned to nobody, because the snapshot is also the tree the probe and the verifiers
+    build in, and a snapshot without the lockfile installs different dependencies from the
+    ones the repository pins, so every build result after that describes a tree nobody has.
+    Nothing else outside the review is copied: any worker may open anything in the
+    snapshot, so the snapshot holds what the job chose and no more, and a lockfile names
+    package versions and nothing else. Only git supplies them; a walk has no tracked set."""
 
     source: str
     files: tuple[str, ...]
     skipped: tuple[Skipped, ...]
     excluded: tuple[str, ...]
+    context: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -824,6 +851,9 @@ class Inventory:
     tree_sha256: str
     commit: Commit = Commit(state="unreadable")
     coverage: Coverage = Coverage()
+    # Copied into the snapshot and read by nobody; see :class:`Listing`. Not in
+    # ``tree_sha256``, which digests what was reviewed.
+    context: tuple[FileEntry, ...] = ()
 
 
 def matches(entry: str, path: str) -> bool:
@@ -910,10 +940,10 @@ def _git_environment() -> dict[str, str]:
             if name.upper() not in _GIT_LOCATION_VARIABLES}
 
 
-def _git_entries(root: Path) -> list[str] | None:
-    """Tracked plus non-ignored untracked entries under ``root``, or ``None`` when git is
-    absent or no repository holds ``root``. A repository git cannot read is a refusal, and
-    so is a root inside a git directory.
+def _git_entries(root: Path, *, tracked_only: bool = False) -> list[str] | None:
+    """Tracked plus non-ignored untracked entries under ``root`` — tracked alone with
+    ``tracked_only`` — or ``None`` when git is absent or no repository holds ``root``. A
+    repository git cannot read is a refusal, and so is a root inside a git directory.
 
     NUL-delimited on purpose: without ``-z`` git quotes a name holding a newline or a
     non-ASCII byte, and the quoted form names no file. Read as bytes and decoded once,
@@ -952,7 +982,10 @@ def _git_entries(root: Path) -> list[str] | None:
             )
         return None
     entries: list[str] = []
-    for listing in (["ls-files", "-z"], ["ls-files", "-z", "--others", "--exclude-standard"]):
+    listings = [["ls-files", "-z"]]
+    if not tracked_only:
+        listings.append(["ls-files", "-z", "--others", "--exclude-standard"])
+    for listing in listings:
         proc = subprocess.run(_git_argv(root, *listing), capture_output=True, env=env)
         if proc.returncode != 0:
             detail = proc.stderr.decode("utf-8", errors="replace").strip()
@@ -1349,15 +1382,25 @@ def enumerate_files(job: Job) -> Listing:
     since a listed path the report can never show under *not read* is a silent gap.
 
     """
+    tree: list[str] | None = None
     if job.files:
         _check_listed_root(job)
         raw: list[str] | None = list(job.files)
         source = "list"
+        # Only for the files a build needs beside the listed ones. A list names its own
+        # scope and never needed git, so a host where git cannot answer still plans; its
+        # snapshot then holds the listed files alone.
+        try:
+            tree = _git_entries(job.root, tracked_only=True)
+        except InventoryError:
+            tree = None
     else:
         raw = _git_entries(job.root)
         source = "git" if raw is not None else "walk"
         if raw is None:
             raw = _walk_entries(job.root)
+        else:
+            tree = _git_entries(job.root, tracked_only=True)
     files: list[str] = []
     skipped: list[Skipped] = []
     excluded: list[str] = []
@@ -1412,7 +1455,36 @@ def enumerate_files(job: Job) -> Listing:
             f"{len(skipped)} skipped)"
         )
     return Listing(source=source, files=tuple(files), skipped=tuple(skipped),
-                   excluded=tuple(excluded))
+                   excluded=tuple(excluded),
+                   context=_context_files(job.root, tree, set(files), ancestors))
+
+
+def _context_files(root: Path, tree: list[str] | None, in_scope: set[str],
+                   ancestors: dict[str, bool]) -> tuple[str, ...]:
+    """The lockfiles git tracks under ``root`` that are not in scope: what the snapshot
+    carries beside the review so a build inside it installs what the repository pins. See
+    :class:`Listing`.
+
+    A path that is not a plain regular file — a link, a nested checkout, repository
+    metadata — is left out, by the same classification the in-scope files pass. So is one
+    the host will not describe: it is out of scope, nobody reads it, and refusing the plan
+    over a file the owner excluded would make an exclusion the thing that breaks a run.
+    """
+    if tree is None:
+        return ()
+    out: list[str] = []
+    for rel in sorted(set(tree) - in_scope):
+        if any(ch < " " or ch == "\x7f" for ch in rel):
+            continue
+        if not is_lockfile(rel):
+            continue
+        try:
+            rel.encode("utf-8")
+            if _classify(root, rel, ancestors) is None:
+                out.append(rel)
+        except (InventoryError, UnicodeEncodeError):
+            continue
+    return tuple(out)
 
 
 _CHUNK = 1 << 20
@@ -1487,7 +1559,41 @@ def measure_files(job: Job, listing: Listing) -> Inventory:
         excluded=listing.excluded, tree_sha256=tree.hexdigest(),
         commit=_git_commit(job.root),
         coverage=_coverage(job.root, listing.files),
+        context=_measure_context(job.root, listing.context, listing.files),
     )
+
+
+def _measure_context(root: Path, context: Sequence[str],
+                     in_scope: Sequence[str]) -> tuple[FileEntry, ...]:
+    """Measure the out-of-scope files the snapshot carries, leaving out any it cannot hold.
+
+    Left out rather than refused, for the reason :func:`_context_files` gives: nobody reads
+    these, so one the host will not read, or one whose name differs only by case from
+    another path and cannot share a case-insensitive run volume with it, costs the build
+    that file and nothing else. An in-scope collision is still refused, by
+    :func:`_check_case_collisions`."""
+    def prefixes(path: str) -> list[str]:
+        parts = path.casefold().split("/")
+        return ["/".join(parts[:i]) for i in range(1, len(parts))]
+
+    scope_files = {path.casefold() for path in in_scope}
+    directories = {prefix for path in (*in_scope, *context) for prefix in prefixes(path)}
+    folded: dict[str, int] = {}
+    for rel in context:
+        folded[rel.casefold()] = folded.get(rel.casefold(), 0) + 1
+    out: list[FileEntry] = []
+    for rel in context:
+        # A file clashes with another file of the same folded name, with a directory of
+        # that name, and — through its own directories — with a file named like one.
+        if (rel.casefold() in scope_files or rel.casefold() in directories
+                or folded[rel.casefold()] > 1
+                or any(prefix in scope_files for prefix in prefixes(rel))):
+            continue
+        try:
+            out.append(_read_measuring(root / rel, rel))
+        except InventoryError:
+            continue
+    return tuple(out)
 
 
 # --------------------------------------------------------------------------- #
@@ -1908,6 +2014,16 @@ def _claim_snapshot(rundir: Path) -> None:
         raise RunDirError(f"cannot create {snapshot}: {exc}") from exc
 
 
+def _source_readable(path: Path, rel: str) -> bool:
+    """Whether ``path`` still reads from start to end, for telling which end of a failed
+    copy failed."""
+    try:
+        _read_measuring(path, rel)
+    except InventoryError:
+        return False
+    return True
+
+
 def write_snapshot(job: Job, inventory: Inventory, rundir: str | Path, *,
                    claimed: bool = False, taken: str | None = None) -> Path:
     """Copy every inventoried file to ``<rundir>/snapshot/`` and write ``inventory.json``.
@@ -1916,7 +2032,11 @@ def write_snapshot(job: Job, inventory: Inventory, rundir: str | Path, *,
     and a reader that could reach them is not reading the snapshot alone. Each copy is
     re-digested as it is written and must match what was measured and partitioned; a
     file that changed in between is refused by name rather than snapshotted as something
-    the areas were not built from. Excluded and skipped entries are not copied.
+    the areas were not built from. The tracked lockfiles outside the review are copied too,
+    so a build in the snapshot installs what the repository pins (see :class:`Listing`);
+    nothing else outside the review is. One of those that changed, vanished or stopped reading
+    since it was measured is left out instead, and ``inventory.json`` lists only the ones
+    copied.
 
     ``claimed`` says the caller has already checked the run directory and the case
     collisions and claimed ``snapshot/``, as ``plan`` does so that it knows which failures
@@ -1938,7 +2058,9 @@ def write_snapshot(job: Job, inventory: Inventory, rundir: str | Path, *,
         _check_case_collisions(inventory)
         _claim_snapshot(rundir)
     snapshot = rundir / "snapshot"
-    for entry in inventory.files:
+    in_scope = len(inventory.files)
+    kept: list[FileEntry] = []
+    for n, entry in enumerate(inventory.files + inventory.context):
         source = job.root / entry.path
         target = snapshot / entry.path
         tmp = _temp_beside(target)
@@ -1949,8 +2071,23 @@ def write_snapshot(job: Job, inventory: Inventory, rundir: str | Path, *,
         sink = _create_scratch(tmp, entry.path, binary=True)
         try:
             with sink:
-                copied = _read_measuring(source, entry.path, sink)
-            if copied.sha256 != entry.sha256:
+                try:
+                    copied = _read_measuring(source, entry.path, sink)
+                except InventoryError:
+                    # The one error type covers both ends of the copy. Only the SOURCE
+                    # failing is a reason to leave an out-of-scope file out; a run
+                    # directory that cannot take the write refuses the plan, or a full
+                    # disk would quietly drop the lockfile the copy is for.
+                    if n < in_scope or _source_readable(source, entry.path):
+                        raise
+                    copied = None
+            if copied is None or copied.sha256 != entry.sha256:
+                if n >= in_scope:
+                    # Nobody reads an out-of-scope file, so one that changed or went away
+                    # since it was measured costs the build that file, as one the host
+                    # would not read did when it was measured.
+                    _discard(tmp)
+                    continue
                 raise InventoryError(
                     f"{entry.path} changed while the snapshot was being taken; the areas "
                     f"were built from the earlier bytes, so re-run plan"
@@ -1963,12 +2100,18 @@ def write_snapshot(job: Job, inventory: Inventory, rundir: str | Path, *,
         except ReviewPanelError:
             _discard(tmp)
             raise
+        if n >= in_scope:
+            kept.append(entry)
     write_json(rundir / "inventory.json", {
         "source": inventory.source,
         "files": [asdict(entry) for entry in inventory.files],
         "skipped": [asdict(entry) for entry in inventory.skipped],
         "excluded": list(inventory.excluded),
         "tree_sha256": inventory.tree_sha256,
+        # Copied for the build, reviewed by nobody. The snapshot check reads these beside
+        # ``files``, since a changed lockfile changes a build as much as a changed source.
+        # Only those actually copied: the check compares the snapshot against this list.
+        "context": [asdict(entry) for entry in kept],
         # When these bytes were taken. The only field in a run directory that is about the
         # moment rather than about the tree, and the report's subtitle is what it is for.
         "taken": taken or "",
@@ -2015,14 +2158,14 @@ def audit_ceiling(ceiling: Ceiling) -> Ceiling:
     """What one coverage auditor may be asked to read, over the ceiling one area may hold."""
     return Ceiling(lines=ceiling.lines * AUDIT_CEILING_MULTIPLE,
                    bytes=ceiling.bytes * AUDIT_CEILING_MULTIPLE)
-# The two model slots. Every area is read by both: its lens list is dealt to them in turn,
-# so a list of two gives each slot one lens and a list of four gives each two.
-SLOTS = ("A", "B")
-# One auditor per slot, each asking what shape of input no test constructs — for EACH area
+# The two model lanes. Every area is read by both: its lens list is dealt to them in turn,
+# so a list of two gives each lane one lens and a list of four gives each two.
+LANES = ("A", "B")
+# One auditor per lane, each asking what shape of input no test constructs — for EACH area
 # the plan marked audited, so an auditor is bounded the way a reader is. Which areas those
 # are differs by partition mode and is settled in :func:`partition`; see
 # :func:`auditor_areas`.
-AUDITORS = len(SLOTS)
+AUDITORS = len(LANES)
 
 
 @dataclass(frozen=True)
@@ -2223,7 +2366,7 @@ def _assign_subjects(job: Job, sizes: dict[str, tuple[int, int]], excluded) -> l
             if shut:
                 raise PartitionError(
                     f"field '{field}' {entry!r} names an excluded path ({shut[0]}); an "
-                    f"excluded path is not in the snapshot, so no reader can open it"
+                    f"excluded path is outside the review's scope, so no reader is sent to it"
                 )
             if not hits:
                 raise PartitionError(
@@ -2476,6 +2619,32 @@ def _derived_subjects(areas: Sequence[PlannedArea]) -> dict[str, tuple[tuple[str
     return {test: tuple(sorted(links)) for test, links in out.items()}
 
 
+# Said before anything runs, on the preview and on a run started with `--go` alike, because
+# a lockfile outside the review is still in the snapshot for the build, and any worker may
+# open it.
+COPIED_OUTSIDE_SCOPE_LINE = (
+    "{n} lockfile(s) outside the review are copied into the snapshot so a build there "
+    "installs the versions the repository pins; any worker may open them")
+# The files that pin what a build installs. Copied even when excluded or unlisted: each
+# names package versions and where to fetch them, and a build without it resolves versions
+# the repository never pinned.
+LOCKFILE_NAMES = frozenset({
+    "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock",
+    "bun.lockb", "Cargo.lock", "poetry.lock", "Pipfile.lock", "uv.lock", "pdm.lock",
+    "Gemfile.lock", "composer.lock", "go.sum", "mix.lock", "pubspec.lock", "Podfile.lock",
+    "packages.lock.json", "gradle.lockfile", "flake.lock",
+})
+
+
+def is_lockfile(rel: str) -> bool:
+    return rel.rsplit("/", 1)[-1] in LOCKFILE_NAMES
+
+
+def copied_outside_scope_line(context: Sequence[str]) -> str:
+    """The line saying what the snapshot carries beside the review, or ``""`` for nothing."""
+    return COPIED_OUTSIDE_SCOPE_LINE.format(n=len(context)) if context else ""
+
+
 def preview(job: Job, inventory: Inventory, areas: Sequence[PlannedArea],
             ceiling: Ceiling = DEFAULT_CEILING) -> str:
     """What the owner sees before any unit is dispatched: N areas, the readers each gets,
@@ -2489,6 +2658,9 @@ def preview(job: Job, inventory: Inventory, areas: Sequence[PlannedArea],
         f"({inventory.source}); {len(inventory.excluded)} excluded, "
         f"{len(inventory.skipped)} skipped"
     ]
+    copied = copied_outside_scope_line([e.path for e in inventory.context])
+    if copied:
+        out.append(copied)
     for area in areas:
         label = area.subject or ""
         if area.part is not None:
@@ -2583,7 +2755,7 @@ AUDITOR_KIND = "auditor"
 # findings is never read as a count of validated ones.
 PROBE_KIND = "probe"
 PROBES = 1
-PROBE_UNIT_ID = f"probe-{SLOTS[0]}"
+PROBE_UNIT_ID = f"probe-{LANES[0]}"
 PROBE_SCHEMA_NAME = "probe-schema.json"
 UNITS_DIR = "units"
 # The dispatcher's own directory. The engine never READS it — a unit directory holds
@@ -2678,7 +2850,7 @@ class Unit:
     id: str
     kind: str
     area: str | None
-    slot: str
+    lane: str
     lens: str | None
 
 
@@ -3098,7 +3270,7 @@ def _mock_only(text: str, stem: str, language: str) -> bool:
 
     A test that only mocks a class is evidence of nothing about it, and an auditor handed
     the link can only answer in the negative -- at length, and about code the test never
-    runs. One slot returned 30 such findings from a single link of this shape, each one
+    runs. One lane returned 30 such findings from a single link of this shape, each one
     resting on the observation that the test never instantiates the class.
 
     **The quantifier is `all`, and the direction is deliberate.** A test that mocks a class
@@ -3335,26 +3507,26 @@ def auditor_plan_of_snapshot(inventory: dict, declined: bool = False) -> Auditor
 
 
 def assign_units(areas: Sequence[PlannedArea], *, auditors: bool = True) -> tuple[Unit, ...]:
-    """One reader per (area, lens), the lenses dealt to the slots in turn, then one auditor
-    per slot for each area the plan marked audited — where there is a question to put to
+    """One reader per (area, lens), the lenses dealt to the lanes in turn, then one auditor
+    per lane for each area the plan marked audited — where there is a question to put to
     them at all — and one capability probe. Reader and auditor counts are both derived here
     and declared nowhere."""
     units: list[Unit] = []
     for area in areas:
-        dealt = {slot: 0 for slot in SLOTS}
+        dealt = {lane: 0 for lane in LANES}
         for i, lens in enumerate(area.lenses):
-            slot = SLOTS[i % len(SLOTS)]
-            dealt[slot] += 1
-            units.append(Unit(id=f"{area.id}-{slot}{dealt[slot]}", kind=READER_KIND,
-                              area=area.id, slot=slot, lens=lens))
+            lane = LANES[i % len(LANES)]
+            dealt[lane] += 1
+            units.append(Unit(id=f"{area.id}-{lane}{dealt[lane]}", kind=READER_KIND,
+                              area=area.id, lane=lane, lens=lens))
     for area in auditor_areas(areas) if auditors else ():
-        for slot in SLOTS:
-            units.append(Unit(id=f"audit-{area.id}-{slot}", kind=AUDITOR_KIND,
-                              area=area.id, slot=slot, lens=None))
+        for lane in LANES:
+            units.append(Unit(id=f"audit-{area.id}-{lane}", kind=AUDITOR_KIND,
+                              area=area.id, lane=lane, lens=None))
     # Exactly one probe, whatever the partition: the question it answers is about the tree,
-    # not about an area, so a second would ask the same thing twice. It takes the first slot
-    # because some slot has to run it and nothing about the answer depends on which.
-    units.append(Unit(id=PROBE_UNIT_ID, kind=PROBE_KIND, area=None, slot=SLOTS[0], lens=None))
+    # not about an area, so a second would ask the same thing twice. It takes the first lane
+    # because some lane has to run it and nothing about the answer depends on which.
+    units.append(Unit(id=PROBE_UNIT_ID, kind=PROBE_KIND, area=None, lane=LANES[0], lens=None))
     return tuple(units)
 
 
@@ -3538,7 +3710,7 @@ def measure_payload(text: str) -> tuple[int, int]:
 def write_units(rundir: Path, job: Job, inventory: Inventory, areas: Sequence[PlannedArea],
                 companions: Companions | None = None) -> tuple[Unit, ...]:
     """Write ``units/<id>/payload.md`` and ``schema.json`` for every unit, then
-    ``units.json`` listing them with slot, lens and area. A unit carries the schema its own
+    ``units.json`` listing them with lane, lens and area. A unit carries the schema its own
     kind answers against: the readers and the auditors the reader schema, the probe its own.
     Every file lands by the exclusive-create-then-replace rule; a planted path is a refusal
     by name. ``plan`` passes companions it loaded before its first write; a direct caller may
@@ -3587,7 +3759,7 @@ def write_units(rundir: Path, job: Job, inventory: Inventory, areas: Sequence[Pl
             "payload_lines": lines,
             "payload_bytes": size,
         })
-    write_json(rundir / UNITS_FILE_NAME, {"stage": "reading", "slots": list(SLOTS), "units": listing})
+    write_json(rundir / UNITS_FILE_NAME, {"stage": "reading", "lanes": list(LANES), "units": listing})
     return units
 
 
@@ -3759,6 +3931,16 @@ class ResultError(ReviewPanelError):
     field; the unit is recorded failed, never repaired."""
 
 
+class OutOfScope(ResultError):
+    """A finding located in a file the snapshot carries and the job left out of scope.
+
+    Not a broken rule: the snapshot carries the repository's lockfiles beside the review so
+    a build installs what it pins, and a reader following a call can land in one. The owner excluded the file to be told
+    nothing about it, so the finding is dropped and only counted — listed with the
+    rejections it would print a finding the owner asked not to see, and it would mark a
+    unit that answered correctly as one that did not."""
+
+
 @dataclass(frozen=True)
 class Finding:
     """One finding as a reader stated it, with its location normalized to the snapshot
@@ -3792,17 +3974,19 @@ class UnitState:
     reason: str | None
     findings: tuple[Finding, ...]
     rejected: tuple[str, ...] = ()
+    # Findings located in a file the job left out of scope: dropped, and only counted.
+    dropped: int = 0
 
 
 @dataclass(frozen=True)
 class Raised:
-    """One raising of a candidate: which unit, slot and lens, the area that unit read,
+    """One raising of a candidate: which unit, lane and lens, the area that unit read,
     and that reader's own proposal — severity, consequence, direction, fix size,
     reproduction and the source it quotes at the cited lines are the raiser's, kept per
     raiser rather than merged, since the engine infers no value."""
 
     unit: str
-    slot: str
+    lane: str
     lens: str | None
     kind: str
     area: str | None
@@ -3818,7 +4002,7 @@ class Raised:
 class Candidate:
     """One reader's finding, carried whole to verification. Nothing groups before a verdict:
     two readers describing one defect are two candidates, each checked from its own
-    description by a slot that did not raise it. ``raised_by`` therefore holds exactly one
+    description by a lane that did not raise it. ``raised_by`` therefore holds exactly one
     raiser, and ``area`` is the area closure assigned the file to, so every candidate has
     exactly one and the batch key is total."""
 
@@ -3838,7 +4022,7 @@ class Candidate:
 @dataclass(frozen=True)
 class Batch:
     """One verification unit: the candidates of one (area, finder, question) triple,
-    addressed to ``slot``, with the routing rule that chose it written out.
+    addressed to ``lane``, with the routing rule that chose it written out.
 
     ``asks`` is the question this batch puts, one of :data:`ASKS`. It is part of the key
     because the two questions cannot share a brief: a verifier asked whether a claimed
@@ -3849,7 +4033,7 @@ class Batch:
     id: str
     area: str
     finder: str
-    slot: str
+    lane: str
     candidates: tuple[str, ...]
     routing: str
     asks: str = DEFECT_ASKS
@@ -3946,15 +4130,20 @@ def _snapshot_parts(raw: object, field: str) -> list[str]:
     return parts
 
 
-def _location(raw: object, field: str, files: frozenset[str] | set[str]) -> str:
+def _location(raw: object, field: str, files: frozenset[str] | set[str],
+              context: frozenset[str] | set[str] = frozenset()) -> str:
     # A name exactly as the inventory holds it is that file, before any normalizing: a POSIX
     # file named `a\b.py` or `C:notes.py` is otherwise unreachable, or read as another.
     if isinstance(raw, str) and raw in files:
         return raw
+    if isinstance(raw, str) and raw in context:
+        raise OutOfScope(f"field '{field}' {raw!r} is outside the review's scope")
     parts = _snapshot_parts(raw, field)
     if not parts:
         raise ResultError(f"field '{field}' {raw!r} names no file in the snapshot")
     path = "/".join(parts)
+    if path in context and path not in files:
+        raise OutOfScope(f"field '{field}' {path!r} is outside the review's scope")
     if path not in files:
         raise ResultError(
             f"field '{field}' {path!r} is not in the snapshot; a finding is located in a "
@@ -4028,16 +4217,26 @@ def _site_of(raw: object) -> str:
     return where
 
 
-def _parse_finding(raw: object, field: str, files, cwd_files=None) -> Finding:
+def _parse_finding(raw: object, field: str, files, cwd_files=None,
+                   context=frozenset()) -> Finding:
     if not isinstance(raw, dict):
         raise ResultError(f"'{field}' must be a JSON object (found {type(raw).__name__})")
+    if context and "file" in raw:
+        # Asked before any other rule, so a finding in an excluded file is dropped whatever
+        # else is wrong with it, and no rejection ever prints where it was.
+        try:
+            _location(raw["file"], f"{field}.file", files, context)
+        except OutOfScope:
+            raise
+        except ResultError:
+            pass
     _check_keys(raw, field, frozenset(FINDING_KEYS), FINDING_KEYS, ResultError)
     start = _integer(raw["line_start"], f"{field}.line_start", 1)
     end = _integer(raw["line_end"], f"{field}.line_end", 1)
     if end < start:
         raise ResultError(f"field '{field}.line_end' ({end}) is before line_start ({start})")
     return Finding(
-        file=_location(raw["file"], f"{field}.file", files),
+        file=_location(raw["file"], f"{field}.file", files, context),
         line_start=start,
         line_end=end,
         severity=_one_of(raw["severity"], f"{field}.severity", SEVERITIES),
@@ -4076,11 +4275,14 @@ def _check_declared_count(obj: dict, found: int) -> None:
         )
 
 
-def parse_reader_result(obj: object, unit_id: str,
-                        files, cwd_files=None) -> tuple[tuple[Finding, ...], tuple[str, ...]]:
-    """Strictly parse one reading result, returning its findings and the rejections.
+def parse_reader_result(obj: object, unit_id: str, files, cwd_files=None,
+                        context=frozenset()) -> tuple[tuple[Finding, ...], tuple[str, ...], int]:
+    """Strictly parse one reading result, returning its findings, the rejections, and how
+    many findings were dropped for lying outside the review's scope.
 
-    ``files`` is the snapshot's file set, so a location names a file a verifier can open.
+    ``files`` is where a finding may be located. ``context`` is the rest of the snapshot:
+    a finding there is not a broken rule but one the owner asked not to see, so it is
+    counted and dropped — see :class:`OutOfScope`.
 
     **A finding that breaks a rule costs itself and no other.** The rules are unchanged and
     none is relaxed; what changes is the blast radius, and it is the treatment a
@@ -4116,13 +4318,17 @@ def parse_reader_result(obj: object, unit_id: str,
         _check_declared_count(obj, len(obj["findings"]))
         findings: list[Finding] = []
         rejected: list[str] = []
+        dropped = 0
         for i, item in enumerate(obj["findings"]):
             try:
-                findings.append(_parse_finding(item, f"findings[{i}]", files, cwd_files=cwd_files))
+                findings.append(_parse_finding(item, f"findings[{i}]", files,
+                                               cwd_files=cwd_files, context=context))
+            except OutOfScope:
+                dropped += 1
             except ResultError as exc:
                 site = _site_of(item)
                 rejected.append(f"findings[{i}]{f' ({site})' if site else ''}: {exc}")
-        return tuple(findings), tuple(rejected)
+        return tuple(findings), tuple(rejected), dropped
     except ResultError as exc:
         raise ResultError(f"{unit_id}: {exc}") from None
 
@@ -4242,7 +4448,8 @@ def _read_unit_file(rundir: Path, unit_id: str) -> tuple[str, object]:
         return UNIT_FAILED, f"{RESULT_NAME} nests deeper than the JSON decoder can parse"
 
 
-def read_unit_results(rundir: Path, units: Sequence[dict], files) -> tuple[UnitState, ...]:
+def read_unit_results(rundir: Path, units: Sequence[dict], files,
+                      context=frozenset()) -> tuple[UnitState, ...]:
     """Classify every reading unit as exactly one of complete, failed or missing: the
     landing rule of :func:`_read_unit_file`, then the reader schema's vocabulary, a
     refusal from which is a FAILED unit with the rule named.
@@ -4257,12 +4464,14 @@ def read_unit_results(rundir: Path, units: Sequence[dict], files) -> tuple[UnitS
             states.append(UnitState(unit["id"], state, payload, ()))
             continue
         try:
-            findings, rejected = parse_reader_result(
-                payload, unit["id"], _locations_for(unit, files, audited), cwd_files=files)
+            findings, rejected, dropped = parse_reader_result(
+                payload, unit["id"], _locations_for(unit, files, audited),
+                cwd_files=files | context, context=context)
         except ResultError as exc:
             states.append(UnitState(unit["id"], UNIT_FAILED, str(exc), ()))
             continue
-        states.append(UnitState(unit["id"], UNIT_COMPLETE, None, findings, rejected))
+        states.append(UnitState(unit["id"], UNIT_COMPLETE, None, findings, rejected,
+                                dropped))
     return tuple(states)
 
 
@@ -4271,7 +4480,7 @@ def build_candidates(states: Sequence[UnitState], units: Sequence[dict],
     """One candidate per finding, in a deterministic order, each keeping its one raiser.
 
     Nothing groups here. Two readers describing one defect stay two candidates, so each is
-    verified from its own description by the slot that did not raise it — two independent
+    verified from its own description by the lane that did not raise it — two independent
     cross-model checks — and the fact that both found it survives in the artifacts. Grouping
     first collapsed that into one candidate with one verdict and made the co-discovery
     unrecoverable. ``owner`` maps every snapshot file to the area closure assigned it to.
@@ -4291,7 +4500,7 @@ def build_candidates(states: Sequence[UnitState], units: Sequence[dict],
     candidates: list[Candidate] = []
     for n, (_key, unit, finding) in enumerate(rows, 1):
         raised = Raised(
-            unit=unit["id"], slot=unit["slot"], lens=unit["lens"], kind=unit["kind"],
+            unit=unit["id"], lane=unit["lane"], lens=unit["lens"], kind=unit["kind"],
             area=unit["area"], severity=finding.severity, consequence=finding.consequence,
             direction=finding.direction, fix_size=finding.fix_size, quote=finding.quote,
             reproduction=finding.reproduction,
@@ -4502,9 +4711,9 @@ def asks_of(cand: dict) -> str:
 
 
 def route(candidates: Sequence[Candidate]) -> tuple[Batch, ...]:
-    """One batch per (area, finder, question), the finder being the slot that raised its
-    candidates, addressed to the other slot. Every candidate has exactly one raiser, so
-    every batch is addressed to a slot that raised none of it, and each candidate is in
+    """One batch per (area, finder, question), the finder being the lane that raised its
+    candidates, addressed to the other lane. Every candidate has exactly one raiser, so
+    every batch is addressed to a lane that raised none of it, and each candidate is in
     exactly one batch and gets exactly one verdict.
 
     The question is part of the key because it decides which brief the batch is read with.
@@ -4518,22 +4727,22 @@ def route(candidates: Sequence[Candidate]) -> tuple[Batch, ...]:
     keyed: dict[tuple[str, str, str], list[str]] = {}
     for cand in candidates:
         raiser = cand.raised_by[0]
-        keyed.setdefault((cand.area, raiser.slot, asks_of_kind(raiser.kind)), []).append(cand.id)
-    order = {slot: i for i, slot in enumerate(SLOTS)}
+        keyed.setdefault((cand.area, raiser.lane, asks_of_kind(raiser.kind)), []).append(cand.id)
+    order = {lane: i for i, lane in enumerate(LANES)}
     asked = {question: i for i, question in enumerate(ASKS)}
     batches: list[Batch] = []
     for area, finder, question in sorted(keyed, key=lambda k: (k[0], order[k[1]], asked[k[2]])):
-        slot = next(s for s in SLOTS if s != finder)
+        lane = next(s for s in LANES if s != finder)
         coverage = question == COVERAGE_ASKS
         routing = (
-            f"{'coverage gaps ' if coverage else ''}raised by slot {finder} in {area}; "
-            f"addressed to the other slot, {slot}, which raised none of these"
+            f"{'coverage gaps ' if coverage else ''}raised by lane {finder} in {area}; "
+            f"addressed to the other lane, {lane}, which raised none of these"
             + ("; asked whether any test in scope constructs the input, not whether the "
                "code is wrong" if coverage else "")
         )
         batches.append(Batch(
             id=f"verify-{area}-{finder}{COVERAGE_BATCH_SUFFIX if coverage else ''}",
-            area=area, finder=finder, slot=slot, asks=question,
+            area=area, finder=finder, lane=lane, asks=question,
             candidates=tuple(keyed[(area, finder, question)]), routing=routing))
     return tuple(batches)
 
@@ -4559,7 +4768,7 @@ def _payload_field(label: str, text: str) -> list[str]:
 def _candidate_sections(candidates: Sequence[dict]) -> list[str]:
     """Every candidate's own block: its id, where it points, what the engine found when it
     compared the quotation, the failure as raised, and every distinct proposal its raisers
-    made. Who raised it — unit, slot, lens, the summary — is never here: a verifier judges
+    made. Who raised it — unit, lane, lens, the summary — is never here: a verifier judges
     the claim, not its author.
 
     Shared by both verification payloads because a candidate reads the same way whichever
@@ -4593,7 +4802,7 @@ def render_verifier_payload(brief: str, problem: str, candidates: Sequence[dict]
     """The whole of a verifier's payload from exactly these inputs: the brief, the problem
     statement verbatim, what the capability probe established about the tree, and each
     candidate's id, location, failure, and every distinct proposal its raisers made. Who
-    raised it — unit, slot, lens, the reader's summary — is not rendered: the verifier judges
+    raised it — unit, lane, lens, the reader's summary — is not rendered: the verifier judges
     the claim, not its author.
 
     ``probe`` is a declared input and has no default. The payload's byte reconstruction from
@@ -5302,6 +5511,8 @@ def _read_job(rundir: Path) -> dict:
                 raise TypeError(key)
         if "coverage" in doc and not isinstance(doc["coverage"], bool):
             raise TypeError("coverage")
+        if "questions" in doc and not isinstance(doc["questions"], str):
+            raise TypeError("questions")
     except (KeyError, TypeError, AttributeError) as exc:
         raise RunDirError(f"{rundir / JOB_FILE_NAME} is not a job this report can "
                           f"describe: {exc}") from exc
@@ -5342,6 +5553,101 @@ def _read_job_notes(rundir: Path) -> dict[str, str] | None:
     return doc
 
 
+@dataclass(frozen=True)
+class ReportNotes:
+    """``report-notes.json`` as checked against this run's defects.
+
+    ``answers`` holds ``{"question", "answer", "defects"}`` with ``defects`` a tuple of ids;
+    ``corrections`` holds ``{"target", "reason"}``; ``caveats`` holds strings. Every id in
+    either is one ``findings.json`` carries as a defect, or a :data:`BUILD_CHECK_TARGETS`
+    word for a correction."""
+
+    answers: tuple[dict, ...]
+    corrections: tuple[dict, ...]
+    caveats: tuple[str, ...]
+
+    def corrected(self) -> frozenset[str]:
+        return frozenset(entry["target"] for entry in self.corrections)
+
+
+def _read_report_notes(rundir: Path, defects: Sequence[str]) -> ReportNotes | None:
+    """The operator's notes, or ``None`` where there are none.
+
+    **Refused by name rather than ignored when malformed**, for the reason
+    ``job-notes.json`` is: dropped, the report would say nobody wrote any notes while a
+    file of them sits in the run directory unread. An unknown key, a missing field, empty
+    text, a correction without a reason and an id this run has no defect for are each
+    refused. A correction is checked against the ids alone, so a correction written for
+    one clustering and read against another names whatever now carries that id.
+    """
+    path = rundir / REPORT_NOTES_FILE_NAME
+    if _lstat_or_absent(path, REPORT_NOTES_FILE_NAME, RunDirError) is None:
+        return None
+    doc = _read_run_json(rundir, REPORT_NOTES_FILE_NAME)
+    known = frozenset(defects)
+
+    def defect_id(raw: object, field: str) -> str:
+        named = _parse_text(raw, field, RunDirError)
+        if named not in known:
+            raise RunDirError(f"field '{field}' names {named!r}, and no defect in "
+                              f"{FINDINGS_NAME} carries that id")
+        return named
+
+    def entries(key: str) -> list:
+        raw = doc.get(key, [])
+        if not isinstance(raw, list):
+            raise RunDirError(f"field '{key}' must be a list (found {type(raw).__name__})")
+        return raw
+
+    try:
+        if not isinstance(doc, dict):
+            raise RunDirError("it must be a JSON object holding any of: "
+                              + ", ".join(REPORT_NOTES_KEYS))
+        _check_keys(doc, "report notes", frozenset(REPORT_NOTES_KEYS), (), RunDirError)
+        answers = []
+        for i, raw in enumerate(entries("answers")):
+            field = f"answers[{i}]"
+            if not isinstance(raw, dict):
+                raise RunDirError(f"field '{field}' must be an object")
+            _check_keys(raw, field, frozenset(REPORT_NOTE_ANSWER_KEYS),
+                        ("question", "answer"), RunDirError)
+            cited = raw.get("defects", [])
+            if not isinstance(cited, list):
+                raise RunDirError(f"field '{field}.defects' must be a list of defect ids")
+            answers.append({
+                "question": _parse_text(raw["question"], f"{field}.question", RunDirError),
+                "answer": _parse_text(raw["answer"], f"{field}.answer", RunDirError),
+                "defects": tuple(defect_id(d, f"{field}.defects[{j}]")
+                                 for j, d in enumerate(cited)),
+            })
+        corrections, aimed = [], set()
+        for i, raw in enumerate(entries("corrections")):
+            field = f"corrections[{i}]"
+            if not isinstance(raw, dict):
+                raise RunDirError(f"field '{field}' must be an object")
+            _check_keys(raw, field, frozenset(REPORT_NOTE_CORRECTION_KEYS),
+                        REPORT_NOTE_CORRECTION_KEYS, RunDirError)
+            target = _parse_text(raw["target"], f"{field}.target", RunDirError)
+            if target not in BUILD_CHECK_TARGETS:
+                target = defect_id(target, f"{field}.target")
+            # One mark per entry, pointing at one correction: two for one target would
+            # leave the mark pointing at whichever a reader happened to find first.
+            if target in aimed:
+                raise RunDirError(f"field '{field}.target' corrects {target!r} a second "
+                                  f"time; say everything about it in one correction")
+            aimed.add(target)
+            corrections.append({"target": target, "reason": _parse_text(
+                raw["reason"], f"{field}.reason", RunDirError)})
+        caveats = tuple(_parse_text(raw, f"caveats[{i}]", RunDirError)
+                        for i, raw in enumerate(entries("caveats")))
+        if not (answers or corrections or caveats):
+            raise RunDirError("it records nothing; remove it, or add an answer, a "
+                              "correction or a caveat")
+    except RunDirError as exc:
+        raise RunDirError(f"{path}: {exc}") from None
+    return ReportNotes(tuple(answers), tuple(corrections), caveats)
+
+
 def _read_area_tests(rundir: Path) -> dict[str, tuple[str, ...]]:
     """Every area to the test-named files a coverage verifier for it can open.
 
@@ -5367,6 +5673,15 @@ def _read_area_tests(rundir: Path) -> dict[str, tuple[str, ...]]:
             for area in areas["areas"]}
     except (KeyError, TypeError) as exc:
         raise RunDirError(f"areas.json under {rundir} is not the engine's: {exc}") from exc
+
+
+def _read_context(rundir: Path) -> frozenset[str]:
+    """The snapshot files the job left out of scope, off ``inventory.json``."""
+    inventory = _read_run_json(rundir, "inventory.json")
+    try:
+        return frozenset(entry["path"] for entry in inventory["context"])
+    except (KeyError, TypeError) as exc:
+        raise RunDirError(f"inventory.json under {rundir} is not the engine's: {exc}") from exc
 
 
 def _read_audited(rundir: Path) -> dict[str, frozenset[str]]:
@@ -5498,7 +5813,7 @@ def write_route(rundir: Path, units_doc: dict, states: Sequence[UnitState],
             write_json(unit_dir / SCHEMA_NAME, schema)
             lines, size = measure_payload(text)
             listing.append({
-                "id": batch.id, "kind": VERIFIER_KIND, "area": batch.area, "slot": batch.slot,
+                "id": batch.id, "kind": VERIFIER_KIND, "area": batch.area, "lane": batch.lane,
                 "lens": None, "finder": batch.finder, "candidates": list(batch.candidates),
                 "routing": batch.routing, "asks": batch.asks,
                 "payload": f"{UNITS_DIR}/{batch.id}/{PAYLOAD_NAME}",
@@ -5515,17 +5830,18 @@ def write_route(rundir: Path, units_doc: dict, states: Sequence[UnitState],
             "probe": asdict(probe),
             "units": [{
                 "id": state.id, "kind": by_unit[state.id]["kind"], "area": by_unit[state.id]["area"],
-                "slot": by_unit[state.id]["slot"], "lens": by_unit[state.id]["lens"],
+                "lane": by_unit[state.id]["lane"], "lens": by_unit[state.id]["lens"],
                 "state": state.state, "reason": state.reason, "findings": len(state.findings),
                 # The findings this unit lost, carried into the route record so the report
                 # can name them. A count alone would say a unit raised eleven where it
                 # wrote fourteen, with nothing saying where the other three went.
                 "rejected": list(state.rejected),
+                "dropped": state.dropped,
             } for state in states],
             "candidates": [by_id[cand.id] for cand in candidates],
         })
         write_json(rundir / UNITS_FILE_NAME, {
-            "stage": VERIFICATION_STAGE, "slots": units_doc.get("slots", list(SLOTS)), "units": listing,
+            "stage": VERIFICATION_STAGE, "lanes": units_doc.get("lanes", list(LANES)), "units": listing,
         })
     except BaseException:
         # A failure part-way takes back every batch directory this route created and the
@@ -5562,18 +5878,18 @@ def route_summary(states: Sequence[UnitState], candidates: Sequence[Candidate],
     out.append(f"{_plural(len(batches), 'verification unit')}")
     for batch in batches:
         out.append(f"  {batch.id}  {_plural(len(batch.candidates), 'candidate')}  "
-                   f"finder {batch.finder} -> slot {batch.slot}"
+                   f"finder {batch.finder} -> lane {batch.lane}"
                    + ("  (coverage gaps)" if batch.asks == COVERAGE_ASKS else ""))
     return "\n".join(out) + "\n"
 
 
 # --------------------------------------------------------------------------- #
-# dispatch.json — the dispatcher's record of what ran each slot
+# dispatch.json — the dispatcher's record of what ran each lane
 # --------------------------------------------------------------------------- #
-# The engine never spawns, so it cannot know which adapter ran a slot or under what
+# The engine never spawns, so it cannot know which adapter ran a lane or under what
 # permission; the dispatcher writes that down, and the report states it and nothing
 # stronger. Parsed by name like the job: a record that says less than this, or whose rung
-# the slots contradict, is a refusal — a report that guessed the rung would claim an
+# the lanes contradict, is a refusal — a report that guessed the rung would claim an
 # independence the run did not have.
 # Two rungs and no third. One context as both finder and verifier breaks rule 3 — a
 # finding goes to a unit that did not raise it — which every status on the page rests on,
@@ -5583,17 +5899,17 @@ DISPATCH_FILE_NAME = "dispatch.json"
 RUNG_TWO_RUNTIMES = "two-runtimes"
 RUNG_ONE_RUNTIME = "one-runtime"
 RUNGS = (RUNG_TWO_RUNTIMES, RUNG_ONE_RUNTIME)
-DISPATCH_KEYS = ("rung", "slots")
-SLOT_RECORD_KEYS = ("adapter", "permission")
+DISPATCH_KEYS = ("rung", "lanes")
+LANE_RECORD_KEYS = ("adapter", "permission")
 
 
 class DispatchError(ReviewPanelError):
-    """``dispatch.json`` is missing or does not say what ran each slot. Names the field."""
+    """``dispatch.json`` is missing or does not say what ran each lane. Names the field."""
 
 
 @dataclass(frozen=True)
-class SlotRecord:
-    """What ran one slot, in the dispatcher's words: the adapter and the permission mode
+class LaneRecord:
+    """What ran one lane, in the dispatcher's words: the adapter and the permission mode
     it actually applied. Free text on purpose — the engine cannot verify a sandbox, so it
     renders the claim verbatim rather than a vocabulary it could not check."""
 
@@ -5604,14 +5920,14 @@ class SlotRecord:
 @dataclass(frozen=True)
 class DispatchRecord:
     rung: str
-    slots: dict[str, SlotRecord]
+    lanes: dict[str, LaneRecord]
 
 
 def parse_dispatch(obj: object) -> DispatchRecord:
     """Strictly parse the dispatcher's record; raise :class:`DispatchError` by name.
 
-    One cross-check ties the rung to the slots: ``two-runtimes`` claims two models, so both
-    slots recording one adapter contradicts it. ``one-runtime`` is checked no further, and a
+    One cross-check ties the rung to the lanes: ``two-runtimes`` claims two models, so both
+    lanes recording one adapter contradicts it. ``one-runtime`` is checked no further, and a
     record naming it with two adapters is accepted rather than refused — this engine spawns
     nothing, so what it is given is all it knows about what ran, and refusing a record it
     cannot check would refuse true ones with false.
@@ -5624,29 +5940,29 @@ def parse_dispatch(obj: object) -> DispatchRecord:
     rung = obj["rung"]
     if not isinstance(rung, str) or rung not in RUNGS:
         raise DispatchError(f"field 'rung' must be one of: {', '.join(RUNGS)} (found {rung!r})")
-    raw_slots = obj["slots"]
-    if not isinstance(raw_slots, dict):
-        raise DispatchError(f"field 'slots' must be a JSON object (found {type(raw_slots).__name__})")
-    _check_keys(raw_slots, "slots", frozenset(SLOTS), SLOTS, DispatchError)
-    slots: dict[str, SlotRecord] = {}
-    for slot in SLOTS:
-        raw, field = raw_slots[slot], f"slots.{slot}"
+    raw_lanes = obj["lanes"]
+    if not isinstance(raw_lanes, dict):
+        raise DispatchError(f"field 'lanes' must be a JSON object (found {type(raw_lanes).__name__})")
+    _check_keys(raw_lanes, "lanes", frozenset(LANES), LANES, DispatchError)
+    lanes: dict[str, LaneRecord] = {}
+    for lane in LANES:
+        raw, field = raw_lanes[lane], f"lanes.{lane}"
         if not isinstance(raw, dict):
             raise DispatchError(f"field '{field}' must be a JSON object (found {type(raw).__name__})")
-        _check_keys(raw, field, frozenset(SLOT_RECORD_KEYS), SLOT_RECORD_KEYS, DispatchError)
-        slots[slot] = SlotRecord(
+        _check_keys(raw, field, frozenset(LANE_RECORD_KEYS), LANE_RECORD_KEYS, DispatchError)
+        lanes[lane] = LaneRecord(
             adapter=_utf8(_parse_text(raw["adapter"], f"{field}.adapter", DispatchError),
                           f"{field}.adapter", DispatchError),
             permission=_utf8(_parse_text(raw["permission"], f"{field}.permission", DispatchError),
                              f"{field}.permission", DispatchError),
         )
-    adapters = sorted({record.adapter for record in slots.values()})
+    adapters = sorted({record.adapter for record in lanes.values()})
     if rung == RUNG_TWO_RUNTIMES and len(adapters) == 1:
         raise DispatchError(
-            f"rung {RUNG_TWO_RUNTIMES!r} claims two models, but both slots record the same "
+            f"rung {RUNG_TWO_RUNTIMES!r} claims two models, but both lanes record the same "
             f"adapter ({adapters[0]!r}); record the rung that ran"
         )
-    return DispatchRecord(rung=rung, slots=slots)
+    return DispatchRecord(rung=rung, lanes=lanes)
 
 
 def load_dispatch(rundir: Path) -> DispatchRecord:
@@ -5656,7 +5972,7 @@ def load_dispatch(rundir: Path) -> DispatchRecord:
     except FileNotFoundError:
         raise DispatchError(
             f"{path} is missing; the driver writes it from what the run actually did — "
-            f"the rung, and per slot the adapter and permission mode that ran it — as its "
+            f"the rung, and per lane the adapter and permission mode that ran it — as its "
             f"last act before this stage, so a run directory without one never reached "
             f"report"
         ) from None
@@ -5673,7 +5989,7 @@ def load_dispatch(rundir: Path) -> DispatchRecord:
 # cluster — one defect per group of candidates, by judgment, after verification
 # --------------------------------------------------------------------------- #
 # The merge happens here rather than before verification because two descriptions of one
-# defect, each checked by the slot that did not raise it, are two independent checks; and
+# defect, each checked by the lane that did not raise it, are two independent checks; and
 # because a verifier's rationale states the mechanism precisely where reader prose often
 # does not, so identity is easier to judge afterwards. The unit groups and does nothing
 # else: it cannot revise a severity, cannot call a candidate wrong, and cannot remove one.
@@ -5694,13 +6010,13 @@ CLUSTER_KEYS = ("members", "consequence", "split_reason")
 TO_GROUP_HEADING = "\n## Candidates to group\n"
 NO_CHECK_LINE = "What the check found: it did not come back; judge this one from its own description."
 UNGROUPED_NOTE = ("The area was not clustered: every candidate in it is reported on its own, "
-                  "one candidate per cluster, so a defect two readers found twice is shown "
-                  "twice rather than merged.")
+                  "one candidate per cluster, so a defect that two readers both found is "
+                  "shown twice rather than merged.")
 
 
 @dataclass(frozen=True)
 class ClusterUnit:
-    """One clustering unit: one area's candidates of one kind, addressed to one slot.
+    """One clustering unit: one area's candidates of one kind, addressed to one lane.
 
     ``asks`` separates the two. A coverage gap and a defect at the same site are not the
     same thing to merge — one is a test to write and the other is code to fix — so they are
@@ -5709,7 +6025,7 @@ class ClusterUnit:
 
     id: str
     area: str
-    slot: str
+    lane: str
     candidates: tuple[str, ...]
     asks: str = DEFECT_ASKS
 
@@ -5793,8 +6109,8 @@ def plan_clusters(candidates: Sequence[dict]) -> tuple[ClusterUnit, ...]:
     same lines would be one entry that is both a test to write and code to fix, and the
     report has to put it in exactly one place.
 
-    The slots take the areas in turn. Neither slot is a stranger to an area's candidates —
-    both slots read every area — so the routing rule that keeps a finder away from its own
+    The lanes take the areas in turn. Neither lane is a stranger to an area's candidates —
+    both lanes read every area — so the routing rule that keeps a finder away from its own
     finding has nothing to bite on here, and the reason to spread the work is that no one
     model's sense of what counts as the same defect then shapes the whole report.
     """
@@ -5805,7 +6121,7 @@ def plan_clusters(candidates: Sequence[dict]) -> tuple[ClusterUnit, ...]:
     return tuple(
         ClusterUnit(id=f"{CLUSTER_UNIT_PREFIX}{area}"
                        f"{COVERAGE_BATCH_SUFFIX if question == COVERAGE_ASKS else ''}",
-                    area=area, slot=SLOTS[n % len(SLOTS)], asks=question,
+                    area=area, lane=LANES[n % len(LANES)], asks=question,
                     candidates=tuple(keyed[(area, question)]))
         for n, (area, question) in enumerate(sorted(keyed, key=lambda k: (k[0], asked[k[1]])))
     )
@@ -5848,7 +6164,7 @@ def render_clusterer_payload(brief: str, problem: str, candidates: Sequence[dict
     consequences and directions its raisers proposed, their proposed severities, and what
     the agent that checked it said about the mechanism.
 
-    No unit id, no slot, no lens and no verdict status. Who raised a candidate is not
+    No unit id, no lane, no lens and no verdict status. Who raised a candidate is not
     evidence that two candidates are the same defect, and a status is a correctness
     judgment this stage is explicitly not making — shown one, a clusterer starts separating
     refuted claims from established ones, which is a grouping by something other than
@@ -5886,7 +6202,7 @@ def _parse_cluster(raw: object, field: str, handed: frozenset[str],
     scannable. Refusing a reply here for a long one would cost the whole AREA its
     clustering: every candidate in it would go unmerged and be reported on its own, which
     is a far worse document than one heading that wraps. Both runtimes honour the bound as
-    an instruction — measured per dispatch slot on a 151-defect run, 88 characters at the
+    an instruction — measured per dispatch lane on a 151-defect run, 88 characters at the
     longest from one and 107 from the other, none over — so the schema is where it belongs
     and this parser stays permissive on purpose.
     """
@@ -6138,7 +6454,7 @@ def write_clusters(rundir: Path, units_doc: dict, candidates: Sequence[dict],
             write_json(unit_dir / SCHEMA_NAME, companions.clusterer_schema)
             lines, size = measure_payload(text)
             listing.append({
-                "id": unit.id, "kind": CLUSTERER_KIND, "area": unit.area, "slot": unit.slot,
+                "id": unit.id, "kind": CLUSTERER_KIND, "area": unit.area, "lane": unit.lane,
                 "lens": None, "candidates": list(unit.candidates), "asks": unit.asks,
                 "payload": f"{UNITS_DIR}/{unit.id}/{PAYLOAD_NAME}",
                 "schema": f"{UNITS_DIR}/{unit.id}/{SCHEMA_NAME}",
@@ -6146,7 +6462,7 @@ def write_clusters(rundir: Path, units_doc: dict, candidates: Sequence[dict],
                 "payload_bytes": size,
             })
         write_json(rundir / UNITS_FILE_NAME, {
-            "stage": CLUSTERED_STAGE, "slots": units_doc.get("slots", list(SLOTS)), "units": listing,
+            "stage": CLUSTERED_STAGE, "lanes": units_doc.get("lanes", list(LANES)), "units": listing,
         })
     except BaseException:
         # Best effort, deciding nothing: a directory that will not come away is left on
@@ -6163,7 +6479,7 @@ def cluster_summary(units: Sequence[ClusterUnit], states: Sequence[VerificationS
            f"{sum(1 for s in states if s.state == UNIT_MISSING)} missing"]
     out.append(f"{_plural(len(units), 'clustering unit')}")
     for unit in units:
-        out.append(f"  {unit.id}  {_plural(len(unit.candidates), 'candidate')}  slot {unit.slot}")
+        out.append(f"  {unit.id}  {_plural(len(unit.candidates), 'candidate')}  lane {unit.lane}")
     return "\n".join(out) + "\n"
 
 
@@ -6183,7 +6499,7 @@ SYNTHESIS_UNIT_PREFIX = "synth-"
 # index rather than costing any cross-reference: the payload separates that index from the
 # defects this unit judges precisely so a split round can still cite a defect it was not
 # handed.
-SYNTHESIS_UNIT_ID = f"{SYNTHESIS_UNIT_PREFIX}{SLOTS[0]}"
+SYNTHESIS_UNIT_ID = f"{SYNTHESIS_UNIT_PREFIX}{LANES[0]}"
 SYNTHESIZER_RESULT_KEYS = ("tiers", "defects", "summary")
 SYNTHESIS_KEYS = ("defect", "tier", "what_goes_wrong", "fix", "cross_references")
 DEFECT_INDEX_HEADING = "\n## The defect index\n"
@@ -6192,10 +6508,10 @@ TO_JUDGE_HEADING = "\n## Your defects\n"
 
 @dataclass(frozen=True)
 class SynthesisUnit:
-    """The synthesis round's one unit: every defect in the run, addressed to one slot."""
+    """The synthesis round's one unit: every defect in the run, addressed to one lane."""
 
     id: str
-    slot: str
+    lane: str
     defects: tuple[str, ...]
 
 
@@ -6253,7 +6569,7 @@ def plan_synthesis(clusters: Sequence[Cluster]) -> tuple[SynthesisUnit, ...]:
     """
     if not clusters:
         return ()
-    return (SynthesisUnit(id=SYNTHESIS_UNIT_ID, slot=SLOTS[0],
+    return (SynthesisUnit(id=SYNTHESIS_UNIT_ID, lane=LANES[0],
                           defects=tuple(cluster.id for cluster in clusters)),)
 
 
@@ -6673,7 +6989,7 @@ def write_synthesis(rundir: Path, units_doc: dict, units: Sequence[SynthesisUnit
             write_json(unit_dir / SCHEMA_NAME, companions.synthesizer_schema)
             lines, size = measure_payload(text)
             listing.append({
-                "id": unit.id, "kind": SYNTHESIZER_KIND, "area": None, "slot": unit.slot,
+                "id": unit.id, "kind": SYNTHESIZER_KIND, "area": None, "lane": unit.lane,
                 "lens": None, "defects": list(unit.defects),
                 "payload": f"{UNITS_DIR}/{unit.id}/{PAYLOAD_NAME}",
                 "schema": f"{UNITS_DIR}/{unit.id}/{SCHEMA_NAME}",
@@ -6681,7 +6997,7 @@ def write_synthesis(rundir: Path, units_doc: dict, units: Sequence[SynthesisUnit
                 "payload_bytes": size,
             })
         write_json(rundir / UNITS_FILE_NAME, {
-            "stage": SYNTHESIZED_STAGE, "slots": units_doc.get("slots", list(SLOTS)),
+            "stage": SYNTHESIZED_STAGE, "lanes": units_doc.get("lanes", list(LANES)),
             "units": listing,
         })
     except BaseException:
@@ -6695,7 +7011,7 @@ def write_synthesis(rundir: Path, units_doc: dict, units: Sequence[SynthesisUnit
 def synthesis_summary(units: Sequence[SynthesisUnit], clusters: Sequence[Cluster]) -> str:
     out = [f"{_plural(len(clusters), 'defect')} to judge"]
     for unit in units:
-        out.append(f"  {unit.id}  {_plural(len(unit.defects), 'defect')}  slot {unit.slot}")
+        out.append(f"  {unit.id}  {_plural(len(unit.defects), 'defect')}  lane {unit.lane}")
     if not units:
         out.append("  no synthesis unit: the run found nothing to judge")
     return "\n".join(out) + "\n"
@@ -6966,6 +7282,15 @@ SUBSECTION_BY_TIER = "Defects by tier"
 # here rather than left to whoever runs the panel, because the reader of a report is usually
 # not that person and is usually not in the room when the run finishes.
 SUBSECTION_LIMITS = "What this report does not tell you"
+# The synthesis round's own paragraph about the run, which the round writes for this report.
+SUBSECTION_OVERVIEW = "The judgment round's overview"
+# What the operator wrote in `report-notes.json`: its own section, directly after the
+# description, because the answers to the job's questions are what an owner asked for.
+SECTION_OPERATOR = "The operator's notes"
+SUBSECTION_ANSWERS = "Answers to the owner's questions"
+SUBSECTION_CORRECTIONS = "The operator's corrections"
+SUBSECTION_CAVEATS = "Caveats about the whole run"
+CORRECTED_MARK = "Corrected by the operator"
 SECTION_INDEX = "Indices"
 SECTION_ESTABLISHED = "Established defects"
 SECTION_UNRESOLVED = "Unresolved"
@@ -7047,9 +7372,9 @@ DEFECT_META_SEP = " · "
 # sha is stated once, under "How this ran".
 COMMIT_ABBREV = 10
 # The two axes spec section 3 asks for, kept apart so neither can imply the other.
-# Axis A is DISCOVERY BREADTH, and the stored value is the slot fact the run actually
+# Axis A is DISCOVERY BREADTH, and the stored value is the lane fact the run actually
 # establishes: a candidate carries exactly one raiser, so ``both`` can only mean its
-# cluster holds candidates raised by both slots. Which words a rung permits for that —
+# cluster holds candidates raised by both lanes. Which words a rung permits for that —
 # both models, both contexts, or no claim at all where one context was both finder and
 # verifier — is the renderer's, which is why no rung vocabulary is stored here.
 # Axis B is VERIFICATION STRENGTH and follows the evidence rather than the status: a
@@ -7122,12 +7447,12 @@ RUNG_BREADTH = {
 # What a record keeps of each raiser. Its consequence, direction and fix size are lifted to
 # the candidate, which carries exactly one raiser; what is left is the provenance and the
 # two things only the raiser can say — the severity it proposed and the source it quoted.
-RAISER_KEYS = ("unit", "slot", "lens", "kind", "area", "severity", "quote", "reproduction")
+RAISER_KEYS = ("unit", "lane", "lens", "kind", "area", "severity", "quote", "reproduction")
 _FIX_RANK = {size: i for i, size in enumerate(FIX_SIZES)}
 # The rung names the prose layer's ladder, read from the record the dispatcher wrote and
 # never inferred. What the rung lets the report claim is DERIVED in :func:`_rung_line`
 # from what landed, never asserted: a reader that never returned means its area was not
-# read by both slots, and a candidate both slots raised had no other model to go to.
+# read by both lanes, and a candidate both lanes raised had no other model to go to.
 RUNG_NAMES = {
     RUNG_TWO_RUNTIMES: "two runtimes",
     RUNG_ONE_RUNTIME: "one runtime with sub-agents",
@@ -7137,10 +7462,10 @@ RUNG_NAMES = {
 # wrote names snapshot paths and nothing under the source root. Whether a reproduction
 # ran in a disposable copy is the dispatcher's to record in the permission text.
 CONTAINMENT_LINE = (
-    "Containment: the adapter and permission per slot above are as recorded by the "
-    "dispatcher; the engine did not verify it. What the engine can state is that it "
-    "spawned nothing and checked no sandbox, and that the files its payloads list are "
-    "snapshot paths, none under the source root — that, and nothing stronger."
+    "Containment: the adapter and permission for each lane above are as the dispatcher "
+    "recorded them, and the engine did not verify them. All the engine can state is that "
+    "it spawned nothing and checked no sandbox, and that the files its payloads list are "
+    "snapshot paths, none under the source root. It claims nothing stronger."
 )
 EVERY_UNIT_RETURNED = "Every unit returned a valid result."
 # The report keeps at most this much of a reproduction's output, the tail: the brief asks
@@ -7154,9 +7479,10 @@ EVIDENCE_OUTPUT_BOUND = 4096
 # unresolved defect renders none at all, so a warning that points downward at code pointed
 # at the next defect's heading on every established entry and at nothing whatsoever on every
 # unresolved one.
-QUOTE_FLAG = ("The source quoted with this report is not what the pinned tree holds at "
-              "those lines. The range may be wrong; the engine left it exactly as the "
-              "report gave it, so read the location itself before acting on the quotation.")
+QUOTE_FLAG = ("The source quoted with this report does not match what the pinned tree "
+              "holds at those lines. The line range may be wrong. The engine left the range "
+              "exactly as the report gave it, so read the location itself before acting on "
+              "the quotation.")
 QUOTE_UNCHECKED = ("The engine could not read those lines from the pinned tree, so the "
                    "quotation was not checked and no source is shown.")
 # A snippet's context and its ceiling. The pad is what makes a one-line citation readable —
@@ -7257,7 +7583,7 @@ class Resolved:
 
     candidate: str
     unit: str
-    slot: str
+    lane: str
     status: str
     evidence: dict | None
     rationale: str
@@ -7372,13 +7698,13 @@ def resolve(candidates: Sequence[dict], holder: dict[str, dict],
             # verdict it could not read is engine text, and counting it as an answer put
             # the parse error on the page as the checker's own words; the coverage section
             # is where that text belongs, and it is there by name.
-            out[cid] = Resolved(cid, batch["id"], batch["slot"], verdict.status, verdict.evidence,
+            out[cid] = Resolved(cid, batch["id"], batch["lane"], verdict.status, verdict.evidence,
                                 verdict.rationale, verdict.revision, verdict.test_first,
                                 verdict.unresolved_reason, verdict.covered_by,
                                 verdict.needs_files, verdict.from_verifier)
         else:
             out[cid] = Resolved(
-                cid, batch["id"], batch["slot"], "unresolved", None,
+                cid, batch["id"], batch["lane"], "unresolved", None,
                 f"no verdict was received: verification unit {batch['id']} {state.state} ({state.reason})",
                 None, None, None, None, (), False,
             )
@@ -7544,10 +7870,10 @@ def _verification_records(records: Sequence[dict],
     of unresolved, and that is not a verifier's judgment about anything. Reading the two
     together is what tells a spread of opinion from a unit that did not answer.
 
-    ``finder`` is the slot whose findings the unit was handed, off the unit row in
+    ``finder`` is the lane whose findings the unit was handed, off the unit row in
     ``units.json``. Routing keys a batch on (area, finder, question), so every candidate a
-    unit holds was raised by one slot — which is what makes the unresolved share here
-    readable as a question about that slot's findings rather than only about this
+    unit holds was raised by one lane — which is what makes the unresolved share here
+    readable as a question about that lane's findings rather than only about this
     verifier. Taken from the listing and not counted off the records, so a unit that
     failed or never landed still says whose work went unanswered.
 
@@ -7656,7 +7982,7 @@ def build_findings(dispatch: DispatchRecord, candidates: Sequence[dict],
 
     Axis A is read off the cluster because that is the only place the fact lives: a
     candidate carries exactly one raiser, so ``both`` means the cluster holds candidates
-    raised by both slots. A cluster aggregates over its ESTABLISHED members alone — an
+    raised by both lanes. A cluster aggregates over its ESTABLISHED members alone — an
     unestablished sibling must not lend a cluster a severity nothing verified — and falls
     back to all of them where none is established, since a cluster still needs one. No
     aggregate hides a member: each keeps its own status and its own Axis B.
@@ -7684,9 +8010,9 @@ def build_findings(dispatch: DispatchRecord, candidates: Sequence[dict],
     opens the file.
     """
     cluster_of = {cid: cluster for cluster in clustering.clusters for cid in cluster.members}
-    slot_of = {cand["id"]: cand["raised_by"][0]["slot"] for cand in candidates}
+    lane_of = {cand["id"]: cand["raised_by"][0]["lane"] for cand in candidates}
     axis_a_of = {
-        cluster.id: AXIS_A_BOTH if len({slot_of[cid] for cid in cluster.members}) > 1 else AXIS_A_ONE
+        cluster.id: AXIS_A_BOTH if len({lane_of[cid] for cid in cluster.members}) > 1 else AXIS_A_ONE
         for cluster in clustering.clusters
     }
     records: list[dict] = []
@@ -7712,7 +8038,7 @@ def build_findings(dispatch: DispatchRecord, candidates: Sequence[dict],
             "axis_b": _axis_b(status, evidence),
             "raised_by": [{key: entry[key] for key in RAISER_KEYS}
                           for entry in cand["raised_by"]],
-            "verified_by": {"slot": answer.slot, "unit": answer.unit},
+            "verified_by": {"lane": answer.lane, "unit": answer.unit},
             "consequence": raiser["consequence"],
             "failure": cand["failure"],
             "direction": raiser["direction"],
@@ -7856,10 +8182,10 @@ def findings_document(findings: Findings) -> dict:
 
 def _unit_label(unit: dict) -> str:
     if unit["kind"] == VERIFIER_KIND:
-        return f"{unit['id']} (verifier for {unit['area']}, addressed to slot {unit['slot']})"
+        return f"{unit['id']} (verifier for {unit['area']}, addressed to lane {unit['lane']})"
     if unit["kind"] == AUDITOR_KIND:
-        return f"{unit['id']} (auditor, slot {unit['slot']})"
-    return f"{unit['id']} (reader, slot {unit['slot']}, lens {json.dumps(unit['lens'])})"
+        return f"{unit['id']} (auditor, lane {unit['lane']})"
+    return f"{unit['id']} (reader, lane {unit['lane']}, lens {json.dumps(unit['lens'])})"
 
 
 # The fence's language, by extension. NAMING a language costs nothing and lets every
@@ -7996,7 +8322,7 @@ def _item(prefix: str, text: str, tail: str | None = None) -> list[str]:
 
 
 def _recorded(prefix: str, text: str) -> list[str]:
-    """One thing the dispatcher wrote down about how a slot ran, always fenced.
+    """One thing the dispatcher wrote down about how a lane ran, always fenced.
 
     :func:`_item` decides between inline and fenced from the text, which is right for
     worker prose — a one-line rationale reads better on the line it belongs to. It is wrong
@@ -8601,7 +8927,7 @@ def _render_member(record: dict, commit: dict, names: PathNames,
     an unlabelled bullet -- which is what the old shape produced, and what a reader could
     not identify: a lone `by reading` under nothing, repeating the header field above it.
 
-    Section 10: candidate ids, slot letters, unit ids and lens names are audit data and
+    Section 10: candidate ids, lane letters, unit ids and lens names are audit data and
     belong in the provenance appendix, not in the text somebody reads while fixing this.
     What is left is what a fixer uses — what fails, what to do about it, what was concluded
     and what ran — and every string of it is a worker's, so it goes through :func:`_item`.
@@ -8833,7 +9159,7 @@ def _unsettled(members: Sequence[dict], names: PathNames) -> list[str]:
     for the same reason in reverse: their rationale says why the claim is wrong, which is a
     settled answer and not an open question.
 
-    Deduplicated on the rendered text, like the tests and the member blocks: two slots that
+    Deduplicated on the rendered text, like the tests and the member blocks: two lanes that
     could not settle one site for one reason routinely write one account of it.
     """
     out: list[str] = []
@@ -8855,7 +9181,8 @@ def _unsettled(members: Sequence[dict], names: PathNames) -> list[str]:
 
 def _render_defect(cluster: dict, members: Sequence[dict], rung: str,
                    commit: dict, names: PathNames, level: int = 3,
-                   verification: bool = True, unsettled: bool = False) -> list[str]:
+                   verification: bool = True, unsettled: bool = False,
+                   corrected: bool = False) -> list[str]:
     """One defect in full: its id and a one-line label as the heading, the whole
     consequence under it, one line of metadata, and every member's own verdict — an
     established defect never hides the refuted or unresolved sibling that describes the
@@ -8920,6 +9247,11 @@ def _render_defect(cluster: dict, members: Sequence[dict], rung: str,
             # The decode, in place: the short name above is only safe where a reader can
             # get back to the path without leaving the entry.
             f"  {_in_full(cluster, commit)}\n"]
+    # Under the metadata and above everything the panel said, so a reader meets it before
+    # acting on the entry. A pointer and not the reason: the reason is in one place.
+    if corrected:
+        out.append(f"- **{CORRECTED_MARK}.** See "
+                   f"[{SUBSECTION_CORRECTIONS}]({_anchor(SUBSECTION_CORRECTIONS)}).\n")
     # The evidence, directly under the location that names it and ABOVE the prose about
     # it. The heading already says in plain words what goes wrong, so a reader has decided
     # whether this defect is theirs before reaching here; what they want next is the code,
@@ -8980,13 +9312,13 @@ def _render_defect(cluster: dict, members: Sequence[dict], rung: str,
         # What stopped the check, for a defect nothing settled. It sits BETWEEN the
         # mechanism and the fix because that is the order somebody works in here: what is
         # claimed, what would decide whether it holds, and what to do if it does. One entry
-        # per checker, deduplicated the way the tests below are, since two slots describing
+        # per checker, deduplicated the way the tests below are, since two lanes describing
         # one site routinely give one account of what was missing.
         if unsettled:
             out += _unsettled(members, names)
         out += _item(f"- **{FIX_LABEL}** ", cluster["fix"])
         # The test is the verifier's, so it is one per member; deduplicated for the reason
-        # the member blocks below are, since two slots describing one site name one test.
+        # the member blocks below are, since two lanes describing one site name one test.
         tests: list[str] = []
         for record in members:
             named = record["test_first"]
@@ -9004,7 +9336,7 @@ def _render_defect(cluster: dict, members: Sequence[dict], rung: str,
         if cluster["cross_references"]:
             named_refs = ", ".join(f"[{did}](#{did})" for did in cluster["cross_references"])
             out.append(f"- **{RELATED_LABEL}** {named_refs}\n")
-    # Two slots that described one defect in the same words render one entry, not two
+    # Two lanes that described one defect in the same words render one entry, not two
     # identical ones. Nothing is hidden by that: how many reports there were is the
     # corroboration line above, and which units made them is the provenance appendix.
     # Where two members differ at all — a different failure, a different verdict, a
@@ -9061,7 +9393,8 @@ def _render_defect(cluster: dict, members: Sequence[dict], rung: str,
 
 
 def _render_index(clusters: Sequence[dict], rung: str, refuted: int,
-                  names: PathNames, sections: _Sections) -> list[str]:
+                  names: PathNames, sections: _Sections,
+                  corrected: frozenset[str] = frozenset()) -> list[str]:
     """The first of the three views of the defect list: one table, every defect that is
     work, most severe first and cheapest first within that. Section 9 forbids a second
     table that differs only by a filter, so this is the only place the list is ranked.
@@ -9075,20 +9408,26 @@ def _render_index(clusters: Sequence[dict], rung: str, refuted: int,
     separate things a reader has to decide between.
     """
     out = [sections.sub(SUBSECTION_RANKED),
-           "Every defect there is something to do about, most severe first, and the "
-           "cheapest fix first within a severity — so the first rows are the blockers in "
-           "the order to take them.\n"]
+           "Every defect that needs work, most severe first and, within a severity, "
+           "cheapest fix first. So the first rows are the blockers, in the order to take "
+           "them on.\n"]
     if refuted:
         out.append(f"\n{_plural(refuted, 'refuted defect')} "
-                   f"{'is' if refuted == 1 else 'are'} not here. Nothing is to be done "
-                   f"about them, so they are listed under Refuted, in the appendix, with "
-                   f"the reason each was dismissed.\n")
+                   f"{'is' if refuted == 1 else 'are'} not here. Nothing needs doing about "
+                   f"{'it' if refuted == 1 else 'them'}, so "
+                   f"{'it is' if refuted == 1 else 'they are'} listed under Refuted, in the "
+                   f"appendix, with the reason {'it' if refuted == 1 else 'each'} was "
+                   f"dismissed.\n")
     out += [f"\n| {DEFECT_COLUMN} | Consequence | Severity | Status | Location | Fix size "
             f"| Corroboration |\n", "|---|---|---|---|---|---|---|\n"]
     for cluster in clusters:
+        # Marked here as well as on the entry: this is the list a reader works down, and
+        # one who acts from the row never opens the entry that carries the mark.
+        mark = (f", [corrected by the operator]({_anchor(SUBSECTION_CORRECTIONS)})"
+                if cluster["id"] in corrected else "")
         out.append(f"| [{cluster['id']}](#{cluster['id']}) | "
                    f"{_cell(_short(cluster['consequence']))} | "
-                   f"{_term_cell(cluster['severity'])} | {_term_cell(cluster['status'])} | "
+                   f"{_term_cell(cluster['severity'])} | {_term_cell(cluster['status'])}{mark} | "
                    f"{_cell(_at(cluster, names))} | "
                    f"{_term_cell(cluster['fix_size'])} | {_term_cell(_breadth(cluster, rung))} |\n")
     return out
@@ -9115,8 +9454,9 @@ def _render_by_file(clusters: Sequence[dict], by_id: dict, names: PathNames,
             if where not in seen:
                 seen.append(where)
     out = [sections.sub(SUBSECTION_BY_FILE),
-           "The same defects, gathered so one person can take a file and close what is in "
-           "it in one change. A defect reported in two files is listed under both.\n\n",
+           "The same defects, grouped by file, so one person can take a file and close "
+           "every defect listed under it in one change. A defect reported in two files is "
+           "listed under both.\n\n",
            "| File | Defects | Most severe | Lines |\n", "|---|---|---|---|\n"]
     # Ordered by the name the column actually shows. Sorting by the full path would leave
     # a reader a column that is not in any order they can see.
@@ -9156,7 +9496,8 @@ def _by_tier(clusters: Sequence[dict], tiers: Sequence[str]) -> list[tuple[str |
 
 def _render_body(clusters: Sequence[dict], by_id: dict, rung: str,
                  commit: dict, names: PathNames, sections: _Sections,
-                 tiers: Sequence[str] = (), disclaim: bool = False) -> list[str]:
+                 tiers: Sequence[str] = (), disclaim: bool = False,
+                 corrected: frozenset[str] = frozenset()) -> list[str]:
     """The third view: the defects themselves, grouped by status and then by tier, with
     severity order inside. Section 9 refuses a body that claims an ordering it does not
     have, so neither grouping is an ordering: the status is a fact the engine computed, the
@@ -9186,12 +9527,14 @@ def _render_body(clusters: Sequence[dict], by_id: dict, rung: str,
             if name is None:
                 for cluster in group:
                     out += _render_defect(cluster, members(cluster), rung, commit, names,
-                                          level, verification)
+                                          level, verification,
+                                          corrected=cluster["id"] in corrected)
                 continue
             out.append(f"\n{'#' * level} {_counted(_one_line(name), len(group))}\n")
             for cluster in group:
                 out += _render_defect(cluster, members(cluster), rung, commit, names,
-                                      level + 1, verification)
+                                      level + 1, verification,
+                                      corrected=cluster["id"] in corrected)
         return out
 
     out: list[str] = []
@@ -9204,8 +9547,8 @@ def _render_body(clusters: Sequence[dict], by_id: dict, rung: str,
     if not established:
         out.append("Nothing was established.\n")
     else:
-        out.append("Each was confirmed by a check that did not raise it. A defect keeps "
-                   "every report of it, including one its own sibling refuted.\n")
+        out.append("Each was confirmed by a checker that had not raised it. A defect keeps "
+                   "every report of it, including a report that a check refuted.\n")
     out += grouped(established, 3)
 
     unresolved = [c for c in clusters if c["status"] == DEFECT_UNRESOLVED]
@@ -9226,14 +9569,13 @@ def _render_body(clusters: Sequence[dict], by_id: dict, rung: str,
         # that never returned -- which is the distinction that group heading exists to draw.
         out.append(f"Nothing here is established: each is a claim a check could not "
                    f"settle. Where a checker answered, the entry carries "
-                   f"**{UNSETTLED_LABEL}** — that checker's own account of what stopped "
-                   f"it, and for most of these the name of the one file or contract that "
-                   f"would decide the claim; where none did, the group says so and the "
-                   f"entry says a verdict never came back, with Coverage naming the unit "
-                   f"that owes one. Grouped by what would "
-                   f"settle each, and then by what each breaks. Every defect here sits "
-                   f"under exactly one group, so a group's size is a count of work and not "
-                   f"of mentions.\n")
+                   f"**{UNSETTLED_LABEL}** This is that checker's own account of what "
+                   f"stopped it; for most of these it names the one file or contract that "
+                   f"would decide the claim. Where no checker answered, the group says so, the "
+                   f"entry says a verdict never came back, and Coverage names the unit "
+                   f"that owes one. The defects are grouped by what would settle each, and "
+                   f"then by what each breaks. Every defect here sits under exactly one "
+                   f"group, so a group's size counts pieces of work, not mentions.\n")
     # The settling reason stays the PRIMARY grouping: it is a fact the verifiers returned
     # and it is what a person does next. The tier names the substance inside it, which is
     # what turns one group of thirty-nine into groups somebody can take one of — and where
@@ -9264,7 +9606,8 @@ def _render_body(clusters: Sequence[dict], by_id: dict, rung: str,
         # de-duplication and the constant-field suppression above apply here unchanged.
         for cluster in held:
             out += _render_defect(cluster, members(cluster), rung, commit, names, 4,
-                                  verification, unsettled=True)
+                                  verification, unsettled=True,
+                                  corrected=cluster["id"] in corrected)
     return out
 
 
@@ -9301,13 +9644,13 @@ def _render_corroborated(clusters: Sequence[dict], rung: str,
     set, in the order the defects were raised, and says where the facts are. There is
     nothing in it to work from, and nothing to reconcile against the index.
 
-    The membership is the engine's own: a defect whose candidates came from both slots,
+    The membership is the engine's own: a defect whose candidates came from both lanes,
     which is what the index's corroboration column already states one row at a time. The
     section states it once, as a set, which a column cannot.
 
     Refuted defects are left out for the reason they are left out of the ranked views:
     they are not work — and the empty case says so in the same words, because a run whose
-    one both-slot defect was refuted did not fail to corroborate anything.
+    one both-lane defect was refuted did not fail to corroborate anything.
     """
     _, both = RUNG_BREADTH[rung]
     named = sorted((c for c in clusters if _is_work(c) and c["axis_a"] == AXIS_A_BOTH),
@@ -9318,13 +9661,13 @@ def _render_corroborated(clusters: Sequence[dict], rung: str,
         # raised by both" would be FALSE on a run where one was and was then refuted — the
         # line above drops refuted defects, so the sentence has to drop them too or it
         # denies a thing that happened.
-        out.append(f"Nothing left to address was raised by {both}: every defect below came "
-                   f"from a single reader.\n")
+        out.append(f"Nothing left to address was raised by {both}: every defect that needs "
+                   f"work came from a single reader.\n")
         return out
-    out.append(f"Each of these was raised independently by a unit in each slot, both "
-               f"reading blind and neither seeing the other's output — which is the one "
-               f"thing this section says. What each is, how severe it is and where it "
-               f"lives are in the sections above; nothing is ranked here.\n\n")
+    out.append(f"Each of these was raised independently by a unit in each lane. Both "
+               f"units read blind, and neither saw the other's output. That is all this "
+               f"section says. What each defect is, how severe it is and where it is are "
+               f"in the sections above, and nothing is ranked here.\n\n")
     # Two columns, and the id is a link into the defect's own entry. A severity or a
     # location column here would be the duplication this section is written to avoid: every
     # defect in it is in the ranked index, which already carries both. The test a table has
@@ -9337,7 +9680,8 @@ def _render_corroborated(clusters: Sequence[dict], rung: str,
     return out
 
 
-def _render_refuted(clusters: Sequence[dict], by_id: dict, names: PathNames) -> list[str]:
+def _render_refuted(clusters: Sequence[dict], by_id: dict, names: PathNames,
+                    corrected: frozenset[str] = frozenset()) -> list[str]:
     """The claims a check dismissed, each with the reason that dismissed it.
 
     A TABLE, one row per defect: which defect, what it said, where, and why it was
@@ -9362,8 +9706,8 @@ def _render_refuted(clusters: Sequence[dict], by_id: dict, names: PathNames) -> 
     if not refuted:
         out.append("Nothing was refuted.\n")
         return out
-    out.append("Checked and dismissed, each with the reason, so nobody re-treads "
-               "them. Nothing here is work.\n\n")
+    out.append("Claims that were checked and dismissed, each with the reason, so nobody "
+               "goes over them again. Nothing here needs work.\n\n")
     out.append(f"\n| {DEFECT_COLUMN} | Consequence | Location | Why it was dismissed |\n")
     out.append("|---|---|---|---|\n")
     for cluster in refuted:
@@ -9388,8 +9732,13 @@ def _render_refuted(clusters: Sequence[dict], by_id: dict, names: PathNames) -> 
             refs = (f" **{RELATED_LABEL}** "
                     + ", ".join(f"[{did}](#{did})" for did in cluster["cross_references"]))
         flag = f" {QUOTE_FLAG}" if misquoted else ""
+        # In the last cell and never beside the id: the id alone in the first cell is what
+        # gives this row its anchor on the page.
+        mark = (f" **{CORRECTED_MARK}**; see "
+                f"[{SUBSECTION_CORRECTIONS}]({_anchor(SUBSECTION_CORRECTIONS)})."
+                if cluster["id"] in corrected else "")
         out.append(f"| {cluster['id']} | {_cell(_short(cluster['consequence']))} | "
-                   f"{_cell(_at(cluster, names))} | {_cell(reason)}{flag}{refs} |\n")
+                   f"{_cell(_at(cluster, names))} | {_cell(reason)}{flag}{refs}{mark} |\n")
     return out
 
 
@@ -9561,9 +9910,9 @@ def _render_coverage_gaps(findings: Findings, names: PathNames,
     standing = [c for c in gaps if c["status"] == DEFECT_ESTABLISHED]
     unresolved = [c for c in gaps if c["status"] == DEFECT_UNRESOLVED]
     out = [sections.top(SECTION_COVERAGE_GAPS, len(standing))]
-    out.append("Inputs the code distinguishes and no test in scope constructs. **None of "
-               "these says the code is wrong** — a branch can be correct today and still "
-               "have nothing guarding it, which is how it stays correct. Each is a test to "
+    out.append("Inputs the code handles differently that no test in scope constructs. "
+               "**None of these says the code is wrong.** A branch can be correct today with "
+               "no test guarding it, and a test is what keeps it correct. Each is a test to "
                "write, at the lines that decide the input, under the test class that owes "
                "it.\n")
     if not standing and not unresolved:
@@ -9619,8 +9968,8 @@ def _render_covered(findings: Findings, names: PathNames) -> list[str]:
     if not covered:
         out.append("No coverage gap was answered with a test that covers it.\n")
         return out
-    out.append("Raised as untested and settled by a check that named the test sending that "
-               "input. Nothing here is work.\n\n")
+    out.append("Raised as untested and settled by a check that named the test that sends "
+               "that input. Nothing here needs work.\n\n")
     out.append("\n| Gap | Input | Location | The test that covers it |\n")
     out.append("|---|---|---|---|\n")
     for cluster in covered:
@@ -9660,11 +10009,11 @@ def _render_outside_scope(findings: Findings, names: PathNames) -> list[str]:
         out.append("No unresolved verdict named a file outside the reviewed scope.\n")
         return out
     out.append("Files this review did not cover that a verifier named as what would settle "
-               "an open claim, most claims first. One row per class, however many paths the "
-               "verdicts guessed it at — none of them could be opened from here. The count "
-               "is how many defects that one file would answer, so widening the next job's "
-               "scope by one file is a decision with a number against it. It is a floor: a "
-               "file that would settle a claim may settle it either way.\n\n")
+               "an open claim, most claims first. There is one row per class, however many "
+               "paths the verdicts guessed for it; none of those files could be opened from "
+               "here. The count is how many defects that one file would answer, so adding "
+               "one file to the next job's scope is a decision with a number attached. It "
+               "is a floor: a file that would settle a claim may settle it either way.\n\n")
     out.append(f"\n| Outside the scope | Named at | Defects it would settle | Which |\n")
     out.append("|---|---|---|---|\n")
     for row in rows:
@@ -9679,7 +10028,7 @@ def _render_outside_scope(findings: Findings, names: PathNames) -> list[str]:
 
 
 # What the finder column says for a unit no listing row names — a run directory whose
-# `units.json` predates the field. Empty would read as a slot that raised nothing.
+# `units.json` predates the field. Empty would read as a lane that raised nothing.
 UNKNOWN_FINDER = "not recorded"
 SUBSECTION_VERIFIER_NOTES = "What each unit said about its batch"
 VERIFIER_NOTES_NONE = "No verification unit returned a summary."
@@ -9703,8 +10052,8 @@ def _render_verifier_variance(findings: Findings) -> list[str]:
     not a verifier's judgment about anything. Its state is in the row, because reading the
     two together is what separates a spread of opinion from a unit that did not answer.
 
-    **The finder's slot is the second column.** Routing hands a unit the findings of one
-    slot, so an unresolved share that runs from 0% to 62% across a run's units is as much a
+    **The finder's lane is the second column.** Routing hands a unit the findings of one
+    lane, so an unresolved share that runs from 0% to 62% across a run's units is as much a
     question about whose findings those were as about who checked them, and the column is
     what lets a reader ask it. Each unit's own paragraph follows the table, for the reason
     the coverage section states its verifiers': a field the engine reads and nothing prints
@@ -9715,11 +10064,11 @@ def _render_verifier_variance(findings: Findings) -> list[str]:
     if not rows:
         out.append("No verification unit answered for any candidate.\n")
         return out
-    out.append("How each unit's answers fell. Two units of one run asked the same kind of "
-               "question of comparable batches, so a unit that resolves far less than the "
-               "rest is a fact about that unit and not about the code it read. Each was "
-               "handed one slot's findings and never its own, so the second column is whose "
-               "work the row is about.\n\n")
+    out.append("How each unit's answers were split. The units of one run asked the same "
+               "kind of question of comparable batches, so a unit that settles far fewer "
+               "than the rest tells you about that unit, not about the code it read. Each "
+               "was handed one lane's findings, never its own, so the second column says "
+               "whose work the row is about.\n\n")
     out.append("\n| Unit | Findings from | Handed | Established | Unresolved | Refuted |\n")
     out.append("|---|---|---|---|---|---|\n")
     def share(row):
@@ -9737,7 +10086,8 @@ def _render_verifier_variance(findings: Findings) -> list[str]:
     if len(answered) > 1:
         top, bottom = answered[0], answered[-1]
         if share(top) != share(bottom):
-            out.append(f"\nUnresolved runs from {share(bottom):.0%} ({bottom['unit']}, "
+            out.append(f"\nThe share left unresolved ranges from {share(bottom):.0%} "
+                       f"({bottom['unit']}, "
                        f"{bottom['unresolved']} of {bottom['candidates']}) to "
                        f"{share(top):.0%} ({top['unit']}, {top['unresolved']} of "
                        f"{top['candidates']}).\n")
@@ -9757,7 +10107,7 @@ def _render_clustering_notes(findings: Findings, names: PathNames) -> list[str]:
     clusters = findings.clusters
     out = [f"\n### {SUBSECTION_NOTES}\n\n",
            f"Every candidate is in exactly one cluster: {_plural(len(findings.candidates), 'candidate')} "
-           f"in {_plural(len(clusters), 'cluster')}, no drops and no double counting.\n"]
+           f"in {_plural(len(clusters), 'cluster')}, none dropped and none counted twice.\n"]
     merged = sorted((c for c in clusters if len(c["members"]) > 1),
                     key=lambda c: (-len(c["members"]), _id_rank(c["id"])))
     out.append("\n#### The largest clusters\n\n")
@@ -9784,7 +10134,7 @@ def _render_clustering_notes(findings: Findings, names: PathNames) -> list[str]:
 
 
 def _render_provenance(findings: Findings, tags: dict[str, str]) -> list[str]:
-    """Every candidate id, slot letter, unit id and lens name in the document, in one place
+    """Every candidate id, lane letter, unit id and lens name in the document, in one place
     nobody has to read to fix anything. Section 10: this is audit data, and keeping it here
     is what lets the body above be written for the person doing the work.
 
@@ -9822,12 +10172,12 @@ def _render_provenance(findings: Findings, tags: dict[str, str]) -> list[str]:
     by_id = {record["id"]: record for record in raised}
     out = [f"\n### {SUBSECTION_PROVENANCE}\n\n",
            "Which unit raised what, and which answered it. Nothing here is needed to fix a "
-           "defect; it is here so the run can be audited. Everything each unit wrote — what "
-           "it reported, the direction and any reproduction it proposed, and what the "
-           "checker concluded — is in `findings.json` beside this report, against the same "
-           "candidate id, where it is searchable.\n",
-           f"A reader's lens is cited below by its tag, and **{SUBSECTION_THE_JOB}** — two "
-           f"subsections up, in this appendix — is where each one is spelled out.\n"]
+           "defect; it is here so the run can be audited. Everything each unit wrote is in "
+           "`findings.json` beside this report, under the same candidate id, where it can be "
+           "searched: what it reported, the direction and any reproduction it proposed, and "
+           "what the checker concluded.\n",
+           f"Below, a reader's lens is cited by its tag. **{SUBSECTION_THE_JOB}**, two "
+           f"subsections up in this appendix, spells each one out.\n"]
     # One row per candidate. The defect's own sentence is three sections up and is not
     # repeated here: the id is what a reader follows back.
     out.append("\n| Defect | Candidate | Raised by | Proposed | Answered by |\n")
@@ -9837,18 +10187,18 @@ def _render_provenance(findings: Findings, tags: dict[str, str]) -> list[str]:
             record = by_id[cid]
             for raiser in record["raised_by"]:
                 if raiser["kind"] == AUDITOR_KIND:
-                    who = f"{raiser['unit']} (auditor, slot {raiser['slot']})"
+                    who = f"{raiser['unit']} (auditor, lane {raiser['lane']})"
                 else:
                     # Looked up on the lens EXACTLY as the record carries it, which is the
                     # string the job declared: the tags are built from the job, so a lookup
                     # against a rendered form of the same text would miss every time.
                     tag = tags.get(raiser["lens"] or "", "")
-                    who = f"{raiser['unit']} (slot {raiser['slot']}{', ' + tag if tag else ''})"
+                    who = f"{raiser['unit']} (lane {raiser['lane']}{', ' + tag if tag else ''})"
                 addressed = record["verified_by"]
                 if not record["answered"]:
-                    ans = f"{addressed['unit']} (slot {addressed['slot']}) — nothing usable"
+                    ans = f"{addressed['unit']} (lane {addressed['lane']}) — nothing usable"
                 else:
-                    ans = f"{addressed['unit']} (slot {addressed['slot']})"
+                    ans = f"{addressed['unit']} (lane {addressed['lane']})"
                 out.append(f"| {cluster['id']} | {cid} | {who} | {_term_cell(raiser['severity'])} | {ans} |\n")
     return out
 
@@ -9873,7 +10223,8 @@ def _render_synthesis_notes(findings: Findings) -> list[str]:
     out = [f"\n### {SUBSECTION_SYNTHESIS}\n\n",
            f"What the judgment round returned. The tier headings, "
            f"**{WHAT_GOES_WRONG_LABEL[:-1]}**, **{FIX_LABEL[:-1]}** and "
-           f"**{RELATED_LABEL[:-1]}** came from here and nothing else in this report did.\n\n"]
+           f"**{RELATED_LABEL[:-1]}** came from this round, and nothing else in this report "
+           f"did.\n\n"]
     if record["state"] != UNIT_COMPLETE:
         out += _item(f"- {record['unit']} — {record['state']}: ",
                      record["reason"] or "no reason was recorded", SYNTHESIS_DEGRADED)
@@ -9881,13 +10232,95 @@ def _render_synthesis_notes(findings: Findings) -> list[str]:
     out.append(f"- {record['unit']} — complete: {_plural(len(record['tiers']), 'tier')} "
                f"named for {_plural(len(findings.clusters), 'defect')}.\n")
     for message in record["rejected"]:
-        out += _item("- an entry could not be read, and cost its own defect alone: ",
+        out += _item("- an entry could not be read, and only its own defect is affected: ",
                      message, "That defect carries no tier and no account of itself, and "
                      "is grouped by its status instead.")
     for cluster in findings.clusters:
         for dropped in cluster["dropped_cross_references"]:
             out.append(f"- {cluster['id']} cited {_one_line(dropped['defect'])}, which was "
                        f"dropped: {dropped['reason']}.\n")
+    return out
+
+
+OVERVIEW_LEAD = ("One paragraph the judgment round wrote about the run as a whole. It is "
+                 "a reading, and nobody checked it: only the defects it names were "
+                 "verified, each on its own entry below.")
+
+
+def _render_judgment_overview(findings: Findings) -> list[str]:
+    """The synthesis round's own paragraph, under the counts it is about.
+
+    Written for a person reading the report and, until this was rendered, printed nowhere.
+    It is labeled as a reading because it is one: the round saw the verified defects and
+    wrote about them, and nothing checked what it wrote.
+
+    **Nothing is written unless the round completed and said something.** A round that
+    failed or never landed leaves the document a run without the round would have, and
+    the appendix is where its state is said; a heading over an empty paragraph would say
+    the round had nothing to say, which is a different claim.
+    """
+    record = findings.synthesis
+    said = (record.get("summary") or "") if record is not None else ""
+    if record is None or record["state"] != UNIT_COMPLETE or not said.strip():
+        return []
+    return [f"\n### {SUBSECTION_OVERVIEW}\n\n", f"{OVERVIEW_LEAD}\n\n",
+            f"{_paragraph(said)}\n"]
+
+
+OPERATOR_LEAD = ("Written by whoever ran the panel, after the run, with this report, the "
+                 "code and the owner's questions in view. It is their own reading and nothing "
+                 "checked it: only the defects it cites were verified, each on its own entry. "
+                 "The counts in the section above are the panel's, and nothing here changes "
+                 "them.")
+_BUILD_CHECK_WORDS = {"build": ("whether this tree builds", "build"),
+                      "tests": ("whether its tests run", "tests")}
+
+
+def _render_operator_notes(notes: ReportNotes, job: dict, findings: Findings, probe: dict,
+                           sections: _Sections) -> list[str]:
+    """``report-notes.json``, as its own section, labeled as the operator's reading.
+
+    Everything in it is text somebody wrote rather than a fact the engine computed, so each
+    piece goes through the same escaping a worker's text does, and a question is a heading
+    only behind the engine's own ``Q<n>.``: a heading that opened on a defect id would claim
+    that defect's anchor.
+    """
+    out = [sections.top(SECTION_OPERATOR), f"{OPERATOR_LEAD}\n"]
+    asked = job.get("questions")
+    if notes.answers or asked:
+        out.append(sections.sub(SUBSECTION_ANSWERS))
+        if asked:
+            out.append("The job asked:\n\n")
+            out += [f"> {_entities(line)}\n" for line in asked.splitlines()]
+            out.append("\n")
+        if not notes.answers:
+            out.append("The operator recorded no answer.\n")
+        for n, entry in enumerate(notes.answers, 1):
+            out.append(f"\n#### Q{n}. {_one_line(entry['question'])}\n\n")
+            for part in re.split(r"\n\s*\n", entry["answer"].strip()):
+                out.append(f"{_paragraph(part)}\n\n")
+            if entry["defects"]:
+                out.append("Cites " + ", ".join(f"[{did}](#{did})" for did in entry["defects"])
+                           + ".\n")
+    if notes.corrections:
+        out.append(sections.sub(SUBSECTION_CORRECTIONS))
+        out.append("Each is the operator's reason for disagreeing with what the panel "
+                   "concluded. The entry it names carries a mark pointing here, and is "
+                   "otherwise as the panel left it.\n\n")
+        status = {c["id"]: c["status"] for c in findings.clusters}
+        for entry in notes.corrections:
+            target = entry["target"]
+            if target in _BUILD_CHECK_WORDS:
+                question, key = _BUILD_CHECK_WORDS[target]
+                answer = ((probe.get(key) or {}).get("answer", PROBE_UNKNOWN_WORD)
+                          if probe.get("state") == UNIT_COMPLETE else PROBE_UNKNOWN_WORD)
+                what = f"To the build check's answer on {question}, which was {answer}"
+            else:
+                what = f"To [{target}](#{target}), marked {status[target]} by the panel"
+            out.append(f"- {what}: {_one_line(entry['reason'])}\n")
+    if notes.caveats:
+        out.append(sections.sub(SUBSECTION_CAVEATS))
+        out += [f"- {_one_line(caveat)}\n" for caveat in notes.caveats]
     return out
 
 
@@ -9915,7 +10348,8 @@ def _run_kinds(runs: Sequence[dict]) -> str:
     return " — " + ", ".join(parts) if parts else ""
 
 
-def _executability(probe: dict, findings: Findings) -> list[str]:
+def _executability(probe: dict, findings: Findings,
+                   corrected: frozenset[str] = frozenset()) -> list[str]:
     """Section 7, as three facts that are never inferred from one another.
 
     CAPABILITY is the probe's: whether this tree builds and whether its tests run. ATTEMPTS
@@ -9954,21 +10388,37 @@ def _executability(probe: dict, findings: Findings) -> list[str]:
                 f"either the snapshot does not hold what a reproduction needs, or the "
                 f"probe answered for a different tree. Read the line above as what the "
                 f"probe found, not as what this run could do.\n")
+        # The probe's own account, under the answer it explains and after the qualifier,
+        # which has to stay next to the claim it qualifies. A bare `no` tells a reader the
+        # build failed and not why, and the why is what decides whether it was the tree or
+        # the environment the probe ran in.
+        if probe.get("summary"):
+            out += _item("  - What the probe reported: ", probe["summary"])
     else:
         build = tests = PROBE_UNKNOWN_WORD
-        out = [f"- Executability: unknown. The capability probe {probe.get('state')}, so "
+        out = [f"- Executability: unknown. The capability probe is recorded as "
+               f"{probe.get('state')}, so "
                f"nobody found out whether this tree builds or whether its tests run. "
                f"Unknown is not no.\n"]
+    # Beside the answer it corrects and after everything the engine says about that answer,
+    # because the probe's own line and its qualifier are the panel's and stay as they were.
+    which = [word for target, word in (("build", "whether it builds"),
+                                       ("tests", "whether its tests run"))
+             if target in corrected]
+    if which:
+        out.append(f"  - **{CORRECTED_MARK}**, on {' and '.join(which)}; see "
+                   f"[{SUBSECTION_CORRECTIONS}]({_anchor(SUBSECTION_CORRECTIONS)}).\n")
     out.append(f"- Reproductions: {proposed} proposed, {ran} run{_run_kinds(runs)}. "
-               f"Capability, attempts and successes are three facts and are counted as "
-               f"three.\n")
+               f"Whether this tree builds and its tests run, how many reproductions were "
+               f"proposed and how many ran are three separate facts, and each is counted "
+               f"on its own.\n")
     # Said once, where the numbers are, because "documentary" is this report's word and a
     # reader meeting it beside a defect has nowhere to look it up.
     if any(evidence.get(RUN_KIND_KEY) == "documentary" for evidence in runs):
         out.append("  - **Documentary** means the command inspected the tree without "
-                   "running the code under review — a search for a string, a listing, a "
-                   "checksum. It is evidence, and it is judged by the same standard; it is "
-                   "not a run of the code, which is why the two are counted apart.\n")
+                   "running the code under review: a search for a string, a listing, a "
+                   "checksum. It is evidence, and it is judged by the same standard. It is "
+                   "not a run of the code, which is why the two are counted separately.\n")
     # `0 proposed, 1 run` reads as impossible and is not. A reader proposes a reproduction
     # for the claims it can think of one for; a verifier is free to devise its own, and
     # counting only what was proposed makes its work look like an arithmetic error. Seen in
@@ -9989,14 +10439,15 @@ def _executability(probe: dict, findings: Findings) -> list[str]:
                    f"proposed and none ran, so what would have settled them is still "
                    f"open.\n")
     elif build != "yes" and tests != "yes":
-        out.append("- **Nothing could be executed**: nothing established that anything in "
+        out.append("- **Nothing could be executed**: nothing showed that anything in "
                    "this tree can be built or run, and no candidate proposed a "
                    "reproduction.\n")
     else:
         out.append("- **Nothing was executed**: no candidate proposed a reproduction, so "
                    "nothing was tried.\n")
     out.append("  Every established finding below was established by reading. A count "
-               "of them is a count of readings and not of validations.\n")
+               "of them counts claims confirmed by reading, not claims confirmed by "
+               "running the code.\n")
     return out
 
 
@@ -10071,9 +10522,9 @@ def _reachability(inventory: dict, names: PathNames) -> list[str]:
     """
     coverage = inventory["coverage"]
     if coverage["state"] != "computed":
-        return ["- Reachability: the reviewed set was not compared against what the "
-                "repository tracks, so whether anything reaching these defects was left "
-                "out is unknown.\n"]
+        return ["- Reachability: the reviewed set was not compared with the files the "
+                "repository tracks, so it is unknown whether anything that reaches these "
+                "defects was left out.\n"]
     missing = coverage["tracked_not_reviewed"]
     if not missing:
         return ["- Reachability: every tracked file was in the reviewed set.\n"]
@@ -10083,18 +10534,18 @@ def _reachability(inventory: dict, names: PathNames) -> list[str]:
             f"reviewed root, which sits at `{_one_line(coverage['root'])}/` inside it."
             if coverage["root"] else "")
     out = [f"- **Reachability**: {_plural(len(missing), 'tracked file')} "
-           f"{'is' if len(missing) == 1 else 'are'} not in the reviewed set, against "
-           f"{_plural(len(reviewed), 'file')} that {'is' if len(reviewed) == 1 else 'are'}, "
+           f"{'is' if len(missing) == 1 else 'are'} not in the reviewed set, while "
+           f"{_plural(len(reviewed), 'file')} {'is' if len(reviewed) == 1 else 'are'}, "
            f"so nothing below can say whether they reach these defects.{base}\n"]
     adjacent = _reachability_dirs(inventory)
     if not adjacent:
-        out.append("  - None of them sits in a directory this run read, so an unreviewed "
-                   "caller is somewhere the job did not go near at all.\n")
+        out.append("  - None of them sits in a directory this run read, so any unreviewed "
+                   "caller is in a part of the repository the job did not go near at all.\n")
         return out
     shown = adjacent[:_ADJACENT_CEILING]
     out.append(f"  - Unreviewed files sit beside reviewed ones in "
-               f"{_plural(len(adjacent), 'directory', 'directories')}, which is where a "
-               f"caller nobody read is likeliest to be:\n")
+               f"{_plural(len(adjacent), 'directory', 'directories')}, which is where an "
+               f"unreviewed caller is most likely to be:\n")
     out += [f"    - {_one_line(names.short(name) or '.')} — {_plural(count, 'file')}\n"
             for name, count in shown]
     if len(adjacent) > len(shown):
@@ -10152,7 +10603,8 @@ def _render_limits() -> list[str]:
     """
     return [
         f"\n### {SUBSECTION_LIMITS}\n\n",
-        "**Yield is not recall, and a panel improves the first.** Measured over one tree "
+        "**Reporting more defects is not the same as catching more of the bugs that are "
+        "there, and a panel improves the first.** Measured over one tree "
         "against five production bugs its owner already knew about: three runs found 3, "
         "then 2, then 1 of the five, while the count of defects they reported went 29, "
         "then 100, then 147. The reports got steadily better and the chance of one naming "
@@ -10161,19 +10613,20 @@ def _render_limits() -> list[str]:
         # not a Markdown parser: a paragraph following a list continues inside the last
         # `<li>`, so a closing caveat placed at the end would render as part of the final
         # bullet and read as scoped to it.
-        "This page is organized, honest about its coverage and plainly written, which "
-        "makes it more convincing than a rough one and leaves it exactly as incomplete. "
+        "This page is organized, honest about its coverage and plainly written. That "
+        "makes it more convincing than a rough one, and leaves it just as incomplete. "
         "Read it as a set of claims that were raised and checked, never as a verdict on "
         "the tree.\n\n",
-        "Two things follow, and neither is fixable by making a report nicer.\n\n",
-        "- **A clean sweep is not evidence this tree is sound.** It is evidence that a set "
-        "of agents reading a set of areas raised what they raised. Nothing here samples "
-        "for the defects that matter most to you; a bug you already know about is the only "
-        "way to find out whether a run would have caught it.\n",
+        "Two things follow, and making a report nicer fixes neither.\n\n",
+        "- **A clean sweep is not evidence this tree is sound.** It is evidence only of what "
+        "a set of agents raised while reading a set of areas. Nothing here looks "
+        "specifically for the defects that matter most to you. The only way to find out "
+        "whether a run would have caught one is to test the run against a bug you "
+        "already know about.\n",
         "- **A long report is not a thorough one.** Volume comes from more areas, more "
         "lenses and more agents willing to raise a doubt. Whether the hard defect is in "
-        "here is a different question from how many entries there are, and the second "
-        "number is the one that goes up.\n\n",
+        "here is a different question from how many entries there are, and it is the "
+        "number of entries that goes up.\n\n",
         # No single-asterisk emphasis anywhere in here: the page conversion recognizes
         # `**` alone, so one pair of stars reaches a reader as two literal characters.
     ]
@@ -10201,8 +10654,8 @@ def _render_by_tier(findings: Findings) -> list[str]:
         return []
     grouped = _by_tier(findings.clusters, tiers)
     out = [f"\n### {SUBSECTION_BY_TIER}\n\n",
-           "What the run found, by the themes the judgment round named. Counts only — the "
-           "three views below are the lists to work from.\n\n",
+           "What the run found, grouped by the themes the judgment round named. The table "
+           "holds counts only; the three views below are the lists to work from.\n\n",
            "\n| Tier | " + " | ".join(level.capitalize() for level in SEVERITIES)
            + " | Defects |\n",
            "|---|" + "---|" * (len(SEVERITIES) + 1) + "\n"]
@@ -10226,16 +10679,15 @@ def _render_legend(names: PathNames) -> list[str]:
     if not rows:
         out.append("No file or directory is named in this report.\n")
         return out
-    out.append("Every file and directory this report names, under the short name it is "
-               "printed by. A path is spelled in full here and under the defect it locates, "
-               "and nowhere else, so a name that "
-               "appears twice below is one file both times. Two things are reproduced rather "
-               "than composed and keep their own spelling: a sentence quoted from a worker, "
-               "and the job printed under **The job** — shortening a path in either would be "
-               "editing a record, and the job has to stay something a reader can paste. A "
-               "path whose whitespace this page would otherwise swallow is written below "
-               "with that whitespace escaped, so its spelling names one file and no "
-               "other.\n\n")
+    out.append("Every file and directory this report names, under the short name the "
+               "report uses for it. A path is spelled in full only here and under the defect "
+               "it locates, so a name that appears twice below is the same file both times. "
+               "Two things are copied as they were rather than written by the report, and "
+               "keep their own spelling: a sentence quoted from a worker, and the job printed "
+               "under **The job**. Shortening a path in either would be editing a record, and "
+               "the job has to stay something a reader can paste. Where this page would "
+               "otherwise lose the whitespace in a path, that whitespace is escaped below, "
+               "so the spelling names one file and no other.\n\n")
     out += ["| Short name | Full path |\n", "|---|---|\n"]
     out += [f"| {_cell(short)} | {_cell(_spelled(full))} |\n" for short, full in rows]
     return out
@@ -10332,21 +10784,21 @@ def _job_pointer(job: dict, notes: dict[str, str] | None, inventory: dict,
     the panel read anything, and a reader who assumes the panel chose its own scope reads every
     coverage claim on the page wrongly.
     """
-    out = [f"\n{_shape_of_the_run(job, inventory, areas)} The rest of the job — the root, what "
-           f"was excluded, and the instruction each reader was handed — is at "
-           f"[this link]({_anchor(SUBSECTION_THE_JOB)}), in the appendix, together with the "
-           f"job itself and what it takes to run the same audit again.\n\n"]
+    out = [f"\n{_shape_of_the_run(job, inventory, areas)} The rest of the job is in the "
+           f"appendix, at [this link]({_anchor(SUBSECTION_THE_JOB)}): the root, what was "
+           f"excluded and the instruction each reader was handed, together with the job "
+           f"itself and what it takes to run the same audit again.\n\n"]
     # Who decided. Said differently according to what the run directory can support: with the
     # interview's record beside the job this is a fact, and without it the honest sentence is
     # that the fields were settled beforehand and nothing says by which route.
     if notes is not None:
         out.append("Those fields were settled before the panel read anything, in an interview "
-                   "with whoever asked for the audit; where nobody answered, the skill applied "
-                   "its own default, and the section marks each one.\n")
+                   "with whoever asked for the audit. Where nobody answered, the skill applied "
+                   "its own default, and that section marks each one.\n")
     else:
-        out.append("Those fields were settled before the panel read anything and not by it — "
-                   "in an interview with whoever asked for the audit, or handed over "
-                   "ready-made as a job file. Nothing in the run directory records which.\n")
+        out.append("Those fields were settled before the panel read anything, and not by the "
+                   "panel: either in an interview with whoever asked for the audit, or handed "
+                   "over ready-made as a job file. Nothing in the run directory records which.\n")
     return out
 
 
@@ -10372,9 +10824,10 @@ def _printed_job(job: dict) -> list[str]:
     see :data:`ROOT_PLACEHOLDER`.
     """
     shown = {key: (ROOT_PLACEHOLDER if key == "root" else value) for key, value in job.items()}
-    return [f"\nThe job, to paste back in where the file itself is not to hand. `root` is the "
-            f"one field replaced — the tree is on your disk, at your path, and this page "
-            f"carries no path from the machine it ran on but the run directory above:\n",
+    return [f"\nThe job, to paste back in when you do not have the file itself. `root` is "
+            f"the only field replaced: the tree is on your disk, at your path, and the only "
+            f"path on this page from the machine the audit ran on is the run directory "
+            f"above:\n",
             *_fenced(json.dumps(shown, indent=2, ensure_ascii=False).splitlines(),
                      indent="", lang="json")]
 
@@ -10400,11 +10853,11 @@ def _rerun_instructions(job: dict, rundir_stated: bool) -> list[str]:
              else "the run directory this report was built from")
     return [f"\n#### {RERUN_HEADING}\n",
             *_printed_job(job),
-            f"\nWhere the run directory is still to hand, the same job is `{JOB_FILE_NAME}` "
+            f"\nIf you still have the run directory, the same job is `{JOB_FILE_NAME}` "
             f"in {where}. "
             f"Copy it out before running: the driver creates the run directory itself and "
-            f"refuses one that already holds a run, so the old directory is not a place to "
-            f"plan from.\n",
+            f"refuses one that already holds a run, so a new run cannot be planned in the "
+            f"old directory.\n",
             *_fenced([f"cp <run directory>/{JOB_FILE_NAME} ./{JOB_FILE_NAME}",
                       "python3 review_panel_run.py run \\",
                       f"        --job ./{JOB_FILE_NAME} \\",
@@ -10413,7 +10866,7 @@ def _rerun_instructions(job: dict, rundir_stated: bool) -> list[str]:
                       "        --go"], indent=""),
             f"\nThree things this page cannot fill in. `--rundir` has to name a directory that "
             f"does not exist yet, outside the reviewed tree and outside every git repository. "
-            f"`--adapter` is the configuration saying which runtime runs each slot — what ran "
+            f"`--adapter` is the configuration saying which runtime runs each lane. What ran "
             f"this time is described under **{SUBSECTION_HOW_IT_RAN}** above, but the "
             f"configuration itself was never in the run directory. And the tree has to be the "
             f"one this report was read from, at the commit and tree sha256 named there: the job "
@@ -10423,7 +10876,7 @@ def _rerun_instructions(job: dict, rundir_stated: bool) -> list[str]:
 
 def _render_the_job(job: dict, notes: dict[str, str] | None, inventory: dict,
                     areas: Sequence[dict], tags: dict[str, str],
-                    rundir_stated: bool = False) -> list[str]:
+                    rundir_stated: bool = False, answered: bool = False) -> list[str]:
     """The appendix subsection: the job the run answers, one line per field, and what it takes
     to ask for it again.
 
@@ -10452,14 +10905,14 @@ def _render_the_job(job: dict, notes: dict[str, str] | None, inventory: dict,
     out.append(f"A field marked (default) is one nobody stated and the interview filled in.\n"
                if notes is not None else
                f"Which fields the owner asked for and which the interview filled in is not "
-               f"recorded: no `{JOB_NOTES_FILE_NAME}` sits beside the job, so a job handed in "
-               f"ready-made and one the interview wrote read alike here.\n")
+               f"recorded: there is no `{JOB_NOTES_FILE_NAME}` beside the job, so a job handed "
+               f"in ready-made and one the interview wrote look the same here.\n")
     out.append("\n- Read for: the statement under the title, carried verbatim into every "
                "reader's payload.\n")
     # The root as a FIELD, not as a path: see the note above.
-    out.append(f"- Tree: the root the job names — in `{JOB_FILE_NAME}`, not on this page, "
-               f"which carries no path from the machine it ran on but the run directory "
-               f"above.{_marked('root', notes)}\n")
+    out.append(f"- Tree: the root the job names. It is in `{JOB_FILE_NAME}`, not on this "
+               f"page: the only path on this page from the machine the audit ran on is the "
+               f"run directory above.{_marked('root', notes)}\n")
     if job.get("files"):
         tracked = _tracked_total(inventory)
         # Why the reachability line below counts so much of the repository as unreviewed. A
@@ -10487,11 +10940,16 @@ def _render_the_job(job: dict, notes: dict[str, str] | None, inventory: dict,
     each = (" of the list that applies to it (the job's, unless the area above names its own)"
             if overridden else "")
     out.append(f"- Read with {_plural(len(job['lenses']), 'lens', 'lenses')}. A lens is the "
-               f"instruction a reader is handed for how to read its area; every area was "
-               f"read once per lens{each}, and the lenses were dealt to the two model slots "
-               f"in turn.{_marked('lenses', notes)}\n")
+               f"instruction a reader is handed for how to read its area. Every area was "
+               f"read once per lens{each}, and the lenses were assigned to the two model "
+               f"lanes in turn.{_marked('lenses', notes)}\n")
     out += _lens_items(job["lenses"], tags, "  ")
     out.append(f"- Coverage: {_coverage_choice(job, areas)}{_marked('coverage', notes)}\n")
+    if job.get("questions"):
+        where = (f"answered under **{SECTION_OPERATOR}**" if answered else
+                 f"and no answer was recorded in `{REPORT_NOTES_FILE_NAME}`")
+        out.append(f"- Questions: put to whoever ran the panel rather than to its readers, "
+                   f"{where}.\n")
     out += _rerun_instructions(job, rundir_stated)
     return out
 
@@ -10536,10 +10994,10 @@ def _coverage_choice(job: dict, areas: Sequence[dict]) -> str:
 def _rung_line(dispatch: DispatchRecord, reading: Sequence[dict], areas: Sequence[dict],
                findings: Findings) -> str:
     """The rung and what it lets the report claim, counted from the data. An area counts
-    as read by both slots only when both its readers completed; a candidate counts as
-    checked by the other slot when a verdict came back, and as left unresolved otherwise —
+    as read by both lanes only when both its readers completed; a candidate counts as
+    checked by the other lane when a verdict came back, and as left unresolved otherwise —
     a failed or missing verification unit included. Every candidate carries one raiser, so
-    every one of them has an other slot and there is no third case to count."""
+    every one of them has an other lane and there is no third case to count."""
     units = _plural_states([u["state"] for u in reading])
     readers: dict[str, list[bool]] = {}
     for unit in reading:
@@ -10552,19 +11010,21 @@ def _rung_line(dispatch: DispatchRecord, reading: Sequence[dict], areas: Sequenc
     if dispatch.rung == RUNG_TWO_RUNTIMES:
         return (f"{name}. Reading units: {units}; {coverage} read by both models. "
                 f"Candidates: {len(findings.candidates)} — {other} checked by the other model, "
-                f"{unresolved} left unresolved. Where the slots disagree, that is model "
-                f"divergence.")
+                f"{unresolved} left unresolved. Where the lanes disagree, the disagreement "
+                f"is between two different models.")
     return (f"{name}. Reading units: {units}; {coverage} read by both contexts. "
-            f"Candidates: {len(findings.candidates)} — {other} checked by the same model, fresh context, "
-            f"that did not raise them, {unresolved} left unresolved. Where the slots disagree, "
-            f"that is context divergence, and the report claims no more than that.")
+            f"Candidates: {len(findings.candidates)} — {other} checked by a fresh context of "
+            f"the same model, not the one that raised them, {unresolved} left unresolved. "
+            f"Where the lanes disagree, the disagreement is between two contexts of one "
+            f"model, and the report claims no more than that.")
 
 
 def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: Sequence[dict],
                   findings: Findings, reading: Sequence[dict], batches: Sequence[dict],
                   states: Sequence[VerificationState], probe: dict,
                   *, rundir: Path | None = None, generated: str | None = None,
-                  job_notes: dict[str, str] | None = None) -> str:
+                  job_notes: dict[str, str] | None = None,
+                  report_notes: ReportNotes | None = None) -> str:
     """The whole report from the run directory's data and nothing else — no clock, and no
     path but the run directory it names — so two runs over one tree into one run directory
     render byte-identical reports, and two into different ones differ on that line alone.
@@ -10584,6 +11044,9 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
     is a field the report cannot state, and the statement on its own is what a reader who had
     not written the job was left with. ``job_notes`` is ``job-notes.json`` where the interview
     left one, saying which fields nobody chose; absent, no field is marked.
+    ``report_notes`` is ``report-notes.json`` where the operator wrote one. It adds a section
+    and a mark beside what it corrects, and changes no count: the counts are what the panel
+    found, and stay comparable between runs.
 
     ``findings`` is every defect fact the report states: the candidate records, the cluster
     records and one record per area clustering touched. Nothing about a defect is computed
@@ -10678,15 +11141,15 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
     # the rung line below, and saying any of it twice puts the two out of step. Nor is
     # blindness claimed here — the rung is what permits that word, and the rung line makes
     # the claim once.
-    out.append("A panel of agents read this tree in bounded pieces, and what one of "
-               "them raised went to another that had not, to be checked.\n")
-    out.append("A **defect** here is one thing to fix: the reports that describe the same "
-               "problem are merged into it, and the merge is set out in the appendix so "
-               "the count can be argued with.\n")
-    out.append("**Established** means a check that did not raise the claim upheld it. "
+    out.append("A panel of agents read this tree in bounded pieces. Whatever one agent "
+               "raised was sent to another agent that had not raised it, to be checked.\n")
+    out.append("A **defect** here is one thing to fix. Reports that describe the same "
+               "problem are merged into one defect, and the appendix sets out how they "
+               "were merged, so the count can be challenged.\n")
+    out.append("**Established** means a checker that had not raised the claim upheld it. "
                "**Unresolved** means nothing settled it, and the group it sits under "
-               "says what would. **Refuted** means a check dismissed it, so it is not "
-               "work and it sits in the appendix with the reason.\n")
+               "says what would. **Refuted** means a check dismissed it, so there is "
+               "nothing to do about it; it is listed in the appendix with the reason.\n")
     # What the appendix holds is set out at the top of the appendix itself; what a reader
     # needs here is only that there is one and that skipping it costs them nothing.
     out.append("The **appendix** at the end is the record of the run rather than the work "
@@ -10696,6 +11159,14 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
     out.append(f"- By status: {counts[DEFECT_ESTABLISHED]} established, "
                f"{counts[DEFECT_REFUTED]} refuted, "
                f"{counts[DEFECT_UNRESOLVED]} unresolved.\n")
+    corrected = report_notes.corrected() if report_notes is not None else frozenset()
+    disputed = [c["id"] for c in sorted(findings.clusters, key=lambda c: _id_rank(c["id"]))
+                if c["id"] in corrected]
+    if disputed:
+        out.append(f"  - The operator corrected {len(disputed)} of these: "
+                   f"{', '.join(f'[{did}](#{did})' for did in disputed)}. The counts are "
+                   f"the panel's own and stay as they are; the corrections are under "
+                   f"**{SECTION_OPERATOR}**.\n")
     verdicts = {status: sum(1 for r in findings.candidates if r["status"] == status)
                 for status in VERDICT_STATUSES}
     out.append(f"- Candidates behind them: {len(findings.candidates)} — "
@@ -10732,7 +11203,7 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
     # first defect and below four lines of adapter strings; the rung is what every claim
     # below is bounded by, so it belongs with the counts it bounds.
     out.append(f"- Rung: {_rung_line(dispatch, reading, areas, findings)}\n")
-    out += _executability(probe, findings)
+    out += _executability(probe, findings, corrected)
     out += _reachability(inventory, names)
     # The legend itself is in the appendix; this is the pointer to it. One row per file the
     # report names is hundreds or thousands of lines on a real tree, and sitting here it
@@ -10740,13 +11211,16 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
     # It is a decoder -- consulted when a short name is unfamiliar and ignored otherwise --
     # which is what the appendix is for. Moving it without leaving this line would trade
     # one obstruction for a dead end.
-    out.append(f"- Every file is named by a short name; **{SUBSECTION_LEGEND}**, in the "
-               f"appendix, spells each one out in full.\n")
+    out.append(f"- This report names every file by a short name; the **{SUBSECTION_LEGEND}**, "
+               f"in the appendix, gives each one's full path.\n")
+    out += _render_judgment_overview(findings)
     out += _render_by_tier(findings)
     # Last under the description, and after the counts rather than before them: it is a
     # caveat about the numbers a reader has just taken in, and the sentence about volume
     # lands on the total they are holding.
     out += _render_limits()
+    if report_notes is not None:
+        out += _render_operator_notes(report_notes, job, findings, probe, sections)
 
     # One section, two ways in. They were sibling headings, which said they were two
     # sections of the report rather than one list a reader can enter by rank or by file.
@@ -10754,17 +11228,21 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
     if not findings.candidates:
         lead, empty = "No candidate was raised.", ("Nothing to rank.", "Nothing to gather.")
     elif not work:
-        lead = (f"Nothing to do: every one of the {_plural(refuted_count, 'defect')} "
+        lead = (f"Nothing to do: the {_plural(refuted_count, 'defect')} raised was checked "
+                f"and dismissed. It is "
+                f"under Refuted, in the appendix, with the reason."
+                if refuted_count == 1 else
+                f"Nothing to do: every one of the {_plural(refuted_count, 'defect')} "
                 f"raised was checked and dismissed. They are under Refuted, in the "
                 f"appendix, with the reason for each.")
         empty = ("Nothing to do; see Refuted, in the appendix.",) * 2
     else:
         # Short, because each way in states its own rule under its own heading; saying it
         # here as well puts one sentence in two places where an edit touches half of them.
-        lead, empty = "One list of defects, entered by rank or by file.", None
+        lead, empty = "One list of defects, with two ways in: by rank or by file.", None
     out.append(f"{lead}\n")
     if empty is None:
-        out += _render_index(work, dispatch.rung, refuted_count, names, sections)
+        out += _render_index(work, dispatch.rung, refuted_count, names, sections, corrected)
         out += _render_by_file(work, by_id, names, sections)
     else:
         # Both ways in are WRITTEN even with nothing to put in them. A subsection that
@@ -10779,7 +11257,7 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
     tiers = tuple(findings.synthesis["tiers"]) if findings.synthesis else ()
     disclaim = any(_carries_a_reading(cluster) for cluster in ordered)
     out += _render_body(ordered, by_id, dispatch.rung, findings.commit, names,
-                        sections, tiers, disclaim)
+                        sections, tiers, disclaim, corrected)
     out += _render_corroborated(ordered, dispatch.rung, sections)
     # Above the appendix, because a named missing test is work. Written only where the
     # coverage round produced something: a section that is always there and usually empty
@@ -10797,7 +11275,7 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
     out.append("The record of the run rather than the work: what was dismissed, how the "
                "duplicates were merged, what was asked for and what ran where, what was not "
                "read, and which unit raised what. Nothing below is needed to fix a defect.\n")
-    out += _render_refuted(ordered, by_id, names)
+    out += _render_refuted(ordered, by_id, names, corrected)
     if findings.coverage_clusters:
         out += _render_covered(findings, names)
     out += _render_verifier_variance(findings)
@@ -10819,10 +11297,10 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
     # The job file is NOT a bullet here. It is what **The job**, directly below, is about, and
     # that subsection carries the whole rerun recipe — naming it twice would put one fact in
     # two places where an edit to one is an edit to half of them.
-    for slot in SLOTS:
-        record = dispatch.slots[slot]
-        out += _recorded(f"- Slot {slot} adapter, as recorded by the dispatcher:", record.adapter)
-        out += _recorded(f"- Slot {slot} permission, as recorded by the dispatcher:",
+    for lane in LANES:
+        record = dispatch.lanes[lane]
+        out += _recorded(f"- Lane {lane} adapter, as recorded by the dispatcher:", record.adapter)
+        out += _recorded(f"- Lane {lane} permission, as recorded by the dispatcher:",
                          record.permission)
     out.append(f"- {CONTAINMENT_LINE}\n")
     out.append(f"- Read: {_plural(len(inventory['files']), 'file')} ({inventory['source']}), tree "
@@ -10835,11 +11313,12 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
     # Directly after the record of what ran it, because the two are halves of one answer —
     # what was asked, and what machinery answered it — and because the rerun instructions
     # below reach back to the run directory, the commit and the adapters named just above.
-    out += _render_the_job(job, job_notes, inventory, areas, tags, rundir is not None)
+    out += _render_the_job(job, job_notes, inventory, areas, tags, rundir is not None,
+                           report_notes is not None and bool(report_notes.answers))
 
     out.append(f"\n### {SUBSECTION_COVERAGE}\n\n")
-    out.append("Closure put every file in scope into exactly one area, so a gap is a unit that "
-               "failed or returned nothing valid, or a path the job left out.\n")
+    out.append("Partitioning put every file in scope into exactly one area, so a gap here is "
+               "a unit that failed or returned nothing valid, or a path the job left out.\n")
     # An auditor that was never dispatched is not a unit that failed, so it is stated here
     # rather than in the list below — and stated it must be: the round is the one that
     # answers which inputs the tests never construct, and a report that omitted it reads as
@@ -10905,7 +11384,7 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
     for batch, state in zip(batches, states):
         for message in state.rejected:
             out += _item(f"- {_one_line(_unit_label(batch))} — one verdict could not be "
-                         f"read, and cost its own candidate alone: ", message,
+                         f"read, and only its own candidate lost its verdict: ", message,
                          "Every other verdict in that unit stands.")
     # A finding the engine could not read inside a reading unit that otherwise came back.
     # It raised no candidate, so unlike a rejected verdict there is nothing downstream that
@@ -10941,6 +11420,12 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
         out.append(f"- Skipped, recorded and never followed ({len(inventory['skipped'])}):\n")
         out += [f"  - {_one_line(names.short(entry['path']))} — {_one_line(entry['reason'])}\n"
                 for entry in inventory["skipped"]]
+    # A count and nothing more: the owner left these files out to hear nothing about them,
+    # and the count is what keeps the dropping from being silent.
+    dropped = sum(unit.get("dropped", 0) for unit in reading)
+    if dropped:
+        out.append(f"- {_plural(dropped, 'finding')} located in files outside the review's "
+                   f"scope {'was' if dropped == 1 else 'were'} dropped.\n")
     out += _render_provenance(findings, tags)
     return "".join(out)
 
@@ -11853,7 +12338,7 @@ def plan_redo(rundir: Path, units_doc: dict, kinds: Sequence[str] = REDO_KINDS,
         )
     kept = [unit for unit in units_doc["units"] if unit.get("kind") not in kinds]
     return taking, {"stage": stage,
-                    "slots": units_doc.get("slots", list(SLOTS)), "units": kept}
+                    "lanes": units_doc.get("lanes", list(LANES)), "units": kept}
 
 
 def apply_redo(rundir: Path, taking: Sequence[str], doc: dict,
@@ -11966,6 +12451,7 @@ class CheckOutcome:
 
     rejected: tuple[str, ...]
     quotes: tuple[QuotedRange, ...] = ()
+    dropped: int = 0
 
 
 def check_result(rundir: Path, unit_id: str, payload: object) -> CheckOutcome:
@@ -12019,8 +12505,10 @@ def check_result(rundir: Path, unit_id: str, payload: object) -> CheckOutcome:
     kind = unit.get("kind")
     if kind in (READER_KIND, AUDITOR_KIND):
         owner = frozenset(_read_owner(rundir))
-        findings, rejected = parse_reader_result(
-            payload, unit_id, _locations_for(unit, owner, _read_audited(rundir)), cwd_files=owner)
+        context = _read_context(rundir)
+        findings, rejected, dropped = parse_reader_result(
+            payload, unit_id, _locations_for(unit, owner, _read_audited(rundir)),
+            cwd_files=owner | context, context=context)
         snapshot = rundir / "snapshot"
         quotes = []
         for finding in findings:
@@ -12029,7 +12517,7 @@ def check_result(rundir: Path, unit_id: str, payload: object) -> CheckOutcome:
             quotes.append(QuotedRange(finding.file, finding.line_start, finding.line_end,
                                       checked.state, checked.quoted_line, checked.found_line,
                                       checked.quoted_at, checked.quoted_of, checked.found_at))
-        return CheckOutcome(rejected, tuple(quotes))
+        return CheckOutcome(rejected, tuple(quotes), dropped)
     if kind == PROBE_KIND:
         parse_probe_result(payload, unit_id)
         return CheckOutcome(())
@@ -12117,8 +12605,8 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("unit", help="the unit whose payload the worker was given")
     check.add_argument("--result",
                        help="the file holding the worker's object (default: "
-                            "<rundir>/dispatch/<unit>/reply.json, which is where a slot A "
-                            "worker writes). Pass the path you extracted to for slot B")
+                            "<rundir>/dispatch/<unit>/reply.json, which is where a lane A "
+                            "worker writes). Pass the path you extracted to for lane B")
     report = sub.add_parser("report", help="write the report from the verification, "
                                            "clustering and synthesis results and the record "
                                            "of what ran")
@@ -12240,6 +12728,9 @@ def _run_check(args: argparse.Namespace) -> int:
     # what the run is about to lose, and the exit code stays 0 because landing it is right.
     for message in outcome.rejected:
         sys.stdout.write(f"rejected: {message}\n")
+    if outcome.dropped:
+        sys.stdout.write(f"out of scope: {_plural(outcome.dropped, 'finding')} located in "
+                         f"files the job left out, to be dropped\n")
     # The citations, every one of them, and the two texts wherever they disagree. A wrong
     # range is not a refusal either — it costs its own finding's credibility — but it is the
     # one thing worth re-dispatching a unit over, and this is the last moment that is
@@ -12309,7 +12800,8 @@ def _run_route(args: argparse.Namespace) -> int:
             # unit on every field.
             reading = [u for u in units_doc["units"] if u.get("kind") != PROBE_KIND]
             probe = read_probe_result(rundir, units_doc["units"])
-            states = read_unit_results(rundir, reading, frozenset(owner))
+            states = read_unit_results(rundir, reading, frozenset(owner),
+                                       _read_context(rundir))
             candidates = check_quotes(rundir / "snapshot",
                                       build_candidates(states, reading, owner))
             batches = route(candidates)
@@ -12532,6 +13024,9 @@ def _run_report(args: argparse.Namespace) -> int:
         findings = build_findings(dispatch, routed["candidates"], resolved, clustering,
                                   cluster_states, inventory["commit"], snippets, synthesis,
                                   states, batches)
+        # Checked against the defects just built, so a note naming a defect this run does
+        # not have is refused before anything is published.
+        report_notes = _read_report_notes(rundir, [c["id"] for c in findings.clusters])
         # All three files are one output and they publish under one lock, and so do the
         # stamp they state and the marker that commits them. The lock is a file of its own
         # and NOT one of the three: a claim that is also a published artifact stops being a
@@ -12628,7 +13123,7 @@ def _run_report(args: argparse.Namespace) -> int:
             try:
                 text = render_report(job, dispatch, inventory, areas["areas"], findings,
                                      routed["units"], batches, states, routed["probe"],
-                                     job_notes=job_notes,
+                                     job_notes=job_notes, report_notes=report_notes,
                                      rundir=rundir, generated=generated)
             except BaseException:
                 if wrote_stamp:

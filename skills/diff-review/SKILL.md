@@ -37,9 +37,10 @@ Two properties are non-negotiable:
   implementation conversation coloring judgment.
 - **No tree edits — bounded by flags, not merely requested.** The reviewer *reports*; it never fixes. On rung 1
   this is a bound set by per-instance flags, not merely a prompt asking it not to: Codex
-  `-s read-only -c approval_policy="never"` rejects writes from the shell and the edit tool, and
-  Claude `--permission-mode plan` blocks its edit tools, though a shell command it runs can still
-  write. (Those flags do **not** constrain user-configured hooks, plugins, or MCP
+  `-s read-only -c approval_policy="never"` rejects writes from the shell and the edit tool at the
+  operating-system level, and Claude `--permission-mode plan` refuses the edit tools and any shell
+  command it judges would change a file — a permission check rather than a kernel boundary, so an
+  incidental write by a command it judges read-only still lands. (Those flags do **not** constrain user-configured hooks, plugins, or MCP
   servers, which run outside the sandbox; for an airtight boundary, run the reviewer under an
   OS-level read-only mount or with customizations disabled.) Findings go back to the author/gate.
 
@@ -183,7 +184,7 @@ refusal as grounds to fall back.
 > reviewer over the diff. **Both flags, on the fallback rung too** — `-s read-only` bounds the
 > shell and the approval policy bounds the built-in edit tool, and a reviewer whose edit tools are
 > unbounded is not a review. Rung 1 — launch Claude through the supervisor with its **edit tools blocked**
-> (`--permission-mode plan`; a shell command it runs can still write), returning its **full transcript**:
+> (`--permission-mode plan`, which also refuses a shell command that would change a file), returning its **full transcript**:
 > `<python> <skill-dir>/review_runner.py --idle 900 --deadline 1800 --cwd <dir> --display <cap> --findings <f> --result-mode stream-transcript --schema <skill-dir>/review-schema.json --verdict-json <v> -- claude -p "<review prompt>" --add-dir <dir> --permission-mode plan --json-schema ⟪schema_json⟫ --output-format stream-json --include-partial-messages --verbose`.
 > **Controller vs author / probe:** rung 1 wants a reviewer whose **model differs from the diff's
 > author**. If you — the runtime running this skill — already differ from the author, review directly:

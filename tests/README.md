@@ -33,7 +33,8 @@ and a reader learned what this directory contains by running it instead of readi
 
 They all run in CI (`.github/workflows/validate.yml`), on Ubuntu, macOS and Windows
 alike, the same suites split into four shards per platform, plus a Linux pass under the C
-locale. There is no PowerShell suite and no two-interpreter Windows matrix, because there
+locale. A private fork runs Linux only and gets the other two from a manual run that sets
+the workflow's `all_platforms` input. There is no PowerShell suite and no two-interpreter Windows matrix, because there
 is no PowerShell left: `install.ps1`, `install.Tests.ps1` and `ci-windows.ps1` went with
 the shell installers, and one Python installer needs no parity harness. Every suite here
 is found by the same discovery `python -m unittest discover -s tests -p 'test_*.py'` uses,

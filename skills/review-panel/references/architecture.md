@@ -43,7 +43,7 @@ the records disagree with it. Three consequences settle nearly every placement q
 
 **The engine never learns how a unit is spawned**, and the clearest worked example is
 `WRITE_CAPABLE_KINDS` in the driver: the one enumeration of the unit kinds whose brief
-permits the worker to write. The working directory, which of a slot's two command lines is
+permits the worker to write. The working directory, which of a lane's two command lines is
 used, the run-wide serialization of reproductions, the disk reservation and a copy's
 retention are all read off that one set. Membership turns on whether the brief **permits**
 writing, not on whether the work is expected to produce anything worth keeping — the copy is
@@ -82,18 +82,18 @@ a candidate list, a unit list and a probe record. That is how the engine tells i
 record from some other JSON in the directory. Reading it as a progress marker suggests a
 stage the loop passes through, and there is none.
 
-**One ending is not in the table, and it is the driver's alone.** `refuse_a_stranded_slot`
-runs at every round boundary, before anything is spawned, and ends the run when a slot has
+**One ending is not in the table, and it is the driver's alone.** `refuse_a_stranded_lane`
+runs at every round boundary, before anything is spawned, and ends the run when a lane has
 landed nothing **and** has nothing pending that could change that. It is not a stage and
-writes no marker: the run stops where it stood, with no report, naming the slot and pointing
-at its per-attempt records. The reason is rule 3 rather than throughput — a slot that
+writes no marker: the run stops where it stood, with no report, naming the lane and pointing
+at its per-attempt records. The reason is rule 3 rather than throughput — a lane that
 answered none of its units checked none of the findings addressed to it, so no page the run
 could write would be true.
 
 Both halves of that predicate are load-bearing and were settled by review. Without *landed
-nothing*, a slot having a bad round ends the run. Without *nothing pending*, a run that is
+nothing*, a lane having a bad round ends the run. Without *nothing pending*, a run that is
 **resumed** between the reading round and `route` is refused one step before the stage that
-would have given the silent slot its verifier — so the guard returns early at a boundary
+would have given the silent lane its verifier — so the guard returns early at a boundary
 whose round has nothing left to finish, which is exactly the state a resumed run is in
 there. Such a round has nothing to spawn either, which is why returning early costs the
 earlier refusal nothing. `_derived_rung` keeps the same refusal as a backstop for a run that

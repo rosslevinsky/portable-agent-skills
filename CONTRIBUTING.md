@@ -205,9 +205,10 @@ All three must pass before a PR is eligible to merge. `python3 scripts/shard_tes
 --total 4 --parallel` runs the same suites as the third line, split across your cores. CI
 runs exactly these on **Ubuntu, macOS and Windows**, the suites in four shards per platform,
 plus a Linux pass under the C locale, which is the closest stand-in for the Windows console
-encoding. No command path is PowerShell, so there is no PowerShell driver, though one skill
-ships a PowerShell 5.1 block that nothing statically checks; see `README.md`'s Validation
-section. A fixture that creates a symlink needs a platform guard, since creating one needs
+encoding. A private fork runs Linux only, since its minutes are billed, and gets all three
+from a manual run that sets the workflow's `all_platforms` input. No command path is PowerShell, so there is no PowerShell driver; the one PowerShell block a
+skill ships is parsed and run by the unit suite under every PowerShell on the host, which
+on a Windows runner includes Windows PowerShell 5.1. See `README.md`'s Validation section. A fixture that creates a symlink needs a platform guard, since creating one needs
 elevation on Windows; those cases live in `tests/test_plan_tracker.py` behind a symlink
 probe rather than in the corpus.
 

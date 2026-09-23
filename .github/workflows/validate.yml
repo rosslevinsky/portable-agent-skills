@@ -10,7 +10,17 @@ on:
   # whose feedback should be cheapest to get. It is also how a commit already on `main` gets a
   # run at all when `tested` would otherwise skip one, since that job asks nothing on a manual
   # run and every test job therefore goes ahead.
+  #
+  # `all_platforms` is how a private repository reaches the macOS and Windows runners, which
+  # its automatic events never use: `gh workflow run validate.yml --ref <branch>
+  # -f all_platforms=true`. A public repository runs all three on every event and the
+  # input changes nothing there. See the platform note on the `suite` job for why.
   workflow_dispatch:
+    inputs:
+      all_platforms:
+        description: "Run the suite on macOS and Windows as well as Linux (a private repository runs Linux only by default)"
+        type: boolean
+        default: false
 
 # Read-only token for the whole workflow. Nothing here writes to the repository — it
 # checks out, installs Python and runs checks — so the write access the default
@@ -203,18 +213,29 @@ jobs:
     # asserts the matrix below and the `--total` handed to the runner are the same number,
     # because raising one and missing the other loses a shard's worth of tests in silence.
     #
-    # **Three platforms on every event, and the saving on a merge is `tested` above.** Where a
-    # tree is already proved, this job does not run at all — the whole matrix, not a cheaper
-    # slice of it — so there is nothing left for a narrower platform list here to save.
+    # **Three platforms in a public repository; Linux alone in a private one, unless a manual
+    # run asks for all three.** Where a tree is already proved, this job does not run at all —
+    # the whole matrix, not a cheaper slice of it — so `tested` above is the saving on a
+    # merge, and the platform list is the saving everywhere else. Runner minutes are free in
+    # a public repository and billed in a private one, at two times the Linux rate for
+    # Windows and ten times for macOS, so the repository's visibility is what decides:
+    # `github.event.repository.private` is true where the minutes cost money. A private
+    # repository that wants the full set for one change asks with the `all_platforms` input
+    # of a manual run, on any branch. Nothing here names a repository, so the rule is true in
+    # any fork.
+    #
+    # Windows is the platform where a path-separator or encoding mistake actually surfaces,
+    # and a public repository still runs it on every event; a private one gets that answer
+    # by asking, or when its work reaches a public repository's pull request.
     #
     # A push that gets PAST `tested` is a tree nothing has proved: a direct push, or a merge
     # that bypassed the up-to-date requirement, which an owner-bypassable protection permits.
-    # That is the least tested code ever to reach this job, so it gets the widest matrix rather
-    # than the cheapest. Such pushes are rare, so covering them in full costs almost nothing —
-    # and the alternative is aiming the thinnest coverage at the riskiest case.
+    # That is the least tested code ever to reach this job, and it gets whatever the
+    # visibility rule gives every other event.
     #
-    # One platform list, read the same way on every event, is also one fewer conditional whose
-    # truth somebody has to keep checking.
+    # The list is one expression read the same way on every event: `inputs.all_platforms` is
+    # empty on anything but a manual run that set it, so there is no per-event conditional
+    # whose truth somebody has to keep checking.
     #
     # **This file ships byte-identical to the public repository.** Nothing in it names a
     # repository or reads a branch-protection setting, so it is correct in a tree whose
@@ -224,7 +245,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ fromJSON((github.event.repository.private && !inputs.all_platforms) && '["ubuntu-latest"]' || '["ubuntu-latest", "macos-latest", "windows-latest"]') }}
         shard: [1, 2, 3, 4]
     runs-on: ${{ matrix.os }}
     # A generous ceiling, not a tight fit: a shard runs in two or three minutes, and the

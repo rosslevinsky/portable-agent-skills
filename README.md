@@ -576,13 +576,19 @@ Those three commands are the whole gate, and CI runs them on **Ubuntu, macOS and
 Windows**, the suites split into four shards per platform, plus a Linux pass under the C
 locale, which is the closest stand-in for the Windows console encoding. Windows is where a
 path-separator or text-encoding mistake actually surfaces, so it runs the same set rather
-than a subset. Nothing on any command path is PowerShell, so there is no PowerShell suite.
+than a subset. A **private** fork runs Linux only, because its runner minutes are billed;
+it gets all three platforms by starting the workflow by hand with its `all_platforms` input
+(`gh workflow run validate.yml --ref <branch> -f all_platforms=true`). Nothing on any
+command path is PowerShell, so there is no PowerShell suite.
 
-**One skill does ship PowerShell, and nothing statically checks it.**
+**One skill does ship PowerShell, and the suite runs it under every PowerShell it finds.**
 `security-review-codebase/references/hierarchical-mode.md` carries a Windows PowerShell 5.1
 block that picks a report directory outside the audited repository. It is instructions an
-agent runs, not a file CI executes, so the three commands above do not reach it. Read it
-directly if you are reviewing what this pack runs on Windows.
+agent runs, not a file CI executes, so the validator does not reach it; the unit suite
+does, parsing the block and running its path resolver under each PowerShell on the host.
+On a Linux runner that is PowerShell 7; on a Windows runner it is PowerShell 7 and Windows
+PowerShell 5.1 both, and 5.1 is the one a user's machine runs. With no PowerShell on the
+host those cases skip and say so.
 
 There is a fourth command, and it is a tool rather than a gate:
 

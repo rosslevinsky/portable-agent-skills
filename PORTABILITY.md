@@ -119,7 +119,7 @@ of the skill — it is a different and misleading one.
 `review-panel` is the case. Its whole claim is that a finding was raised by one reader and
 judged by a stranger; at rung 3 one context does both, so the run cannot say the only thing
 it exists to say. It therefore requires two spawnable workers and **refuses** a host that
-cannot supply them, naming the slot that landed nothing. A refusal a caller can act on is
+cannot supply them, naming the lane that landed nothing. A refusal a caller can act on is
 the truthful answer; a document whose own text has to disclaim it is not.
 
 The test is whether the degraded output is *the same kind of thing*, weaker. A review with

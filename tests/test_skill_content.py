@@ -1784,8 +1784,29 @@ class TheUnbornRepoUnstageActuallyUnstages(unittest.TestCase):
                       "`git reset HEAD <path>` fails with its own message, not that one")
 
 
-PWSH = (os.environ.get("PWSH") or shutil.which("pwsh")
-        or shutil.which("powershell"))
+def _powershells():
+    """Every PowerShell on this host, and the shipped block is run under each of them.
+
+    The block targets Windows PowerShell 5.1, which is what runs on a user's Windows
+    machine, and a host that has PowerShell 7 beside it must exercise both: `pwsh` alone
+    answers only for 7, whose parser and cmdlets differ from 5.1's. `PWSH=` names one
+    explicitly and comes first; the rest are whatever the path offers. Deduplicated by
+    resolved path, because on Linux the only one is `pwsh` while on Windows `powershell` is
+    5.1 and a different program.
+    """
+    seen, found = set(), []
+    for candidate in (os.environ.get("PWSH"), shutil.which("pwsh"), shutil.which("powershell")):
+        if not candidate:
+            continue
+        key = os.path.realpath(candidate).lower()
+        if key not in seen:
+            seen.add(key)
+            found.append(candidate)
+    return found
+
+
+POWERSHELLS = _powershells()
+PWSH = POWERSHELLS[0] if POWERSHELLS else None
 
 
 class TheRunDirectoryIsOutsideTheAuditedTree(unittest.TestCase):
@@ -1867,10 +1888,30 @@ class TheRunDirectoryIsOutsideTheAuditedTree(unittest.TestCase):
             self.assertIn(f"Resolve-Physical {side}", safe,
                           f"{side} is still compared as spelled")
 
+    def test_every_shipped_powershell_block_is_ascii(self):
+        """Windows PowerShell 5.1 reads a script file without a byte-order mark in the ANSI
+        code page, so an em dash's UTF-8 bytes arrive as three other characters, one of
+        which it takes for a closing quote: a string holding one ends early and the block
+        does not parse. Asserted here, on every host, because only a Windows runner with
+        5.1 can run the parse check below."""
+        checked = 0
+        for doc in sorted(SKILLS.rglob("*.md")):
+            text = doc.read_text(encoding="utf-8")
+            for line, body in fenced_blocks(text):
+                if not text.splitlines()[line - 1].strip().startswith("```powershell"):
+                    continue
+                checked += 1
+                with self.subTest(doc=doc.relative_to(SKILLS).as_posix(), line=line):
+                    stray = sorted({ch for ch in body if ord(ch) > 127})
+                    self.assertEqual(stray, [], "non-ASCII characters in a PowerShell block")
+        self.assertGreater(checked, 0, "no PowerShell block was found, so nothing was checked")
+
     @unittest.skipUnless(PWSH, "no PowerShell on this host")
     def test_the_windows_block_parses(self):
         """Nothing in this repository has ever parsed that block. A typo in it fails on a
-        user's Windows machine, which is the one place it runs."""
+        user's Windows machine, which is the one place it runs. Parsed under every
+        PowerShell on the host, because the block targets Windows PowerShell 5.1 and a
+        runner that has it beside PowerShell 7 must answer for 5.1 too."""
         block = self._block("Test-SafeBase")
         with tempfile.TemporaryDirectory() as d:
             src = Path(d) / "block.ps1"
@@ -1881,9 +1922,15 @@ class TheRunDirectoryIsOutsideTheAuditedTree(unittest.TestCase):
                 f"'{src}', [ref]$null, [ref]$errs)\n"
                 "if ($errs.Count) {{ $errs | ForEach-Object {{ $_.ToString() }}; exit 1 }}\n"
             ).replace("{{", "{").replace("}}", "}")
-            done = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", check],
-                                  capture_output=True, text=True)
-            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            for shell in POWERSHELLS:
+                with self.subTest(shell=shell):
+                    # Decoded explicitly and forgivingly: Windows PowerShell 5.1 answers in
+                    # the console code page, and a byte the host's default cannot map
+                    # crashes the reader thread and loses the parse error being reported.
+                    done = subprocess.run([shell, "-NoProfile", "-NonInteractive", "-Command", check],
+                                          capture_output=True, encoding="utf-8",
+                                          errors="replace")
+                    self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
 
 
 class TheBoundedPollReportsWhatItActuallySaw(unittest.TestCase):
@@ -2163,12 +2210,14 @@ class ShippedTextSaysWhatTheCodeDoes(unittest.TestCase):
             self.fail("nothing near the adapter lines says those paths must be absolute")
 
     def test_the_writer_claim_is_about_edit_tools(self):
-        """Two lines below it, the same paragraph says the rung-1 Claude reviewer's shell
-        commands can still write. The absolute claim contradicts its own next sentence."""
+        """The bound the flags actually set is over the edit tools and over a shell command
+        judged to change a file — a permission check, not a kernel boundary, so an incidental
+        write by a command judged read-only still lands. A flat "can write" claim overstates
+        what the flags promise, in either direction."""
         text = self._norm("diff-review", "SKILL.md")
         if "a reviewer that can write is not a review" in text:
-            self.fail("the flat claim is still there, beside the admission that this "
-                      "reviewer's shell commands can write")
+            self.fail("the flat claim is still there, in place of the bound the flags "
+                      "actually set over the edit tools")
 
     def test_review_panel_names_git_as_a_prerequisite(self):
         """Auditing a tree inside a repository asks git what is tracked, and `plan` refuses
@@ -2346,13 +2395,16 @@ class TheSafetyChecksSurviveTheirOwnFixes(unittest.TestCase):
             script = Path(d) / "fn.ps1"
             script.write_text(self._ps_function("Resolve-Physical") +
                               f'\nResolve-Physical "{link / "inner"}"\n', encoding="utf-8")
-            done = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-File", str(script)],
-                                  capture_output=True, text=True, timeout=120)
-            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
-            answer = Path(done.stdout.strip())
-            self.assertEqual(answer.resolve(), (real / "inner").resolve(),
-                             "the ancestor link was left unresolved, so containment is "
-                             "decided against a path that is not where the files land")
+            for shell in POWERSHELLS:
+                with self.subTest(shell=shell):
+                    done = subprocess.run([shell, "-NoProfile", "-NonInteractive", "-File", str(script)],
+                                          capture_output=True, text=True, timeout=120)
+                    self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                    answer = Path(done.stdout.strip())
+                    self.assertEqual(answer.resolve(), (real / "inner").resolve(),
+                                     "the ancestor link was left unresolved, so containment "
+                                     "is decided against a path that is not where the files "
+                                     "land")
 
     @unittest.skipUnless(BASH and os.name == "posix", "the POSIX half of the document")
     def test_the_fallback_base_is_checked_too(self):
@@ -2445,14 +2497,16 @@ class TheResolversAnswerIsPhysicalOrItIsNothing(unittest.TestCase):
             script.write_text(self._ps_function("Resolve-Physical") +
                               f'\nResolve-Physical "{Path(d) / "alias" / "temp"}"\n',
                               encoding="utf-8")
-            done = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-File", str(script)],
-                                  capture_output=True, text=True, timeout=120)
-            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
-            answer = Path(done.stdout.strip())
-            self.assertEqual(answer.resolve(), (root / "scratch").resolve(),
-                             "the relative target was resolved against the junction's "
-                             "spelled parent, so a directory inside the audited tree reads "
-                             "as one outside it")
+            for shell in POWERSHELLS:
+                with self.subTest(shell=shell):
+                    done = subprocess.run([shell, "-NoProfile", "-NonInteractive", "-File", str(script)],
+                                          capture_output=True, text=True, timeout=120)
+                    self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                    answer = Path(done.stdout.strip())
+                    self.assertEqual(answer.resolve(), (root / "scratch").resolve(),
+                                     "the relative target was resolved against the "
+                                     "junction's spelled parent, so a directory inside the "
+                                     "audited tree reads as one outside it")
 
     @unittest.skipUnless(BASH and os.name == "posix", "needs a POSIX bash")
     def test_an_audit_rooted_at_the_filesystem_root_is_refused(self):
