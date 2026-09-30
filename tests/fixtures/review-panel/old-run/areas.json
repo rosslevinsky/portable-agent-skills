@@ -1,0 +1,78 @@
+{
+  "areas": [
+    {
+      "also_read": [
+        "tests/test_engine.py"
+      ],
+      "audit_bytes": 0,
+      "audit_lines": 0,
+      "audit_oversize": false,
+      "audited": false,
+      "bytes": 225,
+      "files": [
+        "engine/core.py",
+        "engine/sub/deep.py",
+        "engine/util.py",
+        "run.py"
+      ],
+      "id": "area-01",
+      "lenses": [
+        "bottom-up from the code",
+        "top-down from the contract"
+      ],
+      "lines": 17,
+      "oversize": false,
+      "part": null,
+      "subject": "engine",
+      "tested": []
+    },
+    {
+      "also_read": [],
+      "audit_bytes": 0,
+      "audit_lines": 0,
+      "audit_oversize": false,
+      "audited": false,
+      "bytes": 120,
+      "files": [
+        "README.md",
+        "docs/guide.md"
+      ],
+      "id": "area-02",
+      "lenses": [
+        "bottom-up from the code",
+        "top-down from the contract"
+      ],
+      "lines": 6,
+      "oversize": false,
+      "part": null,
+      "subject": "docs",
+      "tested": []
+    },
+    {
+      "also_read": [],
+      "audit_bytes": 0,
+      "audit_lines": 0,
+      "audit_oversize": false,
+      "audited": true,
+      "bytes": 76,
+      "files": [
+        "tests/test_engine.py"
+      ],
+      "id": "area-03",
+      "lenses": [
+        "bottom-up from the code",
+        "top-down from the contract"
+      ],
+      "lines": 5,
+      "oversize": false,
+      "part": null,
+      "subject": "rest",
+      "tested": []
+    }
+  ],
+  "ceiling": {
+    "bytes": 204800,
+    "lines": 2000
+  },
+  "partition": "subject"
+}

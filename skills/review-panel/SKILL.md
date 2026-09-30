@@ -3,8 +3,9 @@ name: review-panel
 description: >
   Blind multi-agent correctness sweep of a file set. Many readers each take one bounded
   area and see nothing of each other's work; every finding is then checked by an agent
-  that did not raise it, and a claim that can be run is run. Reports findings and what
-  nobody read; never edits the tree it reads. Distinct from diff-review (anchored to a
+  that did not raise it, and a claim that can be run is run. Writes a report for a person
+  (every defect, each place it must be fixed, and what nobody read) and a fix brief an
+  agent can fix from; never edits the tree it reads. Distinct from diff-review (anchored to a
   change set), cyw (the author checking itself) and security-review-codebase (one lens,
   no verification step). Use when the user invokes /review-panel, or says "sweep these
   files for defects", "review the codebase with a panel", "blind review", "have several
@@ -19,12 +20,16 @@ once** and refuses one that cannot; on such a host it works the same under eithe
 The requirement is the product, not a speed-up: every finding is judged by a unit that did
 not raise it, so one worker doing both jobs is not a weaker review but a different and
 misleading one, and there is nothing underneath to degrade to. Within that requirement
-there are two rungs. Stronger is **two runtimes**: two models read every area blind, and
-each finding is verified by the *other* model, so the report may claim model divergence.
-Weaker is **one runtime**: two fresh contexts of the same model, and the report says context
-divergence and nothing stronger. Coverage is the same at both; only what the report may
-claim varies, and the rung follows the configuration, which is pinned for the run. A lane
-that lands no unit ends the run with a refusal naming it — not a third rung. The
+there are four rungs, levels of how independent the checking is. Strongest is **two runtimes**: two models read every area blind,
+and each finding is verified by the *other* model, so the report may claim model divergence.
+Next is **one runtime running two models**: the same claim, from two models that ran under one
+CLI, sharing its tools, system prompt and permission checks, which the report says. Weakest are
+**two runtimes running one model** and **one runtime**: two fresh contexts of the same model,
+in two tools or one, and the report says context divergence and nothing stronger. Models are
+compared by name as written, so one model reached under two names counts as two. Coverage is
+the same at all four; only what the report may claim varies,
+and the rung follows the configuration, which is pinned for the run. A lane that lands no
+unit ends the run with a refusal naming it — not a fifth rung. The
 run is two bundled stdlib-only **Python 3.10+** programs — the stage engine
 `review_panel.py` and the driver `review_panel_run.py` that owns the loop — a prerequisite
 the skill checks before it dispatches anything. `git` is the other one, wherever the tree
@@ -45,9 +50,14 @@ no lock and writes nothing._
 Take a problem statement and a set of files, divide the files into bounded areas, and have
 many agents read them — none seeing another's work — for what is wrong. Then send every
 finding to an agent that did not raise it, which reproduces the claim where it can be run
-and otherwise judges it by reading. The output is one structure and two renderings of it:
-every defect with a location, a plain-language consequence, a severity, what the stranger
-decided and the source it cites quoted from the pinned tree, plus every path nobody read.
+and otherwise judges it by reading. A run writes two outputs from one set of records. **The
+report** (`report.md`, and `report.html`, the same content as a web page) is for a person:
+every defect — one mistake, with every site where it has to be fixed — with a location, a
+plain-language consequence, a severity, what the checker decided and the source it cites
+quoted from the pinned tree, plus every path nobody read. **The fix brief** is for an agent
+that will fix the code: `fix-brief.md` for every defect, `fix-brief/D<n>.md` for one defect
+alone, and `fix-brief.json` with the same records for a script. It leaves out refuted sites
+and everything the fix does not need.
 Which unit raised what is kept to an appendix, out of the material somebody reads while
 fixing. **This skill reports; it never edits, stages or commits in the tree it reads.**
 
@@ -74,8 +84,8 @@ version at startup and exit with the same `Python 3.10+ required` message.
 1. **Bounded area.** One agent gets one chunk it can read closely, not skim.
 2. **Blind.** A payload file contains no other unit's output. It is a property of the
    file, so a test asserts it rather than a prompt requesting it.
-3. **Verified by a stranger.** A finding never goes back to its finder — and at the
-   two-runtime rung, it goes to the **other model**.
+3. **Verified by a stranger.** A finding never goes back to its finder — and where the
+   lanes run two models, it goes to the **other model**.
 4. **Run it if it can be run.** `references/verifier.md` holds the rule in full — what
    counts as evidence, when a verdict must be `unresolved`, and why a search of the source
    is `documentary` rather than `executed` — and it is the file the verifier is handed.
@@ -113,10 +123,11 @@ somebody changing them, and no step of a run sends you there.
    runtime, the model, how many workers run at once (`slots`, two unless the owner picks
    another number when you ask), and the command line to launch a worker with in each of the two permission
    modes. `references/dispatch.md` gives its shape and a worked example. Lanes A
-   and B are what makes rule 3 true, so give them **two runtimes** where the host has two
-   and one runtime with **one model** where it has one; two lanes on one runtime naming
-   different models is refused before anything is planned, because no sentence the report
-   can write about it is true. Then:
+   and B are what makes rule 3 true, so give them **two runtimes** where the host has two.
+   Two models on one runtime run as well, when every command carries `⟪model⟫`, the one
+   proof the named model reached the worker; without it they are refused before anything is
+   planned. A lane may name a backend — an entry in the user's backends file that sets its
+   model and credentials. Then:
 
    ```
    <python> <this skill's dir>/review_panel_run.py run --job <job.json> \
@@ -127,9 +138,11 @@ somebody changing them, and no step of a run sends you there.
    reads stdin. The preview counts one **capability probe** beside the readers — the single
    unit per run that establishes whether the tree builds and whether its tests run, which
    every verification payload then carries (`references/probe.md`). With `--go`, the run
-   goes to a report. Watch `dispatch/progress.log` as it goes. To stop it, create the drain
-   file it names on its first line: claiming stops, what is running finishes, and the run
-   exits resumable — on every platform and at any point.
+   goes to a report through its rounds: reading, verification, clustering into sites, a
+   merge that groups the sites of one mistake into one defect, a check of that grouping by
+   the other lane, and synthesis. Watch `dispatch/progress.log` as it goes. To stop it,
+   create the drain file it names on its first line: claiming stops, what is running
+   finishes, and the run exits resumable — on every platform and at any point.
 
    **A finished run wrote `report.md`, and the driver's last line names it.** Exit 0 alone
    does not say so: a drained run and a `--go`-less preview exit 0 too, having written no
@@ -141,11 +154,16 @@ somebody changing them, and no step of a run sends you there.
    readers is the one to expect, and nothing read against it can be trusted, so that run
    ends there and a new one is planned.
 
-3. **Hand the report to the owner**, as `references/report-format.md` closes. Answers to
-   the owner's questions, whether in the job or asked since, corrections to findings you
-   can show are wrong, and caveats about the run go in `report-notes.json`, not in the
-   conversation; `report --rerender` puts them in the report. Then point the owner at
-   `report.md` by path; never inline a snapshot file, an evidence block or a payload.
+3. **Hand both outputs to the owner**, as `references/report-format.md` closes: the report
+   for a person, the fix brief for an agent. Answers to the owner's questions, whether in
+   the job or asked since, corrections to findings you can show are wrong, and caveats
+   about the run go in `report-notes.json`, not in the conversation; `report --rerender` puts them in the report. Then point the owner at
+   `report.md` and `fix-brief.md` by path; never inline a snapshot file, an evidence block
+   or a payload. To fix, give an agent `fix-brief.md`, or one `fix-brief/D<n>.md` per agent,
+   and the tree the review read — the commit the brief names, plus any uncommitted changes
+   the review saw; its line numbers refer to that tree. The
+   brief does not carry the notes: leave out, or tell the agent about, any defect a note
+   corrects.
 
 ## What the run claims
 
@@ -157,7 +175,7 @@ directories are not separate ports, caches or credentials — and a failure that
 environment's stays `unresolved` rather than becoming a verdict.
 
 The rung the report names follows **the configuration, which is pinned for the life of the
-run**: a resume naming a different runtime or model is refused by name, so no lane quietly
+run**: a resume naming a different runtime, model or backend is refused by name, so no lane quietly
 becomes a second context of the other's runtime and no rung drops below the one configured.
 What a run can do instead is end without one. A lane that lands no unit answered nothing it
 was given, so no finding in the run was checked by a unit that did not raise it — rule 3,

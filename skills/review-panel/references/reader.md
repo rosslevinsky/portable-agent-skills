@@ -12,12 +12,13 @@ one to follow a call, but a finding located in one is dropped.
 The problem statement below is the owner's, verbatim; it says what *wrong* means for this
 job. Read for that — not for style, and not for what you would have written instead.
 
-Three rules. Each one bought a defect that the run without it missed:
+Three rules, each guarding against a way a defect goes missed:
 
 1. **Report every distinct defect, even when several share a root cause.** Three call
    sites that make the same mistake are three findings, each with its own consequence.
    Grouping is a later stage's job, not yours; a finding folded into another is a finding
-   nobody verifies.
+   nobody verifies. The converse holds too: each finding is one mistake, and two problems
+   at one place are two findings.
 2. **Audit the helper, not just the call site.** When a function's name promises what a
    call needs — `normalize`, `is_safe`, `is_valid` — open it and check that its body keeps
    the promise, on every branch and for every input it accepts. A helper trusted by its

@@ -1,0 +1,63 @@
+{
+  "title": "review-panel merge result",
+  "description": "Which of the run's sites are one mistake. A site is the reports of one mistake at one place; one mistake is often made in several places, and this groups those places so the report can present the mistake once, with every place it has to be fixed. This stage groups and nothing else: it judges no site right or wrong, revises no severity, and cannot remove a site. Every site the payload lists appears in exactly one group, and a reply that drops one, repeats one, names one the payload never listed, leaves a group empty, gives a group of several sites no mechanism or not one instance per site, mixes a defect with a coverage gap, or puts a compound site in a group of several is refused whole.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["groups", "compound", "summary"],
+  "properties": {
+    "groups": {
+      "type": "array",
+      "description": "One entry per mistake, in any order. A site that matches no other is a group of one, and that is the normal case rather than a failure to merge. Together the entries partition the payload's site list exactly.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["sites", "mechanism", "instances", "reason_kept_apart"],
+        "properties": {
+          "sites": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "The site ids in this group, as the payload spells them, e.g. `S7`. Never empty, never repeated within a group or across groups, and never an id the payload does not list."
+          },
+          "mechanism": {
+            "type": ["string", "null"],
+            "description": "For a group of two or more: the one rule every site breaks, how breaking it produces the failure, and the rule that corrects it, stated once. Null for a group of one."
+          },
+          "instances": {
+            "type": ["array", "null"],
+            "description": "For a group of two or more: one record per site in the group, saying in one sentence how that site is this mistake. Null for a group of one.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["site", "instance"],
+              "properties": {
+                "site": {"type": "string", "description": "A site id of this group."},
+                "instance": {"type": "string", "description": "One sentence: how this site instantiates the mechanism."}
+              }
+            }
+          },
+          "reason_kept_apart": {
+            "type": ["string", "null"],
+            "description": "For a group of one that you considered merging with another: one sentence saying what differs. Null otherwise."
+          }
+        }
+      }
+    },
+    "compound": {
+      "type": "array",
+      "description": "Every site whose own material asserts a second, independent mistake beyond its consequence, which the corrective rule of any group would not fix. Each such site is in a group of its own. Empty where there is none.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["site", "second_claim"],
+        "properties": {
+          "site": {"type": "string", "description": "The compound site's id."},
+          "second_claim": {"type": "string", "description": "One sentence naming the second claim."}
+        }
+      }
+    },
+    "summary": {
+      "type": "string",
+      "description": "One paragraph for a person reading the report: how many groups of two or more, the largest, and any hard calls."
+    }
+  }
+}

@@ -2,8 +2,8 @@
 
 Three behaviors of this engine read as defects and are not. Nothing here is an instruction,
 and no run reads it: a duel works from `SKILL.md`, the engine and the templates alone. Read it
-before proposing a change to one of the three — each has been proposed once already, and what
-makes the current shape right is not visible from the code on its own.
+before proposing a change to one of the three — each reads as an obvious fix, and what makes
+the current shape right is not visible from the code on its own.
 
 ## An unusable judge scores zero; it does not halt the duel
 
@@ -19,9 +19,9 @@ of degrading. Halting would discard a duel that has already produced two usable 
 strength of one judgment being unavailable.
 
 **What would change it.** A run where a zero from a timed-out re-judge changed which plan the
-summary points at. That is the harm the halt would prevent, and nobody has seen it. The
-`--timeout` help now separates the spawns that halt from the ones that degrade, so the promise
-and the code agree; a report that they still disagree reopens this.
+summary points at. That is the harm the halt would prevent, and no such case is known; until
+one is, the degrade stands. The `--timeout` help separates the spawns that halt from the ones
+that degrade, so the promise and the code agree; a report that they disagree reopens this.
 
 ## Below the supported floor, the interpreter fails before any check of ours
 

@@ -36,20 +36,19 @@ def shipped_python() -> list[Path]:
     explicitly, because neither `scripts/` nor the repository root is wholly shipped, so the
     directory is not the unit there.
 
-    `install.py` was missing from this list while the docstring claimed "every `.py` a user
-    receives", and it is the one Python file EVERY user runs. It cost a real defect:
-    `main()` never reconfigured its output streams, so `--verify` redirected to a file on a
-    cp932 console raised UnicodeEncodeError while reporting a healthy install.
+    `install.py` is on it because it is the one Python file EVERY user runs. Being on it puts
+    the installer under both checks below: every read and write names its encoding, and
+    `main()` reconfigures stdout and stderr, so its report survives a console whose code
+    page, cp932 among them, cannot represent an em dash.
 
     A stricter version would parse that set out of configuration rather than restating it,
     and is deliberately not written: TOML parsing needs `tomllib`, and this project's floor
     is Python 3.10, which predates it.
     """
     found = [REPO_ROOT / "install.py", REPO_ROOT / "scripts/validate_cross_runtime.py"]
-    # Scope, case and the residue filter all come from the validator's traversal. The
-    # `rglob` plus private `"__pycache__" not in p.parts` test this replaces was the third
-    # of three separate residue filters in the repository, and the one furthest from the
-    # other two — which is how they got out of step.
+    # Scope, case and the residue filter all come from the validator's traversal, so this
+    # list and the validator drop residue by one rule rather than by two that can drift
+    # apart.
     found += sorted(
         path
         for skill_md in vcr.iter_skill_roots(REPO_ROOT / "skills")
@@ -103,7 +102,7 @@ def _is_bare_text_subprocess(call: ast.Call) -> bool:
 
     Matched on the keyword rather than on the callee, so it holds however `subprocess` is
     spelled at the call site. The correct answer for the path case — read bytes, decode
-    once, explicitly — was written down long before two shipped call sites got it.
+    once, explicitly — is easy to write down and easy for a call site to miss.
     """
     text_mode = any(
         kw.arg in ("text", "universal_newlines")
@@ -236,15 +235,12 @@ class EntrypointsPinTheirOutputEncoding(unittest.TestCase):
             f"{sorted(entrypoints)}")
 
 
-# `PowerShellEncodingTests` lived here, checking that every shipped `.ps1` was ASCII or
-# carried a UTF-8 BOM. It is gone because its subject is: `install.ps1`,
-# `install.Tests.ps1` and `ci-windows.ps1` were deleted with the shell installers, and this
-# repository now ships no PowerShell at all.
+# No test here checks `.ps1` files, because this repository ships none. The one PowerShell
+# block a skill carries lives inside Markdown, and `test_skill_content.py` parses and runs it.
 #
-# Worth recording HOW that was noticed. The class kept passing locally after the deletion —
-# its `rglob("*.ps1")` was finding `.ps1` files inside stale checkouts of older branches left
-# in the working copy. CI, on a fresh clone, failed immediately. A whole-tree glob run from a
-# working copy can be green for a reason that has nothing to do with the repository.
+# A whole-tree glob run from a working copy can be green for a reason that has nothing to do
+# with the repository: an `rglob("*.ps1")` finds `.ps1` files inside stale checkouts left in
+# the working copy, while CI, on a fresh clone, finds none.
 
 
 if __name__ == "__main__":

@@ -36,13 +36,13 @@ Two properties are non-negotiable:
 - **Diff-first, fresh context.** Review the diff as an outsider would, without the
   implementation conversation coloring judgment.
 - **No tree edits — bounded by flags, not merely requested.** The reviewer *reports*; it never fixes. On rung 1
-  this is a bound set by per-instance flags, not merely a prompt asking it not to: Codex
-  `-s read-only -c approval_policy="never"` rejects writes from the shell and the edit tool at the
-  operating-system level, and Claude `--permission-mode plan` refuses the edit tools and any shell
-  command it judges would change a file — a permission check rather than a kernel boundary, so an
-  incidental write by a command it judges read-only still lands. (Those flags do **not** constrain user-configured hooks, plugins, or MCP
-  servers, which run outside the sandbox; for an airtight boundary, run the reviewer under an
-  OS-level read-only mount or with customizations disabled.) Findings go back to the author/gate.
+  per-instance flags set that bound, and neither is a lock. Codex `-s read-only -c
+  approval_policy="never"` has the operating system refuse the shell's writes on Linux and
+  macOS, less reliably on native Windows, while its own edit tool is checked only inside Codex.
+  Claude `--permission-mode plan` is Claude Code's own permission check, which the user's
+  settings can widen: an allow rule for the shell lets a shell write through. Neither flag
+  constrains user-configured hooks, plugins or MCP servers. For an airtight boundary, run the
+  reviewer on a read-only copy or mount of the tree. Findings go back to the author/gate.
 
 ## Step 1 — Select the diff
 
@@ -126,7 +126,7 @@ reviewer's full narrative** — the verdict is written *alongside* the reasoning
 place of it, because the reasoning is what a human reads and what makes a finding
 actionable.
 
-> **Adapter note — why only one rung-1 command carries a schema flag (measured, not assumed).**
+> **Adapter note — why only one rung-1 command carries a schema flag.**
 > The two runtimes put a schema-validated object in different places, and only one of them
 > keeps the prose:
 > **Claude** returns the object on its terminal result event (`structured_output`) while its
@@ -155,7 +155,7 @@ findings as prose. Never require the object.
 disagree the supervisor **corrects the count** and says so in `verdict_reason` — publishing a
 known-wrong number with only a warning attached would leave the trap armed for any gate that
 reads the count without reading the note. It corrects it **only as far as the findings
-support**: a positive claim is **never lowered to 0**, and an unrecognised severity floors it
+support**: a positive claim is **never lowered to 0**, and an unrecognized severity floors it
 at 1, because 0 is what a gate reads as clean and an off-enum spelling would otherwise erase
 a real finding. The number can therefore be higher than the entries listed — gate on
 `findings[]`.
@@ -184,13 +184,29 @@ refusal as grounds to fall back.
 > reviewer over the diff. **Both flags, on the fallback rung too** — `-s read-only` bounds the
 > shell and the approval policy bounds the built-in edit tool, and a reviewer whose edit tools are
 > unbounded is not a review. Rung 1 — launch Claude through the supervisor with its **edit tools blocked**
-> (`--permission-mode plan`, which also refuses a shell command that would change a file), returning its **full transcript**:
+> (`--permission-mode plan`, bounded as the rule above says), returning its **full transcript**:
 > `<python> <skill-dir>/review_runner.py --idle 900 --deadline 1800 --cwd <dir> --display <cap> --findings <f> --result-mode stream-transcript --schema <skill-dir>/review-schema.json --verdict-json <v> -- claude -p "<review prompt>" --add-dir <dir> --permission-mode plan --json-schema ⟪schema_json⟫ --output-format stream-json --include-partial-messages --verbose`.
 > **Controller vs author / probe:** rung 1 wants a reviewer whose **model differs from the diff's
 > author**. If you — the runtime running this skill — already differ from the author, review directly:
 > you are the cross-model reviewer. Otherwise launch the *other* runtime as above, but only when its
 > CLI is on PATH (probe `command -v <cli>`; native Windows `where <cli>` / `Get-Command <cli>`) and
 > Python 3 is present; else fall open to rung 2.
+
+**A backend chooses rung 1's model.** A user may keep a backends file: a JSON object at
+`~/.portable-agent-skills/backends.json` (or where `PORTABLE_AGENT_SKILLS_BACKENDS` points)
+mapping each name to `harness` (the CLI it is written for), `model`, and optional `args`,
+`env` and `env_from_parent`. When the user names one, pass `--backend <name>` to the
+supervisor and write `⟪model⟫` and `⟪backend_args⟫` into the reviewer argv; the supervisor
+fills them, checks the backend fits the CLI launched, and hands the reviewer its settings and
+key. With no backend named, rung 1 runs on the CLI's own sign-in. Rung 2 is the host's
+in-process sub-agent, which runs the host's own model, so **no backend applies there**; rung 3
+starts no agent. **The report says which ran**: rung 1 with the backend's name and model, or
+on the CLI's own sign-in; rung 2; or rung 3. A refused backend is a launch error: fall open
+and record why.
+
+> **Adapter note — a backend on rung 1.** Add `--backend <name>` before the `--` and the markers
+> after the program: `codex exec --json -s read-only -c approval_policy="never" -m ⟪model⟫
+> ⟪backend_args⟫ …`, or `claude -p "<review prompt>" --model ⟪model⟫ ⟪backend_args⟫ …`.
 
 **Waiting for the supervisor to finish — never poll for its process.** The completion
 signal is the **one-line JSON status** the supervisor prints to stdout — that is the

@@ -1,8 +1,9 @@
 # tests/
 
-Several coexisting test suites live here, covering the pack's halves and hosts. No
-count is given on purpose — a fixed number in prose goes stale the first time a suite
-is added, and each suite below is discoverable by its own glob.
+This directory holds several test suites of two kinds. Together they cover the skills,
+the validator, the installer and the engines the skills bundle, and CI runs them on Linux,
+macOS and Windows. No count is given on purpose. A fixed number in prose goes
+stale the first time a suite is added, and each suite below can be found by its own glob.
 
 - **`test_validate_*.md`** — fixture files that exercise the rules in
   `scripts/validate_cross_runtime.py`
@@ -10,8 +11,8 @@ is added, and each suite below is discoverable by its own glob.
   stub-CLI scenarios from `fixtures/plan-duel/`
 
 `test_skill_content.py` fails if a suite exists on disk and is not named in the table, so
-the table cannot fall behind the directory. For a long time it named only a few of them,
-and a reader learned what this directory contains by running it instead of reading this.
+every suite in this directory must appear in the table. A table naming only a few of them
+leaves a reader learning what this directory contains by running it instead of reading this.
 
 | Suite | What it asserts |
 | --- | --- |
@@ -19,9 +20,9 @@ and a reader learned what this directory contains by running it instead of readi
 | `test_encoding_hygiene.py` | Every text file read or written by shipped Python names its encoding |
 | `test_extract_frames.py` | `extract-frames.sh` must not report success over a caller's bad argument |
 | `test_install_py.py` | The single-file Python installer: it installs what it says, removes only what it recorded, records ownership before it touches a file, and reports an install that does not match the pack |
-| `test_plan_duel_engine.py` | Deterministic unit tests for the stdlib-only plan-duel engine (Phase 1) |
+| `test_plan_duel_engine.py` | Deterministic unit tests for the stdlib-only plan-duel engine |
 | `test_plan_tracker.py` | The plan tracker check: one isolated case per rule of `execution.md`, ported out of the validator's fixture harness so the rules run on Windows |
-| `test_plugin_manifest.py` | `plugin.json` against Agent Plugins 1.0.0: the canonical `$schema`, the name's character rules, and — the one with teeth — that its `version` equals the CHANGELOG's, so the pack cannot advertise a version it is not |
+| `test_plugin_manifest.py` | `plugin.json` against Agent Plugins 1.0.0: the canonical `$schema`, the name's character rules, and, most importantly, that its `version` equals the CHANGELOG's, so the pack cannot advertise a version it is not |
 | `test_review_panel_driver.py` | The stdlib-only review-panel driver, `review_panel_run.py`: ownership, one active attempt per unit, one terminal publication, replay-stable budgets, extraction and completion — driven against a stub worker it writes itself |
 | `test_review_panel_engine.py` | Deterministic unit tests for the stdlib-only review-panel engine, `review_panel.py`; reads `fixtures/review-panel/` |
 | `test_review_runner.py` | Unit tests for the stdlib-only diff-review supervisor, ``review_runner.py`` |
@@ -34,9 +35,10 @@ and a reader learned what this directory contains by running it instead of readi
 They all run in CI (`.github/workflows/validate.yml`), on Ubuntu, macOS and Windows
 alike, the same suites split into four shards per platform, plus a Linux pass under the C
 locale. A private fork runs Linux only and gets the other two from a manual run that sets
-the workflow's `all_platforms` input. There is no PowerShell suite and no two-interpreter Windows matrix, because there
-is no PowerShell left: `install.ps1`, `install.Tests.ps1` and `ci-windows.ps1` went with
-the shell installers, and one Python installer needs no parity harness. Every suite here
+the workflow's `all_platforms` input. There is no PowerShell suite and no two-interpreter
+Windows matrix, because the pack ships no `.ps1` file: the installer is one Python
+program, and one installer needs no parity harness. (The one PowerShell block a skill carries
+is run by `test_skill_content.py`.) Every suite here
 is found by the same discovery `python -m unittest discover -s tests -p 'test_*.py'` uses,
 which `scripts/shard_tests.py` shares, so adding one needs no workflow change.
 
@@ -66,26 +68,26 @@ than its functions.
 | Ownership is recorded first | A manifest that cannot be written stops the run before anything is copied; a failed copy leaves the skill owned, so a re-run repairs it rather than being refused |
 | A name that could inject an entry is refused | The manifest is line-oriented, so a newline, a leading `#`, a Windows-reserved name or an NTFS `:` stream never reaches it |
 | Verify establishes what it claims | A retired skill, a skill not yet installed, and a half-copied one are each a non-zero exit, not a remark |
-| Links are unlinked, never followed | Removing a linked skill leaves its target alone — the hazard that cost `install.ps1` a hand-written `Remove-SkillPath` |
+| Links are unlinked, never followed | Removing a linked skill detaches the link itself and leaves its target's contents in place |
 | Reads a legacy install | A manifest written by the shell installers is understood, updatable and removable |
 | The version travels | Read from `CHANGELOG.md`, `[Unreleased]` skipped, `unknown` when no version can be read; verified from a copy with no git at all |
 | Both runtimes | The defaults name one directory per runtime, each with its own manifest |
-| Three gaps the old suite named | A manifest line cannot reach outside the target; a retired skill is pruned from disk, not only from the manifest; an unowned skill is not replaced without `--force` |
+| Kept from the shell installers | A manifest line cannot reach outside the target; a retired skill is pruned from disk, not only from the manifest; an unowned skill is not replaced without `--force` |
 
-The last group exists because those three behaviors were covered by the bash suite,
-dropped by the first draft of `install.py`, and found by **reading** the suite being
-deleted rather than deleting it. All three were reproduced before they were fixed.
+The last group holds three behaviors the shell installers guaranteed, which `install.py`
+keeps. Each test sets up the hazard it guards against.
 
-`MutationProofs` is what makes the rest trustworthy. These tests could not be written red
-first, because the code was new, so the ones that matter most were checked by breaking
-the implementation and confirming the right test noticed.
+`MutationProofs` is the reason to trust the rest. A test that has never been seen to fail
+has not shown that it can. So for two of the groups that matter most — ownership recorded
+first, and removing only what the manifest records — it breaks the implementation on
+purpose and confirms that the state the group guards against becomes reachable again.
 
 ## `test_validate_*.md` fixtures
 
-Each markdown file in this directory is a deliberately-shaped input
-designed to fire (or not fire) a single check in the validator. The
-`--test-fixtures` mode reads them and confirms each behaves as labeled —
-it's a test-the-linter harness.
+Each Markdown file in this directory is an input written to trigger (or
+not trigger) a single check in the validator. The `--test-fixtures` mode
+reads them and confirms each behaves as labeled. In other words, these
+files test the linter itself.
 
 Paired positive / negative fixtures:
 
@@ -113,6 +115,7 @@ Paired positive / negative fixtures:
 | `test_validate_spawn_permission.md` | **Fails** — three ways: a shell `codex exec` and a JSON one, each with arguments but no sandbox mode, plus a sandbox named without its approval-policy pin |
 | `test_validate_spawn_permission_clean.md` | **Passes** — explicit sandbox modes on every invocation, alongside a bare `codex exec` prose mention that is correctly not treated as one |
 | `test_validate_skill_root_doc_ref.md` | **Fails** — skill text references a repo-root doc (`PORTABILITY.md`) that is not installed with the skill |
+| `test_validate_backends_root_doc.md` | **Fails** — skill text points at `BACKENDS.md`, the backends file's documentation, which lives at the repo root and is not installed with the skill |
 | `test_validate_skill_selfcontained_clean.md` | **Passes** — a `references/` doc whose links stay inside its own skill (single-`../` allowance, README/CHANGELOG exclusion) |
 | `test_validate_skill_sibling_path.md` | **Fails** — a repo-rooted `skills/<other>/…` path, the self-containment defect in the spelling the `../` escape rule cannot see. Carries no dot-dot, so only the sibling rule can reject it |
 | `test_validate_skill_references_escape.md` | **Fails** — the `references/`-level escape threshold: one `../` is allowed there, two and three are not. Asserted on the reported level count, since at depth 0 the same file is rejected for a different reason |
@@ -121,39 +124,38 @@ Paired positive / negative fixtures:
 | `test_validate_v1_routing_unqualified_self.md` | **Fails** — a v1 skill body referring to its own suite unqualified (`everything after /plan-init`); intra-suite references, self-references included, must be `-v1`-qualified |
 | `test_validate_v1_routing_qualified_redirect.md` | **Fails** — the opposite direction: a `Format: v2` refusal guard whose forward redirect has been `-v1`-qualified, when canonical means v2 |
 | `test_validate_v1_routing_clean.md` | **Passes** — both directions right in one file: `-v1`-qualified intra-suite references, unqualified forward redirect |
-| `test_validate_repeated_reference_fallback.md` | a companion's fallback stated once, then referenced repeatedly - the relaxed rule must accept it |
+| `test_validate_repeated_reference_fallback.md` | **Passes** — a companion's fallback stated once, then referenced repeatedly; the relaxed rule must accept it |
 
 
 The **checkbox execution tracker** is covered by a table of temp-*directory* cases in
-`run_test_fixtures()` rather than by committed fixtures. Two of its rules are about
+`test_plan_tracker.py` rather than by committed fixtures. Two of its rules are about
 the directory — a checkbox's link must resolve to a real phase document, and every
 phase document must be listed — which a single flat `.md` file cannot express. Each
 case violates exactly one rule and asserts a finding count of **1** (a fixture tripping
-two rules proves neither), and acceptance cases sit alongside them so a rule that
-simply rejected everything could not satisfy the suite.
+two rules proves neither), and cases that must be accepted sit alongside them, so a rule that
+simply rejected everything could not pass the suite.
 
-Three of the cases are about scope rather than shape, and they are the ones that matter
-most. A **directory scan inspects only `execution.md`** — proven by a sibling v1
-`phases.md` with deliberately dangling links, which would fail loudly if the scan ever
-widened. A **superseded `- phase:` tracker is printed by path and skipped**, not
-silently ignored — asserted through `run_tracker_check`'s captured output, because
-"reported" is the whole point. And a file carrying **both** shapes is an error, not a
-legacy record: "zero boxes is a hard error" and "no boxes means legacy" otherwise
-describe the same file, so a half-migrated tracker would pass.
+Three of the cases are about scope rather than shape, and they matter most. A **directory scan
+inspects only `execution.md`** — proven by a sibling v1 `phases.md` with deliberately dangling
+links, which would fail loudly if the scan ever widened. A **superseded `- phase:` tracker is
+printed by path and skipped**, not silently ignored — asserted through `run_tracker_check`'s
+captured output, because the requirement is that it is reported. And a file carrying **both**
+shapes is an error, not a legacy record: "zero boxes is a hard error" and "no boxes means
+legacy" otherwise describe the same file, so a half-migrated tracker would pass.
 
-**Coverage here is proven by mutation, not by a green run.** Every branch of
-`check_tracker` and `run_tracker_check` has been individually disabled and the suite
-confirmed to go red — eleven mutants, each killed by a named case. Six branches of the
-superseded grammar were found silently untested this way, after the suite had reported
-green for months. A new rule is not covered until its case has killed its own mutant.
+**Coverage here is held to mutation, not to a green run.** The bar for every branch of
+`check_tracker` and `run_tracker_check` is a named case that fails when that branch alone
+is disabled — a mutant, a deliberately broken copy of the code. A green suite can leave a
+branch silently untested for as long as nobody breaks it. A new rule is not covered until
+its case has failed on its own mutant.
 
 > **Run mutants with `PYTHONDONTWRITEBYTECODE=1`, or a green result may be wrong.**
 > Python validates a cached `.pyc` against the source's **mtime and size**, and the usual
 > mutant changes neither: flipping `==` to `!=` keeps the byte count identical, and
-> restoring the file with `cp` in the same second keeps the timestamp. Measured: a
-> restored module went on running the mutant, so a test written against the real source
-> failed while the source was correct, and the readings taken that way had to be redone. `find . -name __pycache__ -prune -exec rm -rf
-> {} +` clears it after the fact; the environment variable prevents it.
+> restoring the file with `cp` in the same second keeps the timestamp. A restored module
+> then goes on running the mutant, so a test written against the real source fails while
+> the source is correct. `find . -name __pycache__ -prune -exec rm -rf {} +` clears it
+> after the fact; the environment variable prevents it.
 
 Several additional fixture checks don't need `.md` files — they build temp
 skills trees in-memory: the discovery rules
@@ -168,7 +170,7 @@ exercised separately, so neither can mask the other).
 ## Why two styles coexist
 
 - The `.md` fixtures are the cheap way to add a new validator rule: write
-  one failing file, register it in `run_test_fixtures()`, done.
+  one failing file and register it in `run_test_fixtures()`.
 - The `test_*.py` suites cover everything a document cannot state: install
   behavior end-to-end (file modes, manifest writes, the ownership-before-copy
   ordering) and the engines the skills bundle.

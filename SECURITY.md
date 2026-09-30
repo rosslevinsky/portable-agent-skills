@@ -5,7 +5,7 @@
 If you believe you've found a security issue in Portable Agent Skills — for
 example, a bug in `install.py` that could be abused to overwrite user files
 outside the configured skills directory, or a validator bypass that lets
-unsafe skill content slip through CI — please report it **privately** via
+unsafe skill content pass CI — please report it **privately** via
 GitHub Security Advisories:
 
 1. Go to [Security → Report a vulnerability](https://github.com/rosslevinsky/portable-agent-skills/security/advisories/new).
@@ -57,7 +57,7 @@ Relevant concerns include:
   accidental overwrite of user data.
 - **Validator and tracker checker**: crafted files that cause uncontrolled
   recursion, resource exhaustion, or false negatives on banned phrases; a
-  link that escapes the refusal above and pulls an external tree into the
+  link that gets past the refusal above and brings an external tree into the
   scan.
 - **Subprocess supervisors**: the argv handed to a spawned CLI, the sandbox and
   approval flags it is pinned to, and whether a hostile or malformed reply from

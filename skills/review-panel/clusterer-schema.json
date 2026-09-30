@@ -20,7 +20,7 @@
           },
           "consequence": {
             "type": "string",
-            "description": "Plain language, ONE SHORT SENTENCE — aim for 12 words and never exceed 20: what a person using this software experiences when this defect goes wrong. It becomes the heading somebody reads first and a cell in a table they scan, so it has to fit on one line: a 138-character heading is a paragraph and stops the index being scannable. Lead with the plain words, put any identifier after them, and leave the mechanism to `what_goes_wrong` — that field is where the detail belongs. Where the members worded it differently, write the one sentence that covers what they agree on rather than picking a favourite.",
+            "description": "Plain language, ONE SHORT SENTENCE — aim for 12 words and never exceed 20: what a person using this software experiences when this defect goes wrong. It becomes the heading somebody reads first and a cell in a table they scan, so it has to fit on one line: a heading longer than one line is a paragraph and stops the index being scannable. Lead with the plain words, put any identifier after them, and leave the mechanism to `what_goes_wrong` — that field is where the detail belongs. Where the members worded it differently, write the one sentence that covers what they agree on rather than picking a favorite.",
             "maxLength": 120
           },
           "split_reason": {

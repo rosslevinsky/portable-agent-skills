@@ -11,8 +11,8 @@ counter, no cache and no marker file is authoritative where the records disagree
 That single rule is what makes a killed run resumable: there is nothing in memory whose
 loss changes an answer.
 
-Four things are worth knowing before reading the rest, because each one killed an earlier
-shape of this program:
+Four things are worth knowing before reading the rest, because a program that ignores any
+one of them fails:
 
 * **A file existing proves nothing about an attempt.** The supervisor creates its
   ``--findings`` path empty when it claims it, deletes it again on a failure, and writes
@@ -52,7 +52,7 @@ import stat
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Sequence
 
@@ -164,7 +164,7 @@ def _canonical(path: Path, what: str) -> Path:
 def remove_tree(root: Path, inside: Path) -> None:
     """Remove a directory this program created, **including a hardened one**.
 
-    A hardened snapshot (§7.3) is a tree nothing can delete from: on POSIX a directory
+    A hardened snapshot is a tree nothing can delete from: on POSIX a directory
     without its write bit gives up no entry, so an ordinary recursive delete leaves the
     whole thing where it was and the next plan then refuses because the path exists. Write
     permission is restored first and the delete follows. Read and traverse permission are
@@ -212,13 +212,14 @@ def remove_tree(root: Path, inside: Path) -> None:
     try:
         # **Two questions, and the second is not the first asked harder.**
         #
-        # Does `root` SIT where it claims? The parent resolved with the leaf name put back on
-        # it is where it claims; `base` is where it leads. A `root` that is a link answers
-        # them differently, and the walk below follows where it leads — so a run directory's
-        # `.partial` pointed at a sibling run had that sibling walked and its hardened
-        # snapshot made writable, with `rmtree` then refusing the link and leaving the
-        # permissions changed. Nothing about the boundary catches this: the sibling really is
-        # inside the directory that holds both of them.
+        # Does `root` SIT where it claims? The parent resolved with the leaf name put back
+        # on it is where it claims; `base` is where it leads. A `root` that is a link
+        # answers them differently, and `rglob` descends through it: a run directory's
+        # `.partial` pointed at a sibling run reaches that sibling's hardened snapshot, whose
+        # every path resolves under `base`, so the chmod below would make it writable while
+        # `rmtree` refuses the link and removes nothing. This check returns first. Nothing
+        # about the boundary catches this: the sibling really is inside the directory that
+        # holds both of them.
         if base != seat:
             return
         # And is it under the boundary the CALLER named? That is the question no property of
@@ -483,15 +484,14 @@ def clear_drain_request(rundir: Path, given: Path | None = None) -> None:
     # The canonical flag is one-to-one with the run, and the lock is what makes that true.
     # The spelling an operator typed is not: an alias can be repointed, so `current.drain`
     # may belong to a run this driver does not own — and clearing it would erase a request
-    # made against a live run, which is the defect this whole control keeps producing. So
+    # made against a live run, which is the failure this whole control has to avoid. So
     # the alias is cleared only while it still RESOLVES to this run.
     #
-    # Ask that of the ALIAS, not of the flag's parent directory. Comparing parents was the
-    # same question asked of the wrong thing: an alias normally lives in a different
-    # directory from the run it points at — that is what makes it an alias — so the
-    # comparison skipped every real one. The flag then stayed on disk while
-    # :func:`drain_flags` went on watching it, and every resume through that spelling
-    # drained the moment it started, forever.
+    # Asked of the ALIAS, not of the flag's parent directory. The flag sits BESIDE the
+    # alias, so its parent is the directory that holds the alias, never the run the alias
+    # points at, and a comparison of it with the run never matches. A flag left on disk
+    # stays in what :func:`drain_flags` watches, and every resume through that spelling
+    # drains the moment it starts.
     if _resolved(given) == _resolved(rundir):
         with contextlib.suppress(OSError):
             given.with_name(given.name + DRAIN_SUFFIX).unlink()
@@ -519,15 +519,15 @@ LOCK_SUFFIX = ".lock"
 PARTIAL_SUFFIX = ".partial"
 # How an operator asks a run to stop claiming, on every platform.
 #
-# **`SIGTERM` is not that mechanism everywhere, and pretending otherwise made a job red.**
+# **`SIGTERM` is not that mechanism everywhere.**
 # Windows delivers no POSIX signal: `signal.signal(SIGTERM, …)` is accepted there and the
 # handler never runs, because the usual way to send one terminates the process outright
 # rather than asking it anything. A drain that only works where signals do is a drain half
 # the supported platforms do not have.
 #
 # So the portable request is a file: create `<rundir>.drain` and the loop stops claiming at
-# its next look, lets what is running finish, and exits 0 resumable — the whole of §4's
-# drain contract, without a signal. A sibling of the run directory for the lock's reason:
+# its next look, lets what is running finish, and exits 0 resumable — the whole drain
+# contract, without a signal. A sibling of the run directory for the lock's reason:
 # the engine's run directory holds only what the engine writes.
 #
 # The request belongs to the run it was made against, so a driver removes it at startup.
@@ -701,10 +701,14 @@ _PLACEHOLDER_RE = re.compile(r"⟪([^⟪⟫]+)⟫")
 # absolute path; `payload` and `schema` are that file and the unit's schema, both under an
 # opaque per-attempt directory; `input` is that directory; `cwd` is the working directory
 # the worker runs in; `transcript` is the path the supervisor collects the reply at, which
-# only an `external-file` adapter needs.
-PLACEHOLDERS = frozenset({"prompt", "payload", "schema", "input", "cwd", "transcript"})
-# One of these must appear, or the worker is launched with no task at all — the failure
-# plan-duel measured, where an accepted-and-ignored prompt mode ran a CLI with no prompt.
+# only an `external-file` adapter needs. `model` is the lane's model and `backend_args` its
+# backend's `args`; both are optional, and a command without them runs as it always has.
+PLACEHOLDERS = frozenset({"prompt", "payload", "schema", "input", "cwd", "transcript",
+                          "model", "backend_args"})
+MODEL_MARKER = f"{PLACEHOLDER_OPEN}model{PLACEHOLDER_CLOSE}"
+BACKEND_ARGS_MARKER = f"{PLACEHOLDER_OPEN}backend_args{PLACEHOLDER_CLOSE}"
+# One of these must appear, or the worker is launched with no task at all — the same
+# failure as an accepted-and-ignored prompt mode, which runs a CLI with no prompt.
 CARRIES_THE_TASK = frozenset({"prompt", "payload"})
 
 READ_ONLY, WRITE_CAPABLE = "read_only", "write_capable"
@@ -712,8 +716,20 @@ MODES = (READ_ONLY, WRITE_CAPABLE)
 RESULT_MODES = frozenset({"external-file", "stream-json-result-event", "stream-transcript"})
 
 _LANE_KEYS = frozenset({"runtime", "model", "account", "adapter", "slots",
-                        "provider_fault_patterns", READ_ONLY, WRITE_CAPABLE})
-_LANE_REQUIRED = ("runtime", "model", "adapter", READ_ONLY, WRITE_CAPABLE)
+                        "provider_fault_patterns", "backend", "env", "env_from_parent",
+                        READ_ONLY, WRITE_CAPABLE})
+# `model` too, unless the lane names a backend, which states it.
+_LANE_REQUIRED = ("runtime", "adapter", READ_ONLY, WRITE_CAPABLE)
+# A variable name and nothing else. A key in an underscore format (`gsk_…`, `hf_…`) passes,
+# so a launching-side name may be a pasted key: no message quotes one, and the pin keeps
+# only a digest of it.
+_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_NOT_A_NAME = ("is not a variable name (letters, digits and underscores, not starting with a "
+               "digit); it is not quoted here, in case a value was typed in its place")
+# The prefix of a name that carries one of a lane's settings to the supervisor in its own
+# environment: a value on an argv is readable by every local user, and a launching-side name
+# on the argv would be written into the attempt's spawn record.
+_CARRIED_ENV_PREFIX = "REVIEW_PANEL_SETTING_"
 # How many of a lane's workers run at once when the config does not say. The number sets how
 # long a run takes and the right one is the account's rate limit, so a defaulted lane is
 # SAID to be defaulted in the preview: a default nobody sees is a run length nobody chose.
@@ -750,8 +766,28 @@ class ModeSpec:
 
 
 @dataclass(frozen=True)
+class ResolvedBackend:
+    """A backend's fields as the supervisor reported them, with ``⟪model⟫`` filled in its
+    ``args``. Literal ``env`` values stay with the supervisor; only their names are kept,
+    to refuse a lane that sets the same variable itself."""
+
+    name: str
+    harness: str
+    model: str
+    args: tuple[str, ...]
+    env_names: tuple[str, ...]
+    env_from_parent: tuple[tuple[str, str], ...]
+    # A digest of every field the supervisor reported, literal `env` values included: a
+    # resume is held to what the name resolved to, not only the name, because an entry
+    # edited between runs to reach another address or read another key is another player.
+    digest: str = ""
+
+
+@dataclass(frozen=True)
 class LaneSpec:
     runtime: str
+    # Empty only for a lane that names a backend and states no model, until the backend is
+    # read: `resolve_lane_backends` fills it before anything uses it.
     model: str
     account: str
     adapter: str
@@ -765,6 +801,71 @@ class LaneSpec:
     # pattern that cannot be compiled is refused before a run is planned rather than raising
     # in the middle of adjudicating an attempt.
     fault_patterns: tuple[re.Pattern, ...] = ()
+    # Which model, where, and with what credentials: the supervisor reads the backend and
+    # applies it with `env` and `env_from_parent` to this lane's workers alone.
+    backend: str | None = None
+    env: tuple[tuple[str, str], ...] = ()
+    env_from_parent: tuple[tuple[str, str], ...] = ()
+    account_stated: bool = True
+    resolved: ResolvedBackend | None = None
+
+
+def _env_key(name: str) -> str:
+    """The key a variable is stored under: Windows names are case-insensitive."""
+    return name.upper() if os.name == "nt" else name
+
+
+def _setting_value(part: str) -> str | None:
+    """The value of a `key=value`, `key="value"` or `key='value'` argument, else ``None``.
+    Read the way the supervisor reads it, so both agree on where a model stands."""
+    key, sep, value = part.partition("=")
+    if not sep or not key or any(ch.isspace() for ch in key):
+        return None
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+def _fills_model(part: str) -> bool:
+    return part == MODEL_MARKER or _setting_value(part) == MODEL_MARKER
+
+
+def _carries_model(command: Sequence[str]) -> bool:
+    return any(_fills_model(part) for part in command)
+
+
+def _lane_settings(spec: LaneSpec) -> tuple[list[str], dict[str, str]]:
+    """The supervisor flags that apply a lane's backend and settings to its worker, and the
+    values those flags read from the supervisor's own environment.
+
+    A non-empty literal value and a forwarded one both travel in that environment under a
+    private name, handed on with ``--env-from-parent``: an argv is readable by every local
+    user, and this one is written into the attempt's spawn record, which must hold neither a
+    value nor a launching-side name. An empty literal blanks a variable and is no secret, and
+    the supervisor refuses an empty forwarded value, so it stays an ``--env`` flag. A
+    forwarded variable unset here is carried empty, and the supervisor refuses it naming the
+    variable the agent reads.
+    """
+    flags: list[str] = []
+    carried: dict[str, str] = {}
+    if spec.backend is not None:
+        flags += ["--backend", spec.backend]
+        # The supervisor reads the backends file on every launch, so the digest this run
+        # pinned goes with the name: an entry edited mid-run is refused, not run.
+        if spec.resolved is not None and spec.resolved.digest:
+            flags += ["--backend-digest", spec.resolved.digest]
+    for name, value in spec.env:
+        if not value:
+            flags += ["--env", f"{name}="]
+            continue
+        private = f"{_CARRIED_ENV_PREFIX}{len(carried)}"
+        carried[private] = value
+        flags += ["--env-from-parent", f"{name}={private}"]
+    for child, parent in spec.env_from_parent:
+        private = f"{_CARRIED_ENV_PREFIX}{len(carried)}"
+        carried[private] = os.environ.get(parent, "")
+        flags += ["--env-from-parent", f"{child}={private}"]
+    return flags, carried
 
 
 def _parse_mode(lane: str, mode: str, raw: object) -> ModeSpec:
@@ -785,6 +886,15 @@ def _parse_mode(lane: str, mode: str, raw: object) -> ModeSpec:
     for part in command:
         used.update(_PLACEHOLDER_RE.findall(part))
     unfilled = sorted(used - PLACEHOLDERS)
+    # The two backend markers stand where the supervisor would fill them and nowhere else:
+    # `⟪backend_args⟫` as a whole argument, `⟪model⟫` as one or as a setting's value.
+    for part in command:
+        if BACKEND_ARGS_MARKER in part and part != BACKEND_ARGS_MARKER:
+            raise DriverError(f"{where}.command: {BACKEND_ARGS_MARKER} must be an argument "
+                              f"of its own, since it stands for several")
+        if MODEL_MARKER in part and not _fills_model(part):
+            raise DriverError(f"{where}.command: {MODEL_MARKER} must be an argument of its "
+                              f"own or a setting's whole value, like model={MODEL_MARKER}")
     if unfilled:
         spelled = ", ".join(f"{PLACEHOLDER_OPEN}{name}{PLACEHOLDER_CLOSE}"
                             for name in unfilled)
@@ -853,25 +963,75 @@ def parse_adapter_config(data: str | dict) -> dict[str, LaneSpec]:
         for key in _LANE_REQUIRED:
             if key not in raw:
                 raise DriverError(f"lanes.{lane} is missing required key {key!r}")
+        backend = raw.get("backend")
+        if backend is not None and (not isinstance(backend, str) or not backend.strip()):
+            raise DriverError(f"lanes.{lane}.backend must be a non-empty string: the name "
+                              f"of a backend in the backends file")
+        if backend is None and "model" not in raw:
+            raise DriverError(f"lanes.{lane} is missing required key 'model' (or a "
+                              f"'backend', which states one)")
         for key in ("runtime", "model", "adapter"):
-            if not isinstance(raw[key], str) or not raw[key].strip():
+            if key in raw and (not isinstance(raw[key], str) or not raw[key].strip()):
                 raise DriverError(f"lanes.{lane}.{key} must be a non-empty string")
-        account = raw.get("account", raw["runtime"])
+        # A lane on a backend is on that provider's account, not on its runtime's: the other
+        # lane may be signed in to the runtime, and one provider's outage must not pause it.
+        account = raw.get("account", backend if backend is not None else raw["runtime"])
         if not isinstance(account, str) or not account.strip():
             raise DriverError(f"lanes.{lane}.account must be a non-empty string")
         slots = raw.get("slots", SLOTS_DEFAULT)
         if not isinstance(slots, int) or isinstance(slots, bool) or slots < 1:
             raise DriverError(f"lanes.{lane}.slots must be a whole number of at least 1: "
                               f"how many of this lane's workers may run at once")
+        env = _parse_lane_env(lane, raw, "env")
+        env_from_parent = _parse_lane_env(lane, raw, "env_from_parent")
+        both = sorted({_env_key(name) for name, _ in env}
+                      & {_env_key(name) for name, _ in env_from_parent})
+        if both:
+            raise DriverError(f"lanes.{lane}: {', '.join(both)} is set by both 'env' and "
+                              f"'env_from_parent'; set it once")
+        modes = {mode: _parse_mode(lane, mode, raw[mode]) for mode in MODES}
+        if backend is None:
+            for mode, spec in modes.items():
+                if BACKEND_ARGS_MARKER in spec.command:
+                    raise DriverError(
+                        f"lanes.{lane}.{mode}.command uses {BACKEND_ARGS_MARKER}, but the "
+                        f"lane names no backend to fill it from")
         lanes[lane] = LaneSpec(
-            runtime=raw["runtime"].strip(), model=raw["model"].strip(),
+            runtime=raw["runtime"].strip(), model=raw.get("model", "").strip(),
             account=account.strip(), adapter=raw["adapter"].strip(), slots=slots,
-            slots_stated="slots" in raw,
-            modes={mode: _parse_mode(lane, mode, raw[mode]) for mode in MODES},
+            slots_stated="slots" in raw, modes=modes,
             fault_patterns=_parse_fault_patterns(lane, raw.get("provider_fault_patterns")),
+            backend=backend, env=env, env_from_parent=env_from_parent,
+            account_stated="account" in raw,
         )
-    _refuse_a_configuration_the_report_could_not_describe(lanes)
+    _refuse_a_shared_account_the_settings_contradict(lanes)
+    if all(spec.model for spec in lanes.values()):
+        _refuse_two_models_the_commands_do_not_carry(lanes)
     return lanes
+
+
+def _parse_lane_env(lane: str, raw: dict, key: str) -> tuple[tuple[str, str], ...]:
+    """One lane's ``env`` or ``env_from_parent``: an object of variable name to string.
+
+    No message quotes a value, nor the launching-side name of ``env_from_parent``: that is
+    where a pasted key lands.
+    """
+    where = f"lanes.{lane}.{key}"
+    mapping = raw.get(key, {})
+    if not isinstance(mapping, dict):
+        raise DriverError(f"{where} must be an object of variable name to string")
+    pairs = []
+    for child, value in mapping.items():
+        if not _ENV_NAME_RE.match(child):
+            raise DriverError(f"{where}: an entry {_NOT_A_NAME}")
+        if not isinstance(value, str):
+            raise DriverError(f"{where} entry {child!r} must be a string")
+        if key == "env_from_parent" and not _ENV_NAME_RE.match(value):
+            raise DriverError(f"{where} entry {child!r}: the variable it reads {_NOT_A_NAME}")
+        if "\0" in value:
+            raise DriverError(f"{where} entry {child!r} holds a NUL character")
+        pairs.append((child, value))
+    return tuple(pairs)
 
 
 def _parse_fault_patterns(lane: str, raw: object) -> tuple[re.Pattern, ...]:
@@ -896,28 +1056,55 @@ def _parse_fault_patterns(lane: str, raw: object) -> tuple[re.Pattern, ...]:
     return tuple(compiled)
 
 
-def _refuse_a_configuration_the_report_could_not_describe(
-        lanes: dict[str, LaneSpec]) -> None:
-    """Refuse two lanes on one runtime with **different models**, before anything is planned.
+def _refuse_two_models_the_commands_do_not_carry(lanes: dict[str, LaneSpec]) -> None:
+    """Refuse two lanes on one runtime with **different models** unless every command of
+    both puts the model in its argv through ``⟪model⟫``, before anything is planned.
 
-    The report has one sentence for a one-runtime run and it says the candidates were
-    checked by the same model, calling any disagreement a difference of context. That
-    sentence is false of two models on one runtime, and the run would have no honest rung to
-    record: it is not two runtimes either. Refusing the configuration keeps every rendered
-    sentence true without touching the renderer — and it has to happen here, at startup,
-    because a run that discovered it later would have already spent a whole reading round.
+    Two models on one runtime earn the rung that says "both models", and ``⟪model⟫`` is the
+    one proof the named model reached the command: a lane whose command states no model
+    runs the harness's default whatever the configuration calls it, and the report would
+    credit two models where one ran. Refused at startup, because a run that discovered it
+    later would have already spent a whole reading round.
     """
-    by_runtime: dict[str, set[str]] = {}
+    by_runtime: dict[str, list[LaneSpec]] = {}
     for spec in lanes.values():
-        by_runtime.setdefault(spec.runtime, set()).add(spec.model)
-    for runtime, models in sorted(by_runtime.items()):
-        if len(models) > 1:
+        by_runtime.setdefault(spec.runtime, []).append(spec)
+    for runtime, specs in sorted(by_runtime.items()):
+        models = sorted({spec.model for spec in specs})
+        if len(models) > 1 and not all(_carries_model(spec.modes[mode].command)
+                                        for spec in specs for mode in MODES):
             raise DriverError(
                 f"both lanes run on {runtime!r} but name different models "
-                f"({', '.join(sorted(models))}); the report describes a one-runtime run as "
-                f"checked by the same model, which that is not, and it is not a two-runtime "
-                f"run either. Give the two lanes one model, or two runtimes"
-            )
+                f"({', '.join(models)}), and not every command of both lanes carries "
+                f"{MODEL_MARKER}. It is the one proof the named model reached the worker, "
+                f"and without it the report could credit two models where the harness ran "
+                f"its default. Put {MODEL_MARKER} where each command takes its model")
+
+
+def _refuse_a_shared_account_the_settings_contradict(lanes: dict[str, LaneSpec]) -> None:
+    """Refuse a lane whose inline settings may point it at a provider of its own while its
+    account is defaulted onto another lane's with different settings.
+
+    An outage pauses every lane on its account, and a lane with inline ``env`` and no
+    backend has no name for its account to default to but its runtime's — so an outage of
+    one provider would pause a lane that never called it, or two providers would share one
+    breaker. Only the user knows whether they are one provider, so they are asked to say.
+    """
+    def settings(spec: LaneSpec) -> tuple:
+        return spec.backend, spec.env, spec.env_from_parent
+
+    for lane, spec in sorted(lanes.items()):
+        if spec.account_stated or spec.backend is not None or not (
+                spec.env or spec.env_from_parent):
+            continue
+        for other, theirs in sorted(lanes.items()):
+            if other != lane and theirs.account == spec.account \
+                    and settings(theirs) != settings(spec):
+                raise DriverError(
+                    f"lanes.{lane} sets its own environment and shares the account "
+                    f"{spec.account!r} with lane {other}, whose settings differ; an outage "
+                    f"pauses every lane on an account. State lanes.{lane}.account: the same "
+                    f"name if the two reach one provider, another if they do not")
 
 
 def load_adapter_config(path: str | Path) -> dict[str, LaneSpec]:
@@ -926,6 +1113,151 @@ def load_adapter_config(path: str | Path) -> dict[str, LaneSpec]:
     except OSError as exc:
         raise DriverError(f"cannot read the adapter config {path}: {exc}") from exc
     return parse_adapter_config(text)
+
+
+def _harness_of(program: str) -> str:
+    """The harness a program name launches, read the way the supervisor reads it: the last
+    path part, without a launcher suffix, case-folded."""
+    base = program.replace("\\", "/").rsplit("/", 1)[-1]
+    stem, suffix = os.path.splitext(base)
+    if suffix.lower() in (".exe", ".cmd", ".bat", ".com"):
+        base = stem
+    return base.casefold()
+
+
+def _args_with_model(args: Sequence[str], model: str) -> tuple[str, ...]:
+    """A backend's ``args`` with ``⟪model⟫`` filled where the supervisor fills it, so the
+    run of arguments this driver inserts is the one the supervisor looks for."""
+    return tuple((model if part == MODEL_MARKER
+                  else part.replace(MODEL_MARKER, model)) if _fills_model(part) else part
+                 for part in args)
+
+
+def _resolve_backend(supervisor: Path, name: str) -> ResolvedBackend:
+    """One backend, read by the supervisor: the backends file has one reader, and it is not
+    this driver."""
+    try:
+        done = subprocess.run([sys.executable, str(supervisor), "--resolve-backend", name],
+                              stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise DriverError(
+            f"backend {name!r} could not be read: the supervisor did not run ({exc})") from exc
+    status = None
+    for line in reversed(done.stdout.decode("utf-8", "replace").splitlines()):
+        if line.strip():
+            with contextlib.suppress(ValueError, RecursionError):
+                status = json.loads(line)
+            break
+    if not isinstance(status, dict) or not isinstance(status.get("status"), str):
+        raise DriverError(f"backend {name!r} could not be read: the supervisor exited "
+                          f"{done.returncode} without a status line")
+    if status["status"] != "ok":
+        raise DriverError(str(status.get("reason") or f"backend {name!r} was refused"))
+    fields = status.get("backend")
+    try:
+        harness, model, args = fields["harness"], fields["model"], fields["args"]
+        env, env_from_parent = fields["env"], fields["env_from_parent"]
+        well_formed = (isinstance(harness, str) and isinstance(model, str) and bool(model)
+                       and isinstance(args, list)
+                       and all(isinstance(part, str) for part in args)
+                       and isinstance(env, dict) and isinstance(env_from_parent, dict)
+                       and all(isinstance(key, str) for key in env)
+                       and all(isinstance(key, str) and isinstance(value, str)
+                               for key, value in env_from_parent.items()))
+    except (KeyError, TypeError, AttributeError):
+        well_formed = False
+    if not well_formed:
+        raise DriverError(
+            f"backend {name!r}: the supervisor reported it in a shape this driver does not read")
+    # The same digest review_runner.py's `backend_digest` takes of these fields and checks
+    # on every launch: if the two formulas ever differ, every launch is refused.
+    return ResolvedBackend(name=name, harness=harness, model=model,
+                           args=_args_with_model(args, model), env_names=tuple(env),
+                           env_from_parent=tuple(env_from_parent.items()),
+                           digest=_name_digest(json.dumps(fields, sort_keys=True)))
+
+
+def resolve_lane_backends(lanes: dict[str, LaneSpec],
+                          supervisor: Path) -> dict[str, LaneSpec]:
+    """``lanes`` with every named backend read and its model taken as the lane's.
+
+    Before anything uses a lane's model — the pin a resume is held to, the rung, the record
+    — because a backend is where that model is stated. A lane that also states its own must
+    state the same one: a lane runs one model. A configuration naming no backend is returned
+    as it is, and reads no backends file.
+    """
+    names = sorted({spec.backend for spec in lanes.values() if spec.backend is not None})
+    if not names:
+        return dict(lanes)
+    found = {name: _resolve_backend(supervisor, name) for name in names}
+    resolved: dict[str, LaneSpec] = {}
+    for lane, spec in lanes.items():
+        backend = found.get(spec.backend) if spec.backend is not None else None
+        if backend is None:
+            resolved[lane] = spec
+            continue
+        if spec.model and spec.model != backend.model:
+            raise DriverError(
+                f"lanes.{lane} states model {spec.model!r}, but its backend {backend.name!r} "
+                f"runs {backend.model!r}. A lane runs one model: drop the lane's 'model', or "
+                f"make the two agree")
+        own = {_env_key(name) for name, _ in spec.env + spec.env_from_parent}
+        theirs = ({_env_key(name) for name in backend.env_names}
+                  | {_env_key(child) for child, _ in backend.env_from_parent})
+        both = sorted(own & theirs)
+        if both:
+            raise DriverError(
+                f"lanes.{lane}: {', '.join(both)} is set both by the lane and by its backend "
+                f"{backend.name!r}; set it once")
+        resolved[lane] = replace(spec, model=backend.model, resolved=backend)
+    _refuse_two_models_the_commands_do_not_carry(resolved)
+    return resolved
+
+
+def preflight_lanes(lanes: dict[str, LaneSpec]) -> None:
+    """Refuse, before anything is planned, what the supervisor would refuse at a launch.
+
+    The supervisor checks a backend's harness, its model and its args, and every forwarded
+    variable, as it launches each worker — so a mistake found there has already cost a
+    reading round. A forwarded variable is checked on the launching side only, since the
+    agent's side is the harness's own name and normally unset by design, and empty counts
+    as unset. An entry is named by the variable the agent reads, never by the one it is
+    read from, which is where a key typed in the wrong place lands.
+    """
+    problems = []
+    for lane, spec in sorted(lanes.items()):
+        backend = spec.resolved
+        for mode in MODES:
+            command = spec.modes[mode].command
+            if backend is None:
+                continue
+            launched, expected = _harness_of(command[0]), _harness_of(backend.harness)
+            if launched != expected:
+                problems.append(
+                    f"lane {lane}'s backend {backend.name!r} is written for {expected!r}, "
+                    f"but its {mode} command launches {launched!r}")
+                break
+            if backend.args and BACKEND_ARGS_MARKER not in command:
+                problems.append(
+                    f"lane {lane}'s backend {backend.name!r} has 'args', but its {mode} "
+                    f"command has no {BACKEND_ARGS_MARKER} to put them in, so its provider "
+                    f"settings would be dropped")
+            if not _carries_model(command) and not any(
+                    part == backend.model or _setting_value(part) == backend.model
+                    for part in command):
+                problems.append(
+                    f"lane {lane}'s backend {backend.name!r} names model {backend.model!r}, "
+                    f"but its {mode} command does not carry it: add {MODEL_MARKER} where "
+                    f"the command takes its model")
+        forwarded = spec.env_from_parent + (backend.env_from_parent if backend else ())
+        unset = sorted({child for child, parent in forwarded if not os.environ.get(parent)})
+        if unset:
+            problems.append(
+                f"lane {lane} forwards {', '.join(unset)} from a variable that is not set, or "
+                f"is empty, in this process's environment")
+    if problems:
+        raise DriverError(f"Refusing to start, before anything is planned: "
+                          f"{'; '.join(problems)}.")
 
 
 def lane_descriptions(lanes: dict[str, LaneSpec],
@@ -974,6 +1306,9 @@ def lane_descriptions(lanes: dict[str, LaneSpec],
                         f"supervisor started")
         described[lane] = {
             "adapter": f"{spec.adapter} ({spec.runtime}, {spec.model}){did}",
+            # The model by itself as well as inside the adapter's free text, which the engine
+            # does not parse: it is what the engine checks a two-model rung against.
+            "model": spec.model,
             "permission": "; ".join(
                 f"{'read-only units' if mode == READ_ONLY else 'write-capable units'}: "
                 f"{spec.modes[mode].permission}"
@@ -1031,18 +1366,20 @@ def no_landing_refusal(stranded: Sequence[str], described: dict[str, dict]) -> s
 # a payload existing, so a round that legitimately produced zero units is a committed
 # round rather than one that gets replanned forever.
 #
-# **`engine.ROUTED_STAGE` is deliberately absent, and it is not a sixth round.** That value
-# is written into `candidates.json`, never into `units.json`, and it is a TYPE TAG rather
-# than a position: `_read_candidates` refuses a file whose `stage` is not `routed`, which is
-# how it tells the engine's route record from some other JSON. A row for it here matched
-# nothing — `_marker` reads `units.json` — while implying the run passes through six stages
-# when `units.json` only ever holds these five.
+# **`engine.ROUTED_STAGE` is deliberately absent, and it is not a round.** That value is
+# written into `candidates.json`, never into `units.json`, and it is a TYPE TAG rather than
+# a position: `_read_candidates` refuses a file whose `stage` is not `routed`, which is how
+# it tells the engine's route record from some other JSON. A row for it here matched
+# nothing — `_marker` reads `units.json` — while implying the run passes through a stage
+# `units.json` never holds.
 REPORTED_STAGE = engine.REPORTED_STAGE
 ROUNDS: dict[str, tuple[tuple[str, ...], str]] = {
     engine.READING_STAGE: ((engine.READER_KIND, engine.AUDITOR_KIND, engine.PROBE_KIND),
                            "route"),
     engine.VERIFICATION_STAGE: ((engine.VERIFIER_KIND,), "cluster"),
-    engine.CLUSTERED_STAGE: ((engine.CLUSTERER_KIND,), "synthesize"),
+    engine.CLUSTERED_STAGE: ((engine.CLUSTERER_KIND,), "merge"),
+    engine.MERGED_STAGE: ((engine.MERGER_KIND,), "merge-check"),
+    engine.MERGE_CHECKED_STAGE: ((engine.MERGE_CHECKER_KIND,), "synthesize"),
     engine.SYNTHESIZED_STAGE: ((engine.SYNTHESIZER_KIND,), "report"),
 }
 
@@ -1149,19 +1486,19 @@ def bootstrap(rundir: Path, job: Path | None) -> None:
 
 # The claims the engine's stages take on a run directory. Enumerated rather than swept: a
 # `.lock` this list does not name is not this program's to remove.
-ENGINE_STAGE_CLAIMS = ("route", "cluster", "synthesize", "report")
+ENGINE_STAGE_CLAIMS = ("route", "cluster", "merge", "merge-check", "synthesize", "report")
 
 
 def clear_engine_claims(rundir: Path) -> list[str]:
     """Remove the stage claims a killed engine stage left, and name what was cleared.
 
-    **Phase 7 took a per-stage claim and disclosed the cost: a hard-killed stage strands it
-    and the next run refuses by name until somebody removes it.** That phase also said what
-    would fix it — a process that owns the run from end to end, which is this one. So this
-    is where the reconciliation belongs, and the run lock is exactly what makes it safe: a
-    driver that holds it knows no other driver is running a stage, and the engine's stages
-    run only in-process, so a claim still on disk is one nobody is holding. The engine
-    cannot reason that way about itself, which is why it refuses instead.
+    **A per-stage claim has a cost: a hard-killed stage strands it and the next run refuses
+    by name until somebody removes it.** What removes it safely is a process that owns the
+    run from end to end, which is this one. So this is where the reconciliation belongs,
+    and the run lock is exactly what makes it safe: a driver that holds it knows no other
+    driver is running a stage, and the engine's stages run only in-process, so a claim
+    still on disk is one nobody is holding. The engine cannot reason that way about itself,
+    which is why it refuses instead.
 
     Only a regular file, and only one of the enumerated names: a directory or a link at that
     path is something else, and it is left for the engine to refuse by name.
@@ -1229,7 +1566,7 @@ ORPHAN_CLAIM, RUNNING, UNCERTAIN = "orphan-claim", "running", "uncertain"
 
 # Grace **authorizes nothing.** Its expiry only moves an attempt to `uncertain`, which
 # quarantines its unit and keeps its capacity reservation, because the worker may still be
-# alive. It is not a licence to re-spawn, and no code path treats it as one.
+# alive. It is not a license to re-spawn, and no code path treats it as one.
 GRACE_DEFAULT = 120.0
 
 # What one attempt may make the supervisor hold. Generous enough that no real reply reaches
@@ -1246,20 +1583,20 @@ OUTCOMES = (ACCEPTED, REFUSED, NO_REPLY, WORKER_FAILED, LAUNCH_FAILED,
             PROVIDER_UNAVAILABLE, INFRASTRUCTURE, OPERATOR_FAILED, OPERATOR_RETRY)
 # The outcomes adjudication can only reach by reading a supervisor's status record, which
 # makes each of them a proof that the supervisor ran. An operator's resolution is not one:
-# it is a person deciding what to do about an attempt nobody could account for, and §6.4's
-# provenance asks what executed, not what was given up on.
+# it is a person deciding what to do about an attempt nobody could account for, and the
+# run's provenance reports what executed, not what was given up on.
 _FROM_A_STATUS = frozenset({ACCEPTED, REFUSED, NO_REPLY, WORKER_FAILED,
                             PROVIDER_UNAVAILABLE, INFRASTRUCTURE})
 
 # What a status line's text has to name for the failure to be storage rather than the
-# worker's. A full disk reaches the caller as `routing failed: [Errno 28] ...`, which read
-# as an ordinary worker failure would charge a unit for the host running out of room — and
-# four of those would publish "this unit failed" as the unit's answer.
+# worker's. A full disk reaches the caller as `routing failed: [Errno 28] ...`; filed as a
+# worker failure it charges the unit's failure allowance, and once that allowance is
+# spent `error.txt` becomes the unit's answer, over the host running out of room.
 # The phrases, matched anywhere and in any case: each is several words and names nothing
 # else. The errno NAMES are matched separately, as whole upper-case tokens -- `eio` is
-# inside `fileio.c`, `audio` and a user called Deion, and a substring match on it paused a
-# run over an engine rejection that quoted a path, then re-dispatched the unit on every
-# resume until it hit the launch ceiling.
+# inside `fileio.c`, `audio` and a user called Deion. A match files the attempt as
+# infrastructure, charges the unit nothing and pauses the run for the volume, so prose that
+# only quotes such a path must not match.
 _STORAGE_PHRASES = ("no space left", "read-only file system", "disk quota exceeded")
 _STORAGE_NAME_TEXT = re.compile(r"\b(?:ENOSPC|EROFS|EIO|EDQUOT)\b")
 # The same four faults as the numbers a message carries them by. Matched with the number
@@ -1314,7 +1651,7 @@ def _is_storage_exception(exc: BaseException) -> bool:
 def _host_refused(exc: BaseException) -> OSError | None:
     """The host's refusal underneath a failure of some other type, or ``None``.
 
-    **The four storage errnos are not the only refusals** (§7.0). A permission taken off a
+    **The four storage errnos are not the only refusals.** A permission taken off a
     record, a sharing violation, a mount that went away: each is a read that could not be
     made, and none of them says anything about the thing being read. The engine wraps them
     in a refusal of its own, so the ``OSError`` that carries the answer is one or two links
@@ -1338,7 +1675,7 @@ def _host_refused(exc: BaseException) -> OSError | None:
 # an import across that line would make each one's presence the other's requirement.
 _CAPTURE_OVERFLOW = "capture overflow"
 
-# Replay-derived allowances (§5.3 of the design). Every one of these is counted from the
+# Replay-derived allowances. Every one of these is counted from the
 # dispositions on disk; none is stored, so a resumed run reaches the same numbers.
 REPLY_ALLOWANCE = 1        # re-dispatches charged by `refused` and `no-reply`
 FAILURE_ALLOWANCE = 2      # re-dispatches charged by `worker-failed` and `launch-failed`
@@ -1373,7 +1710,7 @@ def attempt_dirs(rundir: Path, unit: str) -> list[Path]:
     name to two spawns.
 
     **An enumeration that failed is not a unit with no attempts.** Every guard downstream —
-    eligibility (§3.3), the capacity count, the reclamation sweep — reads an empty list as
+    eligibility, the capacity count, the reclamation sweep — reads an empty list as
     "nothing is running here", so a refused `iterdir` authorizes a second live attempt and
     the deletion of the first one's input, output and working directories. The guard on the
     record cannot help: this is what finds the record.
@@ -1604,14 +1941,34 @@ def _is_capture_overflow(status: dict) -> bool:
 # which is otherwise never matched (see `_terminal_detail`): that rule keeps a PROVIDER's
 # prose from being classified through this supervisor's account of it, and these strings
 # are the supervisor's account of ITSELF -- fixed text, written before any worker ran.
+# A backend whose entry no longer matches the digest this run pinned: the supervisor's
+# reason already says what to do, and it is not the adapter file that needs fixing.
+_BACKEND_CHANGED = "changed since the run pinned it"
+# A backends file that went missing, stopped parsing, or lost the lane's entry while the run
+# was going: the supervisor refuses before any worker starts, so it is infrastructure, and a
+# unit's attempts are not spent on a file somebody is editing.
+_BACKENDS_FILE_REFUSALS = ("there is no backends file at", "the backends file ",
+                           "no backend named ")
 _SUPERVISOR_REFUSALS = ("reviewer CLI not found on PATH", "launch failed:",
-                        "is a relative path and --cwd was given")
+                        "is a relative path and --cwd was given", _BACKEND_CHANGED,
+                        *_BACKENDS_FILE_REFUSALS)
+
+
+def _backends_file() -> str:
+    """The backends file the supervisor reads, spelled as it spells it in a refusal about an
+    entry: through `Path`, which turns `C:/x` into `C:\\x` on Windows and drops a repeated
+    separator, so the text matches what the supervisor printed."""
+    override = os.environ.get(BACKENDS_ENV_VAR)
+    return str(Path(override) if override
+               else Path.home() / ".portable-agent-skills" / "backends.json")
 
 
 def _is_supervisor_refusal(status: dict) -> bool:
-    """Whether the supervisor refused to start a worker at all, in its own words."""
+    """Whether the supervisor refused to start a worker at all, in its own words. A refusal
+    naming the backends file is one: a malformed entry is reported against the file's path."""
     reason = status.get("reason")
-    return isinstance(reason, str) and any(mark in reason for mark in _SUPERVISOR_REFUSALS)
+    return isinstance(reason, str) and (
+        any(mark in reason for mark in _SUPERVISOR_REFUSALS) or _backends_file() in reason)
 
 
 def _is_supervisor_exit(status: dict) -> bool:
@@ -1720,19 +2077,28 @@ def adjudicate(ctx: "Run", attempt: Attempt) -> dict:
             elif _is_supervisor_refusal(status):
                 # The supervisor never launched a worker: the lane's command names a program
                 # that is not on PATH, or one that could not be started. That is the
-                # adapter's mistake, not the unit's, and filing it as a worker failure spent
-                # every unit's launch allowance on that lane and ended the run in the one
-                # refusal that cannot be resumed -- taking the other lane's finished work
-                # with it, over a typo. Infrastructure, charged to nobody, and the run stops
-                # where the operator can fix the adapter and run the same command again.
+                # adapter's mistake, not the unit's, so it is filed as infrastructure, not
+                # as a worker failure: it charges nobody and spends none of the unit's
+                # failure allowance, whose exhaustion makes `error.txt` the unit's final
+                # answer. The run pauses where the operator can fix the adapter and run the
+                # same command again.
                 record["outcome"] = INFRASTRUCTURE
                 record["supervisor_refusal"] = True
                 lane = attempt.lane if getattr(attempt, "lane", None) else \
                     ctx.unit_row(attempt.unit).get("lane", "?")
+                reason = str(status.get("reason"))
+                if _BACKEND_CHANGED in reason:
+                    advice = ""
+                elif (any(mark in reason for mark in _BACKENDS_FILE_REFUSALS)
+                      or _backends_file() in reason):
+                    advice = (" Restore or repair the backends file, then run the same "
+                              "command again")
+                else:
+                    advice = (" Fix that lane's command in the adapter file, then run the "
+                              "same command again")
                 ctx.request_pause(
                     f"lane {lane}'s supervisor could not start a worker for {attempt.unit}: "
-                    f"{status.get('reason')}. Nothing was charged. Fix that lane's command in "
-                    "the adapter file, then run the same command again")
+                    f"{reason}. Nothing was charged.{advice}")
             elif _is_supervisor_exit(status):
                 # The supervisor ended without saying what happened to its worker, which
                 # is nobody's answer: not the worker's, which may have finished or never
@@ -1807,15 +2173,15 @@ def adjudicate(ctx: "Run", attempt: Attempt) -> dict:
                         # engine's refusal — indistinguishable in type from a reply the
                         # engine rejected. Charged as a rejection it spends the reply
                         # allowance twice and publishes `error.txt`: the disk's fault
-                        # becomes the unit's answer, which is the one thing §7.1 forbids.
+                        # becomes the unit's answer, which a storage fault must never be.
                         if _is_storage_exception(exc):
                             record["outcome"] = INFRASTRUCTURE
                             record["storage_fault"] = True
                             record["reason"] = (f"the reply could not be checked because a "
                                                 f"read failed: {exc}")
                         else:
-                            # **A read that was refused is not a reply that was rejected**
-                            # (§7.0), and the volume's four errnos are not the only way a
+                            # **A read that was refused is not a reply that was rejected**,
+                            # and the volume's four errnos are not the only way a
                             # read is refused: a permission taken off `areas.json`, a
                             # Windows sharing violation on `units.json`, a mount that went
                             # away. Every one of those arrives here wearing the same type
@@ -2193,7 +2559,7 @@ class LaneExecution:
     ``unknown`` is the third: an attempt prepared, never shown to have started, and never
     shown not to have. A kill between the spawn record and the launch leaves exactly that,
     and so does an operator failing an attempt whose supervisor never printed a status.
-    §6.4 asks for **proven** execution, so what cannot be proved is counted as itself rather
+    The provenance reports only **proven** execution, so what cannot be proved is counted as itself rather
     than rounded up into work the run can claim it did.
     """
 
@@ -2270,17 +2636,33 @@ def _derived_rung(lanes: dict[str, LaneSpec],
     asks the same question at each round boundary — and this is the backstop for the callers
     that reach here by another path.
     """
-    configured = (engine.RUNG_TWO_RUNTIMES
-                  if len({spec.runtime for spec in lanes.values()}) > 1
-                  else engine.RUNG_ONE_RUNTIME)
     if executed is None:
-        return configured
+        return _rung_of([lanes[lane] for lane in sorted(lanes)])
     working = [lane for lane, record in executed.items() if record.landed]
     if len(working) < 2:
         raise DriverError(no_landing_refusal(
             [lane for lane in sorted(lanes) if lane not in working], described))
-    if len({lanes[lane].runtime for lane in working}) > 1:
+    return _rung_of([lanes[lane] for lane in sorted(working)])
+
+
+def _rung_of(specs: Sequence[LaneSpec]) -> str:
+    """Two runtimes, told apart by whether their models differ; else two models on one
+    runtime; else one model in two contexts.
+
+    Two runtimes can run one model — two backends can point both at it — and that is two
+    sessions of one model, never two models. Models are compared as written.
+
+    Two models on one runtime are claimed only where every command put the model in its
+    argv through ``⟪model⟫``. The configuration is refused without it before anything is
+    planned, and this refuses again rather than name a rung for lanes built some other way.
+    """
+    if len({spec.runtime for spec in specs}) > 1:
+        if len({spec.model for spec in specs}) == 1:
+            return engine.RUNG_TWO_RUNTIMES_ONE_MODEL
         return engine.RUNG_TWO_RUNTIMES
+    if len({spec.model for spec in specs}) > 1:
+        _refuse_two_models_the_commands_do_not_carry(dict(enumerate(specs)))
+        return engine.RUNG_TWO_MODELS
     return engine.RUNG_ONE_RUNTIME
 
 
@@ -2576,7 +2958,7 @@ def _make_writable(root: Path) -> None:
     rewrite a file. Executable bits are preserved: a copy whose scripts stopped being
     executable would fail a build for a reason that has nothing to do with the code.
 
-    **A restoration that did not happen fails the preparation** (§5.4). Suppressed, this
+    **A restoration that did not happen fails the preparation.** Suppressed, this
     returns success over a copy that is still read-only: the worker then cannot write its
     own fixtures, and that failure is charged to it as its behavior — the unit answers for
     something this program failed to do. Only a path that vanished under the walk is passed
@@ -2645,7 +3027,7 @@ def prepare_worker_paths(rundir: Path, unit: dict,
         # available and an unexaminable path pauses the run instead.
         if not _present(work):
             work.parent.mkdir(parents=True, exist_ok=True)
-            # The copy comes from the hardened snapshot (§7.3) and `copytree` carries those
+            # The copy comes from the hardened snapshot and `copytree` carries those
             # modes over, so between these two statements the tree is read-only. A process
             # that dies in that window leaves one behind, which is why every sweep that
             # removes a worker's copy goes through `remove_tree` and never a plain
@@ -2741,6 +3123,15 @@ def keeps_evidence(attempt: Attempt) -> bool:
 _NEW_PROCESS_GROUP = 0x00000200
 
 
+def _encodable(text: str) -> bool:
+    """Whether ``text`` survives the encoding a child's environment is passed in."""
+    try:
+        os.fsencode(text)
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _own_process_group() -> dict:
     """The Popen keywords that put a supervisor in a process group of its own.
 
@@ -2762,12 +3153,12 @@ def _execution_ended(attempt: Attempt) -> bool:
     """Whether this attempt's worker can no longer be running.
 
     **One predicate, used by everything that asks the question** — the capacity reservation,
-    the write-capable serialization and the copy cleanup — because two spellings of it
-    disagreed: a lane stayed reserved for an operator-failed attempt that a late status had
-    since proved finished, while the count of running writers ignored that same attempt and
-    let a second write-capable worker start beside one that might still be live.
+    the write-capable serialization and the copy cleanup — because two spellings of it can
+    disagree: a lane stays reserved for an operator-failed attempt that a late status has
+    since proved finished, while the count of running writers ignores that same attempt and
+    lets a second write-capable worker start beside one that might still be live.
 
-    A complete status record is the design's own definition of an execution that ended, and
+    A complete status record is this program's definition of an execution that ended, and
     an operator's attestation is the other. A launch that raised never started anything.
     """
     if attempt.status is not None:
@@ -2998,9 +3389,10 @@ class Run:
         **Set, never added.** The run's own advice on a spent budget is to run the same
         command again, and an operator who does that has `--extend` in the command line
         every time — on every restart after a crash, a pause or a drain, not only the one
-        that asked for more time. Added on each invocation, the same flag granted a fresh
-        extension per restart, and a run restarted enough times had no limit at all. Asking
-        for more is a larger number.
+        that asked for more time. So the flag sets the grant to the figure it names, and a
+        restart carrying the same flag leaves the grant where it was; a figure added per
+        invocation grows with every restart and sets no limit at all. Asking for more is a
+        larger number.
         """
         self._extended = max(0.0, hours) * 3600.0
         self.save_budget(force=True)
@@ -3160,7 +3552,7 @@ class Run:
         # the unit and stops the run for an operator. It is not a narrow window: it is as
         # long as the copy. Done first, a kill here leaves an `in/` and `work/` directory
         # no attempt names, which is disk rather than a stopped run, and the claim and its
-        # record become two adjacent writes, which is the order §3.1 asks for.
+        # record become two adjacent writes, with nothing between them.
         token = reserve_token(self.rundir)
         try:
             inbox, outbox, cwd = prepare_worker_paths(self.rundir, unit, token)
@@ -3214,9 +3606,15 @@ class Run:
             "transcript": str(transcript),
             "prompt": (f"Read {inbox / engine.PAYLOAD_NAME} in full and do exactly what "
                        f"it says."),
+            "model": lane.model,
         }
-        rendered = [_PLACEHOLDER_RE.sub(lambda m: values[m.group(1)], part)
-                    for part in spec.command]
+        rendered: list[str] = []
+        for part in spec.command:
+            if part == BACKEND_ARGS_MARKER:
+                rendered.extend(lane.resolved.args if lane.resolved is not None else ())
+                continue
+            rendered.append(_PLACEHOLDER_RE.sub(lambda m: values[m.group(1)], part))
+        settings, carried = _lane_settings(lane)
         argv = [sys.executable, str(self.supervisor),
                 "--idle", str(spec.idle), "--deadline", str(spec.deadline),
                 "--cwd", str(cwd), "--display", str(attempt_path / DISPLAY_NAME),
@@ -3228,7 +3626,7 @@ class Run:
                 # held whole in the supervisor's memory, four hundred times over.
                 "--status-detail",
                 "--max-capture-bytes", str(self.max_capture_bytes),
-                "--", *rendered]
+                *settings, "--", *rendered]
         record = {
             "argv": argv, "adapter": lane.adapter, "lane": unit.get("lane"),
             "account": lane.account, "generation": self.generation(lane.account),
@@ -3266,17 +3664,27 @@ class Run:
         except OSError as exc:
             # **The same outcome as a failed spawn, because that is what this is.** The
             # attempt directory and a complete `argv.json` are already on disk when this
-            # runs, and nothing has been started. Raised as a plain refusal it left no
-            # record that nothing launched, so the next pass read the attempt as running,
-            # then `uncertain`, and asked an operator to reconcile a worker that never
-            # existed.
+            # runs, and nothing has been started. So it is adjudicated here, as a failed
+            # spawn is, and the disposition records that nothing launched. An attempt with
+            # `argv.json` and no status reads as running until its deadline and grace pass,
+            # then as `uncertain`, which quarantines its unit for an operator.
             return self._record_no_launch(unit_id, attempt_path, index, exc)
+        # Passed only when the lane carries a setting, so a lane with none starts its
+        # supervisor exactly as it always has.
+        extra = {"env": {**os.environ, **carried}} if carried else {}
         try:
             with handle, errors:
                 child = subprocess.Popen(
                     argv, stdout=handle, stderr=errors,
                     stdin=subprocess.DEVNULL, cwd=str(self.rundir),
-                    **_own_process_group())
+                    **extra, **_own_process_group())
+        except UnicodeEncodeError as exc:
+            # Never quoted when a setting is what failed: the error names a character of its
+            # value. Anything else — the argv, a path — is reported as itself.
+            if any(not _encodable(value) for value in carried.values()):
+                return self._record_no_launch(unit_id, attempt_path, index, ValueError(
+                    "a setting could not be passed in this platform's encoding"))
+            return self._record_no_launch(unit_id, attempt_path, index, exc)
         except (OSError, ValueError) as exc:
             return self._record_no_launch(unit_id, attempt_path, index, exc)
         self._children.append((child, attempt_path, unit_id))
@@ -3372,8 +3780,8 @@ class Run:
         more than one way to reach it: the spawn itself can fail, and so can opening the
         file the spawn was going to write its status into.
 
-        **A launch the volume stopped is not a launch the supervisor failed.** §5.3 gives
-        `launch-failed` a failure allowance because it means the supervisor could not start
+        **A launch the volume stopped is not a launch the supervisor failed.** `launch-failed`
+        has a failure allowance because it means the supervisor could not start
         — not because the disk broke. Read as that, three storage faults publish
         `error.txt` as this unit's answer while the thing to fix is the volume. Classified
         before the charging disposition is built, so what is recorded charges nothing, and
@@ -3488,7 +3896,7 @@ class Run:
         """Record that an attempt's failure was the volume's, for the reconciliation below.
 
         Kept per process rather than replayed from the dispositions, deliberately: a
-        disposition marked with a storage fault stays on disk for ever, and a run resumed
+        disposition marked with a storage fault stays on disk forever, and a run resumed
         after the disk was fixed would read it and pause again before doing any work. Each
         fault stops the run once — the pass that first adjudicates it — and never again.
         """
@@ -3657,7 +4065,7 @@ class Run:
         # leaves no account of why it is gone — and nothing can reconstruct one, because the
         # copy that would have been enumerated is exactly what was deleted. Written first,
         # an interrupted deletion is an entry whose directory is still there, which the next
-        # pass finishes: the shape §3.5 already uses for a publication.
+        # pass finishes: the shape a publication already uses.
         self._record_copies(protected, kept, dropped)
         for copy in dropped:
             remove_tree(copy.path, self.rundir)
@@ -3770,7 +4178,7 @@ class Run:
         **An attempt record that exists and could not be read stops the whole sweep.** The
         record is what names an attempt's token, so a read the host refused leaves a live
         worker's input, output and working directory looking exactly like a leak — and this
-        would delete all three out from under it. Deletion needs two facts (§5.4) and an
+        would delete all three out from under it. Deletion needs two facts and an
         unreadable record establishes neither; a leak that survives an outage costs disk,
         and the other mistake costs a running worker its tree.
         """
@@ -3823,7 +4231,7 @@ class Run:
 
         ``by`` says what closed it, because the two answers are not the same claim: a probe
         closing one is this program observing the provider work, and a resume closing one is
-        an operator asserting it (§6.3 and the resume rule below).
+        an operator asserting it (the resume rule below).
         """
         path = self.rundir / engine.DISPATCH_DIR / f"{GENERATIONS_PREFIX}{account}.json"
         if self.generation(account) > generation:
@@ -3975,10 +4383,10 @@ class Run:
         mine = [unit for unit in self.units() if unit.get("kind") in kinds]
         self.say(f"round: {len(mine)} unit(s) of kind {', '.join(kinds)}")
         # Reset HERE, where the round begins, and not inside the loop below, whose every
-        # pass is one poll. Reset per poll, a round held back for room with work still in
-        # flight measured every copy on disk at every poll interval — the very cost that
-        # keeps the sweep off the scoped pass — while `_blocked_on_disk` below is per poll
-        # on purpose, because it is the answer of the pass that set it.
+        # pass is one poll: a round held back for room sweeps once, not at every poll
+        # interval, because the sweep measures every copy on disk — the very cost that
+        # keeps it off the scoped pass. `_blocked_on_disk` below is reset per poll on
+        # purpose, because it is the answer of the pass that set it.
         self._swept_for_room = False
         while True:
             self.adopt(mine)
@@ -4017,7 +4425,7 @@ class Run:
             # eligible".** A unit can be eligible and permanently unable to start — its
             # lane's slot held by an `uncertain` attempt whose worker may still be
             # alive, which is a reservation nothing releases without an operator. Asking
-            # about eligibility instead spins here for ever on a run that should have
+            # about eligibility instead spins here forever on a run that should have
             # stopped and named the attempt nobody can account for.
             if claimed == 0 and not self._in_flight(mine) and not self._waiting_to_probe(mine):
                 # **Nothing can run, and the reason may be the volume rather than the
@@ -4060,7 +4468,8 @@ class Run:
             # for room it never needed — which stops a round where nothing was waiting.
             # Asked before the claim and never after: a unit refused for room charges
             # nothing and is claimable again the moment there is room. Failing it here
-            # would make the volume the unit's answer, which is the whole of §7.
+            # would make the volume the unit's answer, which sections 7.1-7.4 exist to
+            # prevent.
             short = self.headroom()
             if short:
                 # Before holding the round back, enforce the retention cap once. A copy over
@@ -4244,7 +4653,7 @@ class Run:
             # `reported` and the loop returns. So the round that matters most, the one whose
             # answers are published, is the one this would otherwise never check. On Windows
             # a read-only attribute does not stop a file being created, which is exactly why
-            # §7.3 verifies the file set and not only the digests.
+            # the snapshot check verifies the file set and not only the digests.
             self.check_snapshot()
             # **A stop is reported before a quarantine is**, and the order is the point: a
             # run that stopped claiming because it was asked to, or because its budget ran
@@ -4328,8 +4737,9 @@ def resolve_attempt(rundir: Path, unit: str, attempt_name: str, *, action: str,
     worker beside a live one.
 
     ``--fail`` requires it too. Without the attestation the attempt's capacity reservation
-    was kept, because execution may continue -- and nothing ever released it, which at one
-    slot per lane stopped the lane for the rest of the run.
+    would be kept, because execution may continue -- and only a completion the worker may
+    never write would release it, which at one slot per lane can stop the lane for the rest
+    of the run.
     """
     if action == "retry" and not stopped_confirmed:
         raise DriverError(
@@ -4338,14 +4748,15 @@ def resolve_attempt(rundir: Path, unit: str, attempt_name: str, *, action: str,
             "or use --fail")
     if action == "fail" and not stopped_confirmed:
         # The same rule as `--retry`, and for the same reason taken one step further. A
-        # `--fail` without the attestation kept the capacity reservation on purpose, because
-        # execution may continue -- and nothing ever released it. At one slot per lane,
-        # that is the lane stopped for the rest of the run: every later
-        # unit on it refused on every resume, and the only way out failing each of them by
-        # hand and discarding its work. For a write-capable unit it was the run's one writer
-        # lane and so every write-capable unit. Either way the operator has the same two
-        # answers -- confirm the worker has stopped, or wait out its deadline -- and asking
-        # for one of them here is what keeps the run from needing a third.
+        # `--fail` without the attestation would keep the capacity reservation on purpose,
+        # because execution may continue -- and only a completion the worker may never write
+        # would release it. At one slot per lane, that can be the lane stopped for the rest of
+        # the run: every later unit on it refused on every resume, and the only way out
+        # failing each of them by hand and discarding its work. For a write-capable unit it
+        # is the run's one writer lane and so every write-capable unit. Either way the
+        # operator has the same two answers -- confirm the worker has stopped, or wait out
+        # its deadline -- and asking for one of them here is what keeps the run from needing
+        # a third.
         raise DriverError(
             f"--fail on {unit} needs --stopped-confirmed: without it the attempt's capacity "
             "reservation is never released, and at one slot per lane that stops the lane "
@@ -4468,7 +4879,7 @@ def resolve_unit(rundir: Path, unit: str, *, grant: int | None,
         # **The record first, the publication second.** Publishing straight from here left
         # an `error.txt` no adoption pass could attribute to anything: a kill before
         # `landed.json` and the unit is not terminal, while at the launch ceiling it stays
-        # quarantined for ever and below it further work can still be authorized against the
+        # quarantined forever and below it further work can still be authorized against the
         # operator's decision. Written once, the record is what makes the publication
         # replayable, so this call finishes it and a resumed run finishes it just the same.
         _write_json(base / UNIT_RESOLUTION_NAME, {
@@ -4665,6 +5076,20 @@ def _with_default_subcommand(argv: Sequence[str]) -> list[str]:
     return argv
 
 
+# Where the user's backends file is, when not in its default place. Read by the supervisor,
+# never by this driver.
+BACKENDS_ENV_VAR = "PORTABLE_AGENT_SKILLS_BACKENDS"
+
+
+def _pin_backends_path() -> None:
+    """Make a relative backends-file override absolute, against the directory the driver was
+    started in. The preflight reads the file from here and every worker's supervisor starts in
+    the run directory, so a relative path left as it is would name two different files."""
+    override = os.environ.get(BACKENDS_ENV_VAR)
+    if override and not os.path.isabs(override):
+        os.environ[BACKENDS_ENV_VAR] = os.path.abspath(override)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -4672,6 +5097,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (AttributeError, TypeError, ValueError, OSError):
             pass
     engine.require_python(3, 10)
+    _pin_backends_path()
     args = build_parser().parse_args(
         _with_default_subcommand(sys.argv[1:] if argv is None else argv))
     try:
@@ -4699,11 +5125,11 @@ def _dispatch(args: argparse.Namespace) -> int:
     rundir = _canonical(Path(args.rundir), "run directory")
     if args.command == "run":
         # The lock is the run directory's SIBLING, so it needs the parent to exist -- and
-        # bootstrap, which makes the run directory, runs under the lock. A fresh
-        # `--rundir reviews/run1` with no `reviews/` yet was refused at "cannot open the run
-        # lock" before anything could create it. Made here, for `run` only: `status` and the
-        # resolve commands describe a run that exists, and should not leave a directory
-        # behind when it does not.
+        # bootstrap, which makes the run directory, runs under the lock. So the parent is
+        # created here, before the lock is opened, and a fresh `--rundir reviews/run1` with
+        # no `reviews/` yet can start. Made here, for `run` only: `status` and the resolve
+        # commands describe a run that exists, and should not leave a directory behind when
+        # it does not.
         try:
             rundir.parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -4768,6 +5194,10 @@ def _command_run(args: argparse.Namespace, rundir: Path, lock: RunLock) -> int:
         raise DriverError(
             f"{supervisor} is not a file, so it is not the supervisor this run launches "
             f"every attempt with; pass --supervisor")
+    # Before the lock and the plan: a backend written for the wrong harness, or a key that
+    # is not exported, found at the first launch has already cost a reading round.
+    lanes = resolve_lane_backends(lanes, supervisor)
+    preflight_lanes(lanes)
     if args.max_capture_bytes <= 0:
         raise DriverError("--max-capture-bytes must be a positive number of bytes; a cap "
                           "of zero bounds every reply to nothing")
@@ -4844,19 +5274,48 @@ def _command_run(args: argparse.Namespace, rundir: Path, lock: RunLock) -> int:
 def _pin_adapter(rundir: Path, lanes: dict[str, LaneSpec]) -> None:
     """Record the configuration this run is planned against, and refuse a resume with a
     different one. A run whose lanes changed half way through has no honest provenance:
-    the report would name one adapter for work two of them did."""
-    fingerprint = {lane: {"runtime": spec.runtime, "model": spec.model,
-                          "account": spec.account, "adapter": spec.adapter}
-                   for lane, spec in lanes.items()}
+    the report would name one adapter for work two of them did.
+
+    **Who played, not how they ran**: the same model reached through another backend or
+    another credential is a different player, so the backend and the settings are pinned;
+    `slots` is not. A launching-side name and a literal value are pinned as digests — the
+    one may be a key pasted where a name belongs — and a lane with neither field pins exactly
+    what it always did, so a run planned before lanes carried them still resumes.
+    """
+    fingerprint = {}
+    for lane, spec in lanes.items():
+        pinned = {"runtime": spec.runtime, "model": spec.model,
+                  "account": spec.account, "adapter": spec.adapter}
+        if spec.backend is not None:
+            pinned["backend"] = spec.backend
+        if spec.resolved is not None:
+            pinned["backend_digest"] = spec.resolved.digest
+        if spec.env:
+            pinned["env"] = {name: _name_digest(value) for name, value in spec.env}
+        if spec.env_from_parent:
+            pinned["env_from_parent"] = {child: _name_digest(parent)
+                                         for child, parent in spec.env_from_parent}
+        fingerprint[lane] = pinned
     path = rundir / "adapter-pin.json"
     existing = _read_json(path)
     if existing is None:
         _write_json(path, fingerprint)
         return
-    if existing != fingerprint:
+    # A pin written before backends were digested is compared on what it pinned, so a run
+    # started then still resumes on the same backend.
+    compared = {lane: ({key: value for key, value in pinned.items() if key != "backend_digest"}
+                       if isinstance(existing, dict) and isinstance(existing.get(lane), dict)
+                       and "backend_digest" not in existing[lane] else pinned)
+                for lane, pinned in fingerprint.items()}
+    if existing != compared:
         raise DriverError(
             f"{path} pins a different adapter configuration than the one given; a run "
             f"cannot change the lanes it is described by half way through")
+
+
+def _name_digest(text: str) -> str:
+    """Enough of a SHA-256 of ``text`` to tell two apart, and not enough to be either."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
 def _copied_outside_scope(rundir: Path) -> str:
@@ -4898,6 +5357,12 @@ def _preview(rundir: Path, lanes: dict[str, LaneSpec]) -> str:
                      f"{spec.slots} at a time, in about {-(-free // spec.slots)} "
                      f"wave(s)" + (f"; {shared} write-capable unit(s) run one at a time"
                                    if shared else ""))
+        # Which lanes pause together: an outage pauses every lane on its account.
+        together = [other for other, theirs in lanes.items()
+                    if other != lane and theirs.account == spec.account]
+        lines.append(f"  account {spec.account!r}"
+                     + (f", shared with lane {', '.join(together)}: an outage pauses both"
+                        if together else ""))
     lines.append(f"Write-capable units ({', '.join(sorted(WRITE_CAPABLE_KINDS))}) run one at "
                  f"a time across both lanes, whatever the slots say: they build and run the "
                  f"tree, and separate copies still share ports, caches and credentials.")

@@ -16,6 +16,7 @@ modules are imported by their own names, the way the engine suite reaches ``revi
 """
 
 import contextlib
+import dataclasses
 import errno
 import hashlib
 import json
@@ -46,7 +47,9 @@ _FIXTURE_TREE = Path(__file__).resolve().parent / "fixtures" / "review-panel" / 
 # fixture, so it sits beside the tests that drive it and no run can pick up a stale copy.
 STUB = r'''#!/usr/bin/env python3
 """A stub worker: answers one review-panel unit from its payload and its schema."""
+import hashlib
 import json
+import os
 import pathlib
 import re
 import sys
@@ -65,6 +68,14 @@ except (OSError, ValueError):
 counter = control_path.with_name("stub-count.txt")
 with open(counter, "a", encoding="utf-8") as fh:
     fh.write("x\n")
+# What reached this worker, for the tests that ask: its argv, and a SHA-256 of each named
+# variable — never the value, which is what a secret sweep searches for.
+if control.get("record"):
+    with open(control_path.with_name("seen.jsonl"), "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"argv": sys.argv[1:], "env": {
+            name: (None if os.environ.get(name) is None
+                   else hashlib.sha256(os.environ[name].encode("utf-8")).hexdigest())
+            for name in control["record"]}}) + "\n")
 n = len(counter.read_text(encoding="utf-8").splitlines())
 
 if control.get("sleep"):
@@ -137,6 +148,31 @@ elif props >= {"verdicts"}:
         "unresolved_reason": None,
     } for cid in ids(r"cand-\d+", "\n## Candidates\n")],
         "summary": "checked every candidate by reading"}
+elif props >= {"groups", "compound"}:
+    # The first two defect sites are proposed as one mistake, so the run has a group for
+    # the merge check to uphold; every other site is a group of its own.
+    kinds = re.findall(r"### (S\d+)\n\nArea: [^\n]*\nKind: ([^\n]*)\n",
+                       section("\n## Your sites\n"))
+    pair = [sid for sid, kind in kinds if kind.startswith("a defect")][:2]
+    groups = ([{"sites": pair, "mechanism": "One opening line misdescribes its file.",
+                "instances": [{"site": sid, "instance": f"{sid} opens with the wrong line."}
+                              for sid in pair], "reason_kept_apart": None}]
+              if len(pair) == 2 else [])
+    groups += [{"sites": [sid], "mechanism": None, "instances": None,
+                "reason_kept_apart": None} for sid, _kind in kinds if sid not in pair or
+               len(pair) < 2]
+    answer = {"groups": groups, "compound": [], "summary": "two sites are one mistake"}
+elif props >= {"groups"}:
+    groups = re.findall(r"\n### (G\d+)\n", section("\n## The groups\n"))
+    body = section("\n## The groups\n")
+    answer = {"groups": [{
+        "group": gid,
+        "sites": [{"site": sid, "verdict": "fits", "reason": "It is that mistake."}
+                  for sid in re.findall(r"\n#### (S\d+) ",
+                                        body.split(f"\n### {gid}\n", 1)[1]
+                                        .split("\n### ", 1)[0])],
+        "hidden_claims": [], "fix_touches_refuted": {"value": False, "sites": []},
+    } for gid in groups], "summary": "upheld every group"}
 elif props >= {"clusters"}:
     answer = {"clusters": [{
         "members": [cid],
@@ -147,10 +183,10 @@ elif props >= {"clusters"}:
 else:
     tier = "A reader is misled"
     answer = {"tiers": [tier], "defects": [{
-        "defect": did, "tier": tier,
+        "defect": did, "heading": "The opening line misdescribes its file.", "tier": tier,
         "what_goes_wrong": "The opening line of the file describes something else.",
         "fix": "Rewrite the opening line to say what the file does.",
-        "cross_references": [],
+        "site_notes": [], "cross_references": [],
     } for did in ids(r"\bD\d+\b", "\n## Your defects\n")], "summary": "one tier"}
 
 # Refusing by KIND rather than by count, so which units come back unusable does not depend
@@ -170,6 +206,10 @@ elif mode == "refused":
 else:
     body = "Working on it.\n\n" + text + "\n"
 transcript.write_text(body, encoding="utf-8")
+# Replace a file once this worker has answered: how a test edits something the run reads
+# while the run is in progress.
+if control.get("rewrite"):
+    pathlib.Path(control["rewrite"][0]).write_text(control["rewrite"][1], encoding="utf-8")
 '''
 
 
@@ -269,7 +309,7 @@ class _Case(unittest.TestCase):
         return len(counter.read_text(encoding="utf-8").splitlines()) if counter.exists() else 0
 
     # -- driving ------------------------------------------------------------ #
-    def drive(self, *extra, expect=0, timeout=300):
+    def drive(self, *extra, expect=0, timeout=300, env=None):
         """Run the driver as a child, decoding its output as UTF-8 explicitly.
 
         Explicitly, because `text=True` decodes with the PARENT's preferred encoding — ASCII
@@ -281,7 +321,8 @@ class _Case(unittest.TestCase):
             [sys.executable, str(_DRIVER), "--job", str(self.job_path),
              "--rundir", str(self.rundir), "--adapter", str(self.adapter_path),
              "--poll", "0.1", *extra],
-            capture_output=True, encoding="utf-8", errors="replace", timeout=timeout)
+            capture_output=True, encoding="utf-8", errors="replace", timeout=timeout,
+            env=env)
         if expect is not None:
             self.assertEqual(proc.returncode, expect, proc.stdout + proc.stderr)
         return proc
@@ -499,10 +540,9 @@ class TheRunHasOneOwner(_Case):
         self.assertFalse(self.rundir.exists())
 
     def test_a_second_driver_is_refused_while_the_first_is_inside_planning(self):
-        """Bootstrap is the window draft 2 left unowned: the lock was taken AFTER planning,
-        so two drivers could both see one `.partial` directory and one delete the other's
-        live planning. Modelled as the state that window actually is — the lock held and an
-        uncommitted partial on disk."""
+        """Bootstrap takes the lock before planning, so a second driver is refused while the
+        first is still planning and cannot delete its live `.partial` directory. Modelled as
+        that state — the lock held and an uncommitted partial on disk."""
         partial = Path(str(self.rundir) + driver.PARTIAL_SUFFIX)
         partial.mkdir(parents=True)
         (partial / "job.json").write_text("{}", encoding="utf-8")
@@ -792,6 +832,16 @@ class TheAdapterConfigIsData(_Case):
         self.assertEqual(driver.dispatch_record(lanes)["rung"],
                          review_panel.RUNG_ONE_RUNTIME)
 
+    def test_two_runtimes_running_one_model_are_not_two_models(self):
+        """Two backends can put one model behind two runtimes. That is two sessions of one
+        model, and a record claiming two models for it would be false."""
+        lanes = driver.load_adapter_config(self.adapter_path)
+        self.assertNotEqual(lanes["A"].runtime, lanes["B"].runtime)
+        lanes["B"] = dataclasses.replace(lanes["B"], model=lanes["A"].model)
+        record = driver.dispatch_record(lanes)
+        self.assertEqual(record["rung"], review_panel.RUNG_TWO_RUNTIMES_ONE_MODEL)
+        review_panel.parse_dispatch(record)   # the engine's own strict parse
+
 
 # --------------------------------------------------------------------------- #
 # 5.1 extraction
@@ -1036,10 +1086,10 @@ class OneSelectedTerminalPublication(_Case):
 # 5.3 allowances
 # --------------------------------------------------------------------------- #
 class WhatThisPhaseMustNotDestroy(_Case):
-    """Retention and its budget are the storage phase's. What this phase owes that work is
-    not to delete what it exists to keep: a copy whose landed verdict names a run that was
-    actually performed. Deferring a deletion costs disk; the other mistake costs the
-    reproduction."""
+    """Retention and its budget are the retention cap's to decide. What releasing a copy
+    owes that work is not to delete what it exists to keep: a copy whose landed verdict
+    names a run that was actually performed. Deferring a deletion costs disk; the other
+    mistake costs the reproduction."""
 
     def setUp(self):
         super().setUp()
@@ -1328,7 +1378,7 @@ class OperatorReconciliation(_Case):
         """The record first, the publication second — the order every other terminal outcome
         already uses. Publishing straight out left an `error.txt` adoption could attribute
         to nothing: a kill before `landed.json` and the unit is not terminal, while at the
-        launch ceiling it stays quarantined for ever."""
+        launch ceiling it stays quarantined forever."""
         self.dispositions_at_ceiling()
         order = []
         real_publish = driver.publish
@@ -1634,6 +1684,39 @@ class AFullRun(_Case):
             argv = json.loads(record.read_text(encoding="utf-8"))
             self.assertNotIn("review_panel.py", " ".join(argv["argv"]))
 
+    def test_the_merge_and_check_units_land_results_and_the_report_holds_a_merged_defect(self):
+        """The stub answers both the merge and merge-check kinds with real results, so
+        each unit ends in `result.json` rather than `error.txt`, and the defect the check
+        upheld is one defect of several sites in the report."""
+        units = self.units_doc()["units"]
+        for kind, unit_id in ((review_panel.MERGER_KIND, review_panel.MERGE_UNIT_ID),
+                              (review_panel.MERGE_CHECKER_KIND,
+                               review_panel.MERGE_CHECK_UNIT_ID)):
+            self.assertEqual([u["id"] for u in units if u["kind"] == kind], [unit_id])
+            here = self.rundir / "units" / unit_id
+            self.assertTrue((here / "result.json").is_file(), unit_id)
+            self.assertFalse((here / "error.txt").exists(), unit_id)
+        findings = json.loads((self.rundir / "findings.json").read_text(encoding="utf-8"))
+        self.assertEqual([unit["state"] for unit in findings["merge_check"]["units"]],
+                         [review_panel.UNIT_COMPLETE])
+        merged = [d for d in findings["defects"] if len(d["sites"]) > 1]
+        self.assertEqual(len(merged), 1, findings["defects"])
+        self.assertEqual(merged[0]["sites"], findings["merge_check"]["groups"][0]["accepted"])
+
+    def test_the_merge_unit_lands_a_result_the_engine_accepts(self):
+        """The stub answers the merge kind with a real result, so the run's merge unit ends
+        in `result.json`, and the report read it as complete rather than as a unit that
+        failed."""
+        mergers = [unit for unit in self.units_doc()["units"]
+                   if unit["kind"] == review_panel.MERGER_KIND]
+        self.assertEqual([unit["id"] for unit in mergers], [review_panel.MERGE_UNIT_ID])
+        here = self.rundir / "units" / review_panel.MERGE_UNIT_ID
+        self.assertTrue((here / "result.json").is_file())
+        self.assertFalse((here / "error.txt").exists())
+        findings = json.loads((self.rundir / "findings.json").read_text(encoding="utf-8"))
+        self.assertEqual([unit["state"] for unit in findings["merge"]["units"]],
+                         [review_panel.UNIT_COMPLETE])
+
     def test_the_progress_log_names_every_spawn_and_every_landing(self):
         text = (self.rundir / "dispatch" / "progress.log").read_text(encoding="utf-8")
         self.assertIn("spawning", text)
@@ -1658,9 +1741,9 @@ class AFullRun(_Case):
 
 
 class RecoveryTheOwnerIsTheOnlyOneThatCanDo(_Case):
-    """Phase 7 took a per-stage claim in the engine and disclosed the cost: a hard-killed
-    stage strands it and the next run refuses by name. It also said what would fix it — one
-    process that owns the run end to end. This is that process."""
+    """A per-stage claim in the engine has a cost: a hard-killed stage strands it and the
+    next run refuses by name. What clears it safely is one process that owns the run end to
+    end. This is that process."""
 
     def test_a_stranded_engine_claim_is_cleared_before_the_stage_runs(self):
         self.plan_only()
@@ -1723,6 +1806,114 @@ class RecoveryTheOwnerIsTheOnlyOneThatCanDo(_Case):
         recorded = json.loads(
             next(self.rundir.glob("dispatch/*/a0/argv.json")).read_text(encoding="utf-8"))
         self.assertTrue(Path(recorded["argv"][1]).is_absolute(), recorded["argv"][1])
+
+
+class TheMergeRoundIsARoundLikeAnyOther(_Case):
+    """The merge round sits between clustering and synthesis, reads only, and is resumed and
+    quarantined like every other round."""
+
+    def cut_after_merge(self):
+        """A run killed right after `merge` committed its marker, before its unit ran."""
+        self.plan_only()
+        killed = self.run_object(poll=0.05)
+        real = driver._engine_stage
+
+        def stage(*argv):
+            result = real(*argv)
+            if argv[0] == "merge":
+                raise KeyboardInterrupt("killed after merge")
+            return result
+
+        with mock.patch.object(driver, "_engine_stage", side_effect=stage):
+            with self.assertRaises(KeyboardInterrupt):
+                killed.loop()
+        for child, _attempt, _unit in killed._children:
+            child.wait()
+        doc = json.loads((self.rundir / "units.json").read_text(encoding="utf-8"))
+        self.assertEqual(doc["stage"], review_panel.MERGED_STAGE)
+        self.assertIsNone(driver.landed(self.rundir, review_panel.MERGE_UNIT_ID))
+
+    def test_the_round_sits_between_clustering_and_the_merge_check(self):
+        self.assertEqual(driver.ROUNDS[review_panel.CLUSTERED_STAGE],
+                         ((review_panel.CLUSTERER_KIND,), "merge"))
+        self.assertEqual(driver.ROUNDS[review_panel.MERGED_STAGE],
+                         ((review_panel.MERGER_KIND,), "merge-check"))
+        self.assertEqual(driver.ENGINE_STAGE_CLAIMS,
+                         ("route", "cluster", "merge", "merge-check", "synthesize", "report"))
+        self.assertNotIn(review_panel.MERGER_KIND, driver.WRITE_CAPABLE_KINDS)
+
+    def test_a_run_stopped_at_the_merge_round_resumes_to_a_report(self):
+        self.cut_after_merge()
+        proc = self.drive("--go")
+        self.assertIn("reported:", proc.stdout)
+        self.assertIsNotNone(driver.landed(self.rundir, review_panel.MERGE_UNIT_ID))
+        self.assertEqual(len(driver.attempt_dirs(self.rundir, review_panel.MERGE_UNIT_ID)), 1)
+
+    def test_a_merge_unit_nobody_can_account_for_is_quarantined_and_named(self):
+        self.cut_after_merge()
+        (self.rundir / "dispatch" / review_panel.MERGE_UNIT_ID / "a0").mkdir(parents=True)
+        proc = self.drive("--go", expect=driver.EXIT_STOPPED)
+        self.assertIn(f"stopped: {review_panel.MERGE_UNIT_ID}", proc.stdout)
+        self.assertIn("orphan-claim", proc.stdout)
+        self.assertIsNone(driver.landed(self.rundir, review_panel.MERGE_UNIT_ID))
+        self.assertFalse((self.rundir / "units" / review_panel.SYNTHESIS_UNIT_ID).exists(),
+                         "synthesis was planned over a merge round that had not finished")
+
+
+class TheMergeCheckIsARoundLikeAnyOther(_Case):
+    """The merge check sits between the merge and synthesis, reads only, runs on the lane
+    the merge did not, and is resumed and quarantined like every other round."""
+
+    def cut_after_merge_check(self):
+        """A run killed right after `merge-check` committed its marker, before its unit
+        ran."""
+        self.plan_only()
+        killed = self.run_object(poll=0.05)
+        real = driver._engine_stage
+
+        def stage(*argv):
+            result = real(*argv)
+            if argv[0] == "merge-check":
+                raise KeyboardInterrupt("killed after merge-check")
+            return result
+
+        with mock.patch.object(driver, "_engine_stage", side_effect=stage):
+            with self.assertRaises(KeyboardInterrupt):
+                killed.loop()
+        for child, _attempt, _unit in killed._children:
+            child.wait()
+        doc = json.loads((self.rundir / "units.json").read_text(encoding="utf-8"))
+        self.assertEqual(doc["stage"], review_panel.MERGE_CHECKED_STAGE)
+        self.assertIsNone(driver.landed(self.rundir, review_panel.MERGE_CHECK_UNIT_ID))
+
+    def test_the_round_sits_between_the_merge_and_synthesis_and_reads_only(self):
+        self.assertEqual(driver.ROUNDS[review_panel.MERGED_STAGE],
+                         ((review_panel.MERGER_KIND,), "merge-check"))
+        self.assertEqual(driver.ROUNDS[review_panel.MERGE_CHECKED_STAGE],
+                         ((review_panel.MERGE_CHECKER_KIND,), "synthesize"))
+        self.assertIn("merge-check", driver.ENGINE_STAGE_CLAIMS)
+        self.assertNotIn(review_panel.MERGE_CHECKER_KIND, driver.WRITE_CAPABLE_KINDS)
+
+    def test_a_run_stopped_at_the_merge_check_resumes_to_a_report(self):
+        self.cut_after_merge_check()
+        proc = self.drive("--go")
+        self.assertIn("reported:", proc.stdout)
+        self.assertIsNotNone(driver.landed(self.rundir, review_panel.MERGE_CHECK_UNIT_ID))
+        self.assertEqual(
+            len(driver.attempt_dirs(self.rundir, review_panel.MERGE_CHECK_UNIT_ID)), 1)
+        findings = json.loads((self.rundir / "findings.json").read_text(encoding="utf-8"))
+        self.assertTrue(any(len(d["sites"]) > 1 for d in findings["defects"]))
+
+    def test_a_merge_check_unit_nobody_can_account_for_is_quarantined_and_named(self):
+        self.cut_after_merge_check()
+        (self.rundir / "dispatch" / review_panel.MERGE_CHECK_UNIT_ID / "a0").mkdir(
+            parents=True)
+        proc = self.drive("--go", expect=driver.EXIT_STOPPED)
+        self.assertIn(f"stopped: {review_panel.MERGE_CHECK_UNIT_ID}", proc.stdout)
+        self.assertIn("orphan-claim", proc.stdout)
+        self.assertIsNone(driver.landed(self.rundir, review_panel.MERGE_CHECK_UNIT_ID))
+        self.assertFalse((self.rundir / "units" / review_panel.SYNTHESIS_UNIT_ID).exists(),
+                         "synthesis was planned over a merge check that had not finished")
 
 
 class TheLoopAndItsStops(_Case):
@@ -2077,9 +2268,9 @@ class TheLoopAndItsStops(_Case):
         self.assertEqual(self.stub_invocations(), 0, "a spent budget still claimed work")
         spent = json.loads((self.rundir / "budget.json").read_text(encoding="utf-8"))
         self.assertGreaterEqual(spent["seconds"], 0.0)
-        # **The limit is KEPT on the resume.** Dropping it removes the ceiling rather than
-        # testing the extension, so the old shape would have passed with `--extend` doing
-        # nothing at all. An hour of credit against a limit of nothing is an hour.
+        # **The limit is KEPT on the resume.** Dropping it removes the ceiling, and the
+        # resume would then show only that the credit is recorded, not that the budget
+        # honors it. An hour of credit against a limit of nothing is an hour.
         self.drive("--go", "--max-hours", "0", "--extend", "1")
         self.assertEqual(
             json.loads((self.rundir / "units.json").read_text(encoding="utf-8"))["stage"],
@@ -2198,7 +2389,7 @@ class TheLoopAndItsStops(_Case):
         """The reservation an `uncertain` or `orphan-claim` attempt keeps is one nothing
         releases without an operator. At one slot per lane that leaves other units of the
         same lane eligible and permanently unable to start — so a loop that waits for "no
-        unit is eligible" waits for ever, on a run that should stop and name the attempt
+        unit is eligible" waits forever, on a run that should stop and name the attempt
         nobody can account for."""
         self.drive()
         (self.rundir / "dispatch" / "area-01-A1" / "a0").mkdir(parents=True)
@@ -2618,7 +2809,7 @@ class ADrainedProviderIsRetriedWhenTheRunIsStartedAgain(_Providers):
     The dispositions that drained it are immutable and belong to a generation only a
     successful probe advances — so a resumed run re-derives the same drain, declines to
     probe, finds nothing eligible and exits 0 having reviewed nothing. **A run that
-    silently does nothing and reports success is the failure this phase exists to
+    silently does nothing and reports success is the failure these rules exist to
     prevent.** Restarting the run is the operator asserting the provider is fixed, which is
     the assertion a probe goes out to test, so the reset is theirs to make and is recorded
     once rather than retaken every poll.
@@ -2744,6 +2935,20 @@ class WhatTheSupervisorCouldNotHold(_Case):
         record = driver.adjudicate(run, driver.read_attempt(self.rundir, "u1", path, grace=120.0))
         self.assertEqual(record["outcome"], driver.WORKER_FAILED)
         self.assertEqual(run.pause_reason, "")
+
+    def test_a_backend_changed_since_the_run_pinned_it_stops_the_run_naming_it(self):
+        """The entry was edited while the run was in progress. Retried, every launch on that
+        backend would be refused the same way, so it charges nobody and stops the run."""
+        path = self.attempt("u1", 0, status=json.dumps(
+            {"status": "error", "reason": "the entry for backend 'fw' in the backends file "
+                                          "changed since the run pinned it, so nothing was launched. "
+                                          "Put the entry back as it was, or start a new run"}))
+        run = self.run_object()
+        record = driver.adjudicate(run, driver.read_attempt(self.rundir, "u1", path,
+                                                            grace=120.0))
+        self.assertEqual(record["outcome"], driver.INFRASTRUCTURE)
+        self.assertIn("'fw'", run.pause_reason)
+        self.assertNotIn("adapter file", run.pause_reason)
 
     def test_a_capped_but_intact_reply_is_still_read_as_a_reply(self):
         """The notice is PREPENDED, so a transcript that still ends in its closing object is
@@ -3085,16 +3290,533 @@ class ThePathSaysWhatRanIt(_Case):
                       "a lane that never ran a write-capable unit claimed it had")
 
     def test_two_models_on_one_runtime_are_refused_before_anything_is_planned(self):
-        """The report describes a one-runtime run as checked by the same model, and that
-        sentence would be false. Refused at startup, so the refusal does not arrive after a
-        whole reading round has been spent."""
+        """Two models on one runtime run at a rung of their own — but only when both lanes
+        put the model in every command through ⟪model⟫, the one proof the named model
+        reached the worker. Without it the configuration is refused at startup, so the
+        refusal does not arrive after a whole reading round has been spent."""
+        marked = _modelled(self.stub, self.control)
+        self.write_adapter(A={"runtime": "one-runtime", "read_only": marked,
+                              "write_capable": marked},
+                           B={"runtime": "one-runtime", "model": "a different model",
+                              "read_only": marked, "write_capable": marked})
+        self.land("u1")
+        self.land("u2")
+        record = self.record()
+        self.assertEqual(record["rung"], review_panel.RUNG_TWO_MODELS)
+        self.assertEqual([record["lanes"][lane]["model"] for lane in ("A", "B")],
+                         ["stub-model-A", "a different model"])
+        review_panel.parse_dispatch(record)
         shutil.rmtree(self.rundir)
+        self.plan_only()
+
+        _discard(self.rundir)
         self.write_adapter(A={"runtime": "one-runtime"},
                            B={"runtime": "one-runtime", "model": "a different model"})
         proc = self.drive(expect=driver.EXIT_REFUSED)
         self.assertIn("different models", proc.stderr)
+        self.assertIn("⟪model⟫", proc.stderr)
         self.assertFalse(self.rundir.exists(), "a refused configuration planned a run")
         self.assertFalse(self.rundir.with_name(self.rundir.name + ".partial").exists())
+
+    def test_two_models_marked_in_only_some_commands_are_still_refused(self):
+        """A command without ⟪model⟫ runs the harness's default, so the report could name a
+        model that never read anything."""
+        marked = _modelled(self.stub, self.control)
+        for label, lane_a, lane_b in (
+                ("one lane", {"read_only": marked, "write_capable": marked}, {}),
+                ("one mode", {"read_only": marked},
+                 {"read_only": marked, "write_capable": marked})):
+            with self.subTest(label):
+                _discard(self.rundir)
+                self.write_adapter(A={"runtime": "one-runtime", **lane_a},
+                                   B={"runtime": "one-runtime", "model": "a different model",
+                                      **lane_b})
+                proc = self.drive(expect=driver.EXIT_REFUSED)
+                self.assertIn("⟪model⟫", proc.stderr)
+                self.assertFalse(self.rundir.exists(), "a refused configuration planned a run")
+
+    def test_a_lane_that_landed_nothing_ends_a_two_model_run_too(self):
+        marked = _modelled(self.stub, self.control)
+        self.write_adapter(A={"runtime": "one-runtime", "read_only": marked,
+                              "write_capable": marked},
+                           B={"runtime": "one-runtime", "read_only": marked,
+                              "write_capable": marked})
+        self.land("u1")
+        self.assertIn("landed no unit", self.refusal())
+
+    def test_one_runtime_with_one_model_is_still_the_one_runtime_rung(self):
+        self.write_adapter(A={"runtime": "one-runtime"},
+                           B={"runtime": "one-runtime", "model": "stub-model-A"})
+        self.land("u1")
+        self.land("u2")
+        self.assertEqual(self.record()["rung"], review_panel.RUNG_ONE_RUNTIME)
+
+
+# --------------------------------------------------------------------------- #
+# backends — a lane chooses the model it runs
+# --------------------------------------------------------------------------- #
+BACKENDS_VARIABLE = "PORTABLE_AGENT_SKILLS_BACKENDS"
+
+
+def _modelled(stub: Path, control: Path, backend_args: bool = False) -> dict:
+    """A lane command that takes its model through the marker, and a backend's arguments
+    through the other one when the lane has a backend to fill it from."""
+    mode = _stub_mode(stub, control)
+    mode["command"] = mode["command"] + ["--model", "⟪model⟫"] + (
+        ["⟪backend_args⟫"] if backend_args else [])
+    return mode
+
+
+class _Backends(_Case):
+    """Lanes on backends, read through the real supervisor's `--resolve-backend`."""
+
+    def setUp(self):
+        super().setUp()
+        self.backends_path = self.tmp / "backends.json"
+        self.env = {**os.environ, BACKENDS_VARIABLE: str(self.backends_path)}
+
+    def backends(self, **entries):
+        self.backends_path.write_text(json.dumps(entries), encoding="utf-8")
+
+    @staticmethod
+    def entry(**over):
+        """A backend for the stub, which this interpreter launches."""
+        return {"harness": sys.executable, "model": "provider-model", **over}
+
+    def lane_control(self, name, **control):
+        """A control file of the lane's own, so what its workers saw is kept apart."""
+        where = self.tmp / f"lane-{name}"
+        where.mkdir(exist_ok=True)
+        path = where / "control.json"
+        path.write_text(json.dumps(control), encoding="utf-8")
+        return path
+
+    def on_backend(self, name, control=None, **extra):
+        """A lane on backend ``name``, stating no model of its own."""
+        mode = _modelled(self.stub, control or self.control, backend_args=True)
+        return {"backend": name, "read_only": mode, "write_capable": mode, **extra}
+
+    def write_lanes(self, **lanes):
+        """The default adapter, with ``lanes`` replacing whole lanes rather than keys."""
+        self.write_adapter()
+        raw = json.loads(self.adapter_path.read_text(encoding="utf-8"))
+        for lane, spec in lanes.items():
+            raw["lanes"][lane] = {"runtime": f"stub-{lane}", "adapter": f"stub lane {lane}",
+                                  "slots": 2, **spec}
+        self.adapter_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    def refused(self, env=None):
+        proc = self.drive(expect=driver.EXIT_REFUSED, env=env or self.env)
+        self.assertFalse(self.rundir.exists(), "a refused configuration planned a run")
+        return proc.stderr
+
+    @staticmethod
+    def seen(control):
+        path = control.with_name("seen.jsonl")
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def _digest(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+class ALaneCarriesABackend(_Backends):
+    """A backend names the lane's model and its credentials; the supervisor applies them to
+    the worker, and a lane with neither is launched exactly as it always was."""
+
+    LITERAL = "literal-setting-4d1c"
+
+    def test_its_fields_and_its_backend_reach_the_supervisors_command(self):
+        self.backends(fw=self.entry(args=["--provider", "fw"],
+                                    env={"STUB_BASE": "https://example.invalid"},
+                                    env_from_parent={"STUB_KEY": "RP_TEST_BACKEND_KEY"}))
+        control = self.lane_control("A", record=["STUB_KEY", "STUB_BASE", "STUB_LITERAL",
+                                                 "STUB_BLANK", "STUB_FORWARD"])
+        self.write_lanes(A=self.on_backend(
+            "fw", control, env={"STUB_LITERAL": self.LITERAL, "STUB_BLANK": ""},
+            env_from_parent={"STUB_FORWARD": "RP_TEST_FORWARDED"}))
+        env = {**self.env, "RP_TEST_BACKEND_KEY": "backend-key", "STUB_BLANK": "not blank",
+               "RP_TEST_FORWARDED": "forwarded"}
+        self.drive("--go", env=env)
+        seen = self.seen(control)
+        self.assertTrue(seen, "no worker of lane A ran")
+        for record in seen:
+            self.assertEqual(record["env"], {
+                "STUB_KEY": _digest("backend-key"),
+                "STUB_BASE": _digest("https://example.invalid"),
+                "STUB_LITERAL": _digest(self.LITERAL), "STUB_BLANK": _digest(""),
+                "STUB_FORWARD": _digest("forwarded")})
+            argv = record["argv"]
+            self.assertEqual(argv[argv.index("--model") + 1], "provider-model")
+            self.assertEqual(argv[argv.index("--provider") + 1], "fw")
+        spawned = [json.loads(path.read_text(encoding="utf-8"))
+                   for path in (self.rundir / "dispatch").glob("*/a*/argv.json")]
+        lane_a = [record["argv"] for record in spawned if record["lane"] == "A"]
+        self.assertTrue(lane_a)
+        for argv in lane_a:
+            head = argv[:argv.index("--")]
+            self.assertEqual(head[head.index("--backend") + 1], "fw")
+            self.assertIn("STUB_BLANK=", head)
+            text = json.dumps(argv)
+            # A literal value travels in the supervisor's environment, never on its argv,
+            # and no launching-side name is written down.
+            self.assertNotIn(self.LITERAL, text)
+            self.assertNotIn("RP_TEST_FORWARDED", text)
+            self.assertNotIn("RP_TEST_BACKEND_KEY", text)
+        record = json.loads((self.rundir / "dispatch.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["lanes"]["A"]["model"], "provider-model")
+        self.assertIn("provider-model", record["lanes"]["A"]["adapter"])
+
+    def test_the_worker_argv_carries_the_digest_the_backend_was_pinned_at(self):
+        """The supervisor reads the backends file on every launch; the digest taken when the
+        run began goes with the name, so every launch is held to the same entry."""
+        self.backends(fw=self.entry(env={"STUB_BASE": "https://example.invalid"}))
+        self.write_lanes(A=self.on_backend("fw"))
+        self.drive("--go", env=self.env)
+        pinned = json.loads((self.rundir / "adapter-pin.json")
+                            .read_text(encoding="utf-8"))["A"]["backend_digest"]
+        spawned = [json.loads(path.read_text(encoding="utf-8"))
+                   for path in (self.rundir / "dispatch").glob("*/a*/argv.json")]
+        heads = [record["argv"][:record["argv"].index("--")] for record in spawned]
+        lane_a = [head for record, head in zip(spawned, heads) if record["lane"] == "A"]
+        self.assertTrue(lane_a)
+        for head in lane_a:
+            self.assertEqual(head[head.index("--backend-digest") + 1], pinned)
+        for record, head in zip(spawned, heads):
+            if record["lane"] != "A":
+                self.assertNotIn("--backend-digest", head)
+
+    def test_a_backend_edited_while_the_run_is_in_progress_stops_it_naming_the_backend(self):
+        """A worker of lane A edits the backends file once it has answered. The next launch
+        on that backend is refused by the supervisor, and the run stops naming the backend
+        rather than starting workers on another address under the same name."""
+        base = {"env": {"STUB_BASE": "https://example.invalid"}}
+        self.backends(fw=self.entry(**base))
+        edited = json.dumps({"fw": self.entry(env={"STUB_BASE": "https://elsewhere.invalid"})})
+        control = self.lane_control("A", record=["STUB_BASE"],
+                                    rewrite=[str(self.backends_path), edited])
+        self.write_lanes(A=self.on_backend("fw", control, slots=1))
+        proc = self.drive("--go", expect=driver.EXIT_STOPPED, env=self.env)
+        output = proc.stdout + proc.stderr
+        self.assertIn("'fw'", output)
+        self.assertIn("changed since the run pinned it", output)
+        self.assertNotIn("elsewhere.invalid", output)
+        for record in self.seen(control):
+            self.assertEqual(record["env"]["STUB_BASE"], _digest("https://example.invalid"),
+                             "a worker started on the edited backend")
+        self.assertEqual(len(self.seen(control)), 1, "lane A launched after the edit")
+
+    def test_a_backends_file_broken_or_emptied_mid_run_pauses_rather_than_failing_units(self):
+        """The supervisor refuses the next launch before any worker starts, so the refusal is
+        infrastructure: charged to no unit, and the run stops resumable instead of spending
+        each unit's attempts on a file somebody is editing."""
+        for n, (written, said) in enumerate((("{not json", "not valid JSON"),
+                                             ("{}", "no backend named 'fw'"))):
+            with self.subTest(written=written):
+                self.rundir = self.tmp / f"run-{n}"
+                self.backends(fw=self.entry(env={"STUB_BASE": "https://example.invalid"}))
+                control = self.lane_control(f"A{n}", record=["STUB_BASE"],
+                                            rewrite=[str(self.backends_path), written])
+                self.write_lanes(A=self.on_backend("fw", control, slots=1))
+                proc = self.drive("--go", expect=driver.EXIT_STOPPED, env=self.env)
+                self.assertIn(said, proc.stdout + proc.stderr)
+                self.assertIn("repair the backends file", proc.stdout + proc.stderr)
+                self.assertNotIn("adapter file", proc.stdout + proc.stderr)
+                self.assertEqual(len(self.seen(control)), 1, "lane A launched after the edit")
+
+    def test_the_backends_file_is_spelled_as_the_supervisor_spells_it(self):
+        """An entry refusal names the file through `Path`, so the override is compared in
+        that spelling too: `a//b.json` is printed `a/b.json`."""
+        with mock.patch.dict(os.environ, {driver.BACKENDS_ENV_VAR: "/tmp//x//backends.json"}):
+            spelled = driver._backends_file()
+            self.assertEqual(spelled, str(Path("/tmp//x//backends.json")))
+            self.assertTrue(driver._is_supervisor_refusal(
+                {"reason": f"backend 'fw' in {Path('/tmp/x/backends.json')}: 'model' must be "
+                           f"a non-empty string"}))
+
+    def test_a_config_with_neither_renders_as_it_always_has(self):
+        """No backend, no environment and no new marker: the same supervisor argv, no
+        environment handed to it, and the same pin as before lanes could carry either."""
+        self.plan_only()
+        self.assertEqual(
+            json.loads((self.rundir / "adapter-pin.json").read_text(encoding="utf-8")),
+            {lane: {"runtime": f"stub-{lane}", "model": f"stub-model-{lane}",
+                    "account": f"stub-{lane}", "adapter": f"stub lane {lane}"}
+             for lane in review_panel.LANES})
+        run = self.run_object()
+        unit = next(u for u in run.units() if u.get("kind") == review_panel.READER_KIND)
+        with mock.patch.object(driver.subprocess, "Popen") as popen:
+            self.assertTrue(run.spawn(unit))
+        argv, kwargs = popen.call_args.args[0], popen.call_args.kwargs
+        self.assertNotIn("env", kwargs)
+        spec = run.lanes[unit["lane"]].modes[driver.READ_ONLY]
+        record = json.loads(next((self.rundir / "dispatch" / unit["id"]).glob("a*/argv.json"))
+                            .read_text(encoding="utf-8"))
+        payload = argv[argv.index("--payload") + 1]
+        inbox = Path(payload).parent
+        values = {"payload": payload, "schema": str(inbox / review_panel.SCHEMA_NAME),
+                  "transcript": record["transcript"]}
+        rendered = [driver._PLACEHOLDER_RE.sub(lambda m: values[m.group(1)], part)
+                    for part in spec.command]
+        self.assertEqual(argv, [
+            sys.executable, str(_SUPERVISOR), "--idle", str(spec.idle),
+            "--deadline", str(spec.deadline), "--cwd", record["cwd"],
+            "--display", str(self.rundir / "dispatch" / unit["id"] / record["attempt"]
+                             / driver.DISPLAY_NAME),
+            "--findings", record["transcript"], "--result-mode", spec.result_mode,
+            "--status-detail", "--max-capture-bytes", str(driver.MAX_CAPTURE_BYTES_DEFAULT),
+            "--", *rendered])
+
+    def test_a_resume_changing_a_lanes_backend_is_refused_by_the_pin(self):
+        """The same model on another provider is a different player."""
+        self.backends(fw=self.entry(), other=self.entry())
+        self.write_lanes(A=self.on_backend("fw", account="one-account"))
+        self.drive(env=self.env)
+        self.write_lanes(A=self.on_backend("other", account="one-account"))
+        proc = self.drive(expect=driver.EXIT_REFUSED, env=self.env)
+        self.assertIn("pins a different adapter configuration", proc.stderr)
+
+    def test_a_resume_after_the_same_backend_was_edited_is_refused_by_the_pin(self):
+        """The name is not the player: an entry edited between runs to reach another address
+        or read another key is a different provider or account behind the same name."""
+        for n, edited in enumerate(({"env": {"STUB_BASE": "https://elsewhere.invalid"}},
+                                    {"env_from_parent": {"STUB_FORWARD": "RP_TEST_OTHER_KEY"}},
+                                    {"args": ["--provider", "other"]})):
+            with self.subTest(edited=edited):
+                self.rundir = self.tmp / f"run-{n}"
+                base = {"env": {"STUB_BASE": "https://example.invalid"},
+                        "env_from_parent": {"STUB_FORWARD": "RP_TEST_KEY"}}
+                self.backends(fw=self.entry(**base))
+                self.write_lanes(A=self.on_backend("fw", account="one-account"))
+                env = {**self.env, "RP_TEST_KEY": "k", "RP_TEST_OTHER_KEY": "k"}
+                self.drive(env=env)
+                self.backends(fw=self.entry(**{**base, **edited}))
+                proc = self.drive(expect=driver.EXIT_REFUSED, env=env)
+                self.assertIn("pins a different adapter configuration", proc.stderr)
+
+    def test_a_pin_written_before_backends_were_digested_still_resumes_unchanged(self):
+        """A run pinned without `backend_digest` is compared on what it pinned: refusing the
+        same backend there would strand every run started before the digest existed."""
+        self.backends(fw=self.entry())
+        self.write_lanes(A=self.on_backend("fw", account="one-account"))
+        self.drive(env=self.env)
+        path = self.rundir / "adapter-pin.json"
+        pin = json.loads(path.read_text(encoding="utf-8"))
+        pin["A"].pop("backend_digest")
+        path.write_text(json.dumps(pin), encoding="utf-8")
+        self.drive(env=self.env)
+
+    def test_the_pin_keeps_a_digest_of_the_backend_and_no_value_from_it(self):
+        secret = "https://private-gateway.invalid/team"
+        self.backends(fw=self.entry(env={"STUB_BASE": secret}))
+        self.write_lanes(A=self.on_backend("fw"))
+        self.drive(env=self.env)
+        text = (self.rundir / "adapter-pin.json").read_text(encoding="utf-8")
+        self.assertIn("backend_digest", json.loads(text)["A"])
+        self.assertNotIn(secret, text)
+
+    def test_the_pin_holds_the_backend_and_the_forwarded_names_but_no_launching_name(self):
+        self.backends(fw=self.entry())
+        pasted = "gsk_ThisLooksLikeANameButIsAKey0123"
+        self.write_lanes(A=self.on_backend("fw", env_from_parent={"STUB_KEY": pasted}))
+        self.drive(env={**self.env, pasted: "x"})
+        text = (self.rundir / "adapter-pin.json").read_text(encoding="utf-8")
+        pin = json.loads(text)["A"]
+        self.assertEqual((pin["backend"], pin["model"], pin["account"]),
+                         ("fw", "provider-model", "fw"))
+        self.assertEqual(list(pin["env_from_parent"]), ["STUB_KEY"])
+        self.assertNotIn(pasted, text)
+
+
+class ABackendIsItsOwnAccount(_Providers):
+    """An outage pauses a whole account, and a lane on a backend is on that provider's
+    account — not its runtime's, which the other lane may be signed in to."""
+
+    ACCOUNT = "fw"
+
+    def setUp(self):
+        super().setUp()
+        marked = _modelled(self.stub, self.control)
+        self.write_adapter(
+            A={"runtime": "one", "backend": "fw", "read_only": marked, "write_capable": marked,
+               "provider_fault_patterns": ["usage limit"]},
+            B={"runtime": "one", "read_only": marked, "write_capable": marked,
+               "provider_fault_patterns": ["usage limit"]})
+
+    def claims(self):
+        """Which units one pass would claim after lane A's account met an outage."""
+        self.failing("u1", 0, lane="A")
+        run = self.adopted(slots=2)
+        reserved, probed, claims = run.reserving(), set(), []
+        for unit in run.units():
+            claim, probe = run.claim_decision(unit, reserved, 0, run.providers(), probed)
+            if not claim:
+                continue
+            claims.append((unit["id"], probe))
+            if probe:
+                probed.add(run.lanes[unit["lane"]].account)
+            reserved[unit["lane"]] = reserved.get(unit["lane"], 0) + 1
+        return run, claims
+
+    def test_a_backend_lane_and_a_signed_in_lane_on_one_runtime_are_two_accounts(self):
+        run, claims = self.claims()
+        self.assertEqual(run.accounts(), {"fw": ["A"], "one": ["B"]})
+        # The backend's outage sends its own lane's probe and leaves the other one claiming.
+        self.assertEqual(claims, [("u1", True), ("u3", False)])
+
+    def test_two_lanes_stating_one_account_still_pause_together(self):
+        raw = json.loads(self.adapter_path.read_text(encoding="utf-8"))
+        for lane in raw["lanes"].values():
+            lane["account"] = self.ACCOUNT
+        self.adapter_path.write_text(json.dumps(raw), encoding="utf-8")
+        _run, claims = self.claims()
+        self.assertEqual(claims, [("u1", True)])
+
+    def test_an_inline_env_lane_sharing_a_defaulted_account_is_refused_before_planning(self):
+        shutil.rmtree(self.rundir)
+        self.write_adapter(A={"runtime": "one", "env": {"STUB_BASE": "https://a.invalid"}},
+                           B={"runtime": "one", "model": "stub-model-A"})
+        proc = self.drive(expect=driver.EXIT_REFUSED)
+        self.assertIn("account", proc.stderr)
+        self.assertIn("lanes.A", proc.stderr)
+        self.assertFalse(self.rundir.exists(), "a refused configuration planned a run")
+        self.write_adapter(A={"runtime": "one", "env": {"STUB_BASE": "https://a.invalid"},
+                              "account": "the-other-provider"},
+                           B={"runtime": "one", "model": "stub-model-A"})
+        self.plan_only()
+
+
+class AMissingKeyStopsTheRunBeforeItStarts(_Backends):
+    """What the supervisor would refuse at the first launch is refused before planning, on
+    either lane: found at the first reading round, it has already cost that round."""
+
+    def test_an_unset_forwarded_name_is_refused_naming_what_the_agent_reads(self):
+        pasted = "gsk_UnsetNameThatIsReallyAKey42"
+        for lane in review_panel.LANES:
+            for where in ("lane", "backend"):
+                with self.subTest(lane=lane, where=where):
+                    forward = {"STUB_KEY": pasted}
+                    self.backends(fw=self.entry(
+                        **({"env_from_parent": forward} if where == "backend" else {})))
+                    self.write_lanes(**{lane: self.on_backend(
+                        "fw", **({"env_from_parent": forward} if where == "lane" else {}))})
+                    message = self.refused()
+                    self.assertIn("STUB_KEY", message)
+                    self.assertNotIn(pasted, message)
+
+    def test_a_backend_written_for_another_harness_is_refused(self):
+        for lane in review_panel.LANES:
+            with self.subTest(lane=lane):
+                self.backends(fw=self.entry(harness="some-other-cli"))
+                self.write_lanes(**{lane: self.on_backend("fw")})
+                self.assertIn("some-other-cli", self.refused())
+
+    def test_a_model_disagreeing_with_the_lanes_is_refused(self):
+        for lane in review_panel.LANES:
+            with self.subTest(lane=lane):
+                self.backends(fw=self.entry())
+                self.write_lanes(**{lane: self.on_backend("fw", model="a model of its own")})
+                message = self.refused()
+                self.assertIn("a model of its own", message)
+                self.assertIn("provider-model", message)
+
+    def test_backend_args_with_nowhere_to_go_are_refused(self):
+        self.backends(fw=self.entry(args=["--provider", "fw"]))
+        lane = self.on_backend("fw")
+        for mode in driver.MODES:
+            lane[mode] = _modelled(self.stub, self.control)
+        self.write_lanes(A=lane)
+        self.assertIn("⟪backend_args⟫", self.refused())
+
+    def test_a_backend_nobody_defined_is_refused_naming_what_is(self):
+        self.backends(fw=self.entry())
+        self.write_lanes(B=self.on_backend("missing"))
+        message = self.refused()
+        self.assertIn("'missing'", message)
+        self.assertIn("fw", message)
+
+    def test_a_lane_naming_a_backend_and_no_model_loads(self):
+        for lane in review_panel.LANES:
+            with self.subTest(lane=lane):
+                self.backends(fw=self.entry())
+                self.write_lanes(**{lane: self.on_backend("fw")})
+                self.drive(env=self.env)
+                pin = json.loads((self.rundir / "adapter-pin.json").read_text(encoding="utf-8"))
+                self.assertEqual(pin[lane]["model"], "provider-model")
+                _discard(self.rundir)
+
+    def test_a_lane_with_neither_a_model_nor_a_backend_is_refused(self):
+        raw = json.loads(self.adapter_path.read_text(encoding="utf-8"))
+        del raw["lanes"]["A"]["model"]
+        with self.assertRaises(driver.DriverError) as ctx:
+            driver.parse_adapter_config(raw)
+        self.assertIn("'model'", str(ctx.exception))
+
+    def test_the_fields_are_checked_when_the_config_is_read(self):
+        for over, fragment in (({"backend": ""}, "lanes.A.backend"),
+                               ({"backend": 3}, "lanes.A.backend"),
+                               ({"env": {"KEY": 1}}, "lanes.A.env"),
+                               ({"env": ["KEY"]}, "lanes.A.env"),
+                               ({"env_from_parent": {"KEY": "not a name"}},
+                                "lanes.A.env_from_parent"),
+                               ({"env": {"1BAD": "x"}}, "lanes.A.env"),
+                               ({"env": {"KEY": "a"}, "env_from_parent": {"KEY": "OTHER"}},
+                                "KEY")):
+            with self.subTest(over=over):
+                raw = json.loads(self.adapter_path.read_text(encoding="utf-8"))
+                raw["lanes"]["A"].update(over)
+                with self.assertRaises(driver.DriverError) as ctx:
+                    driver.parse_adapter_config(raw)
+                self.assertIn(fragment, str(ctx.exception))
+                self.assertNotIn("not a name", str(ctx.exception))
+
+    def test_a_backend_marker_on_a_lane_with_no_backend_is_refused(self):
+        marked = _modelled(self.stub, self.control, backend_args=True)
+        self.write_lanes(A={"model": "m", "read_only": marked, "write_capable": marked})
+        with self.assertRaises(driver.DriverError) as ctx:
+            driver.load_adapter_config(self.adapter_path)
+        self.assertIn("⟪backend_args⟫", str(ctx.exception))
+
+    def test_a_marker_inside_other_text_is_refused(self):
+        mode = _stub_mode(self.stub, self.control)
+        mode["command"] = mode["command"] + ["--model-⟪model⟫"]
+        self.write_lanes(A={"model": "m", "read_only": mode, "write_capable": mode})
+        with self.assertRaises(driver.DriverError) as ctx:
+            driver.load_adapter_config(self.adapter_path)
+        self.assertIn("⟪model⟫", str(ctx.exception))
+
+
+class ASecretNeverReachesTheRunDirectory(_Backends):
+    """A forwarded value is read by the supervisor and placed in the worker's environment,
+    and nowhere else: not the dispatch records, the pin, the progress log, the transcripts
+    or the report. Nor is a launching-side name, which is where a pasted key lands."""
+
+    def test_a_forwarded_sentinel_appears_nowhere_in_the_run_directory(self):
+        backend_value, inline_value = "SENTINEL-backend-7f3a", "SENTINEL-inline-9c1e"
+        pasted = "gsk_LaunchingNameShapedLikeAKey77"
+        self.backends(fw=self.entry(env_from_parent={"STUB_KEY": "RP_TEST_BACKEND_KEY"}))
+        control = self.lane_control("A", record=["STUB_KEY", "STUB_FORWARD"])
+        self.write_lanes(A=self.on_backend("fw", control,
+                                           env_from_parent={"STUB_FORWARD": pasted}))
+        proc = self.drive("--go", env={**self.env, "RP_TEST_BACKEND_KEY": backend_value,
+                                       pasted: inline_value})
+        self.assertTrue((self.rundir / "report.md").is_file(), "the run wrote no report")
+        seen = self.seen(control)
+        self.assertTrue(seen, "no worker of lane A ran")
+        self.assertEqual(seen[0]["env"], {"STUB_KEY": _digest(backend_value),
+                                          "STUB_FORWARD": _digest(inline_value)})
+        swept = 0
+        for path in self.rundir.rglob("*"):
+            if path.is_file() and not path.is_symlink():
+                data = path.read_bytes()
+                swept += 1
+                for secret in (backend_value, inline_value, pasted):
+                    self.assertNotIn(secret.encode("utf-8"), data, path)
+        self.assertGreater(swept, 10)
+        for secret in (backend_value, inline_value, pasted):
+            self.assertNotIn(secret, proc.stdout + proc.stderr)
 
 
 # --------------------------------------------------------------------------- #
@@ -3213,7 +3935,7 @@ class AStorageFaultNeverAdjudicatesAUnit(_Case):
 
     def test_a_reply_the_engine_rejects_is_still_a_refusal(self):
         """The other half of the rule above: only the disk's failures are the disk's, and a
-        reply the engine read and refused still spends the allowance it always did."""
+        reply the engine read and refused still spends its reply allowance."""
         self.attempt("u1", 0, status='{"status": "ok"}',
                      transcript='{"findings": [], "summary": "read the area"}')
         with mock.patch.object(review_panel, "check_result", side_effect=
@@ -4197,9 +4919,9 @@ class TheSynthesizerGetsACopyLikeEveryOtherWriter(_Case):
     the tree every other unit of the run was measured against — and one lane's read-only
     mode does not stop it, because `references/dispatch.md` records that it blocks the edit
     tools and not a shell command the worker runs. The next snapshot check then refuses the
-    whole run, after every reading and verification round has been paid for. The probe and
-    the verifiers are already out of reach of this because they run in a copy; synthesis
-    was the one round left standing in the original.
+    whole run, after every reading and verification round has been paid for. The probe, the
+    verifiers and synthesis are the three kinds in `WRITE_CAPABLE_KINDS`, so each gets a
+    copy and none runs in the original.
     """
 
     def setUp(self):
@@ -4408,11 +5130,11 @@ class DiskHeadroomStopsClaimingRatherThanFailing(_Case):
     def test_the_sweep_runs_once_per_round_and_not_once_per_poll(self):
         """The same rule, asked of the loop that owns the flag rather than of one decision.
 
-        A round is many polls, and the flag is reset where the round begins. Reset where
-        each POLL begins instead, a round held back for room with work still in flight
-        measured every copy on disk at every poll interval — which is the cost the full
-        pass keeps off the polls on purpose, and the test above cannot see, because it never
-        enters the loop."""
+        A round is many polls, and the flag is reset once, before the round's poll loop
+        starts. So a round held back for room with work still in flight measures every copy
+        on disk once, not at every poll interval — the cost the full pass keeps off the
+        polls on purpose. The test above cannot check this, because it never enters the
+        loop."""
         run = self.run_object(disk_floor=1 << 62, poll=0.01)
         swept = []
         run.sweep_copies = lambda: swept.append(True)
@@ -4655,12 +5377,12 @@ class AnUnreadableThingIsNotAnAbsentThing(_Case):
         self.assertTrue(issubclass(driver.UnreadableRecord, driver.RunPaused))
 
     def test_a_record_the_check_could_not_read_is_not_a_reply_the_engine_rejected(self):
-        """§7.0's distinction at the one place it costs a unit its answer. `check_result`
-        reads the run's own metadata, and a permission taken off `areas.json` — or a sharing
-        violation on it — arrives here wearing the same exception type as a reply the engine
-        refused. Charged as that it spends the reply allowance on two replies nobody ever
-        looked at and then publishes `error.txt` as the unit's own answer, and restoring the
-        access recovers none of it.
+        """A refused read is not a rejected reply, at the one place that costs a unit its
+        answer. `check_result` reads the run's own metadata, and a permission taken off
+        `areas.json` — or a sharing violation on it — arrives here wearing the same exception
+        type as a reply the engine refused. Charged as that it spends the reply allowance on
+        two replies nobody ever looked at and then publishes `error.txt` as the unit's own
+        answer, and restoring the access recovers none of it.
 
         Injected into the engine's real read rather than into `check_result` itself, because
         the defect is that the driver cannot tell those two failures apart, and a fake that
@@ -4697,7 +5419,7 @@ class AnUnreadableThingIsNotAnAbsentThing(_Case):
                 ["--rundir", str(self.rundir), "--adapter", str(self.adapter_path),
                  "--job", str(self.job_path), "--go"]), driver.EXIT_STOPPED)
 
-    # -- B2: the enumeration that finds the record --------------------------- #
+    # -- the enumeration that finds the record -------------------------------- #
     def test_an_enumeration_that_failed_is_not_a_unit_with_no_attempts(self):
         """`attempt_dirs` answering `[]` tells eligibility there is nothing running, the
         capacity count that nothing is reserved, and the reclamation sweep that no attempt
@@ -4741,7 +5463,7 @@ class AnUnreadableThingIsNotAnAbsentThing(_Case):
             with self.assertRaises(driver.StorageFault):
                 self.run_object().granted("u1")
 
-    # -- B3: a launch the volume stopped ------------------------------------- #
+    # -- a launch the volume stopped ------------------------------------------ #
     def test_a_launch_the_volume_stopped_charges_no_failure_allowance(self):
         """§5.3 gives `launch-failed` a failure allowance because it means the supervisor
         could not start — not because the disk broke. Charged, three of them publish
@@ -4764,7 +5486,7 @@ class AnUnreadableThingIsNotAnAbsentThing(_Case):
     def test_a_launch_that_failed_for_any_other_reason_still_charges(self):
         """The other half, or the rule above would excuse every failed launch: a supervisor
         that is not where the configuration says it is has to spend the allowance §5.3 gives
-        it, or the unit would retry against it for ever."""
+        it, or the unit would retry against it forever."""
         run = self.run_object()
         with mock.patch.object(driver.subprocess, "Popen",
                                side_effect=OSError(errno.ENOENT, "No such file")):
@@ -4792,6 +5514,15 @@ class AnUnreadableThingIsNotAnAbsentThing(_Case):
                 self.assertTrue(driver._execution_ended(attempt))
                 self.assertFalse(driver._reserves_capacity(attempt))
 
+    def test_an_encoding_failure_on_a_lane_with_no_settings_is_not_blamed_on_one(self):
+        run = self.run_object()
+        failure = UnicodeEncodeError("ascii", "rundir-é", 7, 8, "ordinal not in range")
+        with mock.patch.object(driver.subprocess, "Popen", side_effect=failure):
+            run.spawn(run.unit_row("u1"))
+        attempt = driver.read_attempts(self.rundir, "u1", grace=120.0)[0]
+        self.assertEqual(attempt.disposition["outcome"], driver.LAUNCH_FAILED)
+        self.assertNotIn("a setting", attempt.disposition["reason"])
+
     def test_a_status_file_that_could_not_be_created_records_that_nothing_launched(self):
         """The spawn is not the only step that can fail before a worker exists: the status
         record the supervisor writes into is opened first. A failure there lands after the
@@ -4816,7 +5547,7 @@ class AnUnreadableThingIsNotAnAbsentThing(_Case):
                          "an attempt that never launched was left for an operator")
         self.assertTrue(run.pause_reason, "a full disk at the status file did not pause")
 
-    # -- B4: the copy a write-capable unit runs in --------------------------- #
+    # -- the copy a write-capable unit runs in -------------------------------- #
     def test_a_permission_that_could_not_be_restored_fails_the_preparation(self):
         """§5.4 requires the copy to be created writable. Suppressed, this returns success
         over a copy that is still read-only: the worker cannot write its own fixtures, and
@@ -4867,7 +5598,7 @@ class AnUnreadableThingIsNotAnAbsentThing(_Case):
         self.assertTrue(gone["done"], "the vanishing file was never reached")
         self.assertTrue(os.access(work, os.W_OK))
 
-    # -- B5: the questions asked of a path rather than of its contents -------- #
+    # -- the questions asked of a path rather than of its contents ------------- #
     def test_an_attempt_directory_nobody_can_describe_is_not_an_entry_that_is_no_attempt(self):
         """The guarded listing finds `a0`; this is the question one level in. Dropped here,
         the attempt is dropped from eligibility, from the capacity count and from the
@@ -5174,8 +5905,8 @@ class ClearingAWorkingCopyStaysInsideIt(unittest.TestCase):
         which is right where a comparison that cannot be made should simply not match. Here
         both sides fall back together: the root and its parent compare equal lexically, the
         boundary contains the lexical path, both questions pass, and the walk proceeds on a
-        tree nothing could place. The reviewer's case is a host that permits traversal while
-        refusing `readlink`; the property is the same whatever refused."""
+        tree nothing could place. One such host permits traversal while refusing `readlink`;
+        the property is the same whatever refused."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "copy"; root.mkdir()
             (root / "f.txt").write_text("mine", encoding="utf-8")
@@ -5218,6 +5949,54 @@ class AStorageFaultIsNamedByAWholeToken(unittest.TestCase):
     def test_a_number_that_merely_starts_with_a_fault_is_not_one(self):
         self.assertFalse(driver._names_storage_fault("errno 51"))
 
+
+
+@contextlib.contextmanager
+def _inside(directory):
+    """`contextlib.chdir`, which is 3.11+; the pack supports 3.10."""
+    before = os.getcwd()
+    os.chdir(directory)
+    try:
+        yield
+    finally:
+        os.chdir(before)
+
+
+class ARelativeBackendsPathIsReadFromWhereTheDriverStarted(unittest.TestCase):
+    """The preflight reads the backends file from the directory the driver was started in,
+    and every worker's supervisor starts in the run directory. A relative
+    `PORTABLE_AGENT_SKILLS_BACKENDS` left as it is names two different files, so the driver
+    makes it absolute before anything reads it."""
+
+    def test_a_relative_override_is_made_absolute_against_the_starting_directory(self):
+        with tempfile.TemporaryDirectory() as tmp, _inside(tmp), \
+                mock.patch.dict(os.environ, {driver.BACKENDS_ENV_VAR: "conf/backends.json"}):
+            driver._pin_backends_path()
+            pinned = Path(os.environ[driver.BACKENDS_ENV_VAR])
+            self.assertTrue(pinned.is_absolute())
+            # Both sides resolved: Windows can report the working directory by its 8.3 short
+            # name, which is the same directory spelled differently.
+            self.assertEqual(pinned.resolve(), Path(tmp).resolve() / "conf" / "backends.json")
+
+    def test_an_absolute_or_absent_override_is_left_alone(self):
+        absolute = str(Path(tempfile.gettempdir()).resolve() / "b.json")
+        with mock.patch.dict(os.environ, {driver.BACKENDS_ENV_VAR: absolute}):
+            driver._pin_backends_path()
+            self.assertEqual(os.environ[driver.BACKENDS_ENV_VAR], absolute)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(driver.BACKENDS_ENV_VAR, None)
+            driver._pin_backends_path()
+            self.assertNotIn(driver.BACKENDS_ENV_VAR, os.environ)
+
+    def test_main_pins_it_before_it_dispatches(self):
+        seen = {}
+        with tempfile.TemporaryDirectory() as tmp, _inside(tmp), \
+                mock.patch.dict(os.environ, {driver.BACKENDS_ENV_VAR: "b.json"}), \
+                mock.patch.object(driver, "_dispatch",
+                                  side_effect=lambda args: seen.setdefault(
+                                      "path", os.environ[driver.BACKENDS_ENV_VAR]) and 0):
+            driver.main(["status", tmp])
+        self.assertTrue(Path(seen["path"]).is_absolute())
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,29 @@
+{
+  "answers": [
+    {
+      "question": "Is the helper's doubling ever right?",
+      "answer": "No. D2 is the doubling, and D7 is the guide that never says so.",
+      "defects": [
+        "D2",
+        "D7"
+      ]
+    }
+  ],
+  "corrections": [
+    {
+      "target": "D2",
+      "reason": "The contract changed last month; doubling was once right."
+    },
+    {
+      "target": "D6",
+      "reason": "The README is shipped, so its claims are the product's."
+    },
+    {
+      "target": "build",
+      "reason": "It built only because nothing here is compiled."
+    }
+  ],
+  "caveats": [
+    "The tree is a fixture, read as it stands."
+  ]
+}

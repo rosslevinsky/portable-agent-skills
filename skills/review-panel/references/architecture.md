@@ -9,7 +9,7 @@ would otherwise have to infer the boundaries from ten thousand lines of Python.
 Four pieces, each owning one thing.
 
 - **`SKILL.md`** — the interview that produces `job.json`, the adapter config, one command,
-  and reading `report.md` back to the owner. It dispatches nothing.
+  and handing `report.md` and the fix brief to the owner. It dispatches nothing.
 - **The driver, `review_panel_run.py`** — the loop and **every worker spawn**: bootstrap, the
   run lock, the attempt protocol, landing a reply, resume, providers, storage headroom, and
   the disposable working copies. It imports the engine and calls its stages **in-process**, so
@@ -17,7 +17,7 @@ Four pieces, each owning one thing.
   `status`, `resolve-attempt`, `resolve-unit` — and `run` is filled in when the first
   argument is none of them.
 - **The engine, `review_panel.py`** — stage logic, and **it never spawns a worker**: `plan`,
-  `route`, `cluster`, `synthesize`, `report`, plus `check` for parsing one reply. It does run
+  `route`, `cluster`, `merge`, `merge-check`, `synthesize`, `report`, plus `check` for parsing one reply. It does run
   `git`, which is not the same thing and is the distinction the placement rule below turns
   on. It reads `result.json` and `error.txt` and never asks who produced them or how many
   attempts it took.
@@ -66,21 +66,34 @@ still a committed round.
 |---|---|
 | `reading` | the reading round — readers, auditors, the capability probe — then `route` |
 | `verification` | the verification round, then `cluster` |
-| `clustered` | the clustering round, then `synthesize` |
+| `clustered` | the clustering round, then `merge` |
+| `merged` | the merge round, then `merge-check` |
+| `merge-checked` | the merge check, then `synthesize` |
 | `synthesized` | the synthesis round, then `report` |
 | `reported` | nothing: the run is finished |
 
 That table is the driver's `ROUNDS`, which maps each marker to the unit kinds its round
-dispatches and the engine stage that closes it. **Those five are every value `units.json`
+dispatches and the engine stage that closes it. **Those seven are every value `units.json`
 ever holds.**
 
-**`ROUTED_STAGE` is a sixth constant and not a sixth stage**, which is worth knowing before
-it misleads you the way it has misled others. `"routed"` is written into `candidates.json`
-and never into `units.json`, and it is a **type tag** rather than a position:
-`_read_candidates` refuses a file whose `stage` is not `routed`, beside checking it carries
-a candidate list, a unit list and a probe record. That is how the engine tells its own route
-record from some other JSON in the directory. Reading it as a progress marker suggests a
-stage the loop passes through, and there is none.
+**`merged` and `merge-checked` are where sites become defects.** Clustering stays per area
+and produces sites; the merge unit, on the first lane, proposes which sites are one mistake (split into
+batches by directory when there are too many sites, with no merging across batches),
+and the check, on `MERGE_CHECK_LANE`, judges each proposed group site by site. Both only
+read, so neither kind is in `WRITE_CAPABLE_KINDS`. A run with fewer than two sites plans no
+merge unit, and one whose merge proposed no group of several plans no check, yet each still
+commits its marker. Defect ids are assigned from the grouping the check accepted, so the
+grouping is positional state like a clustering: a redo from clustering or routing removes
+both rounds' units, and a synthesis or check planned against another grouping is refused by
+name rather than rendered.
+
+**`ROUTED_STAGE` is an eighth constant and not an eighth stage**, which is worth knowing
+before it misleads you. `"routed"` is written into `candidates.json` and never into
+`units.json`, and it is a **type tag** rather than a position: `_read_candidates` refuses a
+file whose `stage` is not `routed`, beside checking it carries a candidate list, a unit list
+and a probe record. That is how the engine tells its own route record from some other JSON in
+the directory. Reading it as a progress marker suggests a stage the loop passes through, and
+there is none.
 
 **One ending is not in the table, and it is the driver's alone.** `refuse_a_stranded_lane`
 runs at every round boundary, before anything is spawned, and ends the run when a lane has
@@ -90,7 +103,7 @@ at its per-attempt records. The reason is rule 3 rather than throughput — a la
 answered none of its units checked none of the findings addressed to it, so no page the run
 could write would be true.
 
-Both halves of that predicate are load-bearing and were settled by review. Without *landed
+Both halves of that predicate are needed. Without *landed
 nothing*, a lane having a bad round ends the run. Without *nothing pending*, a run that is
 **resumed** between the reading round and `route` is refused one step before the stage that
 would have given the silent lane its verifier — so the guard returns early at a boundary
@@ -152,7 +165,7 @@ or `spec_`, or a trailing `ITCase`, `Tests`, `Test`, `Specs`, `Spec`, `IT`, `_te
 `_test`, `_spec`, `.test`, `.spec`, longest first so `Tests` is not read as `Test` with a
 stray `s` — and a source file matches when **the stripped test stem starts with that
 source's stem**, `stem.startswith(_stem_of(s))`, and not the other way round. So
-`LeaseServiceMoveOutTest.java` selects `LeaseService.java`, while `FooTest.java` does **not**
+`OrderServiceCancelTest.java` selects `OrderService.java`, while `FooTest.java` does **not**
 select `FooBar.java`. Ties break on three keys in order: **exact extension equality** — the
 file suffix, so a `.kt` test of a `.java` class scores nothing here and is settled by the
 keys below it — then the longer source stem, then the more shared leading directories. At
@@ -256,7 +269,7 @@ every mention survives. That is what makes the table safe to grow one row at a t
    reason: a pattern reading any declaration that *contains* `require(` deletes
    `const real = new Thing(require("./config"))`, and one reading `import` as a prefix
    deletes a dynamic `import("./helper").then(() => new Thing())`. Both are constructions,
-   and both went silently.
+   and both go silently.
    **Emptying the field instead is not the cheaper answer it looks like**, whatever a
    language where imports share lines suggests: over the four rows that ship it turns five
    correct answers into wrong ones and rescues none, because a mocked collaborator is always
@@ -324,7 +337,7 @@ never showed a link proved nothing.
 The table is the per-language rule. The language-neutral one is already in every payload and
 holds wherever there is no row: each link is labeled `named for it` or `mentions it`, and
 `references/coverage-auditor.md` tells the auditor plainly that a test which merely mocks a
-file is evidence of nothing about it. That instruction is obeyed unevenly — one model
-answered a mock-only link with no findings while another returned thirty, each resting on the
+file is evidence of nothing about it. That instruction is obeyed unevenly — one model can
+answer a mock-only link with no findings while another returns dozens, each resting on the
 observation that the test never instantiates the class. The table is there to make that
 answer deterministic, not to take the instruction's place.

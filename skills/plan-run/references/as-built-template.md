@@ -49,7 +49,7 @@ For each success criterion in `plan.md`, its final status:
 ~~~
 
 The per-phase outcomes come from each phase document's filled **Evidence** record — its
-`Outcome` and `Deviations` lines, verbatim. A phase document written under an older shape carries
-the same content under the heading **Review Packet**; read it as it stands and never
+`Outcome` and `Deviations` lines, verbatim. A phase document whose evidence section is headed
+**Review Packet** carries the same content; read it as it stands and never
 re-emit it. The drift table is the one genuinely new synthesis step: walk `plan.md`'s
 success criteria and record how the delivered result measures up.

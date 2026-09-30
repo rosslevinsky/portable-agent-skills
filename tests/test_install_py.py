@@ -10,13 +10,12 @@ trust and what a future edit must not quietly withdraw:
     live directory, and that is the design: ownership is recorded before any file is touched,
     so the half-copied skill is claimed by the manifest, `--verify` reports it, and one re-run
     restores it byte-identical. Asserted by killing a copy mid-flight, not assumed;
-  * a link is unlinked, never followed — the hazard that cost the retired PowerShell
-    installer a hand-written `Remove-SkillPath`;
+  * a link is unlinked, never followed — following one deletes whatever it points at;
   * an install made by the shell installers can still be read, updated and removed.
 
-**These tests could not be written red first**, because the code they cover is new. So the
-ones that carry real load are mutation-tested instead — `MutationProofs` breaks the
-implementation in a specific way and asserts the relevant test notices.
+**A test that has never been seen to fail has not shown that it can.** So the ones that
+carry real load are backed by mutation proofs — `MutationProofs` breaks the implementation
+in a specific way and asserts the bad state the test guards against becomes reachable.
 
 Nothing here touches a real skills directory. Every case runs against a temporary tree.
 """
@@ -26,6 +25,7 @@ import glob
 import io
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -41,7 +41,7 @@ import install  # noqa: E402
 
 # Symlink creation needs elevation or developer mode on Windows, so the link cases are
 # skipped there rather than weakened. Skipping states the gap; asserting less would hide
-# it on the platform where the hazard was originally found.
+# it.
 CAN_SYMLINK = True
 try:
     with tempfile.TemporaryDirectory() as _probe:
@@ -79,9 +79,9 @@ class InstallBase(unittest.TestCase):
     def setUp(self):
         # These tests call the command functions DIRECTLY, which is a way into the installer
         # that skips `main` — and `main` is where the CLI pins its streams to utf-8 before
-        # printing the em dash every mode prints. Without this the pass depended on some
-        # OTHER test in the same process having called `main` first, and a run that split
-        # this class away from that one failed under an ASCII stdout while the code was
+        # printing the em dash every mode prints. Without this the pass depends on some
+        # OTHER test in the same process having called `main` first, and a run that splits
+        # this class away from that one fails under an ASCII stdout while the code is
         # perfectly correct.
         install.prepare_streams()
         self._tmp = tempfile.TemporaryDirectory()
@@ -343,11 +343,11 @@ class ItReadsAnInstallMadeByTheShellInstallers(InstallBase):
 
 
 class TheVersionTravelsWithTheFiles(unittest.TestCase):
-    """The defect this replaced: provenance read from git, absent from a downloaded copy.
+    """Provenance read from git is absent from a downloaded copy.
 
-    Measured on a real install before the change — `source-commit: unknown` and
-    `source-version: unknown`, which is exactly the case where the manifest is the only
-    record there is.
+    A downloaded copy is exactly the case where the manifest is the only record there is,
+    so the version comes from `CHANGELOG.md`, which travels with the files; git is only a
+    fallback, and `unknown` the last resort.
     """
 
     def setUp(self):
@@ -411,7 +411,8 @@ class BothRuntimesAreInstalledTo(unittest.TestCase):
         source = make_source(self.root)
         a, b = self.root / "a", self.root / "b"
         with unittest.mock.patch.dict(
-                os.environ, {"CLAUDE_SKILLS_DIR": str(a), "CODEX_SKILLS_DIR": str(b)}):
+                os.environ, {"CLAUDE_SKILLS_DIR": str(a), "CODEX_SKILLS_DIR": str(b),
+                             install.BACKENDS_ENV_VAR: str(self.root / "backends.json")}):
             install.main(["--source", str(source)])
         for target in (a, b):
             names, meta = install.read_manifest(target)
@@ -441,12 +442,12 @@ class VerifyReportsWithoutRepairing(InstallBase):
 
 
 class MutationProofs(InstallBase):
-    """The tests above could not be written red first, so they are checked by breaking the
-    code and confirming the right one notices.
+    """The tests above guard against states the code can reach when broken; these break
+    it a specific way and assert the bad state really does become reachable.
 
-    Two review rounds turned on tests that passed while asserting nothing — including one
-    that spawned a shell which could not run. A new suite with no demonstrated failure is in
-    that category until someone shows otherwise.
+    A test can pass while asserting nothing — one that spawns a shell which cannot run, for
+    instance. A suite with no demonstrated failure is in that category until someone shows
+    otherwise.
     """
 
     def test_copying_before_recording_ownership_is_caught(self):
@@ -501,11 +502,10 @@ class MutationProofs(InstallBase):
 
 
 class ThreeGapsTheOldSuiteNamed(unittest.TestCase):
-    """Behaviors the bash suite covered that the first draft of `install.py` dropped.
+    """Three behaviors the shell installers' test suite covered, which `install.py` must keep.
 
-    Found by READING the suite being deleted rather than deleting it. All three were
-    reproduced before they were fixed, which is the only reason to trust the fix — and the
-    reason a replacement should be read against what it replaces.
+    Each test sets up the hazard it guards against, and each is a promise a replacement
+    installer must be read against.
     """
 
     def setUp(self):
@@ -541,7 +541,7 @@ class ThreeGapsTheOldSuiteNamed(unittest.TestCase):
             self.assertTrue(install.is_safe_name(name), f"{name!r} was rejected")
 
     def test_a_retired_skill_is_pruned_from_disk_not_only_from_the_manifest(self):
-        """Otherwise it loads for ever and nothing can remove it.
+        """Otherwise it loads forever and nothing can remove it.
 
         Discovery globs for SKILL.md with no allowlist, so a skill dropped from the pack
         keeps being read. Rewriting the manifest without it makes it worse: it is then
@@ -565,7 +565,7 @@ class ThreeGapsTheOldSuiteNamed(unittest.TestCase):
     def test_an_unowned_skill_is_not_replaced_without_force(self):
         """A directory this installer never recorded belongs to the user.
 
-        An ordinary update silently overwrote it, with nothing to say it had happened.
+        An ordinary update must not silently overwrite it, with nothing to say it happened.
         """
         (self.target / "alpha").mkdir()
         (self.target / "alpha" / "SKILL.md").write_text("MINE\n", encoding="utf-8")
@@ -595,7 +595,7 @@ class OwnershipSurvivesAFailure(InstallBase):
     nothing can remove and nothing can update without `--force`, while the user is told the
     opposite.
 
-    Both directions were wrong the same way round: the record was rewritten from what
+    Both directions go wrong the same way round if the record is rewritten from what
     SUCCEEDED rather than from what is actually there.
     """
 
@@ -635,12 +635,11 @@ class OwnershipSurvivesAFailure(InstallBase):
             "a clean uninstall leaves nothing behind, manifest included")
 
     def test_a_failed_update_keeps_owning_the_skill_it_left_on_disk(self):
-        """The same defect on the install path.
+        """The same hazard on the install path.
 
-        `install_skill` stages beside the destination, so a copy that dies leaves the LIVE
-        directory untouched — the skill is still installed, at its previous version.
-        Rewriting the manifest from the successes alone then orphans it, so one transient
-        file lock on Windows makes an installed skill unremovable.
+        A copy that dies part-way still leaves the skill's directory on disk. Rewriting the
+        manifest from the successes alone then orphans it, so one transient file lock on
+        Windows makes an installed skill unremovable.
         """
         self.install()
         real_copytree = shutil.copytree
@@ -748,17 +747,15 @@ class OutputSurvivesANonUtf8Console(unittest.TestCase):
 
 
 class AnInterpreterBelowTheFloorIsRefusedBeforeAnyFileMoves(unittest.TestCase):
-    """The floor was real and unchecked, so it surfaced as a half-done install.
+    """The floor is pack-wide, and it is checked before any file moves.
 
-    `write_manifest` passes `newline="\\n"` to `Path.write_text`, a keyword added in 3.10, and
-    it runs AFTER every skill has been copied. Reproduced on a real 3.9.25 before the guard
-    existed: 16 skills copied, then a `TypeError`, exit 1, and no manifest — 16 directories
-    the installer does not own, which is the orphan state the ownership fixes exist to prevent.
+    An interpreter below it would run until it reached something it lacks and fail
+    part-way, leaving a partial install to repair. Refused first, it changes nothing.
     """
 
-    def test_the_floor_is_the_one_the_manifest_write_actually_needs(self):
+    def test_the_floor_is_the_pack_wide_one(self):
         self.assertEqual(install.MINIMUM_PYTHON, (3, 10),
-                         "the floor is set by Path.write_text(newline=), added in 3.10")
+                         "the floor is the pack-wide Python 3.10")
 
     def test_an_old_interpreter_is_refused_and_a_new_one_is_not(self):
         for version in ((3, 8), (3, 9)):
@@ -831,18 +828,18 @@ class APruneIsAChangeEvenWhenNothingNewLands(InstallBase):
 
 
 class ThePruneRecordsWhatIsThereAndWhatWasCopied(InstallBase):
-    """Two variants the first `pruned_any` fix missed.
+    """Two more variants of the prune case.
 
     Both are about the same question — the manifest is a record of what is installed, and
-    of which release put it there — and both were reachable without simulating a failure.
+    of which release put it there — and both are reachable without simulating a failure.
     """
 
     def test_a_retired_skill_whose_directory_is_already_gone_leaves_the_manifest(self):
-        """`pruned_any` was set only when there was something to remove.
+        """The record must drop a retired name even when there is nothing to remove.
 
         Owned, retired from the pack, and its directory deleted by hand. Nothing to prune
-        and nothing to copy, so the manifest went unwritten and kept naming a directory that
-        is not there — which `--verify` reports as MISSING for ever.
+        and nothing to copy, yet a manifest that kept the name would name a directory that
+        is not there — which `--verify` reports as MISSING forever.
         """
         self.assertEqual(self.install(), 0)
         install.write_manifest(self.target, ["beta"], "test")   # alpha unowned -> nothing copies
@@ -924,7 +921,7 @@ class ThePruneRecordsWhatIsThereAndWhatWasCopied(InstallBase):
         self.assertEqual(self.manifest()[1].get("version"), "2026.01.0")
 
     def test_a_run_that_did_copy_records_the_new_version(self):
-        """Positive control, so the fix cannot freeze the version for ever."""
+        """Positive control, so the fix cannot freeze the version forever."""
         self.assertEqual(self.install(), 0)
         install.write_manifest(self.target, ["alpha", "beta"], "2026.01.0")
         self.assertEqual(self.install(), 0)
@@ -969,8 +966,8 @@ class ThePruneRecordsWhatIsThereAndWhatWasCopied(InstallBase):
 class VerifyNamesEachProblemOnce(InstallBase):
     """One skill, listed, gone from disk and gone from the pack — one line, not two.
 
-    MISSING and RETIRED were both printed for such a name, which reads as two problems with
-    two different remedies. MISSING is the survivor: it is the actionable one and the one
+    Printing both MISSING and RETIRED for such a name reads as two problems with two
+    different remedies. MISSING is the survivor: it is the actionable one and the one
     that sets the exit code.
     """
 
@@ -999,9 +996,9 @@ class VerifyNamesEachProblemOnce(InstallBase):
 class AnEmptyPathArgumentIsRefusedRatherThanReadAsTheCwd(unittest.TestCase):
     """`Path("")` is `Path(".")`, so an empty value means "wherever you are standing".
 
-    `install.py --target ""` installed all sixteen skill directories plus the ownership
-    manifest into the current directory and exited 0; `--uninstall --target ""` then removed
-    them from there. `""` is what an unset shell variable expands to.
+    Read that way, `install.py --target ""` installs every skill directory plus the
+    ownership manifest into the current directory and exits 0; `--uninstall --target ""`
+    then removes them from there. `""` is what an unset shell variable expands to.
 
     Run as a subprocess from a scratch directory on purpose: the point of the test is what
     happens to the current working directory.
@@ -1042,11 +1039,12 @@ class AnEmptyPathArgumentIsRefusedRatherThanReadAsTheCwd(unittest.TestCase):
 class ANameThatCouldInjectAManifestEntryIsRefused(InstallBase):
     """The manifest is line-oriented, so a name is only as safe as the line it becomes.
 
-    `is_safe_name` guarded the READ side from the beginning. Nothing guarded the WRITE side,
-    and a source name never passed through it at all. POSIX permits a newline in a directory
-    name, so one skill could become two manifest entries and `--uninstall` would delete a
-    directory nobody installed — a user's own `victim/` and its contents were removed, and
-    the command exited 0.
+    Install and uninstall pass every name they read from a manifest through
+    `is_recordable_name` before acting on it, and the WRITE side needs a guard too: every
+    source name passes `is_safe_name`, which requires everything `is_recordable_name` does,
+    before it can become a line. POSIX permits a newline in a directory name, so one skill
+    could become two manifest entries and `--uninstall` would delete a directory nobody
+    installed — a user's own `victim/` and its contents removed, and the command exiting 0.
     """
 
     def test_a_newline_in_a_source_name_cannot_become_two_entries(self):
@@ -1069,7 +1067,7 @@ class ANameThatCouldInjectAManifestEntryIsRefused(InstallBase):
         self.assertEqual(self.install(), 1, "a name that cannot be recorded is a failure")
         names, _ = self.manifest()
         self.assertNotIn("injected", names,
-                         "a second entry was synthesised from one skill's name")
+                         "a second entry was synthesized from one skill's name")
         self.assertTrue(victim.exists(), "the user's own directory must survive the install")
 
         install.do_uninstall([self.target])
@@ -1140,10 +1138,10 @@ class OwnershipIsRecordedBeforeAnyFileIsTouched(InstallBase):
 class VerifyEstablishesWhatItClaims(InstallBase):
     """`--verify` says the install "matches this pack". It only ever checked presence.
 
-    Two halves were unenforced. A retired skill still installed and a newly shipped skill
-    absent were both PRINTED and both exited 0. And nothing looked inside a directory, so a
-    half-copied skill verified clean — which matters a great deal now that the installer
-    copies in place.
+    Presence is not enough. A retired skill still installed and a newly shipped skill absent
+    must fail the check, not just be PRINTED with exit 0. And a check that never looks
+    inside a directory verifies a half-copied skill clean — which matters a great deal
+    because the installer copies in place.
     """
 
     def test_a_set_mismatch_is_a_failure_not_a_remark(self):
@@ -1174,12 +1172,12 @@ class VerifyEstablishesWhatItClaims(InstallBase):
 
 
 class TheManifestWriteCannotBeAimedAtAnotherFile(InstallBase):
-    """The temporary file it writes through was a predictable name in a writable directory.
+    """The temporary file it writes through is not a name anyone can plant a link at.
 
-    `write_manifest` wrote to `<manifest>.tmp-<pid>` and `write_text` follows a symlink. A
-    link planted at that name — the pid is guessable, and a wrong guess simply waits for the
-    next run — redirected the write outside the target, truncating whatever it pointed at
-    before `os.replace` moved the link into place.
+    `write_text` follows a symlink, and a name like `<manifest>.tmp-<pid>` is guessable.
+    `write_manifest` creates its temporary file with `mkstemp` — O_EXCL, a random name — and
+    writes through the descriptor, so a link planted at the pid-based name is never opened:
+    what it points at is left untouched, and the manifest is a regular file.
     """
 
     def test_a_symlink_at_the_temporary_path_is_not_written_through(self):
@@ -1199,11 +1197,13 @@ class TheManifestWriteCannotBeAimedAtAnotherFile(InstallBase):
 
 
 class VerifyReportsWhatItCouldNotRead(InstallBase):
-    """An unreadable file verified CLEAN, because the byte check skipped what it could not open.
+    """An unreadable file is a mismatch, never a clean verify.
 
-    `_content_mismatches` caught `OSError` and `continue`d. With the path present and the size
-    matching, no other check had anything to say either — so `--verify` exited 0 having never
-    looked at the file. Reproduced with `chmod 000` on an installed `SKILL.md`.
+    `tree` records a path it cannot read as `("unreadable", reason)`, and the comparison
+    reports every such entry as a difference before it compares anything for equality, so
+    `--verify` exits 1 rather than certifying a file it never looked at — even when the pack's
+    own copy failed to read the same way.
+    Tested with `chmod 000` on an installed `SKILL.md`.
     """
 
     @unittest.skipUnless(os.name == "posix", "chmod 000 does not deny the owner on Windows")
@@ -1237,7 +1237,7 @@ class VerifyComparesKindNotOnlySize(InstallBase):
         `lstat` on a symlink reports the length of its TARGET PATH, so the substitution is
         invisible to a size comparison exactly when that path length equals the file's size.
         The source file is written to that length deliberately — a link of a convenient
-        length would make this test pass against the unfixed code.
+        length would make this test pass against a size-only comparison.
         """
         name = sorted(p.name for p in self.source.iterdir() if p.is_dir())[0]
         origin = (self.source / name / "SKILL.md").resolve()
@@ -1259,16 +1259,16 @@ class VerifyComparesKindNotOnlySize(InstallBase):
 
 
 class VerifyRefusesASkillRootThatIsALink(InstallBase):
-    """A manifest-owned skill directory replaced by a link verified clean.
+    """A manifest-owned skill directory replaced by a link must not verify clean.
 
-    `_shape()` walks THROUGH a link and compares the referent, so pointing an installed skill
-    at the source made every path and every size agree and `--verify` reported the install
-    sound. That is the exact condition `--link` was removed to prevent — editing the installed
-    instructions edits the source — reachable through the command whose job is to certify that
-    it has not happened.
+    A skill pointed at the source holds the same paths and sizes as the source itself, so
+    `--verify` asks whether the skill root is a link before it compares anything, and reports
+    it LINKED. That is the exact condition copying instead of linking exists to prevent —
+    editing the installed instructions edits the source — and the command whose job is to
+    certify it has not happened must see it.
 
-    `is_symlink()` also answers for a Windows junction, which is what made `--force` able to
-    delete the pack's own `skills/` through it.
+    The question is asked through `_is_link()`, which reads the reparse tag and so also
+    answers for a Windows junction, where `is_symlink()` says False.
     """
 
     @unittest.skipUnless(os.name == "posix", "symlink creation needs elevation on Windows")
@@ -1288,10 +1288,10 @@ class VerifyRefusesASkillRootThatIsALink(InstallBase):
 class VerifySeesAnIncompleteCopy(InstallBase):
     """A path set cannot establish completeness, and completeness is the whole claim.
 
-    Removing the staged swap was paid for by `--verify` being able to see a half-copied
-    skill. It could not: a copy that creates the destination filename and then fails while
-    writing its bytes leaves every path present — 1 byte of a 500-byte `SKILL.md`, install
-    exited 1, verify exited 0.
+    Copying in place relies on `--verify` being able to see a half-copied skill. A path set
+    cannot: a copy that creates the destination filename and then fails while writing its
+    bytes leaves every path present — 1 byte of a 500-byte `SKILL.md`, install exiting 1,
+    and a path-only verify exiting 0.
 
     Sizes rather than hashes: `os.lstat` is one call per file, reads nothing, and catches the
     failure a copy can actually produce. A user who edited a skill in place is reported too,
@@ -1340,10 +1340,10 @@ class VerifySeesAnIncompleteCopy(InstallBase):
 class OwnershipOutlivesAChangeToTheNameGrammar(InstallBase):
     """Tightening what may be INSTALLED must not disown what was already installed.
 
-    The strict grammar was applied to manifest entries as well as to source names, so a skill
-    recorded by an earlier release under a name the new rules reject was dropped from the
-    record on the next update: never pruned, and no longer removable — with `legacy:name`,
-    update 0, verify 0, uninstall 0, directory still there.
+    Applied to manifest entries as well as to source names, the strict grammar would drop a
+    skill recorded under a name it rejects from the record on the next update: never pruned,
+    and no longer removable — with `legacy:name`, update 0, verify 0, uninstall 0, directory
+    still there.
 
     Two questions, separated: *may this be installed from a source pack* is strict, and *can
     this name be written as one manifest line and not escape the target* is what ownership
@@ -1381,11 +1381,11 @@ class OwnershipOutlivesAChangeToTheNameGrammar(InstallBase):
 
 
 class ThePackCannotBeInstalledOverItself(InstallBase):
-    """`--source X --target X --force` deleted the pack. All sixteen skills.
+    """Installing the pack over itself is refused.
 
-    Remove-then-copy made it certain: `live` IS the source directory, `_remove` deletes it,
-    and `copytree` then reads what is no longer there — 16 directories before, 0 after. The
-    shell installers guarded this explicitly, and the guard was not carried across.
+    With `--source X --target X --force`, remove-then-copy would make the loss certain:
+    `live` IS the source directory, `_remove` deletes it, and `copytree` then reads what is
+    no longer there.
     """
 
     def test_installing_the_source_onto_itself_is_refused(self):
@@ -1648,6 +1648,239 @@ class ATargetItCannotCompareIsNotADifferentDirectory(InstallBase):
         self.assertIn("could not be compared", err.getvalue())
         self.assertFalse((self.target / "alpha").exists(),
                          "it installed into a target it could not show was not the source")
+
+
+class ADefaultInstallSeedsTheBackendsFile(unittest.TestCase):
+    """A default install writes the pack's backends file into the settings folder when there
+    is none, and from then on the file is the user's: never rewritten, never removed. The key
+    file beside it is created only when missing, with every key empty, and never rewritten."""
+
+    def setUp(self):
+        install.prepare_streams()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.home = self.root / "home"
+        self.home.mkdir()
+        self.source = make_source(self.root)
+        env = {"HOME": str(self.home), "USERPROFILE": str(self.home),
+               "CLAUDE_SKILLS_DIR": str(self.root / "claude"),
+               "CODEX_SKILLS_DIR": str(self.root / "codex")}
+        patcher = unittest.mock.patch.dict(os.environ, env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop(install.BACKENDS_ENV_VAR, None)
+        self.folder = self.home / ".portable-agent-skills"
+
+    def run_installer(self, *args):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = install.main(["--source", str(self.source), *args])
+        return code, out.getvalue()
+
+    def test_a_missing_file_is_created_from_the_shipped_default(self):
+        code, out = self.run_installer()
+        self.assertEqual(code, 0)
+        self.assertEqual((self.folder / "backends.json").read_bytes(),
+                         install.DEFAULT_BACKENDS.read_bytes())
+        self.assertIn("created", out)
+        ignored = (self.folder / ".gitignore").read_text(encoding="utf-8").split()
+        self.assertIn("keys.env", ignored)
+        self.assertIn("keys.ps1", ignored)
+        other = "keys.env" if install.KEY_FILE == "keys.ps1" else "keys.ps1"
+        self.assertFalse((self.folder / other).exists())
+
+    def _existing_ignore(self, text):
+        self.folder.mkdir(parents=True)
+        (self.folder / ".gitignore").write_bytes(text.encode("utf-8"))
+
+    def _ignore(self):
+        return (self.folder / ".gitignore").read_bytes().decode("utf-8")
+
+    def test_an_existing_ignore_file_gains_the_key_files_it_does_not_list(self):
+        """A `.gitignore` of the user's that does not name the key files would leave a filled
+        key file committable, so the names are appended; the user's own lines are kept."""
+        self._existing_ignore("notes/\n*.bak\n")
+        _code, out = self.run_installer()
+        self.assertEqual(self._ignore(), "notes/\n*.bak\nkeys.env\nkeys.ps1\n")
+        self.assertIn("keys.env", out)
+        self.assertIn(".gitignore", out)
+
+    def test_an_ignore_file_that_already_lists_them_is_left_byte_for_byte(self):
+        for text in ("keys.env\nkeys.ps1\n", "# mine\n/keys.env\nkeys.ps1  \r\nother\n"):
+            with self.subTest(text=text):
+                shutil.rmtree(self.folder, ignore_errors=True)
+                self._existing_ignore(text)
+                self.run_installer()
+                self.assertEqual(self._ignore(), text)
+
+    def test_only_the_name_it_lacks_is_appended(self):
+        self._existing_ignore("keys.env\n")
+        self.run_installer()
+        self.assertEqual(self._ignore(), "keys.env\nkeys.ps1\n")
+
+    def test_a_comment_or_a_negation_does_not_count_as_listing_a_key_file(self):
+        """`# keys.env` ignores nothing, and `!keys.env` un-ignores it; a name appended after
+        either is the line git obeys, because the last matching pattern wins."""
+        self._existing_ignore("# keys.env\n!keys.ps1\n")
+        self.run_installer()
+        self.assertEqual(self._ignore(), "# keys.env\n!keys.ps1\nkeys.env\nkeys.ps1\n")
+
+    def test_a_later_negation_undoes_an_earlier_listing(self):
+        """Git obeys the last pattern that matches, so `keys.env` then `!keys.env` leaves the
+        key file unignored, and the names are appended again to win. Any `!` line cancels
+        both: the installer does not work out which names a negation matches."""
+        self._existing_ignore("keys.env\nkeys.ps1\n!keys.env\n")
+        self.run_installer()
+        self.assertEqual(self._ignore(),
+                         "keys.env\nkeys.ps1\n!keys.env\nkeys.env\nkeys.ps1\n")
+
+    def test_whitespace_git_keeps_in_a_pattern_does_not_count(self):
+        """Git strips trailing spaces and a CRLF's CR, and nothing else: a trailing tab stays in
+        the pattern, and a bare CR does not end a line, so neither line names a key file."""
+        for text in ("keys.env\t\nkeys.ps1\t\n", "keys.env\rkeys.ps1\r"):
+            with self.subTest(text=text):
+                shutil.rmtree(self.folder, ignore_errors=True)
+                self._existing_ignore(text)
+                self.run_installer()
+                self.assertTrue(self._ignore().endswith("keys.env\nkeys.ps1\n"), self._ignore())
+
+    def test_an_ignore_file_that_is_a_link_is_left_alone_and_no_key_file_is_made(self):
+        """Git does not read a `.gitignore` that is a symbolic link, so nothing written into
+        one protects a key file. The link and its target are left alone, no key file is
+        created beside it, and the installer says why."""
+        self.folder.mkdir(parents=True)
+        target = self.root / "linked-gitignore"
+        target.write_text("notes/\n", encoding="utf-8")
+        try:
+            (self.folder / ".gitignore").symlink_to(target)
+        except (OSError, NotImplementedError):
+            self.skipTest("this platform/user cannot create a symlink")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, out = self.run_installer()
+        self.assertEqual(code, 0)
+        self.assertEqual(target.read_text(encoding="utf-8"), "notes/\n")
+        self.assertTrue((self.folder / ".gitignore").is_symlink())
+        self.assertFalse((self.folder / install.KEY_FILE).exists())
+        said = out + err.getvalue()
+        self.assertIn("symbolic link", said)
+        self.assertIn(install.KEY_FILE, said)
+        self.assertTrue((self.folder / "backends.json").exists(),
+                        "the backends file does not depend on the key file")
+
+    def test_a_link_to_a_missing_file_does_not_create_its_target(self):
+        """`exists()` is False for a link whose target is missing, and writing to it would
+        create that target wherever the link points."""
+        self.folder.mkdir(parents=True)
+        target = self.root / "elsewhere" / "gitignore"
+        target.parent.mkdir()
+        try:
+            (self.folder / ".gitignore").symlink_to(target)
+        except (OSError, NotImplementedError):
+            self.skipTest("this platform/user cannot create a symlink")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.run_installer()
+        self.assertFalse(target.exists())
+        self.assertFalse((self.folder / install.KEY_FILE).exists())
+
+    def test_a_later_wildcard_negation_undoes_the_listing_too(self):
+        for negation in ("!keys.*", "!*.env", "!keys.e?v", "!**/keys.env", "![[:alpha:]]eys.env",
+                         "!k*", "!/**"):
+            with self.subTest(negation=negation):
+                shutil.rmtree(self.folder, ignore_errors=True)
+                self._existing_ignore(f"keys.env\nkeys.ps1\n{negation}\n")
+                self.run_installer()
+                appended = self._ignore().split(f"{negation}\n", 1)[1]
+                self.assertIn("keys.env", appended.split())
+
+    def test_a_pattern_git_reads_as_another_name_does_not_count(self):
+        """A leading space is part of a git pattern, and `//keys.env` is not `/keys.env`."""
+        self._existing_ignore(" keys.env\n//keys.ps1\n")
+        self.run_installer()
+        self.assertEqual(self._ignore(), " keys.env\n//keys.ps1\nkeys.env\nkeys.ps1\n")
+
+    def test_a_missing_final_newline_does_not_join_the_appended_name_to_the_last_line(self):
+        self._existing_ignore("notes/")
+        self.run_installer()
+        self.assertEqual(self._ignore(), "notes/\nkeys.env\nkeys.ps1\n")
+
+    def test_a_missing_key_file_is_created_empty_and_private(self):
+        _code, out = self.run_installer()
+        keys = self.folder / install.KEY_FILE
+        self.assertIn("keys: created", out)
+        settings = [line for line in keys.read_text(encoding="utf-8").splitlines()
+                    if line and not line.startswith("#")]
+        # Every variable the shipped backends forward, each set, and each to nothing.
+        self.assertEqual(len(settings), 2)
+        for name in ("FIREWORKS_API_KEY", "OPENROUTER_API_KEY"):
+            self.assertTrue(any(name in line for line in settings), name)
+        for line in settings:
+            self.assertTrue(line.endswith('=""') or line.endswith('= ""'), line)
+        if os.name == "posix":
+            self.assertEqual(stat.S_IMODE(keys.stat().st_mode) & 0o077, 0)
+
+    def test_the_key_file_skips_an_entry_set_aside_with_a_comment_name(self):
+        default = self.root / "default.json"
+        default.write_text(
+            '{"//": "a note", "// off": {"env_from_parent": {"X": "SET_ASIDE_KEY"}},'
+            ' "on": {"harness": "codex", "model": "m",'
+            ' "env_from_parent": {"FIREWORKS_API_KEY": "FIREWORKS_API_KEY"}}}',
+            encoding="utf-8")
+        text = install.key_file_text(default)
+        self.assertIn("FIREWORKS_API_KEY", text)
+        self.assertNotIn("SET_ASIDE_KEY", text)
+
+    def test_an_existing_file_and_key_file_survive_reinstall_and_uninstall(self):
+        self.folder.mkdir()
+        mine = b'{"mine": {"harness": "claude", "model": "x"}}\n'
+        (self.folder / "backends.json").write_bytes(mine)
+        (self.folder / install.KEY_FILE).write_bytes(b"# export OPENROUTER_API_KEY=\n")
+        for args in ((), (), ("--uninstall",)):
+            _code, out = self.run_installer(*args)
+            self.assertIn("backends:", out)
+        self.assertEqual((self.folder / "backends.json").read_bytes(), mine)
+        self.assertEqual((self.folder / install.KEY_FILE).read_bytes(),
+                         b"# export OPENROUTER_API_KEY=\n")
+
+    def test_a_targeted_install_leaves_the_home_folder_alone(self):
+        self.run_installer("--target", str(self.root / "elsewhere"))
+        self.assertFalse(self.folder.exists())
+
+    def test_an_overridden_path_is_seeded_without_an_ignore_file(self):
+        chosen = self.root / "mine" / "backends.json"
+        os.environ[install.BACKENDS_ENV_VAR] = str(chosen)
+        self.run_installer()
+        self.assertTrue(chosen.is_file())
+        self.assertFalse((chosen.parent / ".gitignore").exists())
+        self.assertFalse((chosen.parent / install.KEY_FILE).exists())
+        self.assertFalse(self.folder.exists())
+
+    def test_the_installer_seeds_where_the_supervisor_reads(self):
+        sys.path.insert(0, str(REPO_ROOT / "skills" / "diff-review"))
+        self.addCleanup(sys.path.remove, str(REPO_ROOT / "skills" / "diff-review"))
+        import review_runner
+        self.assertEqual(install.BACKENDS_ENV_VAR, review_runner.BACKENDS_ENV_VAR)
+        self.assertEqual(install.backends_path(), review_runner.backends_path())
+        os.environ[install.BACKENDS_ENV_VAR] = str(self.root / "x.json")
+        self.assertEqual(install.backends_path(), review_runner.backends_path())
+
+    def test_every_shipped_backend_passes_the_supervisor_and_names_its_key_by_variable(self):
+        sys.path.insert(0, str(REPO_ROOT / "skills" / "diff-review"))
+        self.addCleanup(sys.path.remove, str(REPO_ROOT / "skills" / "diff-review"))
+        import json
+        import review_runner
+        os.environ[install.BACKENDS_ENV_VAR] = str(install.DEFAULT_BACKENDS)
+        names = [name for name in json.loads(install.DEFAULT_BACKENDS.read_text(encoding="utf-8"))
+                 if not name.startswith(review_runner.COMMENT_PREFIX)]
+        self.assertTrue(names)
+        for name in names:
+            backend = review_runner.resolve_backend(name)
+            # A shipped file holds variable names, never a key: every credential arrives
+            # from the launching shell.
+            self.assertTrue(backend["env_from_parent"], name)
+            for variable, value in backend["env"].items():
+                if variable.endswith(("_KEY", "_TOKEN")):
+                    self.assertEqual(value, "", f"{name}: {variable}")
 
 
 if __name__ == "__main__":

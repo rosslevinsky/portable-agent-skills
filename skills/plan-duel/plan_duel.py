@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """plan-duel engine — stdlib-only, cross-platform duel state machine.
 
-This module owns the deterministic heart of the plan-duel skill. It shells out (via
-argv-list ``subprocess``) to whatever CLIs the ``SKILL.md`` adapter note injects for the
-three LLM judgment points — generate Plan A, generate/critique Plan B, and judge. ``v1``
-in the comments below names the prompt-driven implementation this replaced.
+This module owns the deterministic heart of the plan-duel skill. It launches whatever CLIs
+the ``SKILL.md`` adapter note injects for the three LLM judgment points — generate Plan A,
+generate/critique Plan B, and judge — each as an argv list handed to the diff-review skill's
+supervisor, ``review_runner.py``, which is this skill's one hard dependency. ``v1`` in the
+comments below names the artifact contract ``SKILL.md``, ``round.md`` and ``summary.md``
+spell out; the scenario fixtures hold this engine to its halt lines, exit order, resume
+outcomes and summary layout.
 
 Design rules:
   * Standard library ONLY — no third-party imports, runtime or test. Python 3.10+.
@@ -17,7 +20,7 @@ Design rules:
 
 Known limitation — native Windows batch shims. If ``shutil.which`` resolves a participant
 CLI to a ``.cmd``/``.bat`` (common for npm-installed CLIs, and this module resolves bare
-names through ``which`` so ``PATHEXT`` is honoured), Windows runs it through the shell,
+names through ``which`` so ``PATHEXT`` is honored), Windows runs it through the shell,
 which reinterprets ``%VAR%`` / ``&`` in arguments outside Python's quoting — and the
 arguments here are whole generated prompts. Preflight refuses a shim on native Windows;
 use a non-shim executable, or run the duel under WSL.
@@ -37,7 +40,8 @@ directly:
     state      — RunState / RoundState markers persisted to state.json
     resume     — scan_snapshots / compute_resume / apply_resume
     freeze     — freeze_round_inputs (immutable per-round agent inputs)
-    exec       — resolve_executable / run_cli (argv-list subprocess, never a shell)
+    exec       — resolve_executable / resolve_backends / run_supervised (an argv list
+                 handed to the supervisor, never a shell)
     capture    — run_agent / capture_judge_message / recover_agent_b_round0
     summary    — extract_judge_fields / stamp_winner_plan / rewrite_differences /
                  assemble_summary (winner-only v2 stamp, scoped A/B→name rewrite)
@@ -54,6 +58,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fnmatch
+import hashlib
 import json
 import math
 import errno
@@ -67,7 +72,7 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _replace_fields
 from pathlib import Path
 from typing import Callable, Collection, Mapping, Sequence
 
@@ -93,6 +98,10 @@ class ProcessError(PlanDuelError):
 
 class CliNotFoundError(ProcessError):
     """Raised when an injected CLI executable cannot be resolved on ``PATH``."""
+
+
+class SupervisorNotFoundError(CliNotFoundError):
+    """The supervisor every role launches through is not where it was looked for."""
 
 
 class CliExecutionError(ProcessError):
@@ -123,6 +132,13 @@ class AgentOutputError(PlanDuelError):
 
 class JudgeOutputError(PlanDuelError):
     """Raised when the judge process failed or produced no clean final message."""
+
+
+class BackendChangedError(PlanDuelError):
+    """The supervisor would not start a role because its backend's entry changed since the
+    duel pinned it. Deliberately not a :class:`ProcessError`: the handlers that turn a failed
+    agent or judge into a halt line or a round scored 0 must not catch it, because nothing
+    failed; the duel can only continue on the backend it started with."""
 
 
 # --------------------------------------------------------------------------- #
@@ -191,6 +207,8 @@ PLACEHOLDERS = frozenset(
         "frozen_b",  # path to the immutable plan-b-round-(N-1) snapshot (critique reads)
         "schema_path",  # filesystem path to the shipped judge schema
         "schema_json",  # the SAME schema as compact inline JSON text
+        "model",  # the role's own `model` field; filled per role by render_argv
+        "backend_args",  # the role's backend's `args`, spliced in as whole arguments
     }
 )
 
@@ -291,17 +309,34 @@ STDOUT_MODES = frozenset({"file", "clean-last-message"})
 # reads stdin when its prompt is already in argv otherwise blocks forever, with no output to
 # diagnose it by.
 #
-# "file" and "stdin" were accepted here, stored on the spec, and read by nothing, so a
-# third-party adapter declaring "stdin" ran its CLI with no prompt. Refusing a mode that does
-# nothing is honest; implement one at the dispatch site before re-listing it.
+# "file" and "stdin" are refused at parse time because the dispatch site never reads
+# prompt_mode: the prompt goes only into argv, and stdin is DEVNULL, so an adapter that
+# relied on either mode would hand its CLI no prompt. Implement one at the dispatch site
+# before re-listing it.
 PROMPT_MODES = frozenset({"arg"})
 DECLARED_BUT_UNIMPLEMENTED_PROMPT_MODES = frozenset({"file", "stdin"})
 CWD_ANCHORS = frozenset({"workdir"})
 
 _REQUIRED_ROLE_KEYS = ("command", "stdout")
 _KNOWN_ROLE_KEYS = frozenset(
-    {"command", "stdout", "prompt_mode", "cwd", "placeholders"}
+    {"command", "stdout", "prompt_mode", "cwd", "placeholders", "model", "env",
+     "env_from_parent", "backend"}
 )
+MODEL_MARKER = f"{PLACEHOLDER_OPEN}model{PLACEHOLDER_CLOSE}"
+BACKEND_ARGS_MARKER = f"{PLACEHOLDER_OPEN}backend_args{PLACEHOLDER_CLOSE}"
+
+# A variable name, and nothing else. Stricter than any platform requires, which refuses a
+# key with a hyphen in it — but not one in an underscore format (`gsk_…`, `hf_…`, hex), so
+# a name that passes may still be a pasted key. A refused name is never quoted back, and
+# `frozen_lineup` stores the launching-side name only as a digest.
+_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_NOT_A_NAME = ("is not a variable name (letters, digits and underscores, not starting with a "
+               "digit); it is not quoted here, in case a value was typed in its place")
+
+
+def _env_key(name: str) -> str:
+    """The key a variable is stored under: Windows names are case-insensitive."""
+    return name.upper() if os.name == "nt" else name
 
 
 @dataclass(frozen=True)
@@ -321,6 +356,15 @@ class RoleSpec:
             cwd, e.g. a ``-C``-style participant).
         placeholders: the declared placeholder inventory for this role. When
             non-empty, every marker used in ``command`` must appear here.
+        model: the model this role runs, rendered into ``command`` by ``⟪model⟫``;
+            ``None`` leaves the choice to the CLI. Recorded, never interpreted.
+        env: literal ``(name, value)`` settings for the role's environment — not secrets.
+        env_from_parent: ``(name the child reads, name in this process)`` pairs; names on
+            both sides, never a value.
+        backend: the name of a backend in the user's backends file, which supplies the
+            model, the arguments ``⟪backend_args⟫`` stands for, and settings the supervisor
+            applies. ``None`` for a role that names none.
+        resolved: that backend's fields, once :func:`resolve_backends` has read them.
     """
 
     command: tuple[str, ...]
@@ -328,6 +372,28 @@ class RoleSpec:
     prompt_mode: str = "arg"
     cwd: str | None = None
     placeholders: tuple[str, ...] = field(default_factory=tuple)
+    model: str | None = None
+    env: tuple[tuple[str, str], ...] = field(default_factory=tuple)
+    env_from_parent: tuple[tuple[str, str], ...] = field(default_factory=tuple)
+    backend: str | None = None
+    resolved: ResolvedBackend | None = None
+
+
+@dataclass(frozen=True)
+class ResolvedBackend:
+    """A backend's fields as the supervisor reported them, with ``⟪model⟫`` filled in its
+    ``args``. The literal ``env`` values stay with the supervisor; only their names are kept,
+    to refuse a role that sets the same variable itself."""
+
+    name: str
+    harness: str
+    model: str
+    args: tuple[str, ...]
+    env_names: tuple[str, ...]
+    env_from_parent: tuple[tuple[str, str], ...]
+    # A digest of every field the supervisor reported, literal `env` values included: a
+    # resume is held to what the name resolved to, not only the name.
+    digest: str = ""
 
 
 def _parse_role_spec(role: str, raw: object) -> RoleSpec:
@@ -379,7 +445,7 @@ def _parse_role_spec(role: str, raw: object) -> RoleSpec:
         if isinstance(prompt_mode, str) and prompt_mode in DECLARED_BUT_UNIMPLEMENTED_PROMPT_MODES:
             raise AdapterConfigError(
                 f"role '{role}' asks for prompt_mode {prompt_mode!r}, which this engine "
-                f"honours nowhere: the prompt reaches a CLI only through an argv "
+                f"honors nowhere: the prompt reaches a CLI only through an argv "
                 f"placeholder. Accepting it and ignoring it would run the CLI with no "
                 f"prompt at all. Put the prompt placeholder in 'command' and "
                 f"use prompt_mode 'arg'."
@@ -419,13 +485,97 @@ def _parse_role_spec(role: str, raw: object) -> RoleSpec:
                 f"role '{role}' command uses undeclared placeholder(s): {rendered}"
             )
 
+    model = raw.get("model")
+    if model is not None and (not isinstance(model, str) or not model.strip()
+                              or "\0" in model):
+        raise AdapterConfigError(
+            f"role '{role}' 'model' must be a non-empty string with no NUL character")
+    backend = raw.get("backend")
+    if backend is not None and (not isinstance(backend, str) or not backend.strip()
+                                or "\0" in backend):
+        raise AdapterConfigError(
+            f"role '{role}' 'backend' must be the non-empty name of a backend")
+    # The backend's arguments are spliced in as whole arguments, never pasted into one: a
+    # provider setting inside another argument would reach the CLI as text it never parses.
+    args_marked = [part for part in command if "backend_args" in find_placeholders(part)]
+    if any(part != BACKEND_ARGS_MARKER for part in args_marked):
+        raise AdapterConfigError(
+            f"role '{role}' command uses {BACKEND_ARGS_MARKER} inside another argument; it "
+            f"must stand alone, where the backend's arguments go")
+    if args_marked and backend is None:
+        raise AdapterConfigError(
+            f"role '{role}' command uses {BACKEND_ARGS_MARKER} but the role names no "
+            f"'backend' to fill it")
+    # One statement of the model, in a place the engine can read. The marker with no field
+    # would render an empty argument; the field with no marker would be recorded, and
+    # reported, as the model while the CLI ran its default. A backend is a statement of it.
+    uses_marker = any("model" in find_placeholders(part) for part in command)
+    if uses_marker and model is None and backend is None:
+        raise AdapterConfigError(
+            f"role '{role}' command uses {MODEL_MARKER} but the role has no 'model' to fill it")
+    if backend is not None and not uses_marker:
+        raise AdapterConfigError(
+            f"role '{role}' names backend {backend!r} but its command has no {MODEL_MARKER}, "
+            f"so the CLI would never be told to run the backend's model")
+    # The engine fills every marker, but the supervisor launches a backend role only when the
+    # filled model stands as a whole argument or a setting's whole value somewhere in the argv.
+    # Checked here, the same rule stops the duel before any role runs rather than at the
+    # judge's launch, after both plans were paid for.
+    if backend is not None and not any(
+            part == MODEL_MARKER or _setting_value(part) == MODEL_MARKER for part in command):
+        raise AdapterConfigError(
+            f"role '{role}' names backend {backend!r}, so {MODEL_MARKER} must appear as an "
+            f"argument of its own or a setting's whole value, like model={MODEL_MARKER}")
+    if model is not None and not uses_marker:
+        raise AdapterConfigError(
+            f"role '{role}' names a 'model' but its command has no {MODEL_MARKER}, so the "
+            f"CLI would never be told to run it")
+
+    env = _parse_role_env(role, raw, "env")
+    env_from_parent = _parse_role_env(role, raw, "env_from_parent")
+    both = sorted({_env_key(n) for n, _ in env} & {_env_key(n) for n, _ in env_from_parent})
+    if both:
+        raise AdapterConfigError(
+            f"role '{role}': {', '.join(both)} is set by both 'env' and 'env_from_parent'")
+
     return RoleSpec(
         command=command,
         stdout=stdout,
         prompt_mode=prompt_mode,
         cwd=cwd,
         placeholders=placeholders,
+        model=model,
+        env=env,
+        env_from_parent=env_from_parent,
+        backend=backend,
     )
+
+
+def _parse_role_env(role: str, raw: Mapping[str, object], key: str) -> tuple[tuple[str, str], ...]:
+    """One role's ``env`` or ``env_from_parent``: an object of variable name to string.
+
+    Checked here, when the config is read, so a mistake is refused naming the role and the
+    field rather than surfacing as a ``TypeError`` inside a spawn. No message quotes a value,
+    nor the launching-side name of ``env_from_parent``: that is where a pasted key lands.
+    """
+    mapping = raw.get(key, {})
+    if not isinstance(mapping, dict):
+        raise AdapterConfigError(
+            f"role '{role}' '{key}' must be an object of variable name to string")
+    pairs = []
+    for child, value in mapping.items():
+        if not _ENV_NAME_RE.match(child):
+            raise AdapterConfigError(f"role '{role}': an entry in '{key}' {_NOT_A_NAME}")
+        if not isinstance(value, str):
+            raise AdapterConfigError(f"role '{role}' '{key}' entry {child!r} must be a string")
+        if key == "env_from_parent" and not _ENV_NAME_RE.match(value):
+            raise AdapterConfigError(
+                f"role '{role}' '{key}' entry {child!r}: the variable it reads {_NOT_A_NAME}")
+        if "\0" in value:
+            raise AdapterConfigError(
+                f"role '{role}' '{key}' entry {child!r} holds a NUL character")
+        pairs.append((child, value))
+    return tuple(pairs)
 
 
 def parse_adapter_config(data: str | dict) -> dict[str, RoleSpec]:
@@ -472,10 +622,10 @@ def parse_adapter_config(data: str | dict) -> dict[str, RoleSpec]:
 # ``PREFERRED:``), so a resume over a pre-schema workdir — and a runtime whose CLI has no
 # schema flag — keeps working unchanged.
 _SCORE_LINE_RE = re.compile(r"^\s*SCORE:\s*(.*)$", re.MULTILINE)
-# Signed. Without the `-?` a judge answering `SCORE: -10` yielded 10, which clears
-# convergence_exit's `>= 8` and ended the duel at round 3 on the WORST score the rubric can
-# express. It also made the two score paths disagree: a JSON `-10` was correctly rejected as
-# out-of-range while the string `"-10"` came back as 10 and converged. A negative now lands
+# Signed. Without the `-?`, `SCORE: -10` would parse as 10, which clears convergence_exit's
+# `>= 8` and ends the duel at round 3 on the WORST score the rubric can express. The two
+# score paths would also disagree: a JSON `-10` is rejected as out-of-range, while the
+# string `"-10"` would come back as 10 and converge. With the sign kept, a negative lands
 # in _usable_score's out-of-range path — treated as 0, warned about, duel continues.
 _FIRST_INT_RE = re.compile(r"-?\d+")
 
@@ -632,8 +782,8 @@ def parse_score(text: str) -> int | None:
 
     ``None`` means neither form carried an integer inside the rubric's range. Callers treat
     ``None`` as 0 and emit :func:`score_warning`. A JSON verdict whose ``score`` is missing
-    or unusable still falls through to the marker parser, so the degrade path is never
-    narrower than it was.
+    or unusable still falls through to the marker parser, so the JSON form never narrows
+    the degrade path.
     """
     obj = parse_judge_json(text)
     marker = _usable_score(_marker_score(text))
@@ -1204,9 +1354,10 @@ def _write_bytes_atomic(path: Path, data: bytes) -> None:
             out.flush()
             os.fsync(out.fileno())
         # The mode travels with the content. `mkstemp` creates 0600 and `os.replace` keeps
-        # whatever the temporary had, so a plan every teammate could read became readable by
-        # whoever ran the duel the moment it was stamped. An existing file keeps its own
-        # mode; a new one gets what a plain create would have, which is the umask's answer.
+        # whatever the temporary had, so a plan every teammate could read would become
+        # readable only by whoever ran the duel the moment it was stamped. An existing file
+        # keeps its own mode; a new one gets what a plain create would have, which is the
+        # umask's answer.
         try:
             mode = os.stat(path).st_mode & 0o7777
         except FileNotFoundError:
@@ -1439,11 +1590,15 @@ class RunState:
     controller_name: str = ""
     participant_name: str = ""
     rounds: dict[int, RoundState] = field(default_factory=dict)
+    # Who played each role, as :func:`frozen_lineup` records it. Empty in a state file
+    # written before the record existed, which then resumes unchecked and starts one.
+    lineup: dict[str, dict] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
             "controller_name": self.controller_name,
             "participant_name": self.participant_name,
+            "lineup": self.lineup,
             "rounds": {
                 str(number): {
                     "plans_snapshotted": rs.plans_snapshotted,
@@ -1475,7 +1630,137 @@ class RunState:
             controller_name=str(data.get("controller_name", "")),
             participant_name=str(data.get("participant_name", "")),
             rounds=rounds,
+            lineup=_lineup_from_dict(data.get("lineup")),
         )
+
+
+def frozen_lineup(specs: Mapping[str, RoleSpec]) -> dict[str, dict]:
+    """Who plays each role: what a resume may not change.
+
+    argv0 as the adapter writes it — never the path :func:`resolve_executable` finds, which
+    moves when a CLI is upgraded — the ``model``, and the ``env_from_parent`` mapping, never
+    a value. The name the child reads is kept; the name read from the launching side is kept
+    only as :func:`_name_digest`, because a key pasted there can pass the name check, and a
+    record that holds it verbatim writes the key to disk. Both go through :func:`_env_key`,
+    so a case-only change is no change where names ignore case. Named things only: freezing the whole command would
+    refuse a resume that adds ``--verbose`` or a longer timeout, and a duel with one bad flag
+    could then never be resumed.
+
+    A role naming a backend also records the backend's name, and its ``model`` is the one the
+    backend supplied — so ``specs`` must have been through :func:`resolve_backends`, or, on a
+    resume that launches nothing, :func:`_models_from_record`. The same
+    model reached through another provider is another player. The key is absent for a role
+    with no backend, which is also how a record written before backends reads.
+    """
+    lineup: dict[str, dict] = {}
+    for role, spec in specs.items():
+        if role not in REQUIRED_ROLES:
+            continue
+        record = {
+            "argv0": spec.command[0],
+            "model": spec.model,
+            "env_from_parent": {_env_key(child): _name_digest(_env_key(parent))
+                                for child, parent in spec.env_from_parent},
+        }
+        # The role's own literal settings, and what its backend resolved to, as digests: an
+        # `env` value can be the address that picks the provider, and the agent running the
+        # skill rewrites the config on every run, so a changed value is a changed player.
+        # No value is written down. A record written before these existed has neither, and a
+        # resume that launches nothing reads no backend, so each is compared only where both
+        # sides carry it.
+        record["env"] = _name_digest(json.dumps(
+            sorted((_env_key(name), value) for name, value in spec.env)))
+        if spec.backend is not None:
+            record["backend"] = spec.backend
+        if spec.resolved is not None:
+            record["backend_digest"] = spec.resolved.digest
+        lineup[role] = record
+    return lineup
+
+
+def _name_digest(name: str) -> str:
+    """Enough of a SHA-256 of ``name`` to tell two names apart, and not enough to be one."""
+    return hashlib.sha256(name.encode("utf-8")).hexdigest()[:16]
+
+
+def _lineup_from_dict(raw: object) -> dict[str, dict]:
+    """The recorded lineup, keeping only well-formed entries; :func:`load_state` never raises."""
+    if not isinstance(raw, dict):
+        return {}
+    lineup: dict[str, dict] = {}
+    for role, record in raw.items():
+        if role not in REQUIRED_ROLES or not isinstance(record, dict):
+            continue
+        argv0, model = record.get("argv0"), record.get("model")
+        mapping = record.get("env_from_parent", {})
+        backend = record.get("backend")
+        if (not isinstance(argv0, str) or not (model is None or isinstance(model, str))
+                or not (backend is None or isinstance(backend, str))
+                or not isinstance(mapping, dict)
+                or not all(isinstance(k, str) and isinstance(v, str)
+                           for k, v in mapping.items())):
+            continue
+        lineup[role] = {"argv0": argv0, "model": model, "env_from_parent": dict(mapping)}
+        if backend is not None:
+            lineup[role]["backend"] = backend
+        for key in ("env", "backend_digest"):
+            if isinstance(record.get(key), str):
+                lineup[role][key] = record[key]
+    return lineup
+
+
+def lineup_changes(saved: Mapping[str, dict], current: Mapping[str, dict]) -> list[str]:
+    """Each way ``current`` plays a role differently from ``saved``, one phrase per change.
+
+    A forwarded credential is named by the variable the child reads, never by the one it
+    is read from: that side is where a key gets pasted by mistake.
+    """
+    changes: list[str] = []
+    for role in REQUIRED_ROLES:
+        before, after = saved.get(role), current.get(role)
+        if before is None or after is None:
+            continue
+        if before["argv0"] != after["argv0"]:
+            changes.append(f"{role} ran {before['argv0']!r} and now names {after['argv0']!r}")
+        if before["model"] != after["model"]:
+            changes.append(f"{role} ran {_model_phrase(before['model'])} and now names "
+                           f"{_model_phrase(after['model'])}")
+        if before.get("backend") != after.get("backend"):
+            changes.append(f"{role} ran on {_backend_phrase(before.get('backend'))} and now "
+                           f"names {_backend_phrase(after.get('backend'))}")
+        old, new = before["env_from_parent"], after["env_from_parent"]
+        moved = sorted(name for name in set(old) | set(new) if old.get(name) != new.get(name))
+        if moved:
+            changes.append(f"{role} forwards a different credential as {', '.join(moved)}")
+        if "env" in before and "env" in after and before["env"] != after["env"]:
+            changes.append(f"{role} sets different values in its own env")
+        if ("backend_digest" in before and "backend_digest" in after
+                and before.get("backend") == after.get("backend")
+                and before["backend_digest"] != after["backend_digest"]):
+            changes.append(f"{role}'s backend {after.get('backend')!r} now resolves to "
+                           f"different settings")
+    return changes
+
+
+def _kept_players(plan: "ResumePlan", workdir: Path) -> frozenset[str]:
+    """The roles whose output ``plan`` carries forward: only they are held to the lineup.
+
+    A role whose every output the resume discards is played afresh, so a first spawn that
+    failed on a mistyped model can be retried with the corrected one.
+    """
+    if plan.init_incomplete:
+        return frozenset({"agent_a"}) if plan.reuse_plan_a else frozenset()
+    if scan_snapshots(workdir).judge_rounds:
+        return frozenset(REQUIRED_ROLES)
+    return frozenset({"agent_a", "agent_b"})
+
+
+def _model_phrase(model: str | None) -> str:
+    return f"model {model!r}" if model is not None else "no stated model"
+
+
+def _backend_phrase(backend: str | None) -> str:
+    return f"backend {backend!r}" if backend is not None else "no backend"
 
 
 def save_state(workdir: str | os.PathLike[str], state: RunState) -> None:
@@ -1860,7 +2145,7 @@ def _refuse_batch_shim(resolved: str, argv0: str) -> None:
 def preflight_executables(specs: Mapping[str, RoleSpec]) -> None:
     """Resolve EVERY role's CLI before any billable work starts.
 
-    :func:`run_cli` resolves an executable at spawn time, so without this the participant CLI
+    :func:`run_supervised` resolves an executable at spawn time, so without this the participant CLI
     is validated only at its first dispatch — after Plan A has been generated — and a missing
     CLI throws that whole run away. An executable that FAILS is probed once and reported with
     every role that needs it; one that resolves costs a ``shutil.which`` lookup per role.
@@ -1890,14 +2175,284 @@ def preflight_executables(specs: Mapping[str, RoleSpec]) -> None:
         raise CliNotFoundError(f"CLI not found on PATH: {detail}")
 
 
-@dataclass
-class CliResult:
-    """Outcome of a :func:`run_cli` call."""
+# --------------------------------------------------------------------------- #
+# supervisor — every role launches through diff-review's review_runner.py
+# --------------------------------------------------------------------------- #
+SUPERVISOR_SKILL = "diff-review"
+SUPERVISOR_NAME = "review_runner.py"
+# How long past a spawn's own limit the supervisor may take to stop that spawn and report. Its
+# kill ladder and drain waits are bounded well inside this; it bounds a supervisor that hangs.
+SUPERVISOR_GRACE_SECONDS = 120.0
+# How long a supervisor told to stop is given to stop its CLI, before it is killed itself.
+SUPERVISOR_STOP_SECONDS = 30.0
+# How long an interrupted supervisor is let finish on its own before it is signaled. Its
+# cleanup is a terminate, a kill and a wait of 5 seconds each; a signal during it ends it.
+SUPERVISOR_INTERRUPT_WAIT_SECONDS = 20.0
+# The supervisor's reason when a helper still held the CLI's stdout after it exited.
+_SUPERVISOR_UNDRAINED = "reader did not drain child output"
+# The supervisor's refusal of a backend whose entry changed since the duel pinned it,
+# verbatim from review_runner.py.
+_BACKEND_CHANGED = "changed since the run pinned it"
+# The supervisor's refusals of a backends file that went missing, stopped parsing or lost
+# the role's entry, verbatim from review_runner.py. For a role pinned to a backend these are
+# the same event as a changed entry: the backend it started with can no longer be read.
+_BACKENDS_FILE_REFUSALS = ("there is no backends file at", "the backends file ",
+                           "no backend named ")
 
-    returncode: int
-    stdout_path: Path | None
-    stdout_bytes: bytes | None
-    stderr_bytes: bytes | None = None
+
+def _backends_file_text() -> str:
+    """The backends file the supervisor reads, spelled as it spells it in a refusal about an
+    entry: through `Path`, as the supervisor builds it."""
+    override = os.environ.get("PORTABLE_AGENT_SKILLS_BACKENDS")
+    return str(Path(override) if override
+               else Path.home() / ".portable-agent-skills" / "backends.json")
+
+
+def _is_pinned_backend_refusal(reason: str, spec: "RoleSpec | None") -> bool:
+    """Whether a launch refusal means the role's pinned backend is no longer the one the
+    duel started with: a changed entry, or, for a role on a backend, a backends file that
+    cannot give that entry back at all."""
+    if _BACKEND_CHANGED in reason:
+        return True
+    if spec is None or spec.backend is None:
+        return False
+    return (any(mark in reason for mark in _BACKENDS_FILE_REFUSALS)
+            or _backends_file_text() in reason)
+# The prefix of a name that carries one literal setting to the supervisor in its environment.
+_LITERAL_ENV_PREFIX = "PLAN_DUEL_LITERAL_"
+# The supervisor's own start and end lines in the output log, which are not the CLI's words.
+_SUPERVISOR_MARKER_RE = re.compile(
+    rb"\[review_runner\] (?:start|end status=\S* exit=\S* drained=\S*)\r?\n")
+_LAUNCHER_SUFFIXES = (".exe", ".cmd", ".bat", ".com")
+
+
+def default_supervisor() -> Path:
+    """``review_runner.py`` in the diff-review skill, installed beside this one."""
+    return Path(__file__).resolve().parent.parent / SUPERVISOR_SKILL / SUPERVISOR_NAME
+
+
+def require_supervisor(path: str | os.PathLike[str]) -> Path:
+    """``path`` when it is a file, else a refusal naming the skill that provides it.
+
+    Asked before anything is dispatched, and again at every spawn, where it reaches a caller
+    as a :class:`ProcessError` like any other launch that could not happen — so a resumed
+    re-judge scores zero rather than halting.
+    """
+    path = Path(path)
+    try:
+        info = os.stat(path)
+    except OSError as exc:
+        absent = isinstance(exc, (FileNotFoundError, NotADirectoryError))
+        raise SupervisorNotFoundError(
+            f"plan-duel launches every role through the {SUPERVISOR_SKILL} skill's "
+            f"{SUPERVISOR_NAME}, and "
+            + (f"there is none at {path}" if absent
+               else f"{path} could not be read ({exc.strerror or exc})")
+            + f". Install the {SUPERVISOR_SKILL} skill beside this one, or pass --supervisor "
+              f"with the path to its {SUPERVISOR_NAME}.") from None
+    if not stat.S_ISREG(info.st_mode):
+        raise SupervisorNotFoundError(
+            f"{path} is not a file, so it is not the {SUPERVISOR_SKILL} skill's "
+            f"{SUPERVISOR_NAME} that plan-duel launches every role through; pass --supervisor.")
+    return path
+
+
+def _supervisor_status(stdout: bytes) -> dict | None:
+    """The one JSON status line the supervisor prints last, or ``None`` without one."""
+    for line in reversed(stdout.decode("utf-8", "replace").splitlines()):
+        if not line.strip():
+            continue
+        try:
+            status = json.loads(line)
+        except (ValueError, RecursionError):
+            return None
+        return status if isinstance(status, dict) and isinstance(status.get("status"), str) \
+            else None
+    return None
+
+
+def _harness_of(program: str) -> str:
+    """The harness a program name launches, read the way the supervisor reads it: the last
+    path part, without a launcher suffix, case-folded."""
+    base = program.replace("\\", "/").rsplit("/", 1)[-1]
+    stem, suffix = os.path.splitext(base)
+    if suffix.lower() in _LAUNCHER_SUFFIXES:
+        base = stem
+    return base.casefold()
+
+
+def _setting_value(part: str) -> str | None:
+    """The value of a ``key=value`` argument, unquoted, or ``None`` for anything else."""
+    key, sep, value = part.partition("=")
+    if not sep or not key or any(ch.isspace() for ch in key):
+        return None
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+def _args_with_model(args: Sequence[str], model: str) -> tuple[str, ...]:
+    """A backend's ``args`` with ``⟪model⟫`` filled where it is a whole argument or a
+    setting's value.
+
+    The supervisor fills them by the same rule and then looks for the result in the argv it
+    is handed; an argument filled any other way here is not found there, and the launch is
+    refused rather than run without the backend's settings.
+    """
+    filled = []
+    for part in args:
+        if part == MODEL_MARKER:
+            filled.append(model)
+        elif _setting_value(part) == MODEL_MARKER:
+            key, sep, value = part.partition("=")
+            filled.append(key + sep + value.replace(MODEL_MARKER, model))
+        else:
+            filled.append(part)
+    return tuple(filled)
+
+
+def _resolve_backend(supervisor: Path, name: str) -> ResolvedBackend:
+    """One backend, read by the supervisor: the backends file has one reader, and it is not
+    this engine."""
+    try:
+        done = subprocess.run([sys.executable, str(supervisor), "--resolve-backend", name],
+                              stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise AdapterConfigError(
+            f"backend {name!r} could not be read: the supervisor did not run ({exc})") from exc
+    status = _supervisor_status(done.stdout)
+    if status is None:
+        raise AdapterConfigError(
+            f"backend {name!r} could not be read: the supervisor exited {done.returncode} "
+            f"without a status line")
+    if status["status"] != "ok":
+        raise AdapterConfigError(str(status.get("reason") or f"backend {name!r} was refused"))
+    fields = status.get("backend")
+    try:
+        harness, model, args = fields["harness"], fields["model"], fields["args"]
+        env, env_from_parent = fields["env"], fields["env_from_parent"]
+        well_formed = (isinstance(harness, str) and isinstance(model, str)
+                       and all(isinstance(part, str) for part in args)
+                       and all(isinstance(key, str) for key in env)
+                       and all(isinstance(key, str) and isinstance(value, str)
+                               for key, value in env_from_parent.items()))
+    except (KeyError, TypeError, AttributeError):
+        well_formed = False
+    if not well_formed:
+        raise AdapterConfigError(
+            f"backend {name!r}: the supervisor reported it in a shape this engine does not read")
+    # The same digest review_runner.py's `backend_digest` takes of these fields and checks
+    # on every launch: if the two formulas ever differ, every launch is refused.
+    return ResolvedBackend(name=name, harness=harness, model=model,
+                           args=_args_with_model(args, model), env_names=tuple(env),
+                           env_from_parent=tuple(env_from_parent.items()),
+                           digest=_name_digest(json.dumps(fields, sort_keys=True)))
+
+
+def resolve_backends(specs: Mapping[str, RoleSpec],
+                     supervisor: str | os.PathLike[str]) -> dict[str, RoleSpec]:
+    """``specs`` with every named backend read, and its model taken as the role's.
+
+    Before anything else uses a role's model — the lineup a resume is held to, the summary,
+    the argv — because a backend is where that model is stated. A role that also states its
+    own must state the same one: a role runs one model. A backend with ``args`` needs the
+    command's ``⟪backend_args⟫``, or its provider settings would be dropped and the CLI would
+    reach its default provider under this backend's name. A config naming no backend is
+    returned as it is, and needs no supervisor for this.
+    """
+    names = sorted({spec.backend for spec in specs.values() if spec.backend is not None})
+    if not names:
+        return dict(specs)
+    supervisor = require_supervisor(supervisor)
+    found = {name: _resolve_backend(supervisor, name) for name in names}
+    resolved: dict[str, RoleSpec] = {}
+    for role, spec in specs.items():
+        backend = found.get(spec.backend) if spec.backend is not None else None
+        if backend is None:
+            resolved[role] = spec
+            continue
+        if spec.model is not None and spec.model != backend.model:
+            raise AdapterConfigError(
+                f"role '{role}' states model {spec.model!r}, but its backend {backend.name!r} "
+                f"runs {backend.model!r}. A role runs one model: drop the role's 'model', or "
+                f"make the two agree")
+        if backend.args and BACKEND_ARGS_MARKER not in spec.command:
+            raise AdapterConfigError(
+                f"role '{role}': backend {backend.name!r} has 'args', but the role's command "
+                f"has no {BACKEND_ARGS_MARKER} to put them in, so its provider settings "
+                f"would be dropped")
+        own = {_env_key(name) for name, _ in spec.env + spec.env_from_parent}
+        theirs = ({_env_key(name) for name in backend.env_names}
+                  | {_env_key(child) for child, _ in backend.env_from_parent})
+        both = sorted(own & theirs)
+        if both:
+            raise AdapterConfigError(
+                f"role '{role}': {', '.join(both)} is set both by the role and by its backend "
+                f"{backend.name!r}; set it once")
+        resolved[role] = _replace_fields(spec, model=backend.model, resolved=backend)
+    return resolved
+
+
+def _models_from_record(specs: Mapping[str, RoleSpec],
+                        lineup: Mapping[str, dict]) -> dict[str, RoleSpec]:
+    """``specs`` for a resume that launches nothing: each role naming a backend and no model
+    of its own takes the model the record says that same backend supplied.
+
+    The backend itself is not read, so replaying a finished duel needs neither the backends
+    file nor the supervisor that reads it. A role whose backend differs from the record's is
+    left without one, and the lineup check reports the change of backend.
+    """
+    replayed: dict[str, RoleSpec] = {}
+    for role, spec in specs.items():
+        record = lineup.get(role)
+        if (spec.backend is not None and spec.model is None and record is not None
+                and record.get("backend") == spec.backend):
+            spec = _replace_fields(spec, model=record["model"])
+        replayed[role] = spec
+    return replayed
+
+
+def preflight_launch(specs: Mapping[str, RoleSpec]) -> None:
+    """Refuse, before the first launch, what the supervisor would refuse at a later one.
+
+    The supervisor checks a backend's harness and every forwarded variable as it launches each
+    role, so a mistake on the judge would otherwise surface after both plans were paid for. A
+    forwarded variable is checked on the launching side only — the child's side is the
+    harness's own name, normally unset by design — and empty counts as unset. An entry is
+    named by the variable the agent reads, never by the one it is read from, which is where a
+    key typed in the wrong place lands.
+    """
+    problems = []
+    for role in REQUIRED_ROLES:
+        spec = specs.get(role)
+        if spec is None:
+            continue
+        backend = spec.resolved
+        if backend is not None:
+            launched, expected = _harness_of(spec.command[0]), _harness_of(backend.harness)
+            if launched != expected:
+                problems.append(
+                    f"{role}'s backend {backend.name!r} is written for {expected!r}, but its "
+                    f"command launches {launched!r}")
+        forwarded = spec.env_from_parent + (backend.env_from_parent if backend else ())
+        unset = sorted({child for child, parent in forwarded if not os.environ.get(parent)})
+        if unset:
+            problems.append(
+                f"{role} forwards {', '.join(unset)} from a variable that is not set, or is "
+                f"empty, in this process's environment")
+    if problems:
+        raise PlanDuelError(
+            f"Refusing to start, before any role launches: {'; '.join(problems)}.")
+
+
+@dataclass
+class SpawnResult:
+    """What one supervised spawn left: whether the supervisor has the reply in hand, why not
+    where it has not, and what the CLI printed on either stream, for a halt to quote."""
+
+    ok: bool
+    reason: str | None
+    output: bytes
 
 
 # How long a kill signal is given to land before escalating, and how long the pipes
@@ -1917,15 +2472,16 @@ def _wait_quietly(proc: subprocess.Popen, seconds: float) -> None:
 def _terminate_child(proc: subprocess.Popen, *, group_leader: bool) -> None:
     """Best-effort kill of ``proc`` — its whole process group on POSIX; never raises.
 
-    **POSIX: both rungs go to the GROUP, and neither is conditional on the leader.**
-    ``run_cli`` spawns with ``start_new_session``, so the child's pid *is* the pgid. The
+    **POSIX: both rungs go to the GROUP, and neither is conditional on the leader.** A
+    caller passing ``group_leader`` spawned with ``start_new_session``, so the pid *is* the
+    pgid. The
     leader exiting says nothing about descendants that inherited its pipes — the common wedge
     is a CLI that returns promptly while the runtime it spawned keeps stdout open. Gating the
     signal on ``poll()`` is how such a descendant survives. So SIGTERM the group, wait a
     bounded moment, then SIGKILL the group regardless, stopping early only on ``ESRCH``.
 
     A descendant that calls ``setsid()`` leaves the group and survives; the guarantee is
-    group-wide, not absolute. Signalling a pgid after the leader is reaped is safe: the
+    group-wide, not absolute. Signaling a pgid after the leader is reaped is safe: the
     kernel reserves the pid while it is still a live group's pgid.
 
     **Windows: the tree, via ``taskkill``, then the direct child.** ``terminate()`` reaches
@@ -1942,7 +2498,7 @@ def _terminate_child(proc: subprocess.Popen, *, group_leader: bool) -> None:
                 capture_output=True, timeout=TERMINATE_WAIT_SECONDS,
             )
         except (OSError, subprocess.SubprocessError):
-            pass  # fall through to terminate/kill, which is what this always did
+            pass  # fall through to terminate/kill
         _wait_quietly(proc, TERMINATE_WAIT_SECONDS)
     if group_leader:
         for hard in (False, True):
@@ -1963,151 +2519,220 @@ def _terminate_child(proc: subprocess.Popen, *, group_leader: bool) -> None:
     _wait_quietly(proc, TERMINATE_WAIT_SECONDS)  # never leave it unreaped
 
 
-def run_cli(
+def _program(argv0: str) -> str:
+    """argv0 as the supervisor is given it.
+
+    A bare name stays bare, for the supervisor to find on PATH as the adapter wrote it. A path
+    is made absolute but never resolved through a link: the supervisor reads the harness from
+    the name, and an installed CLI is often a link to a script named nothing like it.
+    """
+    has_sep = os.sep in argv0 or bool(os.altsep and os.altsep in argv0)
+    return os.path.abspath(argv0) if has_sep or Path(argv0).is_absolute() else argv0
+
+
+def _clear_for_supervisor(path: Path) -> None:
+    """Make way for a file the supervisor creates at ``path``.
+
+    The supervisor writes only files it creates, so a regular file left from an earlier spawn
+    is removed here — the same fresh start a truncating write gave. A link is refused, never
+    removed: the path is inside a workdir an agent can write to, and one planted there is
+    where a write would have left the workdir.
+    """
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(info.st_mode):
+        raise PlanDuelError(f"refusing to write agent output through a symlink: {path}")
+    if stat.S_ISREG(info.st_mode):
+        path.unlink()
+
+
+def _read_output(path: Path) -> bytes:
+    """What the CLI printed, from the supervisor's output log, without its own lines.
+
+    Only a regular file is read: a pipe put in its place would hold the read open. A log that
+    cannot be read costs a halt its diagnostic, never the halt.
+    """
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return b""
+        data = path.read_bytes()
+    except OSError:
+        return b""
+    return _SUPERVISOR_MARKER_RE.sub(b"", data)
+
+
+def _stop_supervisor(proc: subprocess.Popen) -> None:
+    """Stop a supervisor and the CLI under it; never raises.
+
+    On POSIX the supervisor is asked first: its own handler ends the CLI's whole process group,
+    which is not this process's to reach. On Windows a terminate ends the supervisor alone, so
+    the tree goes at once. Either way it is bounded, and the last resort is the kill.
+    """
+    if os.name == "posix":
+        with contextlib.suppress(OSError):
+            proc.terminate()
+        try:
+            proc.communicate(timeout=SUPERVISOR_STOP_SECONDS)
+            return
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            pass
+    _terminate_child(proc, group_leader=False)
+    with contextlib.suppress(subprocess.TimeoutExpired, OSError, ValueError):
+        proc.communicate(timeout=DRAIN_AFTER_KILL_SECONDS)
+
+
+def _let_supervisor_finish(proc: subprocess.Popen) -> None:
+    """Give a supervisor that may already be stopping time to finish; never raises.
+
+    A terminal Ctrl-C reaches the supervisor as well as this process, and its handler is then
+    ending the CLI, which runs in a session of its own and is reached by nothing else. A
+    second signal in that window ends the supervisor mid-cleanup and leaves the CLI running,
+    so it is sent only once this wait is over. A second Ctrl-C ends the wait.
+    """
+    with contextlib.suppress(subprocess.TimeoutExpired, KeyboardInterrupt, OSError):
+        proc.wait(timeout=SUPERVISOR_INTERRUPT_WAIT_SECONDS)
+
+
+def run_supervised(
     argv: Sequence[str],
     *,
+    findings: str | os.PathLike[str],
+    mode: str,
+    display: str | os.PathLike[str] | None = None,
     cwd: str | os.PathLike[str] | None = None,
-    stdout_to: str | os.PathLike[str] | None = None,
-    stdout_append: bool = False,
     timeout: float | None = None,
-) -> CliResult:
-    """Run ``argv`` as an ARGV LIST (never a shell string) with stdin ``DEVNULL``.
+    spec: RoleSpec | None = None,
+    supervisor: str | os.PathLike[str] | None = None,
+) -> SpawnResult:
+    """Launch ``argv`` through the supervisor and report what it decided.
 
-    ``stdout_to`` redirects the child's stdout into a file (binary — no newline translation);
-    ``stdout_append`` opens it in append mode. When ``stdout_to`` is ``None`` the stdout bytes
-    are captured into the result. A non-zero exit raises :class:`CliExecutionError`; a timeout
-    :class:`CliTimeoutError`; an unresolvable executable :class:`CliNotFoundError`.
+    ``mode`` is the supervisor's result mode: ``external-file`` for a CLI that writes
+    ``findings`` itself, ``raw-stdout`` for one whose reply is its stdout, which the
+    supervisor writes to ``findings`` byte for byte. ``display`` receives the CLI's stdout and
+    stderr as they arrive; without one they go to a private file, read back and removed. The
+    role's ``env``, ``env_from_parent`` and ``backend`` are handed to the supervisor, which
+    applies them to the CLI alone, so no forwarded value passes through this process's hands.
 
-    **Why a hand-rolled ``Popen`` and not ``subprocess.run(timeout=)``.** That helper's
-    timeout path calls ``Popen.kill()``, which signals ONLY the direct child and leaves the
-    CLI's runtime holding the inherited stdout pipe; on Windows it then calls
-    ``communicate()`` with NO timeout, so that survivor blocks the timeout path itself. Every
-    spawn here carries a finite timeout, so this path is reachable on every run: group kill
-    where the platform has groups, and a BOUNDED drain either way.
+    The CLI gets stdin at end-of-file and a process group of its own, and is stopped at
+    ``timeout``. The supervisor's silence limit is set to the same value: a CLI that answers
+    only at the end is silent until then, and a lower one would stop it for thinking.
+
+    Raises :class:`CliTimeoutError` for a stopped spawn, :class:`CliNotFoundError` for a CLI or
+    supervisor that is not there, and :class:`CliExecutionError` for a CLI that exited non-zero
+    or was not started. A CLI that exited 0 without the reply its mode expects returns
+    ``ok=False``, and the caller's own check of its output decides what that means.
     """
     if not argv:
         raise CliExecutionError("cannot run an empty argv")
-    resolved = resolve_executable(argv[0])
     # Here as well as in preflight: a resume past the round cap skips preflight and still
     # dispatches a judge.
-    _refuse_batch_shim(resolved, argv[0])
-    full_argv = [resolved, *argv[1:]]
-
-    stdout_handle = None
-    stdout_target: Path | None = None
-    popen_kwargs: dict[str, object] = {}
-    # Its own process group, so the kill above can reach grandchildren. The same flag
-    # is what makes ``proc.pid`` a usable pgid, so the two travel together.
-    group_leader = os.name == "posix"
-    if group_leader:
-        popen_kwargs["start_new_session"] = True
+    _refuse_batch_shim(resolve_executable(argv[0]), argv[0])
+    supervisor = require_supervisor(supervisor if supervisor is not None
+                                    else default_supervisor())
+    limit = float(timeout) if timeout is not None else DEFAULT_SPAWN_TIMEOUT_SECONDS
+    findings = Path(os.path.abspath(findings))
+    scratch = Path(tempfile.mkdtemp(prefix="plan-duel-output-")) if display is None else None
     try:
-        if stdout_to is not None:
-            stdout_target = Path(stdout_to)
-            # Same refusal as open_no_follow, and for the same reason: this path is
-            # inside a workdir the dispatched agent can write to, so a planted link
-            # would aim the CLI's whole stdout at a file outside it. Opened here rather
-            # than through the helper because Popen needs the live handle, not a write.
-            _nofollow = getattr(os, "O_NOFOLLOW", 0)
-            _refusal = f"refusing to write agent stdout through a symlink: {stdout_target}"
-            if _nofollow:
-                _flags = os.O_WRONLY | os.O_CREAT | _nofollow
-                _flags |= os.O_APPEND if stdout_append else os.O_TRUNC
-                try:
-                    stdout_handle = os.fdopen(os.open(stdout_target, _flags, 0o666), "wb")
-                except OSError as exc:
-                    if exc.errno in (errno.ELOOP, errno.EMLINK):
-                        raise PlanDuelError(_refusal) from exc
-                    raise
-            else:
-                # Windows. Two reasons this branch exists, and the second is not obvious:
-                # there is no O_NOFOLLOW, so the lstat IS the guard — and the open must be the
-                # BUILTIN one, not os.open.
-                #
-                # O_APPEND on Windows is a C-runtime convention: the CRT re-seeks to the end
-                # before each write. Popen gives the child a duplicated Win32 HANDLE, not a
-                # CRT fd, so an os.open'd append fd starts the child writing at offset ZERO.
-                # `open(..., "ab")` positions the pointer at EOF, and a duplicated handle DOES
-                # inherit the position. Windows CI caught this: a seeded progress file came
-                # back with the seed gone.
-                if stdout_target.is_symlink():
-                    raise PlanDuelError(_refusal)
-                stdout_handle = open(stdout_target, "ab" if stdout_append else "wb")
-            stdout_arg = stdout_handle
-        else:
-            stdout_arg = subprocess.PIPE
-        try:
-            proc = subprocess.Popen(
-                full_argv,
-                stdin=subprocess.DEVNULL,
-                stdout=stdout_arg,
-                stderr=subprocess.PIPE,
-                cwd=str(cwd) if cwd is not None else None,
-                **popen_kwargs,
-            )
-        except OSError as exc:
-            # A file that passed the executable checks but is no program (no interpreter
-            # line, not a Windows image) halts like any failed spawn, naming it.
-            raise CliExecutionError(f"CLI could not be started: {argv[0]} — {exc}") from exc
-        drained = terminated = completed = False
-        try:
+        display = scratch / "output.log" if scratch is not None \
+            else Path(os.path.abspath(display))
+        for path in (findings, display):
             try:
-                stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout)
-                drained = True
-            except subprocess.TimeoutExpired as exc:
-                _terminate_child(proc, group_leader=group_leader)
-                terminated = True
-                try:
-                    proc.communicate(timeout=DRAIN_AFTER_KILL_SECONDS)
-                    drained = True
-                except subprocess.TimeoutExpired:
-                    pass  # a survivor still holds the pipe; abandon it, do not hang
-                raise CliTimeoutError(
-                    f"CLI timed out after {timeout}s: {argv[0]}"
-                ) from exc
-            returncode = proc.returncode
-            completed = True
-        finally:
-            # Never leave a running child behind, whatever raised — a KeyboardInterrupt out
-            # of ``communicate`` is the live case, and ``start_new_session`` means the child
-            # no longer takes the terminal's Ctrl-C for itself.
-            #
-            # Skipped where signalling is wrong rather than merely redundant. The timeout
-            # path already escalated, so repeating the ladder would double this call's
-            # worst-case duration. And a CLEAN run must not be signaled at all: pipes at EOF
-            # means no survivor holds them, while a group kill would still reach a background
-            # helper the CLI deliberately left running.
-            if not (terminated or completed):
-                _terminate_child(proc, group_leader=group_leader)
-            # Closing stays BEHIND the drain guard. On Windows ``communicate`` reads
-            # through helper threads; an undrained reader is still live, and closing
-            # the handle underneath it turns its next read into an uncaught ValueError
-            # in that thread. A drained pipe is already closed by ``communicate``, so
-            # this only ever mops up the paths that raised before it got there.
-            if drained:
-                for pipe in (proc.stdout, proc.stderr):
-                    if pipe is not None:
-                        try:
-                            pipe.close()
-                        except OSError:  # pragma: no cover - platform-dependent
-                            pass
+                _clear_for_supervisor(path)
+            except OSError as exc:
+                raise CliExecutionError(
+                    f"could not clear {path.name} before launching {argv[0]}: {exc}") from exc
+        command = [sys.executable, str(supervisor), "--result-mode", mode,
+                   "--findings", str(findings), "--display", str(display),
+                   "--deadline", repr(limit), "--idle", repr(limit)]
+        if cwd is not None:
+            command += ["--cwd", os.path.abspath(cwd)]
+        supervisor_env = None
+        if spec is not None:
+            if spec.backend is not None:
+                command += ["--backend", spec.backend]
+                # The supervisor reads the backends file on every launch, so the digest this
+                # run pinned goes with the name: an entry edited mid-run is refused, not run.
+                if spec.resolved is not None and spec.resolved.digest:
+                    command += ["--backend-digest", spec.resolved.digest]
+            # A literal value travels in the supervisor's environment, which only its owner
+            # can read, and never on its argv, which every local user can. An empty one blanks
+            # a key, is no secret, and is refused as a forwarded value, so it stays a flag.
+            carried = {}
+            for name, value in spec.env:
+                if value:
+                    private = f"{_LITERAL_ENV_PREFIX}{len(carried)}"
+                    carried[private] = value
+                    command += ["--env-from-parent", f"{name}={private}"]
+                else:
+                    command += ["--env", f"{name}="]
+            if carried:
+                supervisor_env = {**os.environ, **carried}
+            for child, parent in spec.env_from_parent:
+                command += ["--env-from-parent", f"{child}={parent}"]
+        command += ["--", _program(argv[0]), *argv[1:]]
+        try:
+            proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, env=supervisor_env,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except OSError as exc:
+            raise CliExecutionError(
+                f"the supervisor could not be started for {argv[0]}: {exc}") from exc
+        except ValueError:
+            # Never quote the error: it names a character of a setting's value.
+            raise CliExecutionError(
+                f"the supervisor could not be started for {argv[0]}: a setting could not be "
+                f"passed in this platform's encoding") from None
+        try:
+            stdout, stderr = proc.communicate(timeout=limit + SUPERVISOR_GRACE_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            _stop_supervisor(proc)
+            raise CliTimeoutError(f"CLI timed out after {limit:g}s: {argv[0]}") from exc
+        except KeyboardInterrupt:
+            _let_supervisor_finish(proc)
+            _stop_supervisor(proc)
+            raise
+        except BaseException:
+            # Never leave a supervisor behind, whatever raised: a KeyboardInterrupt out of the
+            # wait is the live case.
+            _stop_supervisor(proc)
+            raise
+        output = _read_output(display)
     finally:
-        if stdout_handle is not None:
-            stdout_handle.close()
+        if scratch is not None:
+            shutil.rmtree(scratch, ignore_errors=True)
 
-    if returncode != 0:
-        stderr_text = (stderr_bytes or b"").decode("utf-8", "replace").strip()
-        detail = f" — {stderr_text}" if stderr_text else ""
+    status = _supervisor_status(stdout)
+    if status is None:
+        detail = _tail_line(stderr.decode("utf-8", "replace"), STATUS_TAIL_CHARS)
         raise CliExecutionError(
-            f"CLI exited with code {returncode}: {argv[0]}{detail}"
-        )
-
-    return CliResult(
-        returncode=returncode,
-        stdout_path=stdout_target,
-        stdout_bytes=stdout_bytes if stdout_to is None else None,
-        stderr_bytes=stderr_bytes,
-    )
+            f"the supervisor exited {proc.returncode} without reporting on {argv[0]}"
+            + (f" — {detail}" if detail else ""))
+    if status["status"] == "ok":
+        return SpawnResult(ok=True, reason=None, output=output)
+    if status["status"] in ("deadline", "idle_timeout"):
+        raise CliTimeoutError(f"CLI timed out after {limit:g}s: {argv[0]}")
+    reason = str(status.get("reason") or status["status"])
+    exit_code = status.get("exit_code")
+    if reason == _SUPERVISOR_UNDRAINED and exit_code == 0:
+        # A helper outlived the CLI holding its stdout, and the supervisor released the file
+        # the CLI wrote: a spawn that was stopped, not an agent that wrote nothing. A CLI that
+        # failed is reported by its exit code below, whatever its helpers did.
+        raise CliTimeoutError(
+            f"{argv[0]} exited, but a process it started still held its output and was not "
+            f"stopped")
+    if exit_code is None:
+        # Never launched: a refusal, in the supervisor's own words, which name no value.
+        if reason.startswith("reviewer CLI not found"):
+            raise CliNotFoundError(f"CLI not found on PATH: {argv[0]}")
+        if _is_pinned_backend_refusal(reason, spec):
+            raise BackendChangedError(f"{argv[0]} was not started: {reason}")
+        raise CliExecutionError(f"{argv[0]} was not started: {reason}")
+    if exit_code != 0:
+        tail = _tail_line(output.decode("utf-8", "replace"), STATUS_TAIL_CHARS)
+        raise CliExecutionError(
+            f"CLI exited with code {exit_code}: {argv[0]}" + (f" — {tail}" if tail else ""))
+    return SpawnResult(ok=False, reason=reason, output=output)
 
 
 # --------------------------------------------------------------------------- #
@@ -2248,25 +2873,31 @@ def run_agent(
     round_n: int,
     cwd: str | os.PathLike[str] | None = None,
     status_to: str | os.PathLike[str] | None = None,
-    stdout_append: bool = False,
     timeout: float | None = None,
+    spec: RoleSpec | None = None,
+    supervisor: str | os.PathLike[str] | None = None,
 ) -> Path:
     """Run an agent CLI and validate its FILE output (the capture policy for A/B).
 
-    The agent writes its artifact directly; the CLI's stdout is only a status stream
-    (``status_to``) and is NEVER the result. On any failure — non-zero exit, timeout,
-    unresolvable CLI, or a missing/<200 B output file — the halt mirrors v1 exactly. Returns
-    the validated ``output_file`` path.
+    The agent writes its artifact directly; the CLI's output is only a status stream
+    (``status_to``) and is NEVER the result — unless ``status_to`` IS ``output_file``, the
+    role whose reply is its stdout, which the supervisor then writes there byte for byte. On
+    any failure — non-zero exit, timeout, unresolvable CLI, or a missing/<200 B output file —
+    the halt mirrors v1 exactly. Returns the validated ``output_file`` path.
     """
     output_file = Path(output_file)
     halt = agent_failure_message(side, round_n)
+    reply_is_stdout = status_to is not None and Path(status_to) == output_file
     try:
-        result = run_cli(
+        result = run_supervised(
             argv,
+            findings=output_file,
+            mode="raw-stdout" if reply_is_stdout else "external-file",
+            display=None if reply_is_stdout else status_to,
             cwd=cwd,
-            stdout_to=status_to,
-            stdout_append=stdout_append,
             timeout=timeout,
+            spec=spec,
+            supervisor=supervisor,
         )
     except CliTimeoutError as exc:
         raise AgentOutputError(halt, cause="CLI timed out", spawn_failed=True) from exc
@@ -2283,15 +2914,11 @@ def run_agent(
         # The rejection reason FIRST, then the CLI's tail. An agent that exits 0 after
         # writing a short plan produces a tail that reads like success, so the tail alone
         # sends the reader to the wrong place.
-        tail = status_tail(
-            status_to,
-            stdout_bytes=result.stdout_bytes,
-            stderr_bytes=result.stderr_bytes,
-        )
+        tail = status_tail(None, stdout_bytes=result.output)
         # Only where there is ALREADY a tail. The bare halt — the exact v1 line, with no
-        # cause — is a parity contract pinned by three tests. What the reviewer hit had a
-        # tail reading `wrote /…/plan-a.md`, which looks like success; that is the one worth
-        # annotating, and it is annotated without changing what a bare halt says.
+        # cause — is a parity contract pinned by three tests. A tail reading
+        # `wrote /…/plan-a.md` looks like success; that is the one worth annotating, and it
+        # is annotated without changing what a bare halt says.
         reason = _agent_output_rejection(output_file)
         raise AgentOutputError(halt, cause=f"{reason} — last output: {tail}" if tail else None)
     return output_file
@@ -2306,6 +2933,8 @@ def capture_judge_message(
     status_to: str | os.PathLike[str] | None = None,
     timeout: float | None = None,
     round_n: int | None = None,
+    spec: RoleSpec | None = None,
+    supervisor: str | os.PathLike[str] | None = None,
 ) -> str:
     """Capture the judge's CLEAN final message — never a raw transcript.
 
@@ -2315,17 +2944,19 @@ def capture_judge_message(
     * ``redirect_stdout=False`` (``--output-last-message``-style): the CLI writes
       ``message_path`` itself; its raw stdout (possibly a transcript that echoes
       the prompt's ``SCORE:`` template) goes to ``status_to`` and is discarded.
-    * ``redirect_stdout=True`` (a clean-stdout runtime): the engine redirects the
-      CLI's stdout directly into ``message_path``.
+    * ``redirect_stdout=True`` (a clean-stdout runtime): the supervisor writes the CLI's
+      stdout, and nothing else, into ``message_path``.
 
     Either way the returned text is read from ``message_path``, so the first
     ``SCORE:`` line parse can never be poisoned by an echoed prompt. A process
     failure or an empty/missing message raises :class:`JudgeOutputError`.
     """
     message_path = Path(message_path)
-    stdout_to = message_path if redirect_stdout else status_to
     try:
-        run_cli(argv, cwd=cwd, stdout_to=stdout_to, timeout=timeout)
+        run_supervised(argv, findings=message_path,
+                       mode="raw-stdout" if redirect_stdout else "external-file",
+                       display=status_to, cwd=cwd, timeout=timeout, spec=spec,
+                       supervisor=supervisor)
     except ProcessError as exc:
         raise JudgeOutputError(f"Judge process failed at round {round_n}: {exc}") from exc
 
@@ -2364,7 +2995,7 @@ def recover_agent_b_round0(
             continue
         if _PLAN_A_SNAP_RE.match(name) or _PLAN_B_SNAP_RE.match(name):
             # A round snapshot is engine-written, never a stray participant artifact.
-            # Plan A's round-0 snapshot now lands BEFORE Agent B runs, so without this
+            # Plan A's round-0 snapshot lands BEFORE Agent B runs, so without this
             # guard the fallback would adopt it and make Plan B a copy of Plan A.
             continue
         # os.lstat, and the local is `info` rather than `stat`, because the name `stat`
@@ -2374,8 +3005,9 @@ def recover_agent_b_round0(
         # agent confined to the workdir can still create a link inside it, and the engine is
         # unconfined: `entry.is_file()`, `entry.stat()` and `copy_bytes`' read all
         # dereference, so an outside file's bytes are published as Plan B and frozen as the
-        # round-0 snapshot fed to the judge. This was the one place skipping the lstat check
-        # that _agent_output_is_usable, _require_regular_file and open_no_follow all apply.
+        # round-0 snapshot fed to the judge. This is the same lstat check that
+        # _agent_output_is_usable and _require_regular_file apply, and the same refusal
+        # of a link that open_no_follow makes on a write.
         #
         # NOT pushed down into _direct_child_files: cleanup_higher_rounds and
         # cleanup_all_artifacts share it, and narrowing it there would change which
@@ -2475,10 +3107,10 @@ class JudgeFields:
 def _find_marker(lines: Sequence[str], pattern: re.Pattern[str]) -> int | None:
     """Index of the first line ``pattern`` matches at its head, else ``None``.
 
-    Was ``line.startswith("DIFFERENCES:")`` — exact case, no decoration — so a judge that
-    wrote ``**PREFERRED:** B`` had its winner resolved and its JUSTIFICATION come back
-    empty, while the unmatched marker line was swallowed into the block above it. One
-    definition of "this line is the label" now serves both readers.
+    Decoration and case tolerant, through the patterns :func:`_label_re` builds. An
+    exact-case ``line.startswith("DIFFERENCES:")`` would miss a decorated marker such as
+    ``**DIFFERENCES:**`` and swallow the unmatched line into the block above it. One
+    definition of "this line is the label" serves both readers.
     """
     for index, line in enumerate(lines):
         if pattern.match(line):
@@ -2892,8 +3524,8 @@ def stamp_winner_plan(text: str) -> str:
 
 
 # What a trajectory cell holds when there is no value to put in it. Round 0's SCORE cell
-# has always used this; a word count for an absent snapshot now uses the same mark, so the
-# table has one spelling for "nothing to report" rather than two.
+# and a word count for an absent snapshot both use this mark, so the table has one spelling
+# for "nothing to report" rather than two.
 MISSING_CELL = "—"
 
 
@@ -2939,6 +3571,7 @@ def assemble_summary(
     differences_rewritten: str,
     missed_rejections: str,
     winner_stamped: bool = True,
+    models: Mapping[str, str | None] | None = None,
 ) -> str:
     """Render the full ``summary.md`` body from computed pieces (pure, no I/O).
 
@@ -2962,6 +3595,16 @@ def assemble_summary(
         + ("(stamped `Format: v2` — feed it to `/plan-phase`)" if winner_stamped
            else "(NOT stamped — see the warning above; the round snapshots hold every plan)")
     )
+    # From each role's `model` field, never from a runtime's name, which is free text. A
+    # duel whose roles state no model prints no Models line.
+    if models and any(models.get(role) for role in REQUIRED_ROLES):
+        def ran(model: str | None) -> str:
+            return f"ran `{model}`" if model else "ran its CLI's default model"
+        out.append(
+            f"**Models:** {controller_name} {ran(models.get('agent_a'))}; "
+            f"{participant_name} {ran(models.get('agent_b'))}; "
+            f"the judge {ran(models.get('judge'))}."
+        )
     out.append("")
     out.append("## Score trajectory")
     out.append("")
@@ -3018,9 +3661,22 @@ def render_argv(spec: RoleSpec, values: Mapping[str, object]) -> list[str]:
     """Render a role's argv template by substituting ``⟪name⟫`` markers per element.
 
     Reuses :func:`render_template`, so an argv element with an unresolved marker
-    fails loud rather than spawning a half-substituted command line.
+    fails loud rather than spawning a half-substituted command line. ``⟪model⟫`` is filled
+    from the role's own field and nothing else. ``⟪backend_args⟫`` stands alone and becomes
+    the backend's arguments, one argv element each — none, for a backend with no ``args``.
     """
-    return [render_template(part, values) for part in spec.command]
+    if spec.backend is not None and spec.resolved is None:
+        raise PlanDuelError(
+            f"backend {spec.backend!r} has not been read; resolve_backends reads it")
+    if spec.model is not None:
+        values = {**values, "model": spec.model}
+    argv: list[str] = []
+    for part in spec.command:
+        if part == BACKEND_ARGS_MARKER:
+            argv.extend(spec.resolved.args)
+        else:
+            argv.append(render_template(part, values))
+    return argv
 
 
 # The critique/init companion templates carry one ``## <heading>`` section per role plus
@@ -3100,10 +3756,11 @@ def problem_slug(text: str, *, max_words: int = 4) -> str:
 def _round_context(workdir: Path, round_n: int) -> str:
     """The v1 'round context' sentence for a critique round's agent prompt.
 
-    Three cases, not two. The unreadable-prior-score path fell through to round 1's sentence,
-    so an agent at round 5 was told "This is the first critique round" while the rest of its
-    prompt said round 5 — inviting it to discard four rounds of critique. A missing score is
-    missing information, not a fresh start.
+    Three cases, not two: round 1, a readable prior score, and an unreadable one. The
+    unreadable case gets its own sentence, naming the round, rather than round 1's: "This is
+    the first critique round" at round 5 contradicts the rest of the prompt and invites the
+    agent to discard four rounds of critique. A missing score is missing information, not a
+    fresh start.
     """
     if round_n <= 1:
         return "This is the first critique round."
@@ -3126,6 +3783,8 @@ class DuelContext:
     controller_name: str
     participant_name: str
     skill_dir: Path | None = None
+    # The supervisor every role launches through; None looks beside this skill.
+    supervisor: Path | None = None
     # Set once (post-construction) at run start; the elapsed-time source for
     # progress.log lines. ``init=False`` keeps the positional constructor unchanged.
     started_monotonic: float | None = field(default=None, init=False)
@@ -3268,6 +3927,8 @@ def _dispatch_agent(
             # judge's lands in its message file.
             status_to=output_file if spec.stdout == "clean-last-message" else status_to,
             timeout=timeout,
+            spec=spec,
+            supervisor=ctx.supervisor,
         )
 
 
@@ -3371,6 +4032,8 @@ def _dispatch_judge(
             redirect_stdout=redirect,
             round_n=round_n,
             timeout=timeout,
+            spec=spec,
+            supervisor=ctx.supervisor,
         )
 
 
@@ -3601,15 +4264,14 @@ def run_critique_round(
     judge_path = workdir / f"judge-round-{round_n}.md"
     _progress(ctx, round_n, f"round {round_n}: judging")
     # Record that this round's judge has STARTED, before it has. judge_needs_rerun
-    # documents "the file exists but state.json says that round's judge never completed"
-    # as one of its two re-run conditions — and that state was never written anywhere, so
-    # the condition could not fire. Every RoundState for a critique round was created
-    # after the judge returned, with judge_completed=True.
+    # re-runs a present verdict only when state.json marks that round's judge as not
+    # completed, and this write (with the matching one before a re-judge) is what puts
+    # that marker there; the RoundState written after the judge returns says
+    # judge_completed=True.
     #
-    # What that cost: a judge killed partway through leaves a FRAGMENT on disk and no
-    # marker at all, so the file is present, non-empty and unmarked — which
-    # judge_needs_rerun reads as a complete verdict and trusts. Writing the marker first
-    # makes the interrupted case observable, which is what the docstring always claimed.
+    # judge_needs_rerun treats a present, non-empty file with no marker for its round as a
+    # complete verdict. Writing the marker first means a judge killed partway through
+    # leaves its FRAGMENT beside judge_completed=False, so a resume re-runs it.
     state.rounds[round_n] = RoundState(plans_snapshotted=True, judge_completed=False)
     save_state(workdir, state)
     judge_text = _dispatch_judge(
@@ -3861,9 +4523,11 @@ def _rejudge_round(
             round_n=round_n,
             timeout=timeout,
         )
+    except BackendChangedError:
+        raise
     except (PlanDuelError, OSError) as exc:
-        # PlanDuelError is the base of JudgeOutputError and ProcessError, so this is the
-        # old tuple plus every other deliberate failure — TemplateError above all.
+        # PlanDuelError is the base of JudgeOutputError and ProcessError, so this catches
+        # both plus every other deliberate failure — TemplateError above all.
         # A failure after a partial write leaves bytes the summary would read back as this
         # round's score and preferred side, so they go too.
         with contextlib.suppress(OSError):
@@ -3967,6 +4631,7 @@ def write_summary(
     controller_name: str,
     participant_name: str,
     emit,
+    models: Mapping[str, str | None] | None = None,
 ) -> Path:
     """Assemble + write ``summary.md`` and print it (the Step 3 orchestrator).
 
@@ -3976,8 +4641,8 @@ def write_summary(
 
     **Nothing missing from the workdir stops it.** This runs after the duel has been paid
     for, so every read here degrades and says so: an absent final judge yields empty fields,
-    an absent snapshot a ``—`` word count, an absent live plan a warned skip. Each of those
-    was once a bare ``FileNotFoundError`` that threw away a completed duel.
+    an absent snapshot a ``—`` word count, an absent live plan a warned skip. Letting any of
+    them raise would throw away a duel that has already finished and been paid for.
     """
     controller_slug = slugify_name(controller_name)
     participant_slug = slugify_name(participant_name)
@@ -4077,6 +4742,7 @@ def write_summary(
         ),
         missed_rejections=fields.missed_rejections,
         winner_stamped=stamped,
+        models=models,
     )
     summary_path = workdir / "summary.md"
     # ATOMIC, because this file's existence is what every later resume reads as "the
@@ -4194,7 +4860,7 @@ def _claim_problem_md(workdir: Path, problem: str) -> bool:
         return False
     # Best-effort: the claim above is what makes the workdir ours, and a read-only or
     # full filesystem must not turn a successful claim into a failure. Without the
-    # marker the legacy test in _looks_like_duel_workdir still recognises the workdir
+    # marker the legacy test in _looks_like_duel_workdir still recognizes the workdir
     # as soon as it holds a real artifact.
     try:
         (workdir / DUEL_MARKER_FILENAME).write_bytes(b"")
@@ -4272,6 +4938,7 @@ def execute(
     skill_dir: str | os.PathLike[str] | None = None,
     emit=print,
     timeout: float | None = None,
+    supervisor: str | os.PathLike[str] | None = None,
 ) -> int:
     """The end-to-end duel: resolve args, run/resume the loop, then write summary.
 
@@ -4285,6 +4952,8 @@ def execute(
     anything, rather than adding ``problem.md`` to someone else's files.
     """
     skill_dir_path = Path(skill_dir) if skill_dir else None
+    supervisor_path = (Path(os.path.abspath(supervisor)) if supervisor
+                       else default_supervisor())
 
     # Resolved once; the pre-flight below is deliberately NOT run here. A resume that
     # spawns nothing — replaying a finished duel's summary.md — must stay CLI-free and
@@ -4292,11 +4961,13 @@ def execute(
     # together at the two points where a judge will actually be dispatched.
     schema_values = schema_placeholder_values(skill_dir_path)
 
-    # RESUME INTENT COMES FROM THE POSITIONAL ARGUMENT ALONE, which is what SKILL.md has
-    # always documented: --workdir only chooses where a NEW run lands. While this scanned
-    # both, a --workdir that happened to contain a problem.md was silently taken as a resume
-    # — the new problem statement discarded, and apply_resume then DELETING files matching
-    # patterns as broad as plan-*.md in a directory the user never meant to continue.
+    # RESUME INTENT COMES FROM THE POSITIONAL ARGUMENT ALONE, which is what SKILL.md
+    # documents: --workdir only chooses where a NEW run lands. A --workdir holding a
+    # problem.md is never read as a resume. With no positional argument the new-run branch
+    # refuses it and names the positional form; with one, _resolve_new_workdir refuses it as
+    # not empty. Either way the new problem statement is not discarded, and apply_resume,
+    # which deletes files matching patterns as broad as plan-*.md, never runs in a directory
+    # the user did not ask to continue.
     # Before anything is dispatched or created: two names that slugify alike would send both
     # final plans to one filename, and the summary would still claim two.
     require_distinct_slugs(controller_name, participant_name)
@@ -4325,7 +4996,8 @@ def execute(
 
     if resume_dir is not None:
         workdir = resume_dir
-        ctx = DuelContext(workdir, controller_name, participant_name, skill_dir_path)
+        ctx = DuelContext(workdir, controller_name, participant_name, skill_dir_path,
+                          supervisor_path)
         ctx.started_monotonic = time.monotonic()
         plan = compute_resume(workdir)
         if plan.complete:
@@ -4350,12 +5022,42 @@ def execute(
                 f"{controller_name} and {participant_name}. Plan A and Plan B belong to the "
                 f"runtimes that wrote them, so resume with the names the duel started with."
             )
+        # A backend is where a role's model is stated, so it is read before any model is
+        # compared or reported — but only by a resume that launches something. A replay that
+        # only rebuilds the summary needs neither the supervisor nor the backend, and takes a
+        # backend role's model from the record of the duel it replays.
+        launches = plan.init_incomplete or not _replay_stops_before_spawning(
+            workdir, plan.start_round, saved_state)
+        specs = (resolve_backends(specs, supervisor_path) if launches
+                 else _models_from_record(specs, saved_state.lineup if saved_state else {}))
+        current_lineup = frozen_lineup(specs)
+        if saved_state is not None:
+            # A resume that reads no backend has no digest of its own; the one recorded for
+            # the same backend is carried forward, or saving this lineup would erase it and
+            # the next resume could not tell an edited backend from the one that played.
+            for role, record in current_lineup.items():
+                before = saved_state.lineup.get(role, {})
+                if ("backend_digest" not in record and "backend_digest" in before
+                        and before.get("backend") == record.get("backend")):
+                    record["backend_digest"] = before["backend_digest"]
+            kept = _kept_players(plan, workdir)
+            changes = lineup_changes(
+                {role: record for role, record in saved_state.lineup.items() if role in kept},
+                current_lineup,
+            )
+            if changes:
+                raise PlanDuelError(
+                    f"{workdir} cannot resume with this adapter config, because a resume "
+                    f"cannot change who plays: {'; '.join(changes)}. The work this resume "
+                    f"keeps came from those players, so resume with the CLI, model, backend "
+                    f"and credential names the duel started with, or start a new duel. Other "
+                    f"changes to a command, such as an added flag, do resume."
+                )
         # Nor when the verdicts on disk already end the duel: replaying them spawns nothing.
-        if plan.init_incomplete or (
-            plan.start_round <= MAX_ROUNDS
-            and not _replay_stops_before_spawning(workdir, plan.start_round, saved_state)
-        ):
+        if plan.init_incomplete or (plan.start_round <= MAX_ROUNDS and launches):
+            require_supervisor(supervisor_path)
             preflight_executables(specs)
+            preflight_launch(specs)
             preflight_schema(specs, schema_values)
         for name in apply_resume(plan):
             emit(f"Deleted {name}")
@@ -4364,6 +5066,8 @@ def execute(
         state = load_state(workdir) or RunState(controller_name, participant_name)
         state.controller_name = controller_name
         state.participant_name = participant_name
+        state.lineup = current_lineup
+        save_state(workdir, state)
         if plan.init_incomplete:
             run_init_round(
                 workdir=workdir, specs=specs, ctx=ctx, emit=emit,
@@ -4373,9 +5077,12 @@ def execute(
         else:
             start_round = plan.start_round
     else:
-        # Check every CLI — and the schema an adapter's argv may need — before
-        # creating a workdir or spending a plan run on one.
+        # Check the supervisor, every CLI and what each launch needs — and the schema an
+        # adapter's argv may need — before creating a workdir or spending a plan run on one.
+        specs = resolve_backends(specs, supervisor_path)
+        require_supervisor(supervisor_path)
         preflight_executables(specs)
+        preflight_launch(specs)
         preflight_schema(specs, schema_values)
         # The other way into the refusal above, and the one whose default message would
         # be unhelpful: `--workdir <a duel>` with NO positional argument does not resume.
@@ -4391,9 +5098,13 @@ def execute(
         # A second write here would defeat the exclusivity that made the reservation atomic.
         workdir = _resolve_new_workdir(workdir_arg, problem_statement).resolve()
         emit(str(workdir))
-        ctx = DuelContext(workdir, controller_name, participant_name, skill_dir_path)
+        ctx = DuelContext(workdir, controller_name, participant_name, skill_dir_path,
+                          supervisor_path)
         ctx.started_monotonic = time.monotonic()
-        state = RunState(controller_name, participant_name)
+        state = RunState(controller_name, participant_name, lineup=frozen_lineup(specs))
+        # Before round 0 spawns anything: a validated Plan A is kept for reuse the moment it
+        # exists, and a resume may reuse it only against the lineup that wrote it.
+        save_state(workdir, state)
         run_init_round(
             workdir=workdir, specs=specs, ctx=ctx, emit=emit, timeout=timeout, state=state
         )
@@ -4410,6 +5121,7 @@ def execute(
         controller_name=controller_name,
         participant_name=participant_name,
         emit=emit,
+        models={role: spec.model for role, spec in specs.items()},
     )
     _write_completion_terminator(ctx, rounds_run, stopped_due_to, state)
     return 0
@@ -4487,6 +5199,11 @@ def build_parser() -> argparse.ArgumentParser:
         "killed and halts the duel, except a resume's judge re-run, which scores that "
         "round 0; there is no way to disable the bound.",
     )
+    parser.add_argument(
+        "--supervisor",
+        help="Path to the diff-review skill's review_runner.py, which launches every role "
+        "(default: the one in the diff-review skill installed beside this one).",
+    )
     return parser
 
 
@@ -4539,6 +5256,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             participant_name=args.participant_name,
             skill_dir=args.skill_dir,
             timeout=args.timeout,
+            supervisor=args.supervisor,
         )
     except PlanDuelError as exc:
         sys.stderr.write(f"{exc}\n")
@@ -4549,14 +5267,12 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:
-        # 130 is what a shell reports for SIGINT and what this always exited with — the
-        # traceback is what changes. Eight frames of engine internals told the user nothing
-        # they could act on, and the one thing they need is that the duel is resumable: the
-        # workdir holds every completed round.
-        # Names the POSITIONAL form, because that is the only one that resumes. "The same
-        # command with the same --workdir" is refused by design, since `--workdir` only ever
-        # chooses where a NEW run lands — so the instruction sent the user to the one command
-        # that could not work.
+        # 130 is what a shell reports for SIGINT. No traceback: frames of engine internals
+        # tell the user nothing they can act on, and the one thing they need is that the
+        # duel is resumable: the workdir holds every completed round.
+        # Names the POSITIONAL form, because that is the only one that resumes. `--workdir`
+        # only ever chooses where a NEW run lands, and _resolve_new_workdir refuses a
+        # directory that is not empty, so the same command with the same --workdir fails.
         print("\nInterrupted. The duel is resumable — re-run with the workdir as the "
               "POSITIONAL argument (not --workdir) and it continues from the last "
               "completed round.", file=sys.stderr)

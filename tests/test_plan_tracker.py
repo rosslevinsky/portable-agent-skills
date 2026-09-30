@@ -6,8 +6,8 @@ entry must be listed — which a single flat fixture file cannot express, so eac
 builds a throwaway plan directory.
 
 Every case violates EXACTLY ONE rule and asserts a finding COUNT of 1: a fixture that trips
-two rules proves neither. Each has additionally been mutation-verified. That is not ceremony:
-this repo has a documented history of suites green for the wrong reason.
+two rules proves neither. Each must also go red when its rule is deleted. That is not
+ceremony: a suite can be green for the wrong reason.
 
 **Why a unittest suite and not the validator's fixture harness.** Three of these cases create
 symlinks, which needs elevation on Windows, and they are guarded here rather than skipped
@@ -31,8 +31,8 @@ import check_plan_tracker  # noqa: E402
 from check_plan_tracker import check_tracker, run_tracker_check  # noqa: E402
 
 # Symlink creation needs elevation or developer mode on Windows, so the link cases are
-# skipped there rather than weakened. Skipping states the gap; asserting less would hide it
-# on the platform where the tracker check was previously never exercised at all.
+# skipped there rather than weakened. Skipping states the gap; asserting less would hide
+# it.
 CAN_SYMLINK = True
 try:
     with tempfile.TemporaryDirectory() as _probe:
@@ -106,9 +106,8 @@ REJECTS = [
      "- [ ] [Phase 2: B](./phase-02-b.md)\n",
      ("phase-01-a.md", "phase-02-b.md"), "listed twice"),
     # The single most important rule in the design. Zero boxes must be a hard stop, never
-    # "all phases complete": that is the disaster the retired marker mechanism nearly
-    # caused, a tracker the runner misreads as finished while finalising a plan whose work
-    # never ran.
+    # "all phases complete": otherwise the runner misreads a tracker as finished and
+    # finalizes a plan whose work never ran.
     ("zero-checkboxes", "", (), "no phase checkboxes"),
     # Legacy is identified POSITIVELY. "Zero boxes is an error" and "no boxes means legacy"
     # otherwise describe the same file, so neither a half-migrated tracker nor a stray
@@ -139,8 +138,8 @@ REJECTS = [
      ("phase-01-a.md", "phase-02-b.md"), "contains '~~~'"),
     ("html-comment-opener-in-a-tracker", T_VALID + "<!-- retired\n",
      ("phase-01-a.md", "phase-02-b.md"), "contains '<!--'"),
-    # Pinned on its own: an earlier fixture paired `<!--` and `-->` on one line, so
-    # deleting the closing delimiter from the ban list left the suite green.
+    # Pinned on its own: a fixture pairing `<!--` and `-->` on one line, checked for refusal
+    # or for the opener's message, stays green when `-->` is deleted from the ban list.
     ("standalone-closing-comment-delimiter", T_VALID + "--> resumed\n",
      ("phase-01-a.md", "phase-02-b.md"), "contains '-->'"),
     # The two ordinals are separate patterns, so a fixture for one proves nothing about
@@ -254,12 +253,13 @@ class PathsThatAreNotRegularFiles(TrackerBase):
 class LegacyIsIdentifiedPositively(TrackerBase):
     """Every `- phase:` line must be a well-formed entry naming a phase document HERE.
 
-    Matching a bare token let one malformed line retire a whole tracker from checking: a
-    traversing slug, trailing junk, or an empty entry each read as "legacy". These keep a
-    real phase document on disk on purpose — that is what makes the SLUG the reason for
+    The checker retires a tracker as legacy only when every entry's slug matches the
+    phase-slug pattern in full and names a regular file beside it, so a traversing slug,
+    trailing junk, or an empty entry keeps the tracker under every rule. These keep a real
+    phase document on disk on purpose — that is what makes the SLUG the reason for
     rejection rather than mere non-existence — and it costs a second, cascading "not
     listed" finding, so they assert the ABSENCE OF A LEGACY NOTICE rather than a finding
-    count. That absence is exactly what goes red if the strictness is reverted.
+    count. That absence is exactly what goes red if the strictness is removed.
     """
 
     CASES = [
@@ -388,7 +388,7 @@ class TheCommandLineBranch(TrackerBase):
         super().setUp()
         self.write_plan("live", T_VALID, ("phase-01-a.md", "phase-02-b.md"))
         # A v1 `phases.md` sitting in the same tree. It is a checkbox tracker too, so the
-        # two shapes no longer differ — the v1<->v2 non-collision is now the FILENAME
+        # two shapes do not differ — the v1<->v2 non-collision is the FILENAME
         # alone. Its links are dangling on purpose: if the scan ever widened past
         # `execution.md`, this would fail loudly instead of silently passing.
         self.v1 = self.root / "v1-plan"

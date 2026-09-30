@@ -5,9 +5,9 @@ on:
   push:
     branches: [main]
   # Runnable on demand, on any branch. A feature-branch push runs nothing here, so without
-  # this a change reaches Windows only by opening a pull request — and Windows is the one
-  # platform none of this project's authors develop on, so that is exactly the platform
-  # whose feedback should be cheapest to get. It is also how a commit already on `main` gets a
+  # this a change reaches Windows only by opening a pull request — and Windows is where an
+  # encoding or path-separator mistake surfaces, so that is exactly the platform whose
+  # feedback should be cheapest to get. It is also how a commit already on `main` gets a
   # run at all when `tested` would otherwise skip one, since that job asks nothing on a manual
   # run and every test job therefore goes ahead.
   #
@@ -170,8 +170,8 @@ jobs:
             #
             # So the run has to say which tree it actually checked out. `suite` writes that as
             # an artifact named for the tree, and this asks for the one naming THIS tree. No
-            # receipt, an API that will not answer, a run from before receipts existed: every
-            # one of them falls through to running the suite, which is the safe direction.
+            # receipt, or an API that will not answer: either one falls through to running
+            # the suite, which is the safe direction.
             if gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$run/artifacts" \
                  --jq '.artifacts[].name' 2>/dev/null | grep -qxF "$RECEIPT-$tree"; then
               echo "already=true" >> "$GITHUB_OUTPUT"
@@ -199,13 +199,12 @@ jobs:
     # Split by test CLASS rather than by module: one module is well over half the suite's
     # runtime, so a split by module could never be faster than that module alone.
     #
-    # FOUR shards, and the number is measured rather than preferred. No class is more than
-    # 5% of the suite's runtime, so there is no floor to hit until about twenty; what stops
-    # it at four is that shards are handed out round-robin over sorted class names, which is
-    # blind to how long a class takes. That blindness costs about a tenth against a perfect
-    # split at four widths and swings far wider at twelve. Going further would mean checking
-    # in a table of per-class timings, and the sharder's whole virtue is that a test file
-    # added tomorrow lands on a shard without anybody editing anything.
+    # FOUR shards. No single class dominates the suite's runtime, so no one class sets a
+    # floor; what stops it at four is that shards are handed out round-robin over sorted
+    # class names, which is blind to how long a class takes. That blindness costs little
+    # against a perfect split at four widths and swings far wider at twelve. Going further
+    # would mean checking in a table of per-class timings, and the sharder's whole virtue is
+    # that a test file added tomorrow lands on a shard without anybody editing anything.
     #
     # `tests/test_shard_tests.py` is what makes this safe to rely on. A test that lands on
     # no shard does not fail; it is never run, and the job is green because of it. That file
@@ -225,8 +224,8 @@ jobs:
     # any fork.
     #
     # Windows is the platform where a path-separator or encoding mistake actually surfaces,
-    # and a public repository still runs it on every event; a private one gets that answer
-    # by asking, or when its work reaches a public repository's pull request.
+    # and a public repository runs it on every event; a private one runs it when asked,
+    # through the `all_platforms` input.
     #
     # A push that gets PAST `tested` is a tree nothing has proved: a direct push, or a merge
     # that bypassed the up-to-date requirement, which an owner-bypassable protection permits.
@@ -237,10 +236,9 @@ jobs:
     # empty on anything but a manual run that set it, so there is no per-event conditional
     # whose truth somebody has to keep checking.
     #
-    # **This file ships byte-identical to the public repository.** Nothing in it names a
-    # repository or reads a branch-protection setting, so it is correct in a tree whose
-    # protection this repository does not control, and a fork inherits a rule that is true for
-    # it. A squash merge is covered because `tested` looks up the pull request's head as well as
+    # **Nothing in this file names a repository or reads a branch-protection setting**, so it
+    # is correct in any repository that runs it, whatever that repository's protection, and a
+    # fork inherits a rule that is true for it. A squash merge is covered because `tested` looks up the pull request's head as well as
     # a merge commit's second parent.
     strategy:
       fail-fast: false
@@ -348,9 +346,9 @@ jobs:
 
       # The validator runs under the non-UTF-8 default too, not only the unittest suite.
       # Its own reads are the ones aimed squarely at em-dash-laden prompt files, which makes
-      # it the last thing that should be left out: while it was, twelve bare `read_text()`
-      # calls and a bare `write_text()` sat in it unnoticed, because nothing else ever ran
-      # it without a UTF-8 default.
+      # it the last thing that should be left out: a bare `read_text()` or `write_text()` in
+      # it goes unnoticed on Linux and macOS, whose default is UTF-8, and a private
+      # repository's suite job runs on Linux alone.
       #
       # Tracker checking is deliberately NOT here: it needs a plan directory, which not
       # every clone of this pack has, and this step must run everywhere. Its rules are

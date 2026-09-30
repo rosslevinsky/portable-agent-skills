@@ -123,9 +123,9 @@ git add <the paths this change touched>
 After staging, run `git diff --cached --stat` to confirm exactly what will be committed.
 Compare it against the paths you meant to stage. Anything extra either was in the index
 before you started (Step 2) — a path-scoped commit does **not** exclude it — or a directory
-argument expanded to it. Do not attribute it to the first without checking: that reading is
-what let a newly-created secret inside a named directory pass as pre-existing. Unstage it or
-ask.
+argument expanded to it. Do not attribute it to the first without checking: a file created
+inside a directory you named is new, and reading it as pre-existing lets a new secret through.
+Unstage it or ask.
 
 If there are untracked or unstaged files that seem unrelated to the main change, **do not
 silently skip them and do not silently include them**. List them for the user and ask
@@ -215,7 +215,7 @@ other machines have already fetched. A request that named only committing has no
 for that, and treating the two as one word takes the decision away from whoever made it.
 
 Where nobody can be asked, the request itself decides — the rule above is not suspended by
-the absence of a human. An instruction that already said to publish is the authorisation,
+the absence of a human. An instruction that already said to publish is the authorization,
 and having no one to re-confirm it with does not withdraw it: an autonomous run launched
 with "commit and push" pushes. What must never happen is *resolving an ambiguity* by
 pushing. Where the request named only committing, or is unclear, stop after Step 5, report

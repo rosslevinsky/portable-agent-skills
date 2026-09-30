@@ -1,6 +1,6 @@
 {
   "title": "review-panel synthesis result",
-  "description": "One reading of the whole defect list: the words this run groups its defects by, and for each defect what goes wrong in plain language, what to do about it, and which other defects it belongs beside. Nothing here settles whether a defect is real — another stage did that, and this one cannot reopen it, revise a severity or remove a defect from the run. Every defect the payload lists appears here exactly once; a reply that drops one, repeats one, or names one the payload never listed is refused whole, and the report is then grouped by status as it was before this round existed.",
+  "description": "One reading of the whole defect list: the words this run groups its defects by, and for each defect — one mistake, at one or more sites — a heading, what goes wrong in plain language, what to do about it, what is particular to any site that differs, and which other defects it belongs beside. Nothing here settles whether a defect or a site is real — another stage did that, and this one cannot reopen it, revise a severity or remove a defect from the run. Every defect the payload lists appears here exactly once; a reply that drops one, repeats one, or names one the payload never listed is refused whole, and the report is then grouped by status as it was before this round existed.",
   "type": "object",
   "additionalProperties": false,
   "required": ["tiers", "defects", "summary"],
@@ -17,12 +17,18 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["defect", "tier", "what_goes_wrong", "fix", "cross_references"],
+        "required": ["defect", "heading", "tier", "what_goes_wrong", "fix", "site_notes", "cross_references"],
         "properties": {
           "defect": {
             "type": "string",
             "minLength": 1,
             "description": "The defect id, spelled as the payload spells it, e.g. `D7`."
+          },
+          "heading": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120,
+            "description": "What goes wrong, in one short plain sentence a user of the software would recognize: aim for 12 words, never more than 120 characters. It must be true of every site of the defect."
           },
           "tier": {
             "type": "string",
@@ -32,17 +38,41 @@
           "what_goes_wrong": {
             "type": "string",
             "minLength": 1,
-            "description": "What actually happens, in plain language and in your own voice: the mechanism, and what a person using this software sees when it goes wrong. Write it for someone who has not read the finding, from the material in the payload; where that material is thin, say less rather than inventing the rest. This is read as your impression and the report says so, so do not write it in the voice of something that was checked."
+            "maxLength": 600,
+            "description": "The mechanism and its effect, once for the whole defect however many sites it has, in plain language and in your own voice, for someone who has not read the finding. At most 60 words: the reader sees each site's location, source, outcome and test directly under this, so do not walk through the sites, restate numbers the evidence holds, or repeat the heading. Where the material is thin, say less rather than inventing the rest. This is read as your impression and the report says so, so do not write it in the voice of something that was checked. The engine counts the words and refuses a longer account for this defect alone."
           },
           "fix": {
             "type": "string",
             "minLength": 1,
-            "description": "What to do about it, concretely enough to start: what changes, where, and what to be careful of. It is a proposal, not an instruction that was verified — where the payload's material does not tell you enough to be concrete, say what would have to be decided first."
+            "maxLength": 600,
+            "description": "The one change that addresses every site, and the order where order matters. At most 60 words. It is a proposal, not an instruction that was verified — where the payload's material does not tell you enough to be concrete, say what would have to be decided first. The engine counts the words and refuses a longer fix for this defect alone."
+          },
+          "site_notes": {
+            "type": "array",
+            "description": "One note per site that genuinely differs from the rest of its defect — a different symptom, an extra step, a document rather than code — or an empty list. Leave out every site with nothing particular to say. Each names a site of this defect, as the payload spells it, at most once; a note naming another defect's site, or one site twice, costs this defect its entry.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["site", "note"],
+              "properties": {
+                "site": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "The site id, spelled as the payload spells it, e.g. `S3`."
+                },
+                "note": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 200,
+                  "description": "What is particular to this site, in one sentence of at most 20 words."
+                }
+              }
+            }
           },
           "cross_references": {
             "type": "array",
             "items": {"type": "string", "minLength": 1},
-            "description": "The ids of other defects this one should be read beside, as the payload spells them, or an empty list. Name one only where the two are genuinely connected — the same mechanism, the same call path, one causing or masking the other — never because they sit in the same file. The engine drops any reference whose id is not a defect in this run, or whose defect touches no file this one touches."
+            "description": "The ids of other defects this one should be read beside, as the payload spells them, or an empty list. Name one only where the two are genuinely connected — the same mechanism, the same call path, one causing or masking the other — never because they sit in the same file. The engine drops any reference whose id is not a defect in this run, and keeps one only where the two defects touch a file in common or sit under one tier."
           }
         }
       }

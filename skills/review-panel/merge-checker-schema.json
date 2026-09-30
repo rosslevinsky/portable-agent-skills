@@ -1,0 +1,73 @@
+{
+  "title": "review-panel merge check result",
+  "description": "Whether each proposed group of sites is one mistake. Another agent proposed the groups, each with one stated mechanism and how each site instantiates it; this stage checks that claim site by site and does nothing else: it judges no site right or wrong, revises no severity, and proposes no new group. Every group the payload lists gets exactly one entry with one verdict for each of its sites, and a reply that drops a group or a site, repeats one, or names one the payload never listed is refused whole.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["groups", "summary"],
+  "properties": {
+    "groups": {
+      "type": "array",
+      "description": "One entry per group the payload lists, in any order.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["group", "sites", "hidden_claims", "fix_touches_refuted"],
+        "properties": {
+          "group": {
+            "type": "string",
+            "description": "The group id, as the payload spells it, e.g. `G1`."
+          },
+          "sites": {
+            "type": "array",
+            "description": "One record per site of this group, each naming its site once.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["site", "verdict", "reason"],
+              "properties": {
+                "site": {"type": "string", "description": "A site id of this group, e.g. `S7`."},
+                "verdict": {
+                  "type": "string",
+                  "enum": ["fits", "does_not_fit"],
+                  "description": "`fits` where this site instantiates the stated mechanism and the stated corrective rule addresses its whole claim; `does_not_fit` otherwise."
+                },
+                "reason": {"type": "string", "description": "One sentence saying why."}
+              }
+            }
+          },
+          "hidden_claims": {
+            "type": "array",
+            "description": "Every site of this group whose own material asserts an independent second mistake that the shared account and fix would hide. Empty where there is none.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["site", "claim"],
+              "properties": {
+                "site": {"type": "string", "description": "A site id of this group."},
+                "claim": {"type": "string", "description": "One sentence naming the hidden claim."}
+              }
+            }
+          },
+          "fix_touches_refuted": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["value", "sites"],
+            "description": "Whether the stated corrective rule, applied as stated, would change code at a site whose outcome is refuted.",
+            "properties": {
+              "value": {"type": "boolean", "description": "True where it would."},
+              "sites": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "The refuted site ids of this group it would change; empty where `value` is false."
+              }
+            }
+          }
+        }
+      }
+    },
+    "summary": {
+      "type": "string",
+      "description": "One paragraph for a person reading the report: how many groups were upheld whole, how many sites were removed, and why."
+    }
+  }
+}

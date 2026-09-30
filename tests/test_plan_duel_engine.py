@@ -7,6 +7,7 @@ path derived from THIS file, so the suite runs from any working directory.
 
 import contextlib
 import errno
+import hashlib
 import io
 import json
 import math
@@ -40,6 +41,26 @@ _STATE_FIXTURES = _FIXTURES / "state"
 def _stub_argv(*args):
     """Argv list that runs the stub CLI cross-platform (exercises the argv path)."""
     return [sys.executable, str(_STUB), *args]
+
+
+def _alive(pid):
+    """Whether ``pid`` runs; a zombie waiting to be reaped has stopped, so it does not."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+            return fh.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return True
+
+
+def _kill_quietly(pid):
+    with contextlib.suppress(OSError):
+        os.kill(pid, signal.SIGKILL)
 
 
 class _TempWorkdirMixin:
@@ -897,7 +918,9 @@ class FreezeTests(_TempWorkdirMixin, unittest.TestCase):
 # --------------------------------------------------------------------------- #
 # Process execution (argv-list subprocess against the stub)
 # --------------------------------------------------------------------------- #
-class RunCliTests(_TempWorkdirMixin, unittest.TestCase):
+class SupervisedSpawnTests(_TempWorkdirMixin, unittest.TestCase):
+    """One spawn through the supervisor, driven directly against the stub CLI."""
+
     def test_resolve_executable_absolute_path(self):
         self.assertEqual(
             plan_duel.resolve_executable(sys.executable),
@@ -908,48 +931,159 @@ class RunCliTests(_TempWorkdirMixin, unittest.TestCase):
         with self.assertRaises(plan_duel.CliNotFoundError):
             plan_duel.resolve_executable("definitely-not-a-real-cli-xyz")
 
-    def test_run_cli_writes_file_via_argv_list(self):
+    def _reply(self, argv, **kw):
+        """A spawn whose reply is its stdout, landing in a fresh file."""
+        return plan_duel.run_supervised(argv, findings=self._tmpdir() / "reply.md",
+                                        mode="raw-stdout", **kw)
+
+    def test_a_cli_writes_its_own_file_through_the_argv_list(self):
         wd = self._tmpdir()
         out = wd / "plan-a.md"
-        status = wd / "status.md"
-        result = plan_duel.run_cli(
+        result = plan_duel.run_supervised(
             _stub_argv("--write-file", str(out), "--content", "hello"),
-            stdout_to=status,
-        )
-        self.assertEqual(result.returncode, 0)
+            findings=out, mode="external-file", display=wd / "status.md")
+        self.assertTrue(result.ok, result.reason)
         self.assertEqual(out.read_text(encoding="utf-8"), "hello")
 
-    def test_run_cli_is_argv_list_not_shell(self):
+    def test_the_argv_is_a_list_not_a_shell_line(self):
         # A shell would expand $SHELL; argv-list leaves it literal.
-        wd = self._tmpdir()
-        echo = wd / "echo.txt"
-        plan_duel.run_cli(
-            _stub_argv("--echo-arg", "$SHELL", "--echo-file", str(echo))
-        )
+        echo = self._tmpdir() / "echo.txt"
+        self._reply(_stub_argv("--echo-arg", "$SHELL", "--echo-file", str(echo),
+                               "--stdout", "done"))
         self.assertEqual(echo.read_text(encoding="utf-8"), "$SHELL")
 
-    def test_run_cli_honors_cwd_anchor(self):
+    def test_the_cwd_anchor_is_honored(self):
         wd = self._tmpdir()
         cwd_out = wd / "cwd.txt"
-        plan_duel.run_cli(
-            _stub_argv("--cwd-file", str(cwd_out)),
-            cwd=wd,
-        )
+        self._reply(_stub_argv("--cwd-file", str(cwd_out), "--stdout", "done"), cwd=wd)
         self.assertEqual(
             Path(cwd_out.read_text(encoding="utf-8")).resolve(), wd.resolve()
         )
 
-    def test_run_cli_captures_stdout_bytes_when_no_file(self):
-        result = plan_duel.run_cli(_stub_argv("--stdout", "captured-out"))
-        self.assertEqual(result.stdout_bytes, b"captured-out")
+    def test_a_reply_on_stdout_lands_in_its_file_and_stderr_does_not(self):
+        wd = self._tmpdir()
+        out = wd / "reply.md"
+        result = plan_duel.run_supervised(
+            _stub_argv("--stdout", "captured-out", "--stderr", "diagnostic"),
+            findings=out, mode="raw-stdout")
+        self.assertTrue(result.ok, result.reason)
+        self.assertEqual(out.read_bytes(), b"captured-out")
+        self.assertIn(b"diagnostic", result.output, "stderr is kept for a halt to quote")
 
-    def test_run_cli_nonzero_exit_raises(self):
+    def test_a_nonzero_exit_raises(self):
         with self.assertRaises(plan_duel.CliExecutionError):
-            plan_duel.run_cli(_stub_argv("--exit-code", "3"))
+            self._reply(_stub_argv("--stdout", "x", "--exit-code", "3"))
 
-    def test_run_cli_timeout_raises(self):
+    def test_a_timeout_raises(self):
         with self.assertRaises(plan_duel.CliTimeoutError):
-            plan_duel.run_cli(_stub_argv("--sleep", "5"), timeout=0.4)
+            self._reply(_stub_argv("--sleep", "5"), timeout=0.4)
+
+    def test_a_supervisor_that_could_not_drain_is_a_stopped_spawn(self):
+        # Where no process group can be reaped, a helper still holding stdout leaves the
+        # supervisor undrained, and it releases the file the agent wrote. That is a stopped
+        # spawn, never an agent that wrote a bad plan.
+        fake = self._tmpdir() / "review_runner.py"
+        fake.write_text(
+            "import json\n"
+            "print(json.dumps({'status': 'error', 'exit_code': 0,\n"
+            "                  'reason': 'reader did not drain child output'}))\n",
+            encoding="utf-8")
+        with self.assertRaises(plan_duel.CliTimeoutError):
+            plan_duel.run_supervised(_stub_argv("--stdout", "x"),
+                                     findings=self._tmpdir() / "plan-a.md",
+                                     mode="external-file", supervisor=fake)
+
+    def test_a_failing_cli_is_reported_by_its_exit_code_even_when_undrained(self):
+        fake = self._tmpdir() / "review_runner.py"
+        fake.write_text(
+            "import json\n"
+            "print(json.dumps({'status': 'error', 'exit_code': 3,\n"
+            "                  'reason': 'reader did not drain child output'}))\n",
+            encoding="utf-8")
+        with self.assertRaises(plan_duel.CliExecutionError) as cm:
+            plan_duel.run_supervised(_stub_argv("--stdout", "x"),
+                                     findings=self._tmpdir() / "plan-a.md",
+                                     mode="external-file", supervisor=fake)
+        self.assertNotIsInstance(cm.exception, plan_duel.CliTimeoutError)
+        self.assertIn("code 3", str(cm.exception))
+
+    def test_the_undrained_reason_is_the_supervisors_own_words(self):
+        # The mapping above keys on this text; a supervisor that rewords it undoes the mapping.
+        source = plan_duel.default_supervisor().read_text(encoding="utf-8")
+        self.assertIn(plan_duel._SUPERVISOR_UNDRAINED, source)
+
+    def test_the_supervisors_own_lines_are_stripped_whatever_the_line_ending(self):
+        # The supervisor writes its log in text mode, which ends a line with CRLF on Windows.
+        for eol in (b"\n", b"\r\n"):
+            log = self._tmpdir() / "output.log"
+            log.write_bytes(b"[review_runner] start" + eol + b"said" + eol
+                            + b"[review_runner] end status=ok exit=0 drained=True" + eol)
+            self.assertEqual(plan_duel._read_output(log), b"said" + eol, eol)
+
+    def test_a_literal_setting_reaches_the_cli_without_riding_on_an_argv(self):
+        # Any local user can read a process's argv; only its owner can read its environment.
+        secret, blank = "literal-SENTINEL-5d1f0a", ""
+        seen = self._tmpdir()
+        spec = plan_duel.parse_adapter_config(
+            _config_with(env={"PD_LITERAL": secret, "PD_BLANK": blank}))["agent_a"]
+        launched = []
+        real_popen = subprocess.Popen
+
+        def recording(argv, *args, **kwargs):
+            launched.append(list(argv))
+            return real_popen(argv, *args, **kwargs)
+
+        with unittest.mock.patch.object(plan_duel.subprocess, "Popen", recording):
+            result = self._reply(
+                _stub_argv("--env-digest", f"PD_LITERAL={seen / 'literal.txt'}",
+                           "--env-digest", f"PD_BLANK={seen / 'blank.txt'}",
+                           "--stdout", "done"), spec=spec)
+        self.assertTrue(result.ok, result.reason)
+        self.assertTrue(launched, "the supervisor was not launched through Popen")
+        for argv in launched:
+            self.assertFalse([part for part in argv if secret in part], argv)
+        self.assertEqual((seen / "literal.txt").read_text(encoding="utf-8"),
+                         hashlib.sha256(secret.encode("utf-8")).hexdigest(),
+                         "the literal setting never reached the CLI")
+        self.assertEqual((seen / "blank.txt").read_text(encoding="utf-8"),
+                         hashlib.sha256(b"").hexdigest(), "the blanked setting did not arrive")
+
+    @unittest.skipUnless(os.name == "posix", "a terminal Ctrl-C signals a process group")
+    def test_a_ctrl_c_that_reaches_the_supervisor_too_still_ends_the_cli(self):
+        # The terminal signals plan-duel and the supervisor together; the CLI, in a session
+        # of its own, is reached only by the supervisor's cleanup, which must be let finish.
+        wd = self._tmpdir()
+        pidfile, findings = wd / "cli.pid", wd / "reply.md"
+        cli = [sys.executable, "-c",
+               "import os, signal, sys, time\n"
+               "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+               "open(sys.argv[1], 'w').write(str(os.getpid()))\n"
+               "time.sleep(120)\n", str(pidfile)]
+        driver = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(Path(plan_duel.__file__).parent)!r})\n"
+            "import plan_duel\n"
+            "try:\n"
+            f"    plan_duel.run_supervised({cli!r}, findings={str(findings)!r},\n"
+            "                             mode='raw-stdout', timeout=90)\n"
+            "except KeyboardInterrupt:\n"
+            "    sys.exit(130)\n")
+        proc = subprocess.Popen([sys.executable, "-c", driver], start_new_session=True,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: proc.poll() is None and os.killpg(proc.pid, signal.SIGKILL))
+        deadline = time.monotonic() + 30
+        while not (pidfile.is_file() and pidfile.read_text()) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        cli_pid = int(pidfile.read_text())
+        self.addCleanup(lambda: _kill_quietly(cli_pid))
+        os.killpg(proc.pid, signal.SIGINT)
+        proc.wait(timeout=60)
+        deadline = time.monotonic() + 10
+        while _alive(cli_pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(_alive(cli_pid), "the CLI outlived an interrupted duel")
+        self.assertFalse(findings.exists(), "the supervisor's claimed file was left behind")
 
 
 # --------------------------------------------------------------------------- #
@@ -1178,7 +1312,7 @@ class AgentCaptureTests(_TempWorkdirMixin, unittest.TestCase):
         self.assertEqual((wd / "plan-b.md").read_bytes(), stray.read_bytes())
 
     def test_recover_agent_b_round0_never_adopts_a_plan_snapshot(self):
-        # Plan A's round-0 snapshot now lands BEFORE Agent B runs, so it is always
+        # Plan A's round-0 snapshot lands BEFORE Agent B runs, so it is always
         # recent and large. Adopting it would make Plan B a silent copy of Plan A.
         wd = self._tmpdir()
         (wd / "problem.md").write_text("p" * 300, encoding="utf-8")
@@ -1348,8 +1482,10 @@ class JudgeCaptureTests(_TempWorkdirMixin, unittest.TestCase):
         # prose must not abort the round before the SCORE line is ever parsed.
         wd = self._tmpdir()
         judge_file = wd / "judge-round-1.md"
-        judge_file.write_bytes(b"SCORE: 7\n\nThe plan\x92s scope.\n\nPREFERRED: A\n")
-        argv = _stub_argv("--stdout", "transcript noise")
+        argv = [sys.executable, "-c",
+                "import sys; open(sys.argv[1], 'wb').write("
+                "b'SCORE: 7\\n\\nThe plan\\x92s scope.\\n\\nPREFERRED: A\\n'); "
+                "print('transcript noise')", str(judge_file)]
         message = plan_duel.capture_judge_message(
             argv, judge_file, status_to=wd / "status.md", round_n=1
         )
@@ -1391,17 +1527,6 @@ class ProgressTests(_TempWorkdirMixin, unittest.TestCase):
         self.assertEqual(
             progress.read_text(encoding="utf-8"), "line one\nline two\n"
         )
-
-    def test_run_cli_stdout_append_mode_does_not_truncate(self):
-        wd = self._tmpdir()
-        progress = wd / "participant-progress-1.md"
-        plan_duel.append_progress(progress, "seed\n")
-        plan_duel.run_cli(
-            _stub_argv("--stdout", "streamed\n"),
-            stdout_to=progress,
-            stdout_append=True,
-        )
-        self.assertEqual(progress.read_text(encoding="utf-8"), "seed\nstreamed\n")
 
     def test_agent_outcome_identical_with_progress_on_or_off(self):
         def run_once(enable_progress):
@@ -1639,7 +1764,7 @@ class BothPreferredPathsResolveTheWinnerIdentically(unittest.TestCase):
         "Preferred: an approach from each\n",
         # A CAPITALISED sentence must not resolve to a side, or a judge writing this
         # line early and `PREFERRED: B because it is simpler.` later publishes plan A.
-        # The prose form now requires a connector, and the test for connector
+        # The prose form requires a connector, and the test for connector
         # membership is whether the word can follow the article "a".
         "PREFERRED: A compromise between both plans.\n",
         "PREFERRED: A compromise between both plans was considered.\n",
@@ -2806,9 +2931,9 @@ class ScenarioConvergenceTests(_ScenarioDriverMixin, unittest.TestCase):
         self.assertNotIn("| Format | v2 |", (wd / "plan-codex.md").read_text(encoding="utf-8"))
 
     def test_progress_file_emitted_at_agent_and_judge_points_append_only(self):
-        # Decision-5 progress file: emitted per round at the agent and judge spawn
+        # The progress file: emitted per round at the agent and judge spawn
         # points, append-only, read by nothing on the correctness path — so the outcome
-        # is identical to a run whose progress file no one watches. Not an artifact.
+        # is identical to a run whose progress file no one watches.
         rc, wd, _ = self._run_new("convergence", "Design the notification service.")
         self.assertEqual(rc, 0)
         # Round 0 progress: both agent spawn points recorded (append-only => >= 2 lines).
@@ -2979,10 +3104,11 @@ class WriteSummaryMissingFinalJudgeTests(_TempWorkdirMixin, unittest.TestCase):
 class WriteSummaryMissingSnapshotTests(_TempWorkdirMixin, unittest.TestCase):
     """The other two files write_summary reads without guarding, and what they cost.
 
-    A missing round SNAPSHOT or LIVE PLAN raised a bare `FileNotFoundError` from the last
-    step of a duel already paid for: no summary, a raw traceback, and every round of
-    model output on disk with nothing pointing at it. A snapshot gap is what a workdir
-    looks like after a partial cleanup or an interrupted resume.
+    A missing round SNAPSHOT or LIVE PLAN, left unguarded, raises a bare
+    `FileNotFoundError` from the last step of a duel already paid for: no summary, a raw
+    traceback, and every round of model output on disk with nothing pointing at it. A
+    snapshot gap is what a workdir looks like after a partial cleanup or an interrupted
+    resume.
     """
 
     JUDGE = "SCORE: 8\n\nPREFERRED: A\n"
@@ -3186,7 +3312,7 @@ class ScenarioInitInterruptTests(_ScenarioDriverMixin, unittest.TestCase):
 class ScenarioInitReusePlanATests(_ScenarioDriverMixin, unittest.TestCase):
     def test_resume_after_round0_agent_b_failure_does_not_regenerate_plan_a(self):
         # Same workdir as the full-reset case, plus the validated Plan A snapshot a
-        # round 0 that died at Agent B now leaves behind.
+        # round 0 that died at Agent B leaves behind.
         scenario = _SCENARIOS / "init-interrupt"
         wd = self._tmpdir() / "wd"
         shutil.copytree(scenario / "workdir", wd)
@@ -3694,8 +3820,8 @@ class TimeoutFlagTests(_TempWorkdirMixin, unittest.TestCase):
         return path
 
     def test_a_spawn_that_outlives_the_timeout_halts_the_duel(self):
-        # The plumbing reached subprocess.run(timeout=) but no flag ever set it, so
-        # every spawn was unbounded and CliTimeoutError unreachable from the CLI.
+        # The timeout has to reach the spawn from the CLI flag; without that, the flag
+        # sets nothing and every spawn runs to the engine's default instead.
         tmp = self._tmpdir()
         cfg = self._sleeping_config(tmp / "adapter.json", 30)
         out, err = io.StringIO(), io.StringIO()
@@ -3819,7 +3945,8 @@ class TimeoutFlagTests(_TempWorkdirMixin, unittest.TestCase):
         script = self._write(tmp / "sleeper.py", "import time\ntime.sleep(120)\n")
         started = time.monotonic()
         with self.assertRaises(plan_duel.CliTimeoutError):
-            plan_duel.run_cli([sys.executable, str(script)], timeout=1.0)
+            plan_duel.run_supervised([sys.executable, str(script)], findings=tmp / "reply.md",
+                                     mode="raw-stdout", timeout=1.0)
         # Generous, because the point is "returns" versus "hangs forever", not latency:
         # the kill ladder and the bounded drain together cap at ~21s by construction.
         self.assertLess(time.monotonic() - started, 40)
@@ -3841,7 +3968,9 @@ class TimeoutFlagTests(_TempWorkdirMixin, unittest.TestCase):
             "time.sleep(120)\n",
         )
         with self.assertRaises(plan_duel.CliTimeoutError):
-            plan_duel.run_cli([sys.executable, str(script), str(pidfile)], timeout=1.0)
+            plan_duel.run_supervised([sys.executable, str(script), str(pidfile)],
+                                     findings=tmp / "reply.md", mode="raw-stdout",
+                                     timeout=1.0)
         pid = self._read_pid(pidfile)
         self.addCleanup(self._kill_quietly, pid)
         self._assert_dies(pid, "the timed-out child was left running")
@@ -3867,12 +3996,13 @@ class TimeoutFlagTests(_TempWorkdirMixin, unittest.TestCase):
             "                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
             "with open(sys.argv[2], 'w', encoding='utf-8') as fh:\n"
             "    fh.write(str(child.pid))\n"
+            "print('done')\n"
             "sys.exit(0)\n",
         )
-        result = plan_duel.run_cli(
-            [sys.executable, str(leader), str(helper), str(pidfile)], timeout=30
-        )
-        self.assertEqual(result.returncode, 0)
+        result = plan_duel.run_supervised(
+            [sys.executable, str(leader), str(helper), str(pidfile)],
+            findings=tmp / "reply.md", mode="raw-stdout", timeout=30)
+        self.assertTrue(result.ok, result.reason)
         pid = self._read_pid(pidfile)
         self.addCleanup(self._kill_quietly, pid)
         time.sleep(0.3)  # a wrongly-fired kill would have landed well inside this
@@ -3882,12 +4012,11 @@ class TimeoutFlagTests(_TempWorkdirMixin, unittest.TestCase):
         )
 
     @unittest.skipUnless(os.name == "posix", "process groups are POSIX-only")
-    def test_timeout_kills_a_descendant_that_outlived_the_direct_child(self):
+    def test_a_descendant_that_outlived_the_direct_child_is_killed(self):
         # The real shape of a wedged adapter: the CLI exits promptly but the runtime it
         # spawned keeps running AND holds the inherited stdout pipe, so the read blocks
-        # though the direct child is gone. An escalation that stops when the leader exits
-        # never signals that survivor — which is why `start_new_session` exists and both
-        # rungs go to the GROUP unconditionally.
+        # though the direct child is gone. The supervisor ends that group once the leader
+        # has exited and the pipe stays open, rather than waiting out the limit.
         tmp = self._tmpdir()
         pidfile = tmp / "grandchild.pid"
         grandchild = self._write(
@@ -3905,10 +4034,11 @@ class TimeoutFlagTests(_TempWorkdirMixin, unittest.TestCase):
             "subprocess.Popen([sys.executable, sys.argv[1], sys.argv[2]])\n"
             "sys.exit(0)\n",
         )
-        with self.assertRaises(plan_duel.CliTimeoutError):
-            plan_duel.run_cli(
-                [sys.executable, str(leader), str(grandchild), str(pidfile)], timeout=1.0
-            )
+        started = time.monotonic()
+        plan_duel.run_supervised(
+            [sys.executable, str(leader), str(grandchild), str(pidfile)],
+            findings=tmp / "reply.md", mode="raw-stdout", timeout=60)
+        self.assertLess(time.monotonic() - started, 50, "the survivor was waited out")
         pid = self._read_pid(pidfile)
         self.addCleanup(self._kill_quietly, pid)
         self._assert_dies(
@@ -4146,8 +4276,8 @@ class NewWorkdirResolutionTests(_TempWorkdirMixin, unittest.TestCase):
         )
 
     def test_auto_name_suffixes_on_any_existing_path(self):
-        # The loop only skipped a directory that already held problem.md, so an
-        # interrupted duel whose problem.md never landed was reused and its half-written
+        # Any existing path, not only a directory holding problem.md: otherwise an
+        # interrupted duel whose problem.md never landed is reused and its half-written
         # artifacts inherited by the next run.
         tmp = self._tmpdir()
         self._chdir(tmp)
@@ -4224,8 +4354,9 @@ class NewWorkdirResolutionTests(_TempWorkdirMixin, unittest.TestCase):
 
     @unittest.skipUnless(os.name == "posix", "symlink creation needs privileges on Windows")
     def test_a_dangling_symlink_at_an_explicit_workdir_is_refused(self):
-        # `Path.exists()` follows the link and reports absent, so the path was accepted
-        # and the later mkdir raised a bare FileExistsError instead of this refusal.
+        # `Path.exists()` follows the link and reports absent, so a check built on it
+        # accepts the path and the later mkdir raises a bare FileExistsError instead of
+        # this refusal.
         wd = self._tmpdir() / "wd"
         wd.symlink_to(self._tmpdir() / "nowhere")
         with self.assertRaises(plan_duel.PlanDuelError):
@@ -4250,8 +4381,8 @@ class ReservedDeviceNamesCannotBecomeAWorkdir(unittest.TestCase):
 
     `CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9` and `LPT1`-`LPT9` are device names on Windows
     at every directory level, so `mkdir` fails with an uncaught OSError before the duel has
-    done anything. Nobody here develops on Windows, which is why this belongs in the code
-    rather than in anyone's habits. The slug is lowercased and Windows matches these
+    done anything. A contributor on Linux or macOS never sees this failure, which is why it
+    belongs in the code rather than in anyone's habits. The slug is lowercased and Windows matches these
     case-insensitively, so `con` is as reserved as `CON`; `CON.md` is reserved too.
     """
 
@@ -4279,10 +4410,11 @@ class ResumeIntentTests(_TempWorkdirMixin, unittest.TestCase):
     """Resume intent comes from the POSITIONAL argument, never from ``--workdir``.
 
     `SKILL.md` documents resume as passing the duel workdir positionally, and `--workdir`
-    only as choosing where a NEW run lands. While the engine scanned both, `--workdir`
-    pointed at anything holding a `problem.md` was silently taken as a resume: the new
-    problem statement was discarded and `apply_resume` DELETED files matching `plan-*.md`
-    in a directory the user never meant to resume.
+    only as choosing where a NEW run lands. So the engine refuses a `--workdir` that is not
+    empty, and one holding a `problem.md` with no positional argument, and the refusal names
+    the positional form. A resume keeps the directory's own problem statement and has
+    `apply_resume` DELETE files matching `plan-*.md`; neither belongs in a directory the
+    user named as the place for a new run.
     """
 
     def _specs(self):
@@ -4316,11 +4448,11 @@ class ResumeIntentTests(_TempWorkdirMixin, unittest.TestCase):
             (wd / "problem.md").read_text(encoding="utf-8"), "their original problem\n"
         )
         self.assertTrue((wd / "plan-a.md").is_file())
-        # The message has to say how to resume, since --workdir no longer does it.
+        # The message has to say how to resume, since --workdir does not do it.
         self.assertIn("positional", str(ctx.exception))
 
     def test_workdir_alone_says_how_to_resume_rather_than_demanding_a_problem(self):
-        # `--workdir <a duel>` with no positional argument cannot resume now, so the
+        # `--workdir <a duel>` with no positional argument cannot resume, so the
         # refusal has to name the positional form — otherwise the user is told only
         # "No problem statement provided", which is true and useless.
         wd = self._duel_looking_dir()
@@ -4593,9 +4725,9 @@ class ARejudgeDegradesRatherThanHalting(_ResumeHarness, unittest.TestCase):
     """`_rejudge_round`'s own contract, applied to every way it can fail.
 
     A re-run that fails does NOT halt the duel: it degrades to v1's 0 and says so, because
-    turning a recoverable resume into a halt would be worse than the defect it replaced.
-    The except tuple named `JudgeOutputError`, `ProcessError` and `OSError`; a MISSING
-    SCHEMA raises `TemplateError`, which is none of them.
+    turning a recoverable resume into a halt would be worse than the zero it avoids. So the
+    except clause cannot be a tuple of `JudgeOutputError`, `ProcessError` and `OSError`: a
+    MISSING SCHEMA raises `TemplateError`, which is none of them.
 
     A resume past the round cap is where that bites: it skips `preflight_schema`, since a
     duel whose rounds are all complete needs only its summary written, so the unresolved
@@ -4656,7 +4788,7 @@ class ARejudgeDegradesRatherThanHalting(_ResumeHarness, unittest.TestCase):
                         f"the message must name what was missing: {msgs}")
 
     def test_a_missing_cli_still_degrades_the_same_way(self):
-        """The comparison the finding is stated against — unchanged by this fix."""
+        """The baseline the case above is compared against: a missing CLI falls back to 0."""
         specs = plan_duel.parse_adapter_config({
             "agent_a": {"command": [sys.executable, str(_STUB), "--write-file",
                                     "⟪workdir⟫/plan-a.md", "--content", "A" * 400],
@@ -4734,7 +4866,7 @@ class ResumeWinnerParityTests(_ResumeHarness, unittest.TestCase):
         resumed = self._tmpdir() / "resumed"
         shutil.copytree(whole, resumed)
         # Interrupt: drop the summary, the round that was in flight, and the judge file
-        # of the round before it — the two states this phase is about, together.
+        # of the round before it — the two states resume has to recover, together.
         (resumed / "summary.md").unlink()
         for path in resumed.glob(f"*-round-{interrupt_at}.md"):
             path.unlink()
@@ -4779,11 +4911,11 @@ class ResumeWinnerParityTests(_ResumeHarness, unittest.TestCase):
 class ResumeOnlyTargetsADuelWorkdir(unittest.TestCase):
     """A resume DELETES; what it deletes must be a duel, not a directory that resembles one.
 
-    `problem.md` was the whole test, and it is an ordinary filename. Pointed at a notes
-    directory holding one beside its own `plan-*.md` drafts, the resume lost three real
-    files: the cleanup globs (`plan-*.md`, `judge-*.md`, `rejections-*.md`,
-    `participant-*`, `progress.log`) match an ordinary working directory. The `--workdir`
-    route was closed earlier; the positional route was still open.
+    `problem.md` is an ordinary filename, and the cleanup globs (`plan-*.md`, `judge-*.md`,
+    `rejections-*.md`, `participant-*`, `progress.log`) match an ordinary working directory:
+    a notes directory holding a `problem.md` beside its own `plan-*.md` drafts would lose
+    them. A resume runs only from the positional argument and requires evidence of a duel
+    workdir; `--workdir` names a new duel and refuses a directory that already holds one.
     """
 
     def _dir(self, root, name, files):
@@ -4864,12 +4996,12 @@ class ResumeOnlyTargetsADuelWorkdir(unittest.TestCase):
 
 
 class NegativeScoresDoNotConverge(unittest.TestCase):
-    """The sign was dropped, so the worst score the rubric can express read as the best.
+    """The score keeps its sign, so the rubric's worst score never reads as its best.
 
-    `SCORE: -10` matched `\\d+` as `10`, which clears convergence_exit's `>= 8` and ends the
-    duel at round 3. It also made the two score paths contradict each other: a JSON `-10`
-    reached the isinstance(int) branch and was rejected as out-of-range, while the string
-    `"-10"` came back as 10 and converged.
+    `_FIRST_INT_RE` is `-?\\d+`, so `SCORE: -10` reads as -10, which `_usable_score` rejects
+    as out of range. A bare `\\d+` reads the same line as `10`, which clears
+    convergence_exit's `>= 8` and ends the duel at round 3. The two score paths agree: a
+    JSON `-10` and the string `"-10"` both come back as -10 and are both rejected.
     """
 
     def test_a_negative_marker_score_is_not_read_as_positive(self):
@@ -4888,11 +5020,12 @@ class NegativeScoresDoNotConverge(unittest.TestCase):
 
 
 class UnimplementedPromptModesAreRefused(unittest.TestCase):
-    """A knob that was validated, stored on the spec, and then read by nothing.
+    """A prompt mode the dispatch site never reads is refused when the config is parsed.
 
-    An adapter declaring `stdin` ran its CLI with no prompt at all, and failed somewhere
-    pointing nowhere near the config responsible. Refusing a mode that does nothing is
-    honest; accepting it is not.
+    The prompt reaches every CLI only through an argv placeholder, and the CLI runs with
+    stdin=DEVNULL, so `stdin` and `file` would hand it no prompt at all. The refusal names
+    the mode and points at argv, so the error lands on the config responsible. Refusing a
+    mode that does nothing is honest; accepting it is not.
     """
 
     def _config(self, **role_overrides):
@@ -4962,9 +5095,9 @@ class WritesDoNotFollowSymlinks(unittest.TestCase):
             plan_duel.write_text_utf8(target, "a\r\nb\rc\n")
             self.assertEqual(target.read_bytes(), b"a\nb\nc\n")
 
-    # The two workdir files the guard did not cover. `write_text_utf8` — the only caller
-    # of `open_no_follow` — is called by no production path, and the append branch had no
-    # call site at all, so every assertion above tested a function the engine never runs.
+    # The two workdir files the engine writes itself. The assertions above drive
+    # `write_text_utf8`, which no production path calls, so these drive the engine's own
+    # writers instead.
 
     @unittest.skipUnless(os.name == "posix", "symlink creation differs on Windows")
     def test_save_state_does_not_write_through_a_planted_state_json_link(self):
@@ -5047,12 +5180,12 @@ class WritesDoNotFollowSymlinks(unittest.TestCase):
 
 
 class TheSymlinkGuardIsReachedFromTheEngineItself(_ResumeHarness, unittest.TestCase):
-    """M19's real shape: the guard existed, was tested, and was wired to nothing.
+    """A guard that is tested but wired to nothing protects nothing.
 
-    Every symlink assertion in the suite drove `write_text_utf8`, a function no production
-    path calls. This drives a real critique round against the stub CLI with both
-    `state.json` and `progress.log` planted as links out of the workdir, so what is
-    asserted is the engine's own code path rather than a helper beside it.
+    Other tests call the production writers directly against planted links. This drives
+    a real critique round against the stub CLI with both `state.json` and `progress.log`
+    planted as links out of the workdir, so what is asserted is that the engine's own code
+    path reaches those writers, not only that the writers refuse.
 
     A refused activity write must still not abort the duel: `progress.log` is
     observation-only, and a duel that completed correctly must not be failed by a log line
@@ -5108,7 +5241,7 @@ class TheSymlinkGuardIsReachedFromTheEngineItself(_ResumeHarness, unittest.TestC
             encoding="utf-8"))
 
     def test_a_real_round_reaches_both_guarded_writers(self):
-        """The wiring itself, counted — "present" is what the guard already was.
+        """The wiring itself, counted — a guard that merely exists proves nothing.
 
         A behavioral assertion can be satisfied by an engine that stopped writing the file
         at all, so this records that one ordinary round actually enters `open_no_follow` in
@@ -5167,7 +5300,7 @@ class RuntimeNamesMustNotCollapseToOneSlug(unittest.TestCase):
 
 
 class ARuntimeSlugMustBeOneSafeFilenameComponent(_TempWorkdirMixin, unittest.TestCase):
-    """The collision guard reads a slug as a name; nothing checked it was one.
+    """The collision guard reads a slug as a name, so the slug must be checked to be one.
 
     `slugify_name` lowercases and stops, so a runtime named `x/../../victim` produced
     `plan-x/../../victim.md` — neither `a`, `b`, nor `<a|b>-round-<n>`, so it walks past
@@ -5264,7 +5397,7 @@ class RuntimeNamesMustNotCollideWithTheEnginesOwnFiles(unittest.TestCase):
         copy_bytes(plan-a.md -> plan-{controller_slug}.md)
         copy_bytes(plan-b.md -> plan-{participant_slug}.md)
 
-    so which slugs destroy something has a measured answer. A guard refusing any slug
+    so which slugs destroy something has an exact answer. A guard refusing any slug
     naming an engine file is too broad: it turns away `A`/`B`, where each copy is a
     SELF-copy. The rule is role-aware because the harm is:
 
@@ -5348,7 +5481,7 @@ class RuntimeNamesMustNotCollideWithTheEnginesOwnFiles(unittest.TestCase):
         self.assertIn("plan-b.md", str(caught.exception))
 
     def test_a_role_aligned_duel_runs_end_to_end(self):
-        """The reviewer's case, driven for real rather than argued.
+        """A role-aligned duel, driven end to end rather than argued.
 
         Controller `A`, participant `B`: both final plans land, both carry their own
         side's content, and only the winner is stamped.
@@ -5530,21 +5663,21 @@ class SummaryIsWrittenAtomically(unittest.TestCase):
 
 
 class AnInterruptedJudgeIsDetectable(unittest.TestCase):
-    """judge_needs_rerun documented a state that production never wrote.
+    """A judge killed partway through is re-run on resume, not trusted.
 
-    Its second re-run condition is "the file exists but state.json says that round's judge
-    never completed". Every RoundState for a critique round was created AFTER the judge
-    returned, with judge_completed=True, so the condition could not fire — while a judge
-    killed partway through leaves an unmarked non-empty file, which reads as a complete
-    verdict.
+    judge_needs_rerun's second re-run condition is "the file exists but state.json says that
+    round's judge never completed". Production writes that state: a critique round, and a
+    re-judge, save judge_completed=False BEFORE dispatching the judge and judge_completed=True
+    only after it returns. A killed judge leaves its fragment beside the False marker, where
+    an unmarked non-empty file would read as a complete verdict.
     """
 
     def test_with_no_state_at_all_a_present_verdict_is_still_left_alone(self):
-        """Deliberate and unchanged: without state.json there is nothing to read.
+        """Deliberate: without state.json there is nothing to read.
 
         The engine cannot tell a truncated write from a genuinely unparseable verdict by
-        content, and the conservative reading keeps what the judge said. This fix only
-        makes the case where state.json IS present work.
+        content, and the conservative reading keeps what the judge said. Only the case
+        where state.json IS present is detectable.
         """
         with tempfile.TemporaryDirectory() as td:
             wd = Path(td)
@@ -5573,11 +5706,11 @@ class AnInterruptedJudgeIsDetectable(unittest.TestCase):
 
 
 class RoundContextNeverContradictsTheRoundNumber(unittest.TestCase):
-    """An unreadable prior score fell through to round 1's sentence.
+    """An unreadable prior score must not fall through to round 1's sentence.
 
-    So an agent at round 5 was told "This is the first critique round" while the rest of its
-    prompt said round 5, and invited to discard four rounds of critique. A missing score is
-    missing information, not a fresh start.
+    Otherwise an agent at round 5 is told "This is the first critique round" while the rest
+    of its prompt says round 5, and invited to discard four rounds of critique. A missing
+    score is missing information, not a fresh start.
     """
 
     def test_a_later_round_with_no_readable_prior_score_says_which_round_it_is(self):
@@ -5651,8 +5784,8 @@ class TheWindowsTimeoutEndsTheTreeNotJustTheShim(unittest.TestCase):
 
 
 class MalformedInputIsARefusalNotATraceback(_TempWorkdirMixin, unittest.TestCase):
-    """Each input here once ended a duel in a raw traceback, several after both plans were
-    paid for. Each must now degrade, or stop with a message naming what is wrong."""
+    """Each input here, unhandled, ends a duel in a raw traceback, several after both plans
+    are paid for. Each must degrade, or stop with a message naming what is wrong."""
 
     def _run_main(self, *argv):
         out, err = io.StringIO(), io.StringIO()
@@ -5713,7 +5846,8 @@ class MalformedInputIsARefusalNotATraceback(_TempWorkdirMixin, unittest.TestCase
         tool.write_text("this is not a program\n", encoding="utf-8")
         tool.chmod(0o755)
         with self.assertRaises(plan_duel.ProcessError):
-            plan_duel.run_cli([str(tool)])
+            plan_duel.run_supervised([str(tool)], findings=self._tmpdir() / "reply.md",
+                                     mode="raw-stdout")
 
 
 class ASummaryOutlivesWhatItReads(_TempWorkdirMixin, unittest.TestCase):
@@ -5860,6 +5994,20 @@ class ResumeAndRejudgeTrustOnlyWhatTheyShould(_ResumeHarness, unittest.TestCase)
         self.assertEqual(text, "")
         self.assertFalse((wd / "judge-round-3.md").exists())
 
+    def test_a_changed_backend_halts_a_re_judge_instead_of_scoring_it_zero(self):
+        """A judge the supervisor would not start because its backend changed is not a judge
+        that failed: scoring the round 0 and finishing would report a duel that ran on a
+        backend nobody pinned. The refusal passes through, and the duel stops."""
+        wd = self._seed(self._tmpdir() / "wd", 3)
+        (wd / "judge-round-3.md").unlink()
+        state = self._interrupted_state(wd, 3)
+        refusal = plan_duel.BackendChangedError("judge was not started: backend 'alt' changed")
+        with unittest.mock.patch.object(plan_duel, "_dispatch_judge", side_effect=refusal):
+            with self.assertRaises(plan_duel.BackendChangedError):
+                plan_duel._rejudge_round(workdir=wd, round_n=3, specs=self._specs(),
+                                         ctx=self._ctx(wd), emit=lambda _m: None, timeout=60,
+                                         state=state)
+
     def test_the_timeout_help_says_a_resumed_judge_run_degrades(self):
         help_text = " ".join(plan_duel.build_parser().format_help().split())
         self.assertIn("scores that round 0", help_text)
@@ -5907,8 +6055,8 @@ class ResumeAndRejudgeTrustOnlyWhatTheyShould(_ResumeHarness, unittest.TestCase)
 
 
 class TheStampAndTheSummaryClaimOnlyWhatHappened(_TempWorkdirMixin, unittest.TestCase):
-    """The verdict fields, the stamp and the Winner line, where each once took, rewrote or
-    claimed more than the run did."""
+    """The verdict fields, the stamp and the Winner line must each take, rewrite and
+    claim no more than the run did."""
 
     def _duel(self, plan_bytes):
         wd = self._tmpdir() / "wd"
@@ -6104,9 +6252,9 @@ class WhichProgramRunsAndWhatAnAdapterMeans(_TempWorkdirMixin, unittest.TestCase
 
 
 class TheFixesHoldOnTheirOtherPaths(_ResumeHarness, unittest.TestCase):
-    """Paths the first round of fixes missed: an unusable marker beside a quoted object, an
-    unreadable or piped verdict on replay, and a batch wrapper on a resume that skips
-    preflight."""
+    """The same guarantees on their less obvious paths: an unusable marker beside a quoted
+    object, an unreadable or piped verdict on replay, and a batch wrapper on a resume that
+    skips preflight."""
 
     def test_a_carried_marker_outranks_a_partial_object_even_when_its_value_is_unusable(self):
         text = (
@@ -6162,12 +6310,14 @@ class TheFixesHoldOnTheirOtherPaths(_ResumeHarness, unittest.TestCase):
     def test_a_batch_wrapper_is_refused_at_dispatch_when_preflight_was_skipped(self):
         # os.name is patched around code that builds no Path, as in the preflight test.
         shim = r"C:\tools\npm\judge.cmd"
+        reply = self._tmpdir() / "judge-round-1.md"
         with unittest.mock.patch.object(plan_duel, "resolve_executable", return_value=shim), \
              unittest.mock.patch.object(plan_duel.subprocess, "Popen",
                                         side_effect=AssertionError("spawned a batch wrapper")), \
              unittest.mock.patch.object(plan_duel.os, "name", "nt"):
             with self.assertRaises(plan_duel.CliNotFoundError):
-                plan_duel.run_cli(["judge", "a multi-line\nprompt"])
+                plan_duel.run_supervised(["judge", "a multi-line\nprompt"], findings=reply,
+                                         mode="raw-stdout")
 
 
 # A symlink that points at itself. `os.stat` answers ELOOP -- the filesystem cannot resolve
@@ -6310,9 +6460,10 @@ class ANameTooLongToResolveIsNotAnAbsentName(unittest.TestCase):
                      "no group or world bits to lose, and reports 0o666 or 0o444 for every file")
 class AStampKeepsThePlansPermissions(unittest.TestCase):
     """The winner is stamped by a temporary file and a rename. `mkstemp` creates 0600 and
-    `os.replace` keeps whatever the temporary had, so a plan every teammate could read became
-    readable by whoever ran the duel the moment it was stamped. The mode travels with the
-    content: an existing file keeps its own, a new one gets what a plain create would."""
+    `os.replace` keeps whatever the temporary had, so a plan every teammate could read would
+    become readable only by whoever ran the duel the moment it was stamped. The mode travels
+    with the content: an existing file keeps its own, a new one gets what a plain create
+    would."""
 
     def test_an_existing_files_mode_survives_the_atomic_write(self):
         import os, stat, tempfile
@@ -6335,6 +6486,1109 @@ class AStampKeepsThePlansPermissions(unittest.TestCase):
             finally:
                 os.umask(old)
             self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o644)
+
+
+class LaunchParityTests(_ResumeHarness, unittest.TestCase):
+    """What plan-duel's launch path does, pinned apart from the program that launches.
+
+    Every property here is asserted through a real round driven by the stub CLI, never
+    through the launcher itself: these tests must pass unchanged whatever program the roles
+    launch through, and a test that called the launcher directly would be tied to it and
+    prove nothing about the behavior.
+    """
+
+    NOISE = "STATUS-NOISE-7d1c"
+    ERR = "STDERR-NOISE-4e2a"
+
+    def _role(self, *args, stdout="file"):
+        return {"command": [sys.executable, str(_STUB), *args], "stdout": stdout}
+
+    def _lineup(self, *, agent_a=None, agent_b=None, judge=None):
+        return plan_duel.parse_adapter_config({
+            "agent_a": agent_a or self._role(
+                "--write-file", "⟪workdir⟫/plan-a.md", "--content", "A" * 400),
+            "agent_b": agent_b or self._role(
+                "--write-file", "⟪workdir⟫/plan-b.md", "--content", "B" * 400),
+            "judge": judge or self._role(
+                "--stdout", "SCORE: 9\n\nPREFERRED: A\n", stdout="clean-last-message"),
+        })
+
+    def _duel(self, wd, start_round, specs, *, timeout=60):
+        msgs = []
+        rounds_run, stop = plan_duel.run_duel(
+            workdir=wd, specs=specs, ctx=self._ctx(wd), start_round=start_round,
+            emit=msgs.append, timeout=timeout, state=plan_duel.RunState())
+        return rounds_run, stop, msgs
+
+    def test_a_role_that_writes_its_own_artifact_lands_that_file_and_nothing_else(self):
+        wd = self._seed(self._tmpdir() / "wd", 2)
+        specs = self._lineup(agent_b=self._role(
+            "--write-file", "⟪workdir⟫/plan-b.md", "--content", "B" * 400,
+            "--stdout", self.NOISE, "--stderr", self.ERR))
+        self._duel(wd, 3, specs)
+        self.assertEqual(
+            (wd / plan_duel.plan_snapshot_name("b", 3)).read_text(encoding="utf-8"),
+            "B" * 400, "the plan is the file the CLI wrote, with none of its output in it")
+        # Its stdout is a status stream, kept beside the plan and never mistaken for it.
+        # What else shares that stream is not pinned: only that the plan holds none of it.
+        self.assertIn(self.NOISE, (wd / "participant-round-3-status.md").read_text(
+            encoding="utf-8"))
+
+    def test_a_role_whose_reply_is_its_last_message_captures_only_that_message(self):
+        wd = self._seed(self._tmpdir() / "wd", 2)
+        verdict = "SCORE: 9\n\nPREFERRED: A\n"
+        specs = self._lineup(
+            agent_a=self._role("--stdout", "A" * 400, "--stderr", self.ERR,
+                               stdout="clean-last-message"),
+            judge=self._role("--stdout", verdict, "--stderr", "SCORE: 1\n" + self.ERR,
+                             stdout="clean-last-message"))
+        self._duel(wd, 3, specs)
+        self.assertEqual((wd / "judge-round-3.md").read_text(encoding="utf-8"), verdict,
+                         "the judge's message is its stdout alone, never its stderr")
+        self.assertEqual(
+            (wd / plan_duel.plan_snapshot_name("a", 3)).read_text(encoding="utf-8"),
+            "A" * 400)
+
+    def test_the_progress_channel_is_appended_across_roles_and_rounds(self):
+        wd = self._seed(self._tmpdir() / "wd", 0)
+        log = wd / plan_duel.PROGRESS_LOG_NAME
+        log.write_text("SENTINEL-PRIOR\n", encoding="utf-8")
+        rounds_run, _, _ = self._duel(wd, 1, self._lineup())
+        self.assertEqual(rounds_run, 3, "three rounds had to run for this to mean anything")
+        lines = log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines[0], "SENTINEL-PRIOR", "the progress log was truncated")
+        firsts = []
+        for rnd in (1, 2, 3):
+            mine = [i for i, ln in enumerate(lines) if f"round {rnd}" in ln]
+            self.assertTrue(mine, f"round {rnd} left no line: {lines}")
+            text = "\n".join(lines[i] for i in mine)
+            for role in ("Plan A", "Plan B", "judg"):
+                self.assertIn(role, text, f"round {rnd} has no {role!r} line")
+            firsts.append(mine[0])
+        self.assertEqual(firsts, sorted(firsts), "rounds were not appended in order")
+
+    @unittest.skipUnless(os.name == "posix", "symlink creation differs on Windows")
+    def test_a_symlinked_output_path_is_refused_rather_than_written_through(self):
+        root = self._tmpdir()
+        outside = root / "outside.txt"
+        outside.write_text("PRECIOUS\n", encoding="utf-8")
+        wd = self._seed(root / "wd", 2)
+        (wd / "participant-round-3-status.md").symlink_to(outside)
+        specs = self._lineup(agent_b=self._role(
+            "--write-file", "⟪workdir⟫/plan-b.md", "--content", "B" * 400,
+            "--stdout", self.NOISE))
+        with self.assertRaises(plan_duel.PlanDuelError):
+            self._duel(wd, 3, specs)
+        self.assertEqual(outside.read_text(encoding="utf-8"), "PRECIOUS\n")
+        self.assertFalse((wd / "judge-round-3.md").exists(),
+                         "the duel went on past a refused write")
+
+    @unittest.skipUnless(os.name == "posix", "symlink creation differs on Windows")
+    def test_a_symlinked_reply_path_is_never_written_through(self):
+        """The judge's clean message lands at a path the engine names; a link planted
+        there must not carry the verdict out of the workdir, however the engine avoids it."""
+        root = self._tmpdir()
+        outside = root / "outside.txt"
+        outside.write_text("PRECIOUS\n", encoding="utf-8")
+        wd = self._seed(root / "wd", 2)
+        (wd / "judge-round-3.md").symlink_to(outside)
+        with contextlib.suppress(plan_duel.PlanDuelError):
+            self._duel(wd, 3, self._lineup())
+        self.assertEqual(outside.read_text(encoding="utf-8"), "PRECIOUS\n")
+
+    def test_a_cli_that_reads_standard_input_gets_end_of_file(self):
+        wd = self._seed(self._tmpdir() / "wd", 2)
+        specs = self._lineup(agent_b=self._role(
+            "--read-stdin-to", "⟪workdir⟫/stdin-bytes.txt",
+            "--write-file", "⟪workdir⟫/plan-b.md", "--content", "B" * 400))
+        # The runner's own stdin is usually /dev/null already (CI, the shard runner), and a
+        # child that inherited it would read end-of-file too. Hand this process an open pipe
+        # nobody writes to, so only a child given its own closed stdin can finish.
+        read_end, write_end = os.pipe()
+        saved = os.dup(0)
+        os.dup2(read_end, 0)
+        os.close(read_end)
+        try:
+            started = time.monotonic()
+            _, stop, _ = self._duel(wd, 3, specs, timeout=30)
+        finally:
+            os.dup2(saved, 0)
+            os.close(saved)
+            os.close(write_end)
+        self.assertLess(time.monotonic() - started, 25, "the CLI waited on stdin")
+        self.assertEqual(stop, plan_duel.CONVERGENCE_LABEL)
+        self.assertEqual((wd / "stdin-bytes.txt").read_text(encoding="utf-8"), "0")
+
+    def _slow_agent_b(self, wd):
+        return self._lineup(agent_b=self._role(
+            "--spawn-grandchild", "⟪workdir⟫/grandchild.pid", "--sleep", "60",
+            "--write-file", "⟪workdir⟫/plan-b.md", "--content", "B" * 400))
+
+    def test_a_spawn_that_exceeds_its_ceiling_is_stopped_and_halts_the_duel(self):
+        wd = self._seed(self._tmpdir() / "wd", 2)
+        self.addCleanup(self._reap, wd / "grandchild.pid")
+        started = time.monotonic()
+        with self.assertRaises(plan_duel.AgentOutputError) as caught:
+            self._duel(wd, 3, self._slow_agent_b(wd), timeout=5)
+        self.assertLess(time.monotonic() - started, 40, "the ceiling did not stop the spawn")
+        self.assertTrue(caught.exception.spawn_failed,
+                        "a stopped spawn was reported as an agent that wrote a bad plan")
+        self.assertFalse((wd / "judge-round-3.md").exists(),
+                         "the duel went on to judge a round whose agent was stopped")
+
+    @unittest.skipUnless(os.name == "posix", "process groups are POSIX; Windows ends the "
+                         "tree another way, covered by TheWindowsTimeoutEndsTheTreeNotJustTheShim")
+    def test_the_timeout_kills_the_whole_process_group(self):
+        wd = self._seed(self._tmpdir() / "wd", 2)
+        pidfile = wd / "grandchild.pid"
+        self.addCleanup(self._reap, pidfile)
+        with self.assertRaises(plan_duel.AgentOutputError):
+            self._duel(wd, 3, self._slow_agent_b(wd), timeout=5)
+        self.assertTrue(pidfile.exists(), "the stub was stopped before it started its child, "
+                                          "so this run proves nothing about the group kill")
+        pid = int(pidfile.read_text(encoding="utf-8"))
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and self._alive(pid):
+            time.sleep(0.1)
+        self.assertFalse(self._alive(pid), "the CLI's own child outlived the timeout")
+
+    @staticmethod
+    def _alive(pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        # A killed process nobody has reaped yet still answers signal 0. Where the first
+        # process does not collect orphans, the grandchild stays a zombie: dead, and
+        # reported alive.
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        except OSError:
+            return True
+        return stat.rpartition(")")[2].split()[0] != "Z"
+
+    def _reap(self, pidfile):
+        """Never leave a sleeper behind when an assertion above fails."""
+        try:
+            pid = int(pidfile.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGTERM)
+
+
+def _role_with(**extra):
+    """One role's raw config: `_valid_config`'s agent_a plus the given keys."""
+    role = dict(_valid_config()["agent_a"])
+    role["command"] = ["exe-a", "--model", "⟪model⟫", "-p", "⟪prompt⟫"]
+    role["placeholders"] = ["model", "prompt"]
+    role["model"] = "vendor/model-x"
+    role.update(extra)
+    return role
+
+
+def _config_with(**agent_a):
+    config = _valid_config()
+    config["agent_a"] = _role_with(**agent_a)
+    return config
+
+
+class RoleEnvTests(unittest.TestCase):
+    """A role's model and environment fields are type-checked when the config is read."""
+
+    def _refused(self, **agent_a):
+        with self.assertRaises(plan_duel.AdapterConfigError) as cm:
+            plan_duel.parse_adapter_config(_config_with(**agent_a))
+        return str(cm.exception)
+
+    def test_the_three_fields_parse(self):
+        specs = plan_duel.parse_adapter_config(_config_with(
+            env={"BASE_URL": "https://example.invalid/v1"},
+            env_from_parent={"CHILD_TOKEN": "PARENT_TOKEN"},
+        ))
+        a = specs["agent_a"]
+        self.assertEqual(a.model, "vendor/model-x")
+        self.assertEqual(dict(a.env), {"BASE_URL": "https://example.invalid/v1"})
+        self.assertEqual(dict(a.env_from_parent), {"CHILD_TOKEN": "PARENT_TOKEN"})
+
+    def test_a_role_with_none_of_them_gets_empty_fields(self):
+        b = plan_duel.parse_adapter_config(_valid_config())["agent_b"]
+        self.assertIsNone(b.model)
+        self.assertEqual(dict(b.env), {})
+        self.assertEqual(dict(b.env_from_parent), {})
+
+    def test_a_non_string_env_value_is_refused_by_name(self):
+        message = self._refused(env={"KEY": 1})
+        self.assertIn("agent_a", message)
+        self.assertIn("'env'", message)
+        self.assertIn("KEY", message)
+
+    def test_env_that_is_not_an_object_is_refused(self):
+        self.assertIn("'env'", self._refused(env=["KEY=1"]))
+
+    def test_a_non_string_model_is_refused(self):
+        self.assertIn("'model'", self._refused(model=5))
+
+    def test_an_empty_model_is_refused(self):
+        self.assertIn("'model'", self._refused(model="  "))
+
+    def test_a_model_holding_a_nul_is_refused_when_read(self):
+        self.assertIn("'model'", self._refused(model="vendor/x\0y"))
+
+    def test_env_from_parent_must_be_an_object(self):
+        self.assertIn("'env_from_parent'", self._refused(env_from_parent=["TOKEN"]))
+
+    def test_env_from_parent_must_map_a_name_to_a_name(self):
+        # The side it reads is where a key gets pasted by mistake, so it is never quoted back.
+        typed = "fw-3c9e-not-a-name"
+        message = self._refused(env_from_parent={"CHILD_TOKEN": typed})
+        self.assertIn("'env_from_parent'", message)
+        self.assertIn("CHILD_TOKEN", message)
+        self.assertNotIn(typed, message)
+
+    def test_env_from_parent_refuses_a_non_string_side(self):
+        self.assertIn("'env_from_parent'",
+                      self._refused(env_from_parent={"CHILD_TOKEN": 7}))
+
+    def test_a_name_that_is_not_a_variable_name_is_refused_unquoted(self):
+        typed = "sk-live-4411"
+        for field_name in ("env", "env_from_parent"):
+            with self.subTest(field=field_name):
+                message = self._refused(**{field_name: {typed: "VALUE"}})
+                self.assertIn(f"'{field_name}'", message)
+                self.assertNotIn(typed, message)
+
+    def test_a_nul_in_a_literal_value_is_refused(self):
+        self.assertIn("NUL", self._refused(env={"KEY": "a\0b"}))
+
+    def test_one_name_set_by_both_fields_is_refused(self):
+        message = self._refused(env={"TOKEN": "x"}, env_from_parent={"TOKEN": "PARENT"})
+        self.assertIn("TOKEN", message)
+
+    def test_an_unknown_key_is_still_refused(self):
+        message = self._refused(envs={"KEY": "1"})
+        self.assertIn("envs", message)
+
+
+class ModelMarkerTests(unittest.TestCase):
+    """``⟪model⟫`` renders the role's `model` field, and each needs the other."""
+
+    def test_the_marker_renders_the_field(self):
+        spec = plan_duel.parse_adapter_config(_config_with())["agent_a"]
+        self.assertEqual(plan_duel.render_argv(spec, {"prompt": "P"}),
+                         ["exe-a", "--model", "vendor/model-x", "-p", "P"])
+
+    def test_the_marker_renders_inside_a_setting(self):
+        spec = plan_duel.parse_adapter_config(_config_with(
+            command=["exe-a", "-c", "model=⟪model⟫", "⟪prompt⟫"]))["agent_a"]
+        self.assertEqual(plan_duel.render_argv(spec, {"prompt": "P"}),
+                         ["exe-a", "-c", "model=vendor/model-x", "P"])
+
+    def test_the_marker_without_the_field_is_refused(self):
+        role = _role_with()
+        del role["model"]
+        config = _valid_config()
+        config["agent_a"] = role
+        with self.assertRaises(plan_duel.AdapterConfigError) as cm:
+            plan_duel.parse_adapter_config(config)
+        self.assertIn("agent_a", str(cm.exception))
+        self.assertIn("⟪model⟫", str(cm.exception))
+
+    def test_the_field_without_the_marker_is_refused(self):
+        with self.assertRaises(plan_duel.AdapterConfigError) as cm:
+            plan_duel.parse_adapter_config(_config_with(
+                command=["exe-a", "-p", "⟪prompt⟫"], placeholders=["prompt"]))
+        self.assertIn("agent_a", str(cm.exception))
+        self.assertIn("⟪model⟫", str(cm.exception))
+
+    def test_a_config_with_neither_renders_as_it_always_has(self):
+        specs = plan_duel.parse_adapter_config(_valid_config())
+        values = {"prompt": "P", "workdir": "/wd"}
+        self.assertEqual(plan_duel.render_argv(specs["agent_a"], values),
+                         ["exe-a", "-p", "P", "--add-dir", "/wd"])
+        self.assertEqual(plan_duel.render_argv(specs["agent_b"], values),
+                         ["exe-b", "run", "-C", "/wd", "P"])
+        self.assertEqual(plan_duel.render_argv(specs["judge"], values),
+                         ["exe-a", "-p", "P"])
+
+    def test_a_render_value_named_model_never_replaces_the_field(self):
+        spec = plan_duel.parse_adapter_config(_config_with())["agent_a"]
+        self.assertIn("vendor/model-x",
+                      plan_duel.render_argv(spec, {"prompt": "P", "model": "other"}))
+
+
+class FrozenLineupTests(_ResumeHarness, unittest.TestCase):
+    """Who played is frozen at the first run; how they were run is not."""
+
+    def _lineup(self, *, model="vendor/model-x", argv0=None, extra=(), env_from_parent=None,
+                env=None, b_exit=0, b_model=None, judge_model=None, backend=None):
+        exe = argv0 or sys.executable
+        agent_a = {
+            "command": [exe, str(_STUB), "--write-file", "⟪workdir⟫/plan-a.md",
+                        "--content", "A" * 400, "--stderr", "⟪model⟫", *extra],
+            "stdout": "file", "model": model,
+        }
+        if env_from_parent is not None:
+            agent_a["env_from_parent"] = env_from_parent
+        if env is not None:
+            agent_a["env"] = env
+        if backend is not None:
+            agent_a["backend"] = backend
+        agent_b = {"command": [exe, str(_STUB), "--write-file", "⟪workdir⟫/plan-b.md",
+                               "--content", "B" * 400, "--exit-code", str(b_exit)],
+                   "stdout": "file"}
+        judge = {"command": [exe, str(_STUB), "--stdout", "SCORE: 9\n\nPREFERRED: A\n"],
+                 "stdout": "clean-last-message"}
+        for role, role_model in ((agent_b, b_model), (judge, judge_model)):
+            if role_model is not None:
+                role["command"] += ["--stderr", "⟪model⟫"]
+                role["model"] = role_model
+        return plan_duel.parse_adapter_config(
+            {"agent_a": agent_a, "agent_b": agent_b, "judge": judge})
+
+    def _started(self, specs):
+        """A duel through round 2, whose state records the lineup it started with."""
+        wd = self._seed(self._tmpdir() / "wd", 2)
+        state = plan_duel.RunState("Claude", "Codex", lineup=plan_duel.frozen_lineup(specs))
+        plan_duel.save_state(wd, state)
+        return wd
+
+    def _resume(self, wd, specs):
+        msgs = []
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc = plan_duel.execute(argument=str(wd), specs=specs, controller_name="Claude",
+                                   participant_name="Codex", emit=msgs.append, timeout=60)
+        return rc, msgs
+
+    def _refusal(self, wd, specs):
+        with self.assertRaises(plan_duel.PlanDuelError) as cm:
+            self._resume(wd, specs)
+        self.assertFalse((wd / plan_duel.plan_snapshot_name("a", 3)).exists(),
+                         "a refused resume ran a round")
+        self.assertIn("who plays", str(cm.exception))
+        return str(cm.exception)
+
+    def test_a_changed_model_is_refused_naming_the_role(self):
+        wd = self._started(self._lineup())
+        message = self._refusal(wd, self._lineup(model="vendor/model-y"))
+        self.assertIn("agent_a", message)
+        self.assertIn("vendor/model-x", message)
+        self.assertIn("vendor/model-y", message)
+
+    def test_a_changed_cli_is_refused(self):
+        wd = self._started(self._lineup())
+        other = str(Path(sys.executable).parent / "other-cli")
+        message = self._refusal(wd, self._lineup(argv0=other))
+        self.assertIn("other-cli", message)
+
+    def test_a_changed_credential_name_is_refused_without_quoting_the_parent_side(self):
+        wd = self._started(self._lineup(env_from_parent={"CHILD_TOKEN": "PARENT_ONE"}))
+        message = self._refusal(
+            wd, self._lineup(env_from_parent={"CHILD_TOKEN": "PARENT_TWO"}))
+        self.assertIn("agent_a", message)
+        self.assertIn("CHILD_TOKEN", message)
+        self.assertNotIn("PARENT_ONE", message)
+        self.assertNotIn("PARENT_TWO", message)
+
+    def test_an_added_verbose_flag_resumes(self):
+        wd = self._started(self._lineup())
+        rc, _ = self._resume(wd, self._lineup(extra=("--verbose",)))
+        self.assertEqual(rc, 0)
+        self.assertTrue((wd / plan_duel.plan_snapshot_name("a", 3)).exists())
+
+    def test_a_changed_literal_setting_is_refused_and_no_value_is_recorded(self):
+        """A role's own `env` can hold the address that picks its provider, and the agent
+        running the skill rewrites the config on every run, so any changed value is a
+        changed player: refused and named, never silently resumed."""
+        wd = self._started(self._lineup(env={"ANTHROPIC_BASE_URL": "https://one.invalid"}))
+        text = (wd / plan_duel.STATE_FILENAME).read_text(encoding="utf-8")
+        self.assertNotIn("https://one.invalid", text)
+        message = self._refusal(
+            wd, self._lineup(env={"ANTHROPIC_BASE_URL": "https://two.invalid"}))
+        self.assertIn("agent_a", message)
+        self.assertIn("env", message)
+        rc, _ = self._resume(wd, self._lineup(env={"ANTHROPIC_BASE_URL": "https://one.invalid"}))
+        self.assertEqual(rc, 0, "the unchanged settings must still resume")
+
+    def test_an_added_or_removed_literal_setting_is_refused(self):
+        wd = self._started(self._lineup())
+        self._refusal(wd, self._lineup(env={"LOG_LEVEL": "debug"}))
+
+    def test_a_record_without_the_settings_digest_still_resumes(self):
+        """A duel recorded before literal settings were pinned is compared on what it kept."""
+        wd = self._started(self._lineup(env={"LOG_LEVEL": "info"}))
+        state = plan_duel.load_state(wd)
+        for record in state.lineup.values():
+            record.pop("env", None)
+        plan_duel.save_state(wd, state)
+        rc, _ = self._resume(wd, self._lineup(env={"LOG_LEVEL": "debug"}))
+        self.assertEqual(rc, 0)
+
+    def test_a_state_file_written_before_the_record_existed_still_loads_and_resumes(self):
+        wd = self._seed(self._tmpdir() / "wd", 2)
+        (wd / plan_duel.STATE_FILENAME).write_text(json.dumps({
+            "controller_name": "Claude", "participant_name": "Codex",
+            "rounds": {"1": {"plans_snapshotted": True, "judge_completed": True,
+                             "score": 9}},
+        }), encoding="utf-8")
+        loaded = plan_duel.load_state(wd)
+        self.assertEqual(loaded.lineup, {})
+        self.assertEqual(loaded.rounds[1].score, 9)
+        rc, _ = self._resume(wd, self._lineup())
+        self.assertEqual(rc, 0)
+        self.assertEqual(plan_duel.load_state(wd).lineup["agent_a"]["model"],
+                         "vendor/model-x", "the resume did not start recording who played")
+
+    def test_a_new_run_records_argv0_as_written_not_as_resolved(self):
+        bare = Path(sys.executable).name
+        path = os.pathsep.join([str(Path(sys.executable).parent), os.environ.get("PATH", "")])
+        specs = self._lineup(argv0=bare,
+                             env_from_parent={"CHILD_TOKEN": "PARENT_TOKEN"})
+        wd = self._tmpdir() / "wd"
+        with unittest.mock.patch.dict(os.environ, {"PATH": path, "PARENT_TOKEN": "set"}), \
+                contextlib.redirect_stderr(io.StringIO()):
+            rc = plan_duel.execute(argument="p" * 400, workdir_arg=str(wd), specs=specs,
+                                   controller_name="Claude", participant_name="Codex",
+                                   emit=lambda _m: None, timeout=60)
+        self.assertEqual(rc, 0)
+        record = json.loads((wd / plan_duel.STATE_FILENAME).read_text(encoding="utf-8"))
+        self.assertEqual(record["lineup"]["agent_a"], {
+            "argv0": bare, "model": "vendor/model-x",
+            "env_from_parent": {"CHILD_TOKEN": plan_duel._name_digest("PARENT_TOKEN")},
+            "env": plan_duel._name_digest("[]")})
+        for role in plan_duel.REQUIRED_ROLES:
+            self.assertEqual(record["lineup"][role]["argv0"], bare, role)
+
+    def test_a_changed_model_after_round_0_died_at_agent_b_is_refused(self):
+        # Plan A is validated and kept before Agent B runs, so the lineup must already be on
+        # disk then, or a resume reuses Plan A under a different model.
+        wd = self._tmpdir() / "wd"
+        with contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaises(plan_duel.PlanDuelError):
+            plan_duel.execute(argument="p" * 400, workdir_arg=str(wd),
+                              specs=self._lineup(b_exit=3), controller_name="Claude",
+                              participant_name="Codex", emit=lambda _m: None, timeout=60)
+        self.assertTrue((wd / plan_duel.plan_snapshot_name("a", 0)).exists())
+        with self.assertRaises(plan_duel.PlanDuelError) as cm:
+            self._resume(wd, self._lineup(model="vendor/model-y"))
+        self.assertIn("who plays", str(cm.exception))
+        self.assertIn("agent_a", str(cm.exception))
+        self.assertFalse((wd / "summary.md").exists())
+
+    def test_a_corrected_model_after_round_0_died_at_agent_b_resumes(self):
+        # Nothing Agent B produced survives that failure, so freezing its model would only
+        # stop the user fixing the typo that caused it.
+        wd = self._tmpdir() / "wd"
+        with contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaises(plan_duel.PlanDuelError):
+            plan_duel.execute(argument="p" * 400, workdir_arg=str(wd),
+                              specs=self._lineup(b_exit=3, b_model="vendor/modle-typo"),
+                              controller_name="Claude", participant_name="Codex",
+                              emit=lambda _m: None, timeout=60)
+        rc, _ = self._resume(wd, self._lineup(b_model="vendor/model-fixed"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(plan_duel.load_state(wd).lineup["agent_b"]["model"],
+                         "vendor/model-fixed")
+
+    def test_a_changed_judge_is_refused_once_a_verdict_is_kept(self):
+        wd = self._started(self._lineup(judge_model="vendor/judge-one"))
+        message = self._refusal(wd, self._lineup(judge_model="vendor/judge-two"))
+        self.assertIn("judge", message)
+
+    def test_a_changed_judge_resumes_before_any_verdict_exists(self):
+        wd = self._seed(self._tmpdir() / "wd", 0)
+        state = plan_duel.RunState(
+            "Claude", "Codex",
+            lineup=plan_duel.frozen_lineup(self._lineup(judge_model="vendor/judge-typo")))
+        plan_duel.save_state(wd, state)
+        rc, _ = self._resume(wd, self._lineup(judge_model="vendor/judge-fixed"))
+        self.assertEqual(rc, 0)
+
+    def test_a_changed_plan_writer_is_refused_before_any_verdict_exists(self):
+        # Round 0's plans survive into round 1, so their writers are frozen even unjudged.
+        wd = self._seed(self._tmpdir() / "wd", 0)
+        state = plan_duel.RunState("Claude", "Codex", lineup=plan_duel.frozen_lineup(
+            self._lineup(b_model="vendor/b-one")))
+        plan_duel.save_state(wd, state)
+        message = self._refusal(wd, self._lineup(b_model="vendor/b-two"))
+        self.assertIn("agent_b", message)
+
+    def test_the_launching_side_name_is_recorded_as_a_digest_not_verbatim(self):
+        # A key pasted where a name belongs passes the name check in several common formats.
+        pasted = "gsk_4f9a8b7c6d5e4f3a2b1c"
+        wd = self._started(self._lineup(env_from_parent={"CHILD_TOKEN": pasted}))
+        text = (wd / plan_duel.STATE_FILENAME).read_text(encoding="utf-8")
+        self.assertNotIn(pasted, text)
+        self.assertIn("CHILD_TOKEN", text)
+        message = self._refusal(
+            wd, self._lineup(env_from_parent={"CHILD_TOKEN": "gsk_other"}))
+        self.assertIn("CHILD_TOKEN", message)
+
+    def test_the_same_model_on_a_different_backend_is_refused_for_a_kept_role(self):
+        # One model, two providers: a different player, though the model id is the same.
+        backends = self._tmpdir() / "backends.json"
+        same = {"harness": Path(sys.executable).name, "model": "vendor/model-x"}
+        backends.write_text(json.dumps({"one": same, "two": same}), encoding="utf-8")
+        with unittest.mock.patch.dict(os.environ,
+                                      {"PORTABLE_AGENT_SKILLS_BACKENDS": str(backends)}):
+            started = plan_duel.resolve_backends(self._lineup(backend="one"),
+                                                 plan_duel.default_supervisor())
+            wd = self._started(started)
+            self.assertEqual(plan_duel.load_state(wd).lineup["agent_a"]["backend"], "one")
+            message = self._refusal(wd, self._lineup(backend="two"))
+            self.assertIn("agent_a", message)
+            self.assertIn("'one'", message)
+            self.assertIn("'two'", message)
+            rc, _ = self._resume(wd, self._lineup(backend="one"))
+            self.assertEqual(rc, 0, "the same backend must still resume")
+
+    def test_the_same_backend_edited_between_runs_is_refused_for_a_kept_role(self):
+        """The name is not the player: an entry edited to reach another address or read
+        another key is another provider or account behind the same name."""
+        backends = self._tmpdir() / "backends.json"
+        base = {"harness": Path(sys.executable).name, "model": "vendor/model-x",
+                "env": {"STUB_BASE": "https://one.invalid"}}
+        backends.write_text(json.dumps({"one": base}), encoding="utf-8")
+        with unittest.mock.patch.dict(os.environ,
+                                      {"PORTABLE_AGENT_SKILLS_BACKENDS": str(backends)}):
+            started = plan_duel.resolve_backends(self._lineup(backend="one"),
+                                                 plan_duel.default_supervisor())
+            wd = self._started(started)
+            text = (wd / plan_duel.STATE_FILENAME).read_text(encoding="utf-8")
+            self.assertNotIn("https://one.invalid", text)
+            edited = {**base, "env": {"STUB_BASE": "https://two.invalid"}}
+            backends.write_text(json.dumps({"one": edited}), encoding="utf-8")
+            message = self._refusal(wd, self._lineup(backend="one"))
+            self.assertIn("agent_a", message)
+            backends.write_text(json.dumps({"one": base}), encoding="utf-8")
+            rc, _ = self._resume(wd, self._lineup(backend="one"))
+            self.assertEqual(rc, 0, "the unedited backend must still resume")
+
+    def test_a_record_without_the_backend_digest_still_resumes(self):
+        """A duel recorded before backends were fingerprinted is compared on what it kept."""
+        backends = self._tmpdir() / "backends.json"
+        backends.write_text(json.dumps({"one": {"harness": Path(sys.executable).name,
+                                                "model": "vendor/model-x"}}),
+                            encoding="utf-8")
+        with unittest.mock.patch.dict(os.environ,
+                                      {"PORTABLE_AGENT_SKILLS_BACKENDS": str(backends)}):
+            wd = self._started(plan_duel.resolve_backends(self._lineup(backend="one"),
+                                                          plan_duel.default_supervisor()))
+            state = plan_duel.load_state(wd)
+            self.assertIn("backend_digest", state.lineup["agent_a"])
+            for record in state.lineup.values():
+                record.pop("backend_digest", None)
+            plan_duel.save_state(wd, state)
+            rc, _ = self._resume(wd, self._lineup(backend="one"))
+        self.assertEqual(rc, 0)
+
+    def test_a_case_only_change_is_no_change_where_names_ignore_case(self):
+        with unittest.mock.patch.object(plan_duel, "_env_key", str.upper):
+            before_nt = plan_duel.frozen_lineup(
+                self._lineup(env_from_parent={"child_token": "parent_one"}))
+            after_nt = plan_duel.frozen_lineup(
+                self._lineup(env_from_parent={"CHILD_TOKEN": "PARENT_ONE"}))
+        self.assertEqual(plan_duel.lineup_changes(before_nt, after_nt), [])
+        # Where case matters, it names a different variable.
+        with unittest.mock.patch.object(plan_duel, "_env_key", str):
+            before_posix = plan_duel.frozen_lineup(
+                self._lineup(env_from_parent={"child_token": "parent_one"}))
+            after_posix = plan_duel.frozen_lineup(
+                self._lineup(env_from_parent={"CHILD_TOKEN": "PARENT_ONE"}))
+        self.assertTrue(plan_duel.lineup_changes(before_posix, after_posix))
+
+    def test_two_roles_on_one_cli_with_different_models_run_one_duel(self):
+        def agent(side, model):
+            return {"command": [sys.executable, str(_STUB), "--write-file",
+                                f"⟪workdir⟫/plan-{side}.md", "--content",
+                                "⟪model⟫ " + side.upper() * 400],
+                    "stdout": "file", "model": model}
+        specs = plan_duel.parse_adapter_config({
+            "agent_a": agent("a", "vendor/alpha-large-0925"),
+            "agent_b": agent("b", "other/beta-open-7b"),
+            "judge": {"command": [sys.executable, str(_STUB), "--stdout",
+                                  "SCORE: 9\n\nPREFERRED: B\n"],
+                      "stdout": "clean-last-message"},
+        })
+        wd = self._tmpdir() / "wd"
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc = plan_duel.execute(argument="p" * 400, workdir_arg=str(wd), specs=specs,
+                                   controller_name="Stub-alpha",
+                                   participant_name="Stub-beta",
+                                   emit=lambda _m: None, timeout=60)
+        self.assertEqual(rc, 0)
+        a = (wd / "plan-stub-alpha.md").read_text(encoding="utf-8")
+        b = (wd / "plan-stub-beta.md").read_text(encoding="utf-8")
+        self.assertTrue(a.startswith("vendor/alpha-large-0925 A"), a[:60])
+        self.assertIn("other/beta-open-7b B", b[:200])
+        summary = (wd / "summary.md").read_text(encoding="utf-8")
+        self.assertIn("vendor/alpha-large-0925", summary)
+        self.assertIn("other/beta-open-7b", summary)
+
+    def _assemble(self, **models):
+        return plan_duel.assemble_summary(
+            workdir_display="/wd", rounds_run=3, stopped_due_to="Convergence",
+            controller_name="Claude", participant_name="Codex",
+            controller_slug="claude", participant_slug="codex",
+            winner_name="Claude", winner_file="plan-claude.md",
+            trajectory=[(0, None, 10, 12)], justification="j",
+            differences_rewritten="d", missed_rejections="none", **models)
+
+    def test_a_summary_without_a_model_field_is_unchanged(self):
+        self.assertEqual(self._assemble(), self._assemble(models={}))
+        self.assertNotIn("**Models:**", self._assemble())
+
+    def test_the_summary_names_each_side_with_the_model_from_its_field(self):
+        out = self._assemble(models={"agent_a": "m-one", "agent_b": "m-two",
+                                     "judge": None})
+        line = next(ln for ln in out.splitlines() if ln.startswith("**Models:**"))
+        self.assertIn("Claude ran `m-one`", line)
+        self.assertIn("Codex ran `m-two`", line)
+        self.assertIn("the judge ran its CLI's default model", line)
+
+
+def _this_harness():
+    """The harness name a backend written for the stub's interpreter carries."""
+    return Path(sys.executable).name
+
+
+class _SupervisedDuel(_ResumeHarness):
+    """Duels driven end to end through `execute`, with a backends file of the test's own."""
+
+    def _backends(self, mapping):
+        path = self._tmpdir() / "backends.json"
+        path.write_text(json.dumps(mapping), encoding="utf-8")
+        self._env(PORTABLE_AGENT_SKILLS_BACKENDS=str(path))
+        return path
+
+    def _env(self, **values):
+        """Set each variable, or remove it where the value is None, for this test only."""
+        patcher = unittest.mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name, value in values.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    def _role(self, *args, stdout="file", **fields):
+        return {"command": [sys.executable, str(_STUB), *args], "stdout": stdout, **fields}
+
+    def _config(self, **roles):
+        config = {
+            "agent_a": self._role("--write-file", "⟪workdir⟫/plan-a.md", "--content", "A" * 400),
+            "agent_b": self._role("--write-file", "⟪workdir⟫/plan-b.md", "--content", "B" * 400),
+            "judge": self._role("--stdout", "SCORE: 9\n\nPREFERRED: A\n",
+                                stdout="clean-last-message"),
+        }
+        config.update(roles)
+        return plan_duel.parse_adapter_config(config)
+
+    def _new_duel(self, specs, **kw):
+        """A new duel; returns its workdir, what it emitted and wrote to stderr, and what
+        it raised, if anything."""
+        wd = self._tmpdir() / "wd"
+        msgs, err, raised = [], io.StringIO(), None
+        try:
+            with contextlib.redirect_stderr(err):
+                plan_duel.execute(argument="p" * 400, workdir_arg=str(wd), specs=specs,
+                                  controller_name="Claude", participant_name="Codex",
+                                  emit=msgs.append, timeout=60, **kw)
+        except plan_duel.PlanDuelError as exc:
+            raised = exc
+        return wd, msgs + [err.getvalue()], raised
+
+    def _refused_before_launch(self, specs, **kw):
+        wd, _, raised = self._new_duel(specs, **kw)
+        self.assertIsNotNone(raised, "the duel was not refused")
+        self.assertFalse(wd.exists(), "a workdir was made, so a role could have launched")
+        return str(raised)
+
+
+class SupervisorPrerequisiteTests(_SupervisedDuel, unittest.TestCase):
+    """Every role launches through diff-review's supervisor; without it, nothing starts."""
+
+    def _absent(self):
+        return self._tmpdir() / "diff-review" / "review_runner.py"
+
+    def test_a_new_duel_with_no_supervisor_stops_before_anything_is_created(self):
+        message = self._refused_before_launch(self._config(), supervisor=self._absent())
+        self.assertIn("diff-review", message)
+
+    def test_a_resume_with_no_supervisor_stops_before_it_deletes_anything(self):
+        wd = self._seed(self._tmpdir() / "wd", 2)
+        # An incomplete round, which a resume that went ahead would delete.
+        (wd / plan_duel.plan_snapshot_name("a", 3)).write_text("partial", encoding="utf-8")
+        before = sorted(path.name for path in wd.iterdir())
+        with self.assertRaises(plan_duel.PlanDuelError) as cm, \
+                contextlib.redirect_stderr(io.StringIO()):
+            plan_duel.execute(argument=str(wd), specs=self._config(),
+                              controller_name="Claude", participant_name="Codex",
+                              emit=lambda _m: None, timeout=60, supervisor=self._absent())
+        self.assertIn("diff-review", str(cm.exception))
+        self.assertEqual(sorted(path.name for path in wd.iterdir()), before)
+
+    def test_the_command_line_names_where_the_supervisor_is(self):
+        tmp = self._tmpdir()
+        cfg = tmp / "adapter.json"
+        cfg.write_text(json.dumps({role: self._role("--version")
+                                   for role in plan_duel.REQUIRED_ROLES}), encoding="utf-8")
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = plan_duel.main(["Design the audit log.", "--workdir", str(tmp / "wd"),
+                                 "--adapter-config", str(cfg), "--controller-name", "Claude",
+                                 "--participant-name", "Codex",
+                                 "--supervisor", str(self._absent())])
+        self.assertEqual(rc, 1)
+        self.assertIn("diff-review", err.getvalue())
+        self.assertFalse((tmp / "wd").exists())
+
+    def _rejudge_past_the_cap(self, judge, *, timeout=60, supervisor=None):
+        wd = self._seed(self._tmpdir() / "wd", plan_duel.MAX_ROUNDS, score=9)
+        (wd / f"judge-round-{plan_duel.MAX_ROUNDS}.md").unlink()
+        state = plan_duel.RunState("Claude", "Codex")
+        state.rounds[plan_duel.MAX_ROUNDS] = plan_duel.RoundState(
+            plans_snapshotted=True, judge_completed=False, score=None)
+        plan_duel.save_state(wd, state)
+        ctx = plan_duel.DuelContext(workdir=wd, controller_name="Claude",
+                                    participant_name="Codex", supervisor=supervisor)
+        msgs = []
+        _, stop = plan_duel.run_duel(workdir=wd, specs=self._config(judge=judge), ctx=ctx,
+                                     start_round=plan_duel.MAX_ROUNDS + 1, emit=msgs.append,
+                                     timeout=timeout, state=state)
+        return stop, msgs
+
+    def test_a_resumed_rejudge_with_no_supervisor_scores_zero_rather_than_halting(self):
+        judge = self._role("--stdout", "SCORE: 9\n\nPREFERRED: A\n", stdout="clean-last-message")
+        stop, msgs = self._rejudge_past_the_cap(judge, supervisor=self._absent())
+        self.assertEqual(stop, plan_duel.CONVERGENCE_LABEL)
+        fallback = [m for m in msgs if "falls back to 0" in m]
+        self.assertTrue(fallback, msgs)
+        self.assertIn("diff-review", fallback[0])
+
+    def test_a_supervisor_stop_on_a_resumed_rejudge_scores_zero_rather_than_halting(self):
+        judge = self._role("--sleep", "60", "--stdout", "SCORE: 9\n\nPREFERRED: A\n",
+                           stdout="clean-last-message")
+        started = time.monotonic()
+        stop, msgs = self._rejudge_past_the_cap(judge, timeout=2)
+        self.assertLess(time.monotonic() - started, 45, "the judge was waited out, not stopped")
+        self.assertEqual(stop, plan_duel.CONVERGENCE_LABEL)
+        self.assertTrue([m for m in msgs if "falls back to 0" in m], msgs)
+
+
+class DuelPreflightTests(_SupervisedDuel, unittest.TestCase):
+    """What the supervisor would refuse at the judge's launch is refused before agent A's."""
+
+    def test_an_unset_forwarded_name_on_the_judge_is_refused(self):
+        self._env(PD_PREFLIGHT_PARENT=None)
+        judge = self._role("--stdout", "SCORE: 9\n", stdout="clean-last-message",
+                           env_from_parent={"CHILD_KEY": "PD_PREFLIGHT_PARENT"})
+        message = self._refused_before_launch(self._config(judge=judge))
+        self.assertIn("judge", message)
+        self.assertIn("CHILD_KEY", message)
+        # The launching side is where a key gets pasted, so it is never quoted.
+        self.assertNotIn("PD_PREFLIGHT_PARENT", message)
+
+    def test_an_empty_forwarded_name_counts_as_unset(self):
+        self._env(PD_PREFLIGHT_PARENT="")
+        judge = self._role("--stdout", "SCORE: 9\n", stdout="clean-last-message",
+                           env_from_parent={"CHILD_KEY": "PD_PREFLIGHT_PARENT"})
+        self.assertIn("CHILD_KEY", self._refused_before_launch(self._config(judge=judge)))
+
+    def test_an_unset_name_in_the_judges_backend_is_refused(self):
+        self._env(PD_PREFLIGHT_PARENT=None)
+        self._backends({"keyed": {"harness": _this_harness(), "model": "m-one",
+                                  "env_from_parent": {"BACKEND_KEY": "PD_PREFLIGHT_PARENT"}}})
+        judge = self._role("--stdout", "SCORE: 9\n", "--stderr", "⟪model⟫",
+                           stdout="clean-last-message", backend="keyed")
+        message = self._refused_before_launch(self._config(judge=judge))
+        self.assertIn("judge", message)
+        self.assertIn("BACKEND_KEY", message)
+        self.assertNotIn("PD_PREFLIGHT_PARENT", message)
+
+    def test_a_backend_written_for_the_other_harness_is_refused(self):
+        self._backends({"elsewhere": {"harness": "some-other-cli", "model": "m-one"}})
+        judge = self._role("--stdout", "SCORE: 9\n", "--stderr", "⟪model⟫",
+                           stdout="clean-last-message", backend="elsewhere")
+        message = self._refused_before_launch(self._config(judge=judge))
+        self.assertIn("judge", message)
+        self.assertIn("some-other-cli", message)
+
+    def test_a_model_disagreeing_with_the_roles_is_refused(self):
+        self._backends({"alt": {"harness": _this_harness(), "model": "m-one"}})
+        judge = self._role("--stdout", "SCORE: 9\n", "--stderr", "⟪model⟫",
+                           stdout="clean-last-message", backend="alt", model="m-two")
+        message = self._refused_before_launch(self._config(judge=judge))
+        self.assertIn("judge", message)
+        self.assertIn("m-one", message)
+        self.assertIn("m-two", message)
+
+    def test_a_lineup_with_none_of_these_problems_runs(self):
+        # Anti-vacuity: the refusals above are about the problem, not about a backend.
+        self._env(PD_PREFLIGHT_PARENT="set")
+        self._backends({"alt": {"harness": _this_harness(), "model": "m-one"}})
+        judge = self._role("--stdout", "SCORE: 9\n\nPREFERRED: A\n", "--stderr", "⟪model⟫",
+                           stdout="clean-last-message", backend="alt", model="m-one",
+                           env_from_parent={"CHILD_KEY": "PD_PREFLIGHT_PARENT"})
+        wd, msgs, raised = self._new_duel(self._config(judge=judge))
+        self.assertIsNone(raised, msgs)
+        self.assertTrue((wd / "summary.md").is_file())
+
+
+class DuelSecretSweepTests(_SupervisedDuel, unittest.TestCase):
+    """A value forwarded by name reaches the child and appears in nothing the duel writes."""
+
+    SENTINEL = "sk-sweep-SENTINEL-8c41d2e7"
+
+    def _sweep(self, root, *texts):
+        for path in root.rglob("*"):
+            if path.is_file():
+                self.assertNotIn(self.SENTINEL.encode("utf-8"), path.read_bytes(), str(path))
+        for text in texts:
+            self.assertNotIn(self.SENTINEL, text)
+
+    def test_a_forwarded_value_reaches_the_child_and_nothing_the_duel_writes(self):
+        self._env(PD_SWEEP_PARENT=self.SENTINEL)
+        self._backends({"keyed": {"harness": _this_harness(), "model": "m-keyed",
+                                  "env_from_parent": {"BACKEND_CHILD": "PD_SWEEP_PARENT"}}})
+        seen = self._tmpdir()
+        inline = {"INLINE_CHILD": "PD_SWEEP_PARENT"}
+        agent_a = self._role("--write-file", "⟪workdir⟫/plan-a.md", "--content", "A" * 400,
+                             "--env-digest", f"INLINE_CHILD={seen / 'a.txt'}",
+                             env_from_parent=inline)
+        agent_b = self._role("--write-file", "⟪workdir⟫/plan-b.md", "--content", "B" * 400,
+                             "--stderr", "⟪model⟫",
+                             "--env-digest", f"BACKEND_CHILD={seen / 'b.txt'}", backend="keyed")
+        judge = self._role("--stdout", "SCORE: 9\n\nPREFERRED: A\n",
+                           "--env-digest", f"INLINE_CHILD={seen / 'judge.txt'}",
+                           stdout="clean-last-message", env_from_parent=inline)
+        wd, texts, raised = self._new_duel(
+            self._config(agent_a=agent_a, agent_b=agent_b, judge=judge))
+        self.assertIsNone(raised, texts)
+        digest = hashlib.sha256(self.SENTINEL.encode("utf-8")).hexdigest()
+        for name in ("a.txt", "b.txt", "judge.txt"):
+            self.assertEqual((seen / name).read_text(encoding="utf-8"), digest,
+                             f"the forwarded value never reached the child ({name})")
+        for name in (plan_duel.STATE_FILENAME, plan_duel.PROGRESS_LOG_NAME, "summary.md",
+                     "participant-round-1-status.md", "judge-round-3.md"):
+            self.assertTrue((wd / name).is_file(), f"{name} was not written, so not swept")
+        self.assertIn("m-keyed", (wd / "summary.md").read_text(encoding="utf-8"))
+        self._sweep(wd, *texts)
+
+    def test_no_error_message_carries_a_forwarded_value(self):
+        self._env(PD_SWEEP_PARENT=self.SENTINEL)
+        agent_b = self._role("--write-file", "⟪workdir⟫/plan-b.md", "--content", "B" * 400,
+                             "--stderr", "failing on purpose", "--exit-code", "3",
+                             env_from_parent={"INLINE_CHILD": "PD_SWEEP_PARENT"})
+        wd, texts, raised = self._new_duel(self._config(agent_b=agent_b))
+        self.assertIsNotNone(raised)
+        self.assertIn("failing on purpose", str(raised), "the failure was not described")
+        self._sweep(wd, str(raised), *texts)
+
+
+class RoleBackendTests(_SupervisedDuel, unittest.TestCase):
+    """A role naming a backend takes its model, arguments and settings from it."""
+
+    def test_a_role_naming_a_backend_resolves_it_and_runs(self):
+        seen = self._tmpdir()
+        self._backends({"alt": {
+            "harness": _this_harness(), "model": "vendor/alt-1",
+            "args": ["--echo-arg", "⟪model⟫", "--echo-file", str(seen / "echo.txt")],
+            "env": {"PD_BACKEND_SETTING": "on"}}})
+        agent_a = self._role("--write-file", "⟪workdir⟫/plan-a.md", "--content", "A" * 400,
+                             "--stderr", "⟪model⟫",
+                             "--env-digest", f"PD_BACKEND_SETTING={seen / 'setting.txt'}",
+                             "⟪backend_args⟫", backend="alt")
+        wd, texts, raised = self._new_duel(self._config(agent_a=agent_a))
+        self.assertIsNone(raised, texts)
+        self.assertEqual((seen / "echo.txt").read_text(encoding="utf-8"), "vendor/alt-1")
+        self.assertEqual((seen / "setting.txt").read_text(encoding="utf-8"),
+                         hashlib.sha256(b"on").hexdigest(), "the backend's setting never arrived")
+        self.assertIn("vendor/alt-1", (wd / "summary.md").read_text(encoding="utf-8"))
+        record = json.loads((wd / plan_duel.STATE_FILENAME).read_text(encoding="utf-8"))
+        self.assertEqual(record["lineup"]["agent_a"]["backend"], "alt")
+        self.assertEqual(record["lineup"]["agent_a"]["model"], "vendor/alt-1")
+        self.assertNotIn("backend", record["lineup"]["agent_b"])
+
+    def test_replaying_a_finished_duel_needs_neither_the_backend_nor_the_supervisor(self):
+        # Rebuilding summary.md launches nothing, so it reads nothing a launch would need.
+        self._backends({"alt": {"harness": _this_harness(), "model": "vendor/alt-1"}})
+        agent_a = self._role("--write-file", "⟪workdir⟫/plan-a.md", "--stderr", "⟪model⟫",
+                             backend="alt")
+        specs = self._config(agent_a=agent_a)
+        wd = self._seed(self._tmpdir() / "wd", 3)
+        lineup = plan_duel.frozen_lineup(
+            plan_duel.resolve_backends(specs, plan_duel.default_supervisor()))
+        plan_duel.save_state(wd, plan_duel.RunState("Claude", "Codex", lineup=lineup))
+        self._backends({"other": {"harness": _this_harness(), "model": "m"}})
+        absent = self._tmpdir() / "diff-review" / "review_runner.py"
+        msgs = []
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc = plan_duel.execute(argument=str(wd), specs=specs, controller_name="Claude",
+                                   participant_name="Codex", emit=msgs.append, timeout=60,
+                                   supervisor=absent)
+        self.assertEqual(rc, 0, msgs)
+        self.assertFalse((wd / plan_duel.plan_snapshot_name("a", 4)).exists(),
+                         "the replay ran a round")
+        self.assertIn("vendor/alt-1", (wd / "summary.md").read_text(encoding="utf-8"))
+
+    def test_a_replay_that_reads_no_backend_keeps_the_recorded_backend_digest(self):
+        """A resume that launches nothing does not read the backend, so it has no digest of
+        its own; saving over the record without one would let the next resume accept an
+        edited backend behind the same name."""
+        self._backends({"alt": {"harness": _this_harness(), "model": "vendor/alt-1"}})
+        agent_a = self._role("--write-file", "⟪workdir⟫/plan-a.md", "--stderr", "⟪model⟫",
+                             backend="alt")
+        specs = self._config(agent_a=agent_a)
+        wd = self._seed(self._tmpdir() / "wd", 3)
+        lineup = plan_duel.frozen_lineup(
+            plan_duel.resolve_backends(specs, plan_duel.default_supervisor()))
+        digest = lineup["agent_a"]["backend_digest"]
+        plan_duel.save_state(wd, plan_duel.RunState("Claude", "Codex", lineup=lineup))
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc = plan_duel.execute(argument=str(wd), specs=specs, controller_name="Claude",
+                                   participant_name="Codex", emit=lambda _m: None, timeout=60)
+        self.assertEqual(rc, 0)
+        self.assertEqual(plan_duel.load_state(wd).lineup["agent_a"].get("backend_digest"),
+                         digest)
+
+    def _pinned_role(self):
+        """Role A on backend ``alt``, resolved as a run's start resolves it."""
+        self._backends({"alt": {"harness": _this_harness(), "model": "vendor/alt-1",
+                                "env": {"PD_BACKEND_BASE": "https://private.invalid/team"}}})
+        agent_a = self._role("--write-file", "⟪workdir⟫/plan-a.md", "--stderr", "⟪model⟫",
+                             backend="alt")
+        return plan_duel.resolve_backends(self._config(agent_a=agent_a),
+                                          plan_duel.default_supervisor())["agent_a"]
+
+    def test_the_supervisor_command_carries_the_digest_the_backend_was_pinned_at(self):
+        spec = self._pinned_role()
+        self.assertTrue(spec.resolved.digest)
+        with unittest.mock.patch.object(plan_duel.subprocess, "Popen",
+                                        side_effect=OSError("not today")) as popen, \
+                self.assertRaises(plan_duel.CliExecutionError):
+            plan_duel.run_supervised(_stub_argv("--stderr", "vendor/alt-1"),
+                                     findings=self._tmpdir() / "reply.md",
+                                     mode="raw-stdout", spec=spec)
+        command = popen.call_args.args[0]
+        head = command[:command.index("--")]
+        self.assertEqual(head[head.index("--backend") + 1], "alt")
+        self.assertEqual(head[head.index("--backend-digest") + 1], spec.resolved.digest)
+
+    def test_a_backend_removed_or_broken_after_it_was_pinned_stops_the_next_launch(self):
+        """A pinned backend that can no longer be read at all is no more the backend the duel
+        started with than an edited one: the launch halts the duel the same way, rather than
+        reaching a handler that would score a re-judged round 0 and finish."""
+        for written in ("{not json", "{}"):
+            with self.subTest(written=written):
+                spec = self._pinned_role()
+                Path(os.environ["PORTABLE_AGENT_SKILLS_BACKENDS"]).write_text(written,
+                                                                          encoding="utf-8")
+                out = self._tmpdir() / "plan-a.md"
+                with self.assertRaises(plan_duel.BackendChangedError):
+                    plan_duel.run_supervised(
+                        _stub_argv("--write-file", str(out), "--content", "A" * 400,
+                                   "--stderr", "vendor/alt-1"),
+                        findings=out, mode="external-file", spec=spec)
+                self.assertFalse(out.exists())
+
+    def test_a_backend_edited_after_it_was_pinned_stops_the_next_launch(self):
+        """The supervisor reads the backends file on every launch; an entry edited while the
+        duel runs would start the next agent on another address under the same name."""
+        spec = self._pinned_role()
+        self._backends({"alt": {"harness": _this_harness(), "model": "vendor/alt-1",
+                                "env": {"PD_BACKEND_BASE": "https://elsewhere.invalid"}}})
+        out = self._tmpdir() / "plan-a.md"
+        with self.assertRaises(plan_duel.BackendChangedError) as cm:
+            plan_duel.run_supervised(
+                _stub_argv("--write-file", str(out), "--content", "A" * 400,
+                           "--stderr", "vendor/alt-1"),
+                findings=out, mode="external-file", spec=spec)
+        message = str(cm.exception)
+        self.assertIn("'alt'", message)
+        self.assertIn("changed since the run pinned it", message)
+        self.assertNotIn("elsewhere.invalid", message)
+        self.assertNotIn("private.invalid", message)
+        self.assertFalse(out.exists(), "the agent launched on the edited backend")
+
+    def test_an_unknown_backend_is_refused_before_launch(self):
+        self._backends({"alt": {"harness": _this_harness(), "model": "m"}})
+        agent_a = self._role("--write-file", "⟪workdir⟫/plan-a.md", "--stderr", "⟪model⟫",
+                             backend="nowhere")
+        message = self._refused_before_launch(self._config(agent_a=agent_a))
+        self.assertIn("nowhere", message)
+        self.assertIn("alt", message, "the refusal does not list what is defined")
+
+    def test_backend_args_with_nowhere_to_go_are_refused_before_launch(self):
+        self._backends({"alt": {"harness": _this_harness(), "model": "m",
+                                "args": ["--verbose"]}})
+        agent_a = self._role("--write-file", "⟪workdir⟫/plan-a.md", "--stderr", "⟪model⟫",
+                             backend="alt")
+        message = self._refused_before_launch(self._config(agent_a=agent_a))
+        self.assertIn("agent_a", message)
+        self.assertIn("⟪backend_args⟫", message)
+
+    def _refused_when_read(self, **agent_a):
+        config = _valid_config()
+        config["agent_a"] = {"command": ["exe-a", "--model", "⟪model⟫", "⟪prompt⟫"],
+                             "stdout": "file", **agent_a}
+        with self.assertRaises(plan_duel.AdapterConfigError) as cm:
+            plan_duel.parse_adapter_config(config)
+        return str(cm.exception)
+
+    def test_the_args_marker_without_a_backend_is_refused_when_read(self):
+        message = self._refused_when_read(
+            command=["exe-a", "⟪backend_args⟫", "⟪prompt⟫"])
+        self.assertIn("⟪backend_args⟫", message)
+
+    def test_the_args_marker_must_be_a_whole_argument(self):
+        message = self._refused_when_read(
+            command=["exe-a", "--model", "⟪model⟫", "x=⟪backend_args⟫", "⟪prompt⟫"],
+            backend="alt")
+        self.assertIn("⟪backend_args⟫", message)
+
+    def test_a_backend_role_needs_the_model_marker(self):
+        message = self._refused_when_read(command=["exe-a", "⟪prompt⟫"], backend="alt")
+        self.assertIn("⟪model⟫", message)
+
+    def test_a_backend_role_needs_the_marker_where_the_supervisor_looks(self):
+        # The supervisor launches a backend role only when the filled model stands as a whole
+        # argument or a setting's whole value, and refuses otherwise -- on the judge, after
+        # both plans were paid for. Read here, the misplacement is refused before anything runs.
+        for command in (["exe-a", "-m", "openai/⟪model⟫", "⟪prompt⟫"],
+                        ["exe-a", "-c", "model=openai/⟪model⟫", "⟪prompt⟫"]):
+            with self.subTest(command=command):
+                message = self._refused_when_read(command=command, backend="alt")
+                self.assertIn("agent_a", message)
+                self.assertIn("argument of its own or a setting's whole value", message)
+
+    def test_the_model_marker_forms_the_supervisor_accepts_are_accepted(self):
+        # One good placement is enough, as it is for the supervisor: a second mention inside
+        # another argument is filled too and does not stop the launch.
+        for command in (["exe-a", "--model", "⟪model⟫", "⟪prompt⟫"],
+                        ["exe-a", "-c", "model=⟪model⟫", "⟪prompt⟫"],
+                        ["exe-a", "-c", 'model="⟪model⟫"', "⟪prompt⟫"],
+                        ["exe-a", "-c", "model='⟪model⟫'", "⟪prompt⟫"],
+                        ["exe-a", "--model", "⟪model⟫", "--tag=run-⟪model⟫", "⟪prompt⟫"]):
+            with self.subTest(command=command):
+                config = _valid_config()
+                config["agent_a"] = {"command": command, "stdout": "file", "backend": "alt"}
+                plan_duel.parse_adapter_config(config)
+
+    def test_an_inline_model_may_sit_inside_an_argument(self):
+        # With no backend there is no supervisor check on where the model landed.
+        config = _valid_config()
+        config["agent_a"] = {"command": ["exe-a", "-m", "openai/⟪model⟫", "⟪prompt⟫"],
+                             "stdout": "file", "model": "m"}
+        plan_duel.parse_adapter_config(config)
+
+    def test_a_backend_that_is_not_a_name_is_refused(self):
+        for bad in (5, "", "  "):
+            with self.subTest(backend=bad):
+                self.assertIn("'backend'", self._refused_when_read(backend=bad))
 
 
 if __name__ == "__main__":

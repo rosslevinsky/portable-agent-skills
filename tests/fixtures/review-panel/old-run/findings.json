@@ -1,0 +1,856 @@
+{
+  "candidates": [
+    {
+      "answered": true,
+      "area": "area-02",
+      "asks": "defect",
+      "axis_a": "one",
+      "axis_b": "by reading",
+      "cluster_id": "D6",
+      "consequence": "The README calls the tree small, which it may not stay.",
+      "covered_by": null,
+      "direction": "Drop the size claim.",
+      "evidence": null,
+      "failure": "The README's description is a claim about size.",
+      "file": "README.md",
+      "fix_size": "1 line",
+      "id": "cand-001",
+      "line_end": 3,
+      "line_start": 3,
+      "needs_files": [],
+      "quote_check": "matches",
+      "raised_by": [
+        {
+          "area": "area-02",
+          "kind": "reader",
+          "lane": "B",
+          "lens": "top-down from the contract",
+          "quote": "A small tree the review-panel engine suite inventories and partitions.",
+          "reproduction": null,
+          "severity": "minor",
+          "unit": "area-02-B1"
+        }
+      ],
+      "rationale": "A description of a fixture is not a defect.",
+      "revision": null,
+      "severity_final": "minor",
+      "severity_proposed": "minor",
+      "siblings": 0,
+      "snippet": {
+        "cites_from": 3,
+        "cites_to": 3,
+        "first_line": 1,
+        "lines": [
+          "# Fixture tree",
+          "",
+          "A small tree the review-panel engine suite inventories and partitions."
+        ],
+        "truncated": false
+      },
+      "status": "refuted",
+      "test_first": null,
+      "unresolved_reason": null,
+      "verified_by": {
+        "lane": "A",
+        "unit": "verify-area-02-B"
+      }
+    },
+    {
+      "answered": true,
+      "area": "area-02",
+      "asks": "defect",
+      "axis_a": "one",
+      "axis_b": "by reading",
+      "cluster_id": "D7",
+      "consequence": "The guide describes the engine without the helper's doubling, so a reader trusts it.",
+      "covered_by": null,
+      "direction": "State what helper returns.",
+      "evidence": null,
+      "failure": "The guide says nothing of helper doubling its input.",
+      "file": "docs/guide.md",
+      "fix_size": "1 line",
+      "id": "cand-002",
+      "line_end": 3,
+      "line_start": 3,
+      "needs_files": [],
+      "quote_check": "matches",
+      "raised_by": [
+        {
+          "area": "area-02",
+          "kind": "reader",
+          "lane": "A",
+          "lens": "bottom-up from the code",
+          "quote": "How the engine is used.",
+          "reproduction": null,
+          "severity": "minor",
+          "unit": "area-02-A1"
+        }
+      ],
+      "rationale": "The guide is silent on the doubling.",
+      "revision": null,
+      "severity_final": "minor",
+      "severity_proposed": "minor",
+      "siblings": 0,
+      "snippet": {
+        "cites_from": 3,
+        "cites_to": 3,
+        "first_line": 1,
+        "lines": [
+          "# Guide",
+          "",
+          "How the engine is used."
+        ],
+        "truncated": false
+      },
+      "status": "confirmed_by_reading",
+      "test_first": "tests/test_engine.py: call helper(3) and assert it returns 5.",
+      "unresolved_reason": null,
+      "verified_by": {
+        "lane": "B",
+        "unit": "verify-area-02-A"
+      }
+    },
+    {
+      "answered": true,
+      "area": "area-01",
+      "asks": "defect",
+      "axis_a": "both",
+      "axis_b": "unresolved",
+      "cluster_id": "D1",
+      "consequence": "A string passed to core raises instead of being refused with a message.",
+      "covered_by": null,
+      "direction": "Check the type of x first.",
+      "evidence": null,
+      "failure": "core adds 1 to x with no check that x is a number.",
+      "file": "engine/core.py",
+      "fix_size": "small",
+      "id": "cand-003",
+      "line_end": 2,
+      "line_start": 1,
+      "needs_files": [],
+      "quote_check": "matches",
+      "raised_by": [
+        {
+          "area": "area-01",
+          "kind": "reader",
+          "lane": "A",
+          "lens": "bottom-up from the code",
+          "quote": "def core(x):\n    return x + 1",
+          "reproduction": null,
+          "severity": "minor",
+          "unit": "area-01-A1"
+        }
+      ],
+      "rationale": "Whether a string can reach core is not visible here.",
+      "revision": null,
+      "severity_final": "minor",
+      "severity_proposed": "minor",
+      "siblings": 1,
+      "snippet": {
+        "cites_from": 1,
+        "cites_to": 2,
+        "first_line": 1,
+        "lines": [
+          "def core(x):",
+          "    return x + 1",
+          "",
+          ""
+        ],
+        "truncated": false
+      },
+      "status": "unresolved",
+      "test_first": null,
+      "unresolved_reason": "needs_a_file_outside_the_scope",
+      "verified_by": {
+        "lane": "B",
+        "unit": "verify-area-01-A"
+      }
+    },
+    {
+      "answered": true,
+      "area": "area-01",
+      "asks": "defect",
+      "axis_a": "both",
+      "axis_b": "by reading",
+      "cluster_id": "D1",
+      "consequence": "A string passed to core raises instead of being refused with a message.",
+      "covered_by": null,
+      "direction": "Check the type of x first.",
+      "evidence": null,
+      "failure": "core(x) raises TypeError on a string argument.",
+      "file": "engine/core.py",
+      "fix_size": "small",
+      "id": "cand-004",
+      "line_end": 2,
+      "line_start": 1,
+      "needs_files": [],
+      "quote_check": "matches",
+      "raised_by": [
+        {
+          "area": "area-01",
+          "kind": "reader",
+          "lane": "B",
+          "lens": "top-down from the contract",
+          "quote": "def core(x):\n    return x + 1",
+          "reproduction": null,
+          "severity": "major",
+          "unit": "area-01-B1"
+        }
+      ],
+      "rationale": "Every caller in scope passes an int.",
+      "revision": null,
+      "severity_final": "major",
+      "severity_proposed": "major",
+      "siblings": 1,
+      "snippet": {
+        "cites_from": 1,
+        "cites_to": 2,
+        "first_line": 1,
+        "lines": [
+          "def core(x):",
+          "    return x + 1",
+          "",
+          ""
+        ],
+        "truncated": false
+      },
+      "status": "refuted",
+      "test_first": null,
+      "unresolved_reason": null,
+      "verified_by": {
+        "lane": "A",
+        "unit": "verify-area-01-B"
+      }
+    },
+    {
+      "answered": true,
+      "area": "area-01",
+      "asks": "defect",
+      "axis_a": "both",
+      "axis_b": "by reading",
+      "cluster_id": "D2",
+      "consequence": "Every total built on helper comes out twice as large as the contract says.",
+      "covered_by": null,
+      "direction": "Return y + 2.",
+      "evidence": null,
+      "failure": "helper multiplies by two; the documented behavior adds two.",
+      "file": "engine/core.py",
+      "fix_size": "1 line",
+      "id": "cand-006",
+      "line_end": 6,
+      "line_start": 5,
+      "needs_files": [],
+      "quote_check": "matches",
+      "raised_by": [
+        {
+          "area": "area-01",
+          "kind": "reader",
+          "lane": "B",
+          "lens": "top-down from the contract",
+          "quote": "def helper(y):\n    return y * 2",
+          "reproduction": null,
+          "severity": "blocker",
+          "unit": "area-01-B1"
+        }
+      ],
+      "rationale": "Line 6 multiplies.",
+      "revision": null,
+      "severity_final": "blocker",
+      "severity_proposed": "blocker",
+      "siblings": 1,
+      "snippet": {
+        "cites_from": 5,
+        "cites_to": 6,
+        "first_line": 3,
+        "lines": [
+          "",
+          "",
+          "def helper(y):",
+          "    return y * 2"
+        ],
+        "truncated": false
+      },
+      "status": "confirmed_by_reading",
+      "test_first": "tests/test_engine.py: call helper(3) and assert it returns 5.",
+      "unresolved_reason": null,
+      "verified_by": {
+        "lane": "A",
+        "unit": "verify-area-01-B"
+      }
+    },
+    {
+      "answered": true,
+      "area": "area-01",
+      "asks": "defect",
+      "axis_a": "both",
+      "axis_b": "by running",
+      "cluster_id": "D2",
+      "consequence": "Every total built on helper comes out twice as large as the contract says.",
+      "covered_by": null,
+      "direction": "Return y + 2.",
+      "evidence": {
+        "argv": [
+          "python3",
+          "-c",
+          "from engine.core import helper; print(helper(3))"
+        ],
+        "cwd": ".",
+        "exit_status": 0,
+        "output": "6\n",
+        "run_kind": "executed",
+        "shows": "Shows helper(3) returning 6.",
+        "truncated": false
+      },
+      "failure": "helper returns y * 2 where the contract says it returns y + 2.",
+      "file": "engine/core.py",
+      "fix_size": "1 line",
+      "id": "cand-007",
+      "line_end": 6,
+      "line_start": 5,
+      "needs_files": [],
+      "quote_check": "matches",
+      "raised_by": [
+        {
+          "area": "area-01",
+          "kind": "reader",
+          "lane": "A",
+          "lens": "bottom-up from the code",
+          "quote": "def helper(y):\n    return y * 2",
+          "reproduction": {
+            "argv": [
+              "python3",
+              "-c",
+              "from engine.core import helper; print(helper(3))"
+            ],
+            "cwd": ".",
+            "expect": "prints 6 where the contract says 5"
+          },
+          "severity": "major",
+          "unit": "area-01-A1"
+        }
+      ],
+      "rationale": "The run printed 6.",
+      "revision": {
+        "rationale": "Every total is wrong.",
+        "severity": "blocker"
+      },
+      "severity_final": "blocker",
+      "severity_proposed": "major",
+      "siblings": 1,
+      "snippet": {
+        "cites_from": 5,
+        "cites_to": 6,
+        "first_line": 3,
+        "lines": [
+          "",
+          "",
+          "def helper(y):",
+          "    return y * 2"
+        ],
+        "truncated": false
+      },
+      "status": "reproduced",
+      "test_first": "tests/test_engine.py: call helper(3) and assert it returns 5.",
+      "unresolved_reason": null,
+      "verified_by": {
+        "lane": "B",
+        "unit": "verify-area-01-A"
+      }
+    },
+    {
+      "answered": true,
+      "area": "area-01",
+      "asks": "defect",
+      "axis_a": "one",
+      "axis_b": "unresolved",
+      "cluster_id": "D3",
+      "consequence": "util returns a constant string, so callers cannot tell two calls apart.",
+      "covered_by": null,
+      "direction": "Return something derived from the call.",
+      "evidence": null,
+      "failure": "util ignores every input and returns 'util'.",
+      "file": "engine/util.py",
+      "fix_size": "small",
+      "id": "cand-008",
+      "line_end": 2,
+      "line_start": 1,
+      "needs_files": [],
+      "quote_check": "matches",
+      "raised_by": [
+        {
+          "area": "area-01",
+          "kind": "reader",
+          "lane": "B",
+          "lens": "top-down from the contract",
+          "quote": "def util():\n    return \"util\"",
+          "reproduction": null,
+          "severity": "minor",
+          "unit": "area-01-B1"
+        }
+      ],
+      "rationale": "Could not run it here.",
+      "revision": null,
+      "severity_final": "minor",
+      "severity_proposed": "minor",
+      "siblings": 0,
+      "snippet": {
+        "cites_from": 1,
+        "cites_to": 2,
+        "first_line": 1,
+        "lines": [
+          "def util():",
+          "    return \"util\""
+        ],
+        "truncated": false
+      },
+      "status": "unresolved",
+      "test_first": null,
+      "unresolved_reason": "needs_a_run",
+      "verified_by": {
+        "lane": "A",
+        "unit": "verify-area-01-B"
+      }
+    },
+    {
+      "answered": true,
+      "area": "area-01",
+      "asks": "defect",
+      "axis_a": "one",
+      "axis_b": "by running",
+      "cluster_id": "D4",
+      "consequence": "The tool exits 0 even when it did nothing.",
+      "covered_by": null,
+      "direction": "Return non-zero when no work was done.",
+      "evidence": {
+        "argv": [
+          "python3",
+          "run.py"
+        ],
+        "cwd": ".",
+        "exit_status": 0,
+        "output": "",
+        "run_kind": "executed",
+        "shows": "Shows the tool exiting 0 having printed nothing.",
+        "truncated": false
+      },
+      "failure": "main returns 0 unconditionally.",
+      "file": "run.py",
+      "fix_size": "medium",
+      "id": "cand-009",
+      "line_end": 2,
+      "line_start": 1,
+      "needs_files": [],
+      "quote_check": "matches",
+      "raised_by": [
+        {
+          "area": "area-01",
+          "kind": "reader",
+          "lane": "A",
+          "lens": "bottom-up from the code",
+          "quote": "def main():\n    return 0",
+          "reproduction": {
+            "argv": [
+              "python3",
+              "run.py"
+            ],
+            "cwd": ".",
+            "expect": "exit 0 with no output"
+          },
+          "severity": "major",
+          "unit": "area-01-A1"
+        }
+      ],
+      "rationale": "The run exited 0 with no output.",
+      "revision": null,
+      "severity_final": "major",
+      "severity_proposed": "major",
+      "siblings": 0,
+      "snippet": {
+        "cites_from": 1,
+        "cites_to": 2,
+        "first_line": 1,
+        "lines": [
+          "def main():",
+          "    return 0"
+        ],
+        "truncated": false
+      },
+      "status": "reproduced",
+      "test_first": "tests/test_engine.py: call helper(3) and assert it returns 5.",
+      "unresolved_reason": null,
+      "verified_by": {
+        "lane": "B",
+        "unit": "verify-area-01-A"
+      }
+    }
+  ],
+  "clustering": [
+    {
+      "area": "area-01",
+      "asks": "defect",
+      "listed": true,
+      "reason": null,
+      "state": "complete",
+      "summary": "4 groups",
+      "unit": "cluster-area-01"
+    },
+    {
+      "area": "area-01",
+      "asks": "coverage",
+      "listed": true,
+      "reason": null,
+      "state": "complete",
+      "summary": "1 groups",
+      "unit": "cluster-area-01-coverage"
+    },
+    {
+      "area": "area-02",
+      "asks": "defect",
+      "listed": true,
+      "reason": null,
+      "state": "complete",
+      "summary": "2 groups",
+      "unit": "cluster-area-02"
+    }
+  ],
+  "clusters": [
+    {
+      "area": "area-01",
+      "asks": "defect",
+      "axis_a": "both",
+      "axis_b": "by reading",
+      "consequence": "A string passed to core raises instead of being refused with a message.",
+      "cross_references": [
+        "D2"
+      ],
+      "dropped_cross_references": [],
+      "file": "engine/core.py",
+      "fix": "Refuse a non-number with a message before the addition.",
+      "fix_size": "small",
+      "grouped": true,
+      "id": "D1",
+      "line_end": 2,
+      "line_start": 1,
+      "members": [
+        "cand-003",
+        "cand-004"
+      ],
+      "severity": "major",
+      "split_reason": null,
+      "status": "unresolved",
+      "tier": "A result is wrong",
+      "unresolved_reason": "needs_a_file_outside_the_scope",
+      "unresolved_reasons": [
+        "needs_a_file_outside_the_scope"
+      ],
+      "what_goes_wrong": "core adds to x before anything checks x is a number, so a string raises."
+    },
+    {
+      "area": "area-01",
+      "asks": "defect",
+      "axis_a": "both",
+      "axis_b": "by running",
+      "consequence": "Every total built on helper comes out twice as large as the contract says.",
+      "cross_references": [
+        "D5"
+      ],
+      "dropped_cross_references": [
+        {
+          "defect": "D7",
+          "reason": "the two defects neither touch a file in common nor sit under one tier"
+        }
+      ],
+      "file": "engine/core.py",
+      "fix": "Return y + 2.",
+      "fix_size": "1 line",
+      "grouped": true,
+      "id": "D2",
+      "line_end": 6,
+      "line_start": 5,
+      "members": [
+        "cand-006",
+        "cand-007"
+      ],
+      "severity": "blocker",
+      "split_reason": null,
+      "status": "established",
+      "tier": "A result is wrong",
+      "unresolved_reason": null,
+      "unresolved_reasons": [],
+      "what_goes_wrong": "helper multiplies by two where the contract adds two, so every total built on it is too large."
+    },
+    {
+      "area": "area-01",
+      "asks": "defect",
+      "axis_a": "one",
+      "axis_b": "unresolved",
+      "consequence": "util returns a constant string, so callers cannot tell two calls apart.",
+      "cross_references": [],
+      "dropped_cross_references": [],
+      "file": "engine/util.py",
+      "fix": "Return a value derived from the call.",
+      "fix_size": "small",
+      "grouped": true,
+      "id": "D3",
+      "line_end": 2,
+      "line_start": 1,
+      "members": [
+        "cand-008"
+      ],
+      "severity": "minor",
+      "split_reason": null,
+      "status": "unresolved",
+      "tier": "A result is wrong",
+      "unresolved_reason": "needs_a_run",
+      "unresolved_reasons": [
+        "needs_a_run"
+      ],
+      "what_goes_wrong": "util returns one constant whatever it is asked, so no caller can tell two calls apart."
+    },
+    {
+      "area": "area-01",
+      "asks": "defect",
+      "axis_a": "one",
+      "axis_b": "by running",
+      "consequence": "The tool exits 0 even when it did nothing.",
+      "cross_references": [],
+      "dropped_cross_references": [],
+      "file": "run.py",
+      "fix": "Return non-zero when no work was done.",
+      "fix_size": "medium",
+      "grouped": true,
+      "id": "D4",
+      "line_end": 2,
+      "line_start": 1,
+      "members": [
+        "cand-009"
+      ],
+      "severity": "major",
+      "split_reason": null,
+      "status": "established",
+      "tier": "A result is wrong",
+      "unresolved_reason": null,
+      "unresolved_reasons": [],
+      "what_goes_wrong": "main returns 0 whether or not it did anything, so a caller cannot see a failure."
+    },
+    {
+      "area": "area-02",
+      "asks": "defect",
+      "axis_a": "one",
+      "axis_b": "by reading",
+      "consequence": "The README calls the tree small, which it may not stay.",
+      "cross_references": [],
+      "dropped_cross_references": [],
+      "file": "README.md",
+      "fix": "Drop the size claim.",
+      "fix_size": "1 line",
+      "grouped": true,
+      "id": "D6",
+      "line_end": 3,
+      "line_start": 3,
+      "members": [
+        "cand-001"
+      ],
+      "severity": "minor",
+      "split_reason": null,
+      "status": "refuted",
+      "tier": "The documents do not say what the code does",
+      "unresolved_reason": null,
+      "unresolved_reasons": [],
+      "what_goes_wrong": "The README calls the tree small."
+    },
+    {
+      "area": "area-02",
+      "asks": "defect",
+      "axis_a": "one",
+      "axis_b": "by reading",
+      "consequence": "The guide describes the engine without the helper's doubling, so a reader trusts it.",
+      "cross_references": [],
+      "dropped_cross_references": [],
+      "file": "docs/guide.md",
+      "fix": "State what helper returns.",
+      "fix_size": "1 line",
+      "grouped": true,
+      "id": "D7",
+      "line_end": 3,
+      "line_start": 3,
+      "members": [
+        "cand-002"
+      ],
+      "severity": "minor",
+      "split_reason": null,
+      "status": "established",
+      "tier": "The documents do not say what the code does",
+      "unresolved_reason": null,
+      "unresolved_reasons": [],
+      "what_goes_wrong": "The guide says nothing of what helper returns, so a reader trusts the wrong total."
+    }
+  ],
+  "commit": {
+    "commit": "",
+    "committed": "",
+    "dirty": null,
+    "state": "not-a-repository"
+  },
+  "coverage": [
+    {
+      "answered": true,
+      "area": "area-01",
+      "asks": "coverage",
+      "axis_a": "one",
+      "axis_b": "by reading",
+      "cluster_id": "D5",
+      "consequence": "A negative multiplier is never exercised.",
+      "covered_by": null,
+      "direction": "Add a case in tests/test_engine.py with y = -1.",
+      "evidence": null,
+      "failure": "helper distinguishes y below zero and no test constructs one.",
+      "file": "engine/core.py",
+      "fix_size": "small",
+      "id": "cand-005",
+      "line_end": 6,
+      "line_start": 5,
+      "needs_files": [],
+      "quote_check": "matches",
+      "raised_by": [
+        {
+          "area": "area-03",
+          "kind": "auditor",
+          "lane": "A",
+          "lens": null,
+          "quote": "def helper(y):\n    return y * 2",
+          "reproduction": null,
+          "severity": "major",
+          "unit": "audit-area-03-A"
+        }
+      ],
+      "rationale": "No test constructs a negative y.",
+      "revision": null,
+      "severity_final": "major",
+      "severity_proposed": "major",
+      "siblings": 0,
+      "snippet": {
+        "cites_from": 5,
+        "cites_to": 6,
+        "first_line": 3,
+        "lines": [
+          "",
+          "",
+          "def helper(y):",
+          "    return y * 2"
+        ],
+        "truncated": false
+      },
+      "status": "gap_confirmed",
+      "test_first": "tests/test_engine.py: call helper(3) and assert it returns 5.",
+      "unresolved_reason": null,
+      "verified_by": {
+        "lane": "B",
+        "unit": "verify-area-01-A-coverage"
+      }
+    }
+  ],
+  "coverage_clusters": [
+    {
+      "area": "area-01",
+      "asks": "coverage",
+      "axis_a": "one",
+      "axis_b": "by reading",
+      "consequence": "A negative multiplier is never exercised.",
+      "cross_references": [],
+      "dropped_cross_references": [],
+      "file": "engine/core.py",
+      "fix": "Add a case with y = -1.",
+      "fix_size": "small",
+      "grouped": true,
+      "id": "D5",
+      "line_end": 6,
+      "line_start": 5,
+      "members": [
+        "cand-005"
+      ],
+      "severity": "major",
+      "split_reason": null,
+      "status": "established",
+      "tier": "A result is wrong",
+      "unresolved_reason": null,
+      "unresolved_reasons": [],
+      "what_goes_wrong": "No test constructs a negative y, so the branch helper has for one is unexercised."
+    }
+  ],
+  "outside_scope": [],
+  "rung": "two-runtimes",
+  "synthesis": {
+    "reason": null,
+    "rejected": [],
+    "state": "complete",
+    "summary": "Two tiers: a wrong result, and documents that do not say what the code does.",
+    "tiers": [
+      "A result is wrong",
+      "The documents do not say what the code does"
+    ],
+    "unit": "synth-A"
+  },
+  "verification": [
+    {
+      "asks": "defect",
+      "candidates": 3,
+      "established": 2,
+      "finder": "A",
+      "reason": null,
+      "refuted": 0,
+      "state": "complete",
+      "summary": "checked 3",
+      "unit": "verify-area-01-A",
+      "unresolved": 1
+    },
+    {
+      "asks": "coverage",
+      "candidates": 1,
+      "established": 1,
+      "finder": "A",
+      "reason": null,
+      "refuted": 0,
+      "state": "complete",
+      "summary": "checked 1",
+      "unit": "verify-area-01-A-coverage",
+      "unresolved": 0
+    },
+    {
+      "asks": "defect",
+      "candidates": 3,
+      "established": 1,
+      "finder": "B",
+      "reason": null,
+      "refuted": 1,
+      "state": "complete",
+      "summary": "checked 3",
+      "unit": "verify-area-01-B",
+      "unresolved": 1
+    },
+    {
+      "asks": "defect",
+      "candidates": 1,
+      "established": 1,
+      "finder": "A",
+      "reason": null,
+      "refuted": 0,
+      "state": "complete",
+      "summary": "checked 1",
+      "unit": "verify-area-02-A",
+      "unresolved": 0
+    },
+    {
+      "asks": "defect",
+      "candidates": 1,
+      "established": 0,
+      "finder": "B",
+      "reason": null,
+      "refuted": 1,
+      "state": "complete",
+      "summary": "checked 1",
+      "unit": "verify-area-02-B",
+      "unresolved": 0
+    }
+  ]
+}

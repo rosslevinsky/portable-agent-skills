@@ -8,6 +8,127 @@ Versions use [Calendar Versioning](https://calver.org/) in the form
 A MICRO bump in the same month indicates a follow-up release; a new month
 starts from `.0` again.
 
+## [2026.09.6] - 2026-09-30
+
+### Added
+
+- **The agents a skill starts can run on a model you choose, open-weight models included.**
+  Name a **backend** — an entry in `~/.portable-agent-skills/backends.json` giving the tool
+  to start (Claude Code or Codex), the model, the provider that serves it, and the
+  environment variable that holds its key — and the agent runs on it. This covers the
+  reviewer in `/diff-review`, the planners and the judge in `/plan-duel`, both groups of
+  agents in `/review-panel`, a `/plan-run` phase worker, and a component reviewer in deep
+  `/security-review-codebase`. Name no backend and an agent uses its tool's own sign-in, as
+  before. An agent the host runs inside its own session always uses the host's model.
+  `BACKENDS.md` explains the file, the ways a model can get its credentials, and how to set
+  up OpenRouter and Fireworks. `PORTABLE_AGENT_SKILLS_BACKENDS` points to a file kept
+  somewhere else.
+- **Keys stay in your environment.** A backend names the variable that holds its key; the
+  key itself is never written in the backends file. An agent whose key variable is unset or
+  empty is refused before it starts. The message names the variable the agent reads, such as
+  `ANTHROPIC_AUTH_TOKEN`, and the agent or backend it belongs to; that backend's entry says
+  which of your variables feeds it. `/plan-duel` and
+  `/review-panel` then stop; `/diff-review`, `/plan-run` and `/security-review-codebase` fall
+  back to the host's own model and say so. One run can mix both: one planner on your Claude
+  login, the other on a model served by Fireworks.
+- **Each skill says which model ran.** `/diff-review`'s report names the backend and model,
+  or says the reviewer used its tool's sign-in. `/plan-duel`'s summary gains a **Models**
+  line. `/plan-run`'s evidence record and deep `/security-review-codebase`'s report say how
+  each worker was started.
+- **The installer sets up a starting backends file and a key file.** A default install
+  writes the backends file when you have none, with eleven backends: GLM-5.3, DeepSeek
+  V4.1 Flash and Kimi K3, for Claude Code and for Codex, through OpenRouter and Fireworks,
+  all set up to run the model in the US. The OpenRouter entries use its US address, which
+  needs an OpenRouter Business or Enterprise plan; the Fireworks entries use its US-only
+  models, which cost 1.5 times its standard price. A twelfth, Codex with GLM-5.3 through OpenRouter, is
+  switched off because its answers do not reliably match the format a skill asks for; its
+  entry says so. Beside it goes a key file with `OPENROUTER_API_KEY` and `FIREWORKS_API_KEY`
+  left empty for you to fill in — keys.env, readable only by you, on Linux and macOS, and
+  keys.ps1 on Windows — and a .gitignore that names both. Where that folder already has a
+  .gitignore, the installer adds the names it lacks at the end; where the .gitignore cannot
+  protect the key file, it writes no key file and says why. The key file does nothing until
+  you load it from your shell startup file; the key file's own first lines show the line to
+  add. With
+  `PORTABLE_AGENT_SKILLS_BACKENDS` set, it writes the backends file there and no key file.
+  The installer never rewrites either file once it exists, never reads your keys, never
+  edits a shell startup file, and leaves both in place on uninstall.
+- **Comments in the backends file.** JSON has none, so an entry whose name starts with `//`
+  is a comment. That is how the installed file explains itself, and how you switch an entry
+  off without deleting it.
+- **`/review-panel` can compare two models inside one tool.** Its two groups of agents may
+  both use Claude Code, say, one on Opus and one on Kimi K3, as long as every command in both
+  groups passes the model through. The report names this setup "one runtime running two
+  models", and names the reverse, two tools running the same model, "two runtimes running one
+  model".
+- **`/review-panel` writes a fix brief beside the report.** It is a short version of the
+  report for an agent that will fix the code, as Markdown, as JSON, and as one file per
+  defect so each can go to its own agent. For each place to fix it gives the location, what
+  is wrong there, the test that should fail first and, where the run has one, a command that
+  reproduces the problem and what it shows. Missing tests come after the defects. It leaves out your own
+  notes on the report, so tell the fixing agent about any defect you marked as wrong.
+- **`skills/diff-review/review_runner.py` takes a backend on its command line.** For anyone
+  who runs it directly: `--backend` starts the agent on a named backend, `--env` and
+  `--env-from-parent` pass settings and keys by name, and `--resolve-backend` prints what a
+  backend resolves to without starting anything. A new `raw-stdout` result mode keeps the
+  agent's reply byte for byte and refuses one larger than `--max-capture-bytes`.
+
+### Changed
+
+- **`/plan-duel` now needs `/diff-review` installed.** Every agent it starts goes through
+  the program `/diff-review` ships for starting an agent, watching it and stopping it at its
+  time limit. Without it the duel stops before creating anything and says what is missing;
+  `--supervisor` points to a copy elsewhere.
+- **`/plan-run` and deep `/security-review-codebase` start their workers the same way.**
+  Without `/diff-review`, the work goes to the host's own sub-agent, or runs in the current
+  session where the host has none; when that program reports a failure, it runs in the
+  current session. The record says which way it ran. A component reviewer is
+  stopped after an hour, or after 15 minutes with no output, and leaves its full transcript
+  in the run folder. A `/plan-run` worker's time limit is set per phase.
+- **A resumed `/plan-duel` or `/review-panel` run refuses a changed agent.** In
+  `/plan-duel`, changing the tool, model, backend or key variable of an agent whose results
+  the resume keeps — or editing that backend's entry, or any setting in the agent's own
+  `env` — is refused, naming what changed. `/review-panel` refuses a resume when any group's
+  tool, model, account, backend, backend entry, settings or key variable differ from what
+  the run started with, without naming which. Other edits still resume,
+  such as a longer time limit or a different number of workers at once. Editing a backend's
+  entry during a run stops the next agent on it from starting, and the run stops and names
+  the backend.
+- **`/review-panel` reports one mistake once, with every place it has to be fixed.** The
+  report calls a mistake a **defect** and each place to fix it a **site**. After findings are
+  grouped by place, one group of agents proposes which sites are the same mistake and the
+  other checks each site against that claim; only sites the check upholds are joined.
+- **`/review-panel`'s report puts the defects first and the evidence after them.** A defect
+  counts as established when any of its sites is, and as refuted only when all are. Evidence
+  that several sites share is printed once. Each part of a defect's written summary has a
+  length cap; a summary that runs over any of them is dropped for that defect alone —
+  heading, tier, account, fix, site notes and related links together — and the defect is
+  grouped by its status instead, with a note saying so. A run
+  folder from the previous release still re-renders, with each site as its own defect.
+- **`/review-panel`'s findings.json has a new shape.** The `clusters` and
+  `coverage_clusters` lists are replaced by `sites` and `defects`, and `coverage_sites` and
+  `coverage_defects`, with sites numbered `S1`, … and defects `D1`, …; `merge` and
+  `merge_check` record the two new steps. A tool that reads the old lists needs updating,
+  and re-rendering an older run folder writes the new shape.
+- **Running `/review-panel`'s stages by hand takes two more steps.** Between `cluster` and
+  `synthesize` come `merge` and `merge-check`, each with its units dispatched before the
+  next; `synthesize` refuses a run that has only been clustered. The bundled driver runs
+  them for you.
+- **`/review-panel`'s "What this report does not tell you" describes the run you have.** It
+  says how many files in scope were read, excluded or skipped, and how many sites were
+  checked but not settled, then says briefly what no run can tell you: which bugs it missed.
+
+### Fixed
+
+- **`/diff-review` states the limits of a reviewer's read-only settings more fully**, and the
+  new `BACKENDS.md` states them too; the README gives a shorter account. Claude Code's `--permission-mode plan` is its own permission check,
+  and your settings can widen it. Codex's `-s read-only` has the operating system block shell
+  writes on Linux and macOS, and less reliably on native Windows. Neither covers hooks,
+  plugins or MCP servers. Only a read-only copy or mount of the tree guarantees the reviewer
+  changes nothing.
+- **`skills/diff-review/review_runner.py` no longer follows a symbolic link at its
+  display-log path**, so an agent able to write in that folder cannot send the log to a file
+  outside it.
+
 ## [2026.09.5] - 2026-09-23
 
 ### Added
@@ -662,6 +783,7 @@ release](README.md#installing-a-previous-release) to return to it.
 
 Initial release.
 
+[2026.09.6]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.6
 [2026.09.5]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.5
 [2026.09.4]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.4
 [2026.09.3]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.3

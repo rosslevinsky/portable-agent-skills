@@ -1,0 +1,165 @@
+{
+  "//": "Backends for the portable agent skills. A name that begins with // is a comment: the skills skip it whatever it holds. BACKENDS.md, in the pack's repository, explains every field. Keys are never written here: each entry names the environment variable that holds its key.",
+  "// where it runs: Fireworks": "Fireworks sends its standard serverless requests to sites around the world, outside the US as well. Every Fireworks entry here uses a US-only router model id (one ending -us) on us.api.fireworks.ai. Fireworks documents this as US-only Serverless, which 'serves inference exclusively from the US'. US-only models cost 1.5 times the standard price. The -us model id is what selects US-only serving, and on an ordinary account nothing else does. A plain model id, even sent to us.api.fireworks.ai, is served wherever Fireworks chooses, with no error. Keep every Fireworks model id here ending -us.",
+  "// making Fireworks refuse non-US requests": "An account admin can make Fireworks refuse every request outside the US for the whole account, but only on an Enterprise account (console: Settings > Governances > Data Residency, or: firectl policy residency set US). On any other plan that page does not appear, and nothing refuses a plain model id. Without Enterprise there are two ways to get a refusal. One is to ask Fireworks to enable residency. The other is to reach the model through the OpenRouter entries below, whose US address refuses to run anything outside the US. An OpenRouter key with a guardrail also refuses requests sent to OpenRouter's global address by mistake. For Kimi K3, OpenRouter's US address routes to Fireworks' own US-only serving, at a lower price than Fireworks charges directly; for GLM-5.3 and DeepSeek it routes to other US providers.",
+  "// where it runs: OpenRouter": "Every OpenRouter entry here uses us.openrouter.ai, OpenRouter's In-Region Routing, which needs a Business or Enterprise plan. OpenRouter routes those requests only to provider endpoints whose infrastructure is in the US. It fails with an error rather than sending them elsewhere. Which providers serve a model changes; list them at https://us.openrouter.ai/api/v1/models/<model id>/endpoints. Give the API key a guardrail with allowed data regions set to us, so a request that reaches the global address openrouter.ai by mistake is rejected instead of served.",
+  "// what is kept": "Fireworks does not store prompts or outputs for open models unless you opt in. Its Responses API, which the Codex entries use, keeps a conversation for 30 days only when a request sets store to true, and Codex sends store false. OpenRouter does not store prompts or outputs unless you turn on its logging, and it skips its own logging on the regional endpoints. The provider it routes to follows that provider's own policy, though. To route only to providers that keep nothing, turn on Zero Data Retention enforcement in OpenRouter's privacy settings.",
+  "// what cannot be checked": "No response says which machine served it. Where a request ran and what was kept rest on each provider's published guarantee; recheck their documentation before relying on it.",
+  "glm53-claude-openrouter": {
+    "harness": "claude",
+    "model": "z-ai/glm-5.3",
+    "env": {
+      "ANTHROPIC_BASE_URL": "https://us.openrouter.ai/api",
+      "ANTHROPIC_API_KEY": ""
+    },
+    "env_from_parent": {
+      "ANTHROPIC_AUTH_TOKEN": "OPENROUTER_API_KEY"
+    }
+  },
+  "// glm53-codex-openrouter": {
+    "why": "Set aside: Codex with GLM-5.3 through OpenRouter US does not reliably match the requested schema; it can return an object with other keys, or prose. So a judge, a plan-run worker whose result is parsed, or a review-panel lane on it would fail. The same model matches the schema through Fireworks (glm53-codex-fireworks) and through Claude Code on both providers. To use it anyway, for work whose output nothing parses, delete this why field and the leading // and space from the name.",
+    "harness": "codex",
+    "model": "z-ai/glm-5.3",
+    "args": [
+      "-c",
+      "model_provider=\"openrouter\"",
+      "-c",
+      "model_providers.openrouter={name=\"OpenRouter US\", base_url=\"https://us.openrouter.ai/api/v1\", wire_api=\"responses\", env_key=\"OPENROUTER_API_KEY\"}",
+      "-c",
+      "web_search=\"disabled\""
+    ],
+    "env_from_parent": {
+      "OPENROUTER_API_KEY": "OPENROUTER_API_KEY"
+    }
+  },
+  "glm53-claude-fireworks": {
+    "harness": "claude",
+    "model": "accounts/fireworks/routers/glm-5p3-us",
+    "env": {
+      "ANTHROPIC_BASE_URL": "https://us.api.fireworks.ai/inference",
+      "ANTHROPIC_API_KEY": ""
+    },
+    "env_from_parent": {
+      "ANTHROPIC_AUTH_TOKEN": "FIREWORKS_API_KEY"
+    }
+  },
+  "glm53-codex-fireworks": {
+    "harness": "codex",
+    "model": "accounts/fireworks/routers/glm-5p3-us",
+    "args": [
+      "-c",
+      "model_provider=\"fireworks\"",
+      "-c",
+      "model_providers.fireworks={name=\"Fireworks US\", base_url=\"https://us.api.fireworks.ai/inference/v1\", wire_api=\"responses\", env_key=\"FIREWORKS_API_KEY\"}",
+      "-c",
+      "web_search=\"disabled\""
+    ],
+    "env_from_parent": {
+      "FIREWORKS_API_KEY": "FIREWORKS_API_KEY"
+    }
+  },
+  "deepseek41-claude-openrouter": {
+    "harness": "claude",
+    "model": "deepseek/deepseek-v4.1-flash",
+    "env": {
+      "ANTHROPIC_BASE_URL": "https://us.openrouter.ai/api",
+      "ANTHROPIC_API_KEY": ""
+    },
+    "env_from_parent": {
+      "ANTHROPIC_AUTH_TOKEN": "OPENROUTER_API_KEY"
+    }
+  },
+  "deepseek41-codex-openrouter": {
+    "harness": "codex",
+    "model": "deepseek/deepseek-v4.1-flash",
+    "args": [
+      "-c",
+      "model_provider=\"openrouter\"",
+      "-c",
+      "model_providers.openrouter={name=\"OpenRouter US\", base_url=\"https://us.openrouter.ai/api/v1\", wire_api=\"responses\", env_key=\"OPENROUTER_API_KEY\"}",
+      "-c",
+      "web_search=\"disabled\""
+    ],
+    "env_from_parent": {
+      "OPENROUTER_API_KEY": "OPENROUTER_API_KEY"
+    }
+  },
+  "deepseek41-claude-fireworks": {
+    "harness": "claude",
+    "model": "accounts/fireworks/routers/deepseek-v4p1-flash-us",
+    "env": {
+      "ANTHROPIC_BASE_URL": "https://us.api.fireworks.ai/inference",
+      "ANTHROPIC_API_KEY": ""
+    },
+    "env_from_parent": {
+      "ANTHROPIC_AUTH_TOKEN": "FIREWORKS_API_KEY"
+    }
+  },
+  "deepseek41-codex-fireworks": {
+    "harness": "codex",
+    "model": "accounts/fireworks/routers/deepseek-v4p1-flash-us",
+    "args": [
+      "-c",
+      "model_provider=\"fireworks\"",
+      "-c",
+      "model_providers.fireworks={name=\"Fireworks US\", base_url=\"https://us.api.fireworks.ai/inference/v1\", wire_api=\"responses\", env_key=\"FIREWORKS_API_KEY\"}",
+      "-c",
+      "web_search=\"disabled\""
+    ],
+    "env_from_parent": {
+      "FIREWORKS_API_KEY": "FIREWORKS_API_KEY"
+    }
+  },
+  "kimik3-claude-openrouter": {
+    "harness": "claude",
+    "model": "moonshotai/kimi-k3",
+    "env": {
+      "ANTHROPIC_BASE_URL": "https://us.openrouter.ai/api",
+      "ANTHROPIC_API_KEY": ""
+    },
+    "env_from_parent": {
+      "ANTHROPIC_AUTH_TOKEN": "OPENROUTER_API_KEY"
+    }
+  },
+  "kimik3-codex-openrouter": {
+    "harness": "codex",
+    "model": "moonshotai/kimi-k3",
+    "args": [
+      "-c",
+      "model_provider=\"openrouter\"",
+      "-c",
+      "model_providers.openrouter={name=\"OpenRouter US\", base_url=\"https://us.openrouter.ai/api/v1\", wire_api=\"responses\", env_key=\"OPENROUTER_API_KEY\"}",
+      "-c",
+      "web_search=\"disabled\""
+    ],
+    "env_from_parent": {
+      "OPENROUTER_API_KEY": "OPENROUTER_API_KEY"
+    }
+  },
+  "kimik3-claude-fireworks": {
+    "harness": "claude",
+    "model": "accounts/fireworks/routers/kimi-k3-us",
+    "env": {
+      "ANTHROPIC_BASE_URL": "https://us.api.fireworks.ai/inference",
+      "ANTHROPIC_API_KEY": ""
+    },
+    "env_from_parent": {
+      "ANTHROPIC_AUTH_TOKEN": "FIREWORKS_API_KEY"
+    }
+  },
+  "kimik3-codex-fireworks": {
+    "harness": "codex",
+    "model": "accounts/fireworks/routers/kimi-k3-us",
+    "args": [
+      "-c",
+      "model_provider=\"fireworks\"",
+      "-c",
+      "model_providers.fireworks={name=\"Fireworks US\", base_url=\"https://us.api.fireworks.ai/inference/v1\", wire_api=\"responses\", env_key=\"FIREWORKS_API_KEY\"}",
+      "-c",
+      "web_search=\"disabled\""
+    ],
+    "env_from_parent": {
+      "FIREWORKS_API_KEY": "FIREWORKS_API_KEY"
+    }
+  }
+}

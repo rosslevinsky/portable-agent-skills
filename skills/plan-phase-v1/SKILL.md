@@ -39,7 +39,7 @@ Read the plan document in full.
 If the plan carries a `Format: v2` marker, stop: v2 plans are broken down by
 `/plan-phase` (which writes an `execution.md` tracker), not this v1 skill.
 Tell the user to run `/plan-phase` instead. (This mirrors the v2 skills,
-which already refuse a v1 plan — the guard is now bidirectional.)
+which refuse a v1 plan — the guard runs both ways.)
 
 ### Handling non-plan-init-v1 input
 
