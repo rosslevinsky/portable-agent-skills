@@ -19,10 +19,10 @@ score a relocation out of `SKILL.md` as zero reduction and budget-lock the ledge
 engine at the skill root is executed, not read. And non-markdown under `references/` would
 mean adding a schema field needed a budget raise.
 
-`SKILL.md` alone was a fourth, unstated exclusion, and it made the ratchet avoidable:
-plan-duel's `init.md`, `round.md` and `summary.md` are read by the engine every round and
-were unbudgeted, so moving the last 45% of `SKILL.md` into `round.md` relocated 1044 words,
-removed none, and passed.
+Every skill-root `*.md` counts, not `SKILL.md` alone: plan-duel's `init.md`, `round.md` and
+`summary.md` are prose the duel works from, and because they are counted, moving prose
+out of `SKILL.md` into `round.md` leaves the measured total unchanged instead of reading as a
+reduction.
 
 **The v1 suite is excluded** and holds no budget. It is the superseded suite, on bugfix-only
 support: a new check would put its files under a rule they were never written to.
@@ -68,11 +68,11 @@ class MeasureTests(unittest.TestCase):
             self.assertEqual(measure_skill_words(d), 5)
 
     def test_counts_a_skill_root_companion_markdown_file(self):
-        """The exclusion that was never stated, and made the ratchet avoidable.
+        """Markdown beside `SKILL.md` counts toward the skill's total.
 
         A companion beside `SKILL.md` — plan-duel's `init.md` / `round.md` /
-        `summary.md`, which the engine resolves by name and feeds the models every
-        round — went uncounted, so prose moved into one read as a reduction.
+        `summary.md`, prose the duel works from — must be counted, or prose moved into
+        one reads as a reduction.
         """
         with tempfile.TemporaryDirectory() as tmp:
             d = _skill(Path(tmp), "demo", "a b c")
@@ -309,8 +309,8 @@ class ShippedBudgetsTests(unittest.TestCase):
 
         `check_skill_budgets` only asks whether a skill is OVER its number, and slack
         satisfies that — so raising every budget disarms the check for thousands of words.
-        Measured on the shipped tree before this test existed: tripling all thirteen numbers
-        left the validator, the fixture harness and the whole unit suite green.
+        Without this test, tripling every number leaves the validator, the fixture harness
+        and the rest of the unit suite green.
 
         The contract is that a recorded budget records TODAY'S count, so any slack is a raise
         nobody reviewed. A regression guard, not a defect demonstration: it passes the moment

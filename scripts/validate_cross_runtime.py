@@ -73,14 +73,14 @@ BANNED_PHRASES = [
 # would disclose exactly what it exists to keep unpublished. Put those in the optional
 # side file below.
 PRIVATE_PATH_PATTERNS = [
-    # Home directories on every platform this pack supports, not just Linux. The macOS
-    # and the Windows form went uncaught until a review pasted one into an installer and
-    # watched it pass — and macOS is in the CI matrix, so it is where a real one comes from.
+    # Home directories on every platform this pack supports, not just Linux. A macOS or a
+    # Windows home path is as private as a Linux one, and a Linux-only pattern passes both
+    # — and macOS is in the CI matrix, so it is where a real one comes from.
     re.compile(r"/home/[^/\s]+"),           # hygiene-exempt: this IS the pattern
     re.compile(r"/Users/[^/\s]+"),          # hygiene-exempt: this IS the pattern
     re.compile(r"[A-Za-z]:\\Users\\[^\\\s]+"),
-    # Bare 'dotfiles' / '~/projects' match the breadth of the retired CI grep  # hygiene-exempt: names the patterns
-    # steps for skill text; the doc scan below narrows 'dotfiles' to the path  # hygiene-exempt: names the patterns
+    # Bare 'dotfiles' / '~/projects' are refused anywhere in skill text,  # hygiene-exempt: names the patterns
+    # at their broadest; the doc scan below narrows 'dotfiles' to the path  # hygiene-exempt: names the patterns
     # form because README legitimately uses the word in prose.
     re.compile(r"\bdotfiles\b"),
     re.compile(r"~/projects"),  # hygiene-exempt: this IS the pattern
@@ -125,8 +125,8 @@ def _mode_or_absent(path: Path, *, follow: bool = True) -> int | None:
 def _present(path: Path) -> bool:
     """Is anything at ``path``? Absent answers False; unreadable raises.
 
-    Follows the link, like the ``Path.exists()`` each caller used before it: a dangling
-    link is a name with nothing at it, and a looping one is a name that cannot be resolved.
+    Follows the link, as ``Path.exists()`` does: a dangling link is a name with nothing at
+    it, and a looping one is a name that cannot be resolved.
     """
     return _mode_or_absent(path) is not None
 
@@ -208,7 +208,7 @@ STALE_RUNTIME_CLAIM_PATTERNS = [
 # The doc names listed here exist only at the repo root. README.md / CHANGELOG.md /
 # CONTRIBUTING.md are EXCLUDED — skills legitimately reference same-named files in the
 # user's project — and a path-based reference to those is still caught by the '../' rule.
-NON_INSTALLED_ROOT_DOCS = ["PORTABILITY.md"]
+NON_INSTALLED_ROOT_DOCS = ["PORTABILITY.md", "BACKENDS.md"]
 
 # The same defect as the `../` escape, in the spelling the escape rule cannot see. `../` is
 # caught by counting how far a path climbs; `skills/plan-duel/x.md` climbs nowhere — it
@@ -221,7 +221,7 @@ NON_INSTALLED_ROOT_DOCS = ["PORTABILITY.md"]
 SIBLING_SKILL_PATH_RE = re.compile(r"\bskills[\\/][A-Za-z0-9_.-]+[\\/][^\s`'\"<>|,;)\]]+")
 
 # Codex's documented user skills path is $HOME/.agents/skills (developers.openai.com/
-# codex/skills; empirically confirmed on codex-cli 0.142.5). Skill files and the
+# codex/skills). Skill files and the
 # README must point users at that canonical path and must not steer them at the
 # ~/.codex/skills location.
 # The invocation form of a skill reference. The whole backtick span must BE the command,
@@ -593,11 +593,10 @@ def _candidate_skill_roots(skills_dir: Path, suffix: str = ""):
 def iter_skill_roots(skills_dir: Path, suffix: str = ""):
     """Yield each skill's ``SKILL.md``, refusing a symlinked skill root.
 
-    **"Which skills exist" is a different question from "which files belong to one",** and
-    conflating them is how the root guard went missing: six call sites asked this one, all
-    spelled ``glob("*/SKILL.md")``, and none refused a link — so the *file* walk could refuse
-    every symlink inside a skill and still validate a skill that was itself a link out of
-    the tree.
+    **"Which skills exist" is a different question from "which files belong to one",** so
+    a skill root that is a link is refused here, where skills are listed, and not left to
+    the file walk's own root check alone: a call site that spells it ``glob("*/SKILL.md")``
+    refuses no link. Every call site asks it here.
 
     Refusal here is silent by design and reported by :func:`symlinked_skill_roots`, which
     walks the same predicate.
@@ -612,7 +611,7 @@ def symlinked_skill_roots(skills_dir: Path):
     """Yield the skill roots :func:`iter_skill_roots` refuses, so the refusal is reported.
 
     Same predicate, deliberately. A skill silently skipped is indistinguishable from a skill
-    that passed -- the failure mode this whole phase exists to remove.
+    that passed -- the failure mode this traversal exists to remove.
     """
     for skill_md in _candidate_skill_roots(skills_dir):
         if _is_symlink(skill_md.parent) or _is_symlink(skill_md):
@@ -699,36 +698,35 @@ def discover_skill_artifacts(skills_dir: Path) -> list[str]:
         skill_name = skill_md.parent.name
         artifacts.append(f"{skill_name}/SKILL.md")
         # Every markdown file in the skill, at any depth, via the shared walk — not a glob
-        # plus a hardcoded companion list. The RATCHET was widened three times (depth,
-        # skill-root companions, case) without discovery following, each widening leaving a
-        # file the budget charges for and no rule inspects.
+        # plus a hardcoded companion list. The budget counts at any depth, at the skill
+        # root and in any case, and discovery has to reach the same files, or a file the
+        # budget charges for is one no rule inspects.
         #
-        # ONE walk per skill, classified as it goes: two passes over the same tree is the
-        # shape this removes.
+        # ONE walk per skill, classified as it goes, rather than two passes over the same
+        # tree.
         markdown: list[str] = []
         python: list[str] = []
         for _path, relative, suffix in walk_tree_files(skill_md.parent):
             name = f"{skill_name}/{relative.as_posix()}"
             if suffix == ".md" and str(relative) != "SKILL.md":
-                # B1.5: the ledger IS discovered, so the prose rules run over it, and is
-                # still excluded from the word budget by `measure_skill_words`. One walk, two
+                # The ledger IS discovered, so the prose rules run over it, and is still
+                # excluded from the word budget by `measure_skill_words`. One walk, two
                 # answers — which is why the scope predicate belongs to the CALLER's question
-                # and not to the walk. Before this, `DECISIONS.md` was the only shipped
-                # markdown governed by no rule at all.
+                # and not to the walk. Exempt from the budget is not exempt from every rule.
                 markdown.append(name)
             elif suffix == ".py":
-                # EVERY .py, at any depth, discovered rather than named. Reachable only
-                # through a `plan-duel` branch, the bundled-engine portability rule never
-                # scanned `skills/diff-review/review_runner.py` — a mandatory companion whose
-                # own header claims no branded CLI is baked into it. The same hardcoded
-                # `["claude", "-p", ...]` appended to each engine failed from plan_duel.py and
-                # passed from review_runner.py. A helper under `references/` ships and
-                # executes exactly as a root engine does, and was likewise scanned by nothing.
+                # EVERY .py, at any depth, discovered rather than named. A rule reachable only
+                # through a named skill's branch leaves every other engine unscanned — and
+                # `skills/diff-review/review_runner.py` is a mandatory companion whose own
+                # header claims no branded CLI is baked into it, so a hardcoded
+                # `["claude", "-p", ...]` in it must fail exactly as it does in plan_duel.py.
+                # A helper under `references/` ships and executes exactly as a root engine
+                # does, so it is scanned too.
                 python.append(name)
         artifacts.extend(markdown)
         artifacts.extend(python)
-        # The plan-duel companion list is gone: the markdown walk above reaches init.md,
-        # round.md and summary.md by walking, so a fourth companion is covered the day it
+        # No plan-duel companion list: the markdown walk above reaches init.md, round.md
+        # and summary.md by walking, so a fourth companion is covered the day it
         # lands rather than the day someone remembers to extend a constant. The schema stays
         # named because it is not found by suffix — and the per-artifact rule loop in
         # validate_skills dispatches on .py / .md only, so a .json artifact is gated by the
@@ -1159,12 +1157,12 @@ _PATH_TOKEN_RE = re.compile(r"[^\s()\[\]{}<>`'\"|,;]+")
 def _escaping_relative_paths(line: str, depth: int):
     """Yield ``(path, reason)`` for each path written on ``line`` that leaves the skill.
 
-    **Counting ``../`` is not the same as resolving a path, and the difference was wrong in
-    both directions.** On a file one level down (``references/``), against a rule looking for
-    a literal ``../../``:
+    **Counting ``../`` is not the same as resolving a path, and the difference is wrong in
+    both directions.** On a file one level down (``references/``), a rule looking for a
+    literal ``../../`` against one that resolves the path:
 
     ===========================  ==========  ==========  ==============
-    written on the line          resolves to old verdict this verdict
+    written on the line          resolves to counting    resolving
     ===========================  ==========  ==========  ==============
     ``../..``                    OUTSIDE     passed      flagged
     ``.././../x.md``             OUTSIDE     passed      flagged
@@ -1200,15 +1198,15 @@ def _escaping_relative_paths(line: str, depth: int):
             path = unquote(candidate).replace("\\", "/")
             # Only paths that TRAVERSE are judged. Flagging every anchored path is true of a
             # link target and false of most lines: this rule reads whole lines by design,
-            # and the shipped skills carry 251 absolute-looking tokens in 26 files, almost
-            # all slash-commands like `/cyw`. Flagging those would fire on nearly every skill
+            # and the shipped skills carry hundreds of absolute-looking tokens, almost all
+            # slash-commands like `/cyw`. Flagging those would fire on nearly every skill
             # and teach authors to ignore the rule. Anchored AND traversing is unambiguous.
             if ".." not in path.split("/"):
                 continue
             # An anchored path is reported as what it is rather than counted against the
             # skill root — `/tmp/../../x` never started inside the skill, so "two levels
             # above" would be a true-sounding sentence about the wrong thing. Skipping these
-            # on the reasoning that the private-path patterns catch them was a hole:
+            # on the reasoning that the private-path patterns catch them leaves a hole:
             # `/tmp/../../outside`, `C:\work\..\outside` and a UNC path match none of them.
             if path.startswith("/") or re.match(r"^[A-Za-z]:", path):
                 yield candidate, (
@@ -1283,12 +1281,13 @@ def check_bundled_refs_resolve(filepath: Path, skill_root: Path) -> list[str]:
     ``references/anchored-assumptions.md``, ship no such file, and pass every rule here, so
     the agent following the instruction hits a dead end mid-task.
 
-    **Scoped to ``references/`` deliberately.** Checking every path-shaped token flags 240
-    references in this pack and essentially all are correct: a planning skill legitimately
-    names ``plan.md`` and ``package.json``, which are files in the USER's project. Nothing
-    general separates those from a bundled companion. ``references/`` is this pack's
-    convention for a file that travels inside ``skills/<name>/``, so naming one that is not
-    there is always a defect. A placeholder — ``<...>``, ``⟪...⟫`` or a glob — is skipped.
+    **Scoped to ``references/`` deliberately.** Checking every path-shaped token flags
+    hundreds of references in this pack and essentially all are correct: a planning skill
+    legitimately names ``plan.md`` and ``package.json``, which are files in the USER's
+    project. Nothing general separates those from a bundled companion. ``references/`` is
+    this pack's convention for a file that travels inside ``skills/<name>/``, so naming one
+    that is not there is always a defect. A placeholder — ``<...>``, ``⟪...⟫`` or a glob —
+    is skipped.
     """
     errors = []
     try:
@@ -1369,11 +1368,10 @@ def check_independence_ladder(filepath: Path) -> list[str]:
                   if i >= body_starts and DISPATCHED_REVIEWER_RE.search(line)]
     if not references:
         return []
-    # ONCE PER DOCUMENT, over the whole file rather than a window — the same rule
-    # `check_companion_skill_fallbacks` settled on. With a 6-line window instead, three
-    # files were flagged and all three were correct, stating the fallback in a section the
-    # window could not reach; requiring a restatement beside each adapter mandates exactly
-    # the duplication the budget exists to prevent.
+    # ONCE PER DOCUMENT, as in `check_companion_skill_fallbacks` — but over the whole file,
+    # not that check's 6-line window. A window flags a correct file that states the
+    # fallback in a section the window cannot reach; requiring a restatement beside each
+    # adapter mandates exactly the duplication the budget exists to prevent.
     body = " ".join(lines[body_starts:]).lower()
     if any(indicator in body for indicator in FALLBACK_INDICATORS + LADDER_INDICATORS):
         return []
@@ -1408,7 +1406,7 @@ def check_v1_suite_routing(filepath: Path, in_v1_suite: bool = False) -> list[st
     **Granularity is the paragraph, deliberately — and this is the rule's known limit.** A
     forward redirect and a stale intra-suite reference are textually identical, so a redirect
     paragraph reads EVERY bare name in it as a redirect. Splitting on more than one suite
-    member was rejected against the tree: `plan-run-v1` says "run `/plan-run` instead (with
+    member is not an option: `plan-run-v1` says "run `/plan-run` instead (with
     `/plan-phase` for the work breakdown …)", which names two and is correct.
 
     ``in_v1_suite`` mirrors ``check_self_contained_skill_refs``'s ``depth``: the caller
@@ -1522,7 +1520,7 @@ def check_codex_skill_paths(filepath: Path) -> list[str]:
 #
 # BOTH halves are required, because there are TWO write paths: the sandbox governs the
 # model's shell commands, while a built-in patch/edit tool is gated by the approval policy,
-# so `-s read-only` alone still wrote a file. The executable may carry a path prefix or a
+# so `-s read-only` alone can still write a file. The executable may carry a path prefix or a
 # Windows suffix, which the engine resolves.
 _CODEX_EXEC_SHELL_RE = re.compile(r"(?:^|[\s\"'`(])[\w./\\-]*codex(?:\.exe)?\s+exec\b")
 _CODEX_EXEC_JSON_RE = re.compile(r'"[\w./\\-]*codex(?:\.exe)?"\s*,\s*"exec"')
@@ -1869,10 +1867,9 @@ def check_progress_declaration(filepath: Path) -> list[str]:
     except FileNotFoundError:
         return [f"  File not found: {filepath}"]
 
-    # prose_lines, not splitlines. A `_Progress:` line quoted inside a fenced block used to
-    # satisfy this check, while `check_classification` has carved fences out all along — and
-    # its docstring's claim that the two parse the same way is what kept the gap invisible.
-    # Anyone could delete the real declaration, leave an example behind, and pass.
+    # prose_lines, not splitlines, so a `_Progress:` line quoted inside a fenced block does not
+    # satisfy this check -- the same way `check_classification` carves fences out. Otherwise
+    # anyone could delete the real declaration, leave an example behind, and pass.
     for stripped in prose_lines(content):
         if stripped.startswith(PROGRESS_DECL_PREFIX):
             # Markdown emphasis stripped off the ends BEFORE the word-boundary test. The
@@ -2107,10 +2104,11 @@ def check_shipped_json(skills_dir: Path) -> list[str]:
     errors: list[str] = []
     if not _is_dir(skills_dir):
         return errors
-    # The shared walk, not `rglob("*.json")` plus a private `__pycache__` test. That test was
-    # one of the three separate residue filters this phase collapsed, and the glob folded no
-    # case, so a `SCHEMA.JSON` shipped unparsed. Symlinks are refused here for the same reason
-    # they are everywhere else: parsing a link parses whatever it resolves to.
+    # The shared walk, not `rglob("*.json")` plus a private `__pycache__` test: the walk
+    # drops build residue in the one place every caller shares, and its suffix is
+    # case-folded, so a `SCHEMA.JSON` is parsed like any other. Symlinks are refused here
+    # for the same reason they are everywhere else: parsing a link parses whatever it
+    # resolves to.
     for filepath, _relative, suffix in walk_tree_files(skills_dir):
         if suffix != ".json":
             continue
@@ -2214,9 +2212,9 @@ def check_readme_inventory(readme_path: Path, skill_names: list[str],
             )
 
     # The Classification column must agree with what the skill declares. The README is where
-    # someone decides whether a skill will work for them, and it was free to say `Full`
-    # about a skill whose own text says `Degraded` — the two were checked separately and
-    # compared never. All sixteen agree today, so this is a regression guard.
+    # someone decides whether a skill will work for them, and checked separately from the
+    # skill it could say `Full` about a skill whose own text says `Degraded`. Every skill
+    # agrees today, so this is a regression guard.
     if skills_dir is not None:
         for name in sorted(expected & set(declared_in_readme)):
             actual = declared_classification(skills_dir / name / "SKILL.md")
@@ -2448,20 +2446,20 @@ def iter_hygiene_targets(root: Path):
     for filepath, rel, rel_parts, suffix, is_symlink in candidates:
         # Not tracked, so it is not part of the project, and a file nothing carries onward
         # is not a file this sweep protects. Skipping it is not a narrowing of coverage but
-        # a removal of noise — measured on a working copy carrying the usual residue, 645
-        # violations, every one of them untracked.
+        # a removal of noise: a working copy's untracked files are scratch and build output,
+        # and neither a clone nor a release carries them.
         if tracked is not None and rel not in tracked:
             continue
-        # Anchored to the repository ROOT. `parts` intersection matched at any depth, so
-        # `skills/cyw/plans/leak.md` was skipped — inside the one directory whose text is
-        # the product. A top-level `plans/` holds working notes; a nested one is a skill's
+        # Anchored to the repository ROOT, not matched at any depth, so
+        # `skills/cyw/plans/leak.md` is scanned: it sits inside the one directory whose text
+        # is the product. A top-level `plans/` holds working notes; a nested one is a skill's
         # own content and gets scanned like everything else.
         if rel_parts and rel_parts[0] in HYGIENE_SKIP_ROOTS:
             continue
-        # Build residue is pruned by the walk now (`BUILD_RESIDUE_DIRS`), which is why the
-        # old `HYGIENE_SKIP_ANYWHERE` set is gone: it was the third of three residue filters.
-        # A stray `.pyc` OUTSIDE `__pycache__` is still skipped by suffix — it is compiled
-        # output wherever it sits, and legitimately embeds the path it was built from.
+        # Build residue is pruned by the walk (`BUILD_RESIDUE_DIRS`), so this sweep keeps no
+        # residue list of its own to fall out of step with it. A stray `.pyc` OUTSIDE
+        # `__pycache__` is still skipped by suffix — it is compiled output wherever it sits,
+        # and legitimately embeds the path it was built from.
         if suffix == ".pyc":
             continue
         if rel in HYGIENE_ALLOWLIST:
@@ -2507,8 +2505,8 @@ def sweep_content_hygiene(root: Path) -> list[str]:
         # may be dangling and `is_file()` therefore false. Read the target, not the file.
         if is_symlink:
             # `readlink` raises on a Windows junction, which the walk labels a link for the
-            # same reason it labels a symlink one. Unguarded, the sweep died there and the
-            # top-level OSError catch replaced every finding accumulated so far with one
+            # same reason it labels a symlink one. Unguarded, the sweep dies there and the
+            # top-level OSError catch replaces every finding accumulated so far with one
             # generic line.
             #
             # Guarded, but NOT skipped: an unreadable target is reported. Skipping fails
@@ -2548,8 +2546,8 @@ def check_shipped_files_decode(skills_dir: Path) -> list[str]:
     """Every shipped text file under ``skills_dir`` decodes as strict UTF-8.
 
     A precondition, not a style rule: the rest of the module reads these files with
-    ``read_text(encoding="utf-8")`` at eight separate sites, and one undecodable byte took
-    the whole validation down with a traceback that did not name the file.
+    strict ``read_text(encoding="utf-8")``, and one undecodable byte raises a traceback that
+    does not name the file.
 
     ``.md`` / ``.py`` / ``.json``, because those are what the shipped skills carry. A binary
     asset under ``references/`` is nobody's text.
@@ -2581,13 +2579,12 @@ def validate_skills(skills_dir: Path, repo_root: Path) -> list[str]:
 
     # Before anything reads a shipped file: is every one of them decodable?
     #
-    # Discovery reads strict UTF-8 and catches only OSError, so a single bad byte in any
-    # SKILL.md aborted the run with a raw UnicodeDecodeError — the offending path nowhere in
-    # the traceback — before the private-path sweep, the banned phrases or the budget ratchet
-    # had run. Routing the two reading sites through _read_text_lossy is not sufficient: the
-    # run then dies identically at the next of eight strict reads. So the question is asked
-    # once, up front, and reported the way a bad skill-budgets.json is: name the file and say
-    # what is wrong with it.
+    # Discovery reads strict UTF-8 and catches only FileNotFoundError, so a single bad byte
+    # in any SKILL.md raises a raw UnicodeDecodeError that names no path, before the
+    # private-path sweep, the banned phrases or the budget ratchet run. Routing one reading
+    # site through _read_text_lossy is not sufficient: the reads after it are strict as
+    # well. So the question is asked once, up front, and reported the way a bad
+    # skill-budgets.json is: name the file and say what is wrong with it.
     undecodable = check_shipped_files_decode(skills_dir)
     if undecodable:
         return all_errors + undecodable
@@ -2640,8 +2637,8 @@ def validate_skills(skills_dir: Path, repo_root: Path) -> list[str]:
             # How far below its skill root the file sits, counted from the artifact name:
             # `<skill>/<file>` is depth 0, `<skill>/references/<file>` is 1,
             # `<skill>/references/deep/<file>` is 2. Counting separators rather than
-            # testing `== 1` is the whole fix for the depth-2 false positive — the artifact
-            # name already carried the real depth, and the caller was throwing it away.
+            # testing `== 1` is what keeps a depth-2 file from a false positive — the
+            # artifact name already carries the real depth.
             all_errors.extend(
                 check_self_contained_skill_refs(filepath, depth=artifact.count("/") - 1)
             )
@@ -2864,8 +2861,8 @@ def run_test_fixtures(fixtures_dir: Path) -> list[str]:
                 "  FIXTURE FAIL: the undecodable-file report must name the file; got "
                 f"{decode_errors[0]!r}"
             )
-        # And the whole run degrades rather than dying: this is the call that used to
-        # raise instead of returning a list.
+        # And the whole run degrades rather than dying: this call must return a list, not
+        # raise.
         try:
             run_errors = validate_skills(tmp_skills, Path(tmpdir))
         except UnicodeDecodeError:
@@ -2899,10 +2896,10 @@ def run_test_fixtures(fixtures_dir: Path) -> list[str]:
                 "one must not be discovered as classification-required"
             )
 
-    # The same pairing for an HTML comment, which is where the two sites actually did
-    # disagree: discovery returned the skill on the strength of a commented-out line while
-    # the check accepted that same line as satisfying the requirement. Both directions are
-    # asserted, because fixing only one would reopen the hole from the other side.
+    # The same pairing for an HTML comment, which is where the two sites can disagree:
+    # discovery returning the skill on the strength of a commented-out line while the check
+    # accepts that same line as satisfying the requirement. Both directions are asserted,
+    # because holding only one leaves the hole open from the other side.
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_skills = Path(tmpdir)
         commented = tmp_skills / "commented-out-skill"
@@ -2948,7 +2945,7 @@ def run_test_fixtures(fixtures_dir: Path) -> list[str]:
 
     # Test: a fallback stated ONCE covers every later reference to the same companion.
     # The rule is about the document, not the sentence — restating the degraded path at
-    # every mention is the duplication the pack spent a plan removing.
+    # every mention would repeat the same fallback text, which a skill should state once.
     f = fixtures_dir / "test_validate_repeated_reference_fallback.md"
     if f.exists():
         result = check_companion_skill_fallbacks(f)
@@ -3105,6 +3102,16 @@ def run_test_fixtures(fixtures_dir: Path) -> list[str]:
     else:
         errors.append(f"  Fixture not found: {f}")
 
+    # Test: the backends documentation is a repo-root doc too — a skill naming it points at a
+    # file no install contains, however useful the recipes in it are.
+    f = fixtures_dir / "test_validate_backends_root_doc.md"
+    if f.exists():
+        errors += _rejected_for("test_validate_backends_root_doc.md",
+                                check_self_contained_skill_refs(f, depth=0),
+                                "reference to repo-root doc 'BACKENDS.md'")
+    else:
+        errors.append(f"  Fixture not found: {f}")
+
     # Test: the `references/`-level escape THRESHOLD, at the depth those files are judged at.
     # The clean fixture below proves one `../` is allowed there; nothing proved two is not.
     # Asserted on the reported level count, not on non-emptiness, because at depth 0 the same
@@ -3168,8 +3175,8 @@ def run_test_fixtures(fixtures_dir: Path) -> list[str]:
     else:
         errors.append(f"  Fixture not found: {f}")
 
-    # Test: `check_portability_md` had no negative fixture at all, so its unanchored search
-    # could only ever be observed passing. All three evasions are built from the REAL
+    # Test: `check_portability_md` needs a negative fixture, or an unanchored search could
+    # only ever be observed passing. All three evasions are built from the REAL
     # document rather than a stub, so a mutation is one substitution away from the positive
     # control and the difference between them is exactly the property under test.
     real_portability = fixtures_dir.parent / "PORTABILITY.md"
@@ -3211,9 +3218,9 @@ def run_test_fixtures(fixtures_dir: Path) -> list[str]:
     else:
         errors.append(f"  Fixture not found: {real_portability}")
 
-    # Test: the size ratchet and the counter under it. Neither had `--test-fixtures`
-    # coverage, so a contributor running the two documented gate commands and not `unittest`
-    # never exercised the ceiling that governs every skill's prose.
+    # Test: the size ratchet and the counter under it. Covered here as well as in
+    # `unittest`, so a contributor running the two documented gate commands and not
+    # `unittest` still exercises the ceiling that governs every skill's prose.
     with tempfile.TemporaryDirectory() as tmp:
         probe_skills = Path(tmp) / "skills"
         (probe_skills / "demo" / "references").mkdir(parents=True)
@@ -3719,9 +3726,9 @@ def run_test_fixtures(fixtures_dir: Path) -> list[str]:
             "---\nname: matching-skill\ndescription: >\n  Does a thing.\n---\n\n# X\n"
         , encoding="utf-8")
         # An UNTERMINATED header must not read as well-formed just because the body
-        # contains a thematic break further down. This is a real defect a bulk edit
-        # produced: it dropped the closing `---`, every skill still "parsed"
-        # against the `---` under the overview, and nothing fired.
+        # contains a thematic break further down. The parser ends a header only at a
+        # closing `---` before the body, so a skill that lost its delimiter is reported as
+        # having no `name:` rather than parsed against the `---` under its overview.
         (tmp_skills / "unterminated").mkdir()
         (tmp_skills / "unterminated" / "SKILL.md").write_text(
             "---\nname: unterminated\ndescription: >\n  Does a thing.\n\n"

@@ -14,13 +14,14 @@ skips without a word.
 **Why this is not in `validate_cross_runtime.py`.** That script checks that skills are
 portable — no private paths, no POSIX-only assumptions, no unbounded `codex exec`. This
 checks one document format the planning suite invented, for typos. The two share a language
-and nothing else, and bundling them meant `plan-phase` told its reader to "run the pack's
-validator" over their plan.
+and nothing else, and kept apart, `plan-phase` tells its reader to run this script over their
+plan, not "the pack's validator".
 
 Its rules are exercised by `tests/test_plan_tracker.py`, a **unittest** suite rather than the
-validator's internal fixture harness, which runs on Ubuntu and macOS only — so every rule
-here was unverified on Windows, the platform `plan-run` is most likely to be on when it reads
-a tracker it did not write.
+validator's internal fixture harness, because three of its cases create symlinks: a unittest
+case is skipped where the platform cannot create one, and every other rule still runs on
+Windows, the platform `plan-run` is most likely to be on when it reads a tracker it did not
+write.
 """
 
 from __future__ import annotations
@@ -94,12 +95,13 @@ TRACKER_BOX = re.compile(r"^- \[([ x])\] \[[^\]]+\]\(\./(" + _TRACKER_SLUG + r"\
 # The superseded `- phase:` shape, identified POSITIVELY rather than inferred from "no
 # boxes". Those two conditions otherwise describe the same file, so a truncated new tracker
 # would be waved through as a finished record. Every such line must be a well-formed entry
-# naming a real phase document here — a bare token let `- phase: ../elsewhere/x` traverse
-# out of the plan and left an empty `- phase:` unrecognised.
+# naming a real phase document here. The entry must match the phase slug, which admits no
+# path separator, so `- phase: ../elsewhere/x` cannot point out of the plan; and the line
+# pattern matches an empty `- phase:` too, so that one is recognized and retires nothing.
 TRACKER_LEGACY_LINE = re.compile(r"^-[ \t]+phase:[ \t]*(.*?)[ \t]*$")
 TRACKER_LEGACY_SLUG = re.compile(_TRACKER_SLUG)
 # Banned rather than parsed: a fence or an HTML comment can hide a whole region of the
-# file, and no real tracker has ever contained one.
+# file, and the tracker template never contains one.
 TRACKER_BANNED = ("```", "~~~", "<!--", "-->")
 
 
@@ -143,8 +145,8 @@ def check_tracker(filepath: Path) -> tuple[list[str], list[str]]:
     errors = [f"{at}:{i}: contains '{d}'; a tracker carries no code fences and no HTML "
               f"comments, so no region of it can be hidden from a reader or this checker"
               for i, line in enumerate(lines, 1) for d in TRACKER_BANNED if d in line]
-    # `*` and `+` are bullet markers too: scanning only `- [` meant a reader saw a checkbox
-    # this checker ignored and `plan-run` never executed.
+    # `*` and `+` are bullet markers too, and a reader sees `* [ ]` as a checkbox, so a line
+    # opening with any of the three is collected here and reported unless it is canonical.
     boxed = [i for i, line in enumerate(lines, 1)
              if line[:1] in ("-", "*", "+") and line[1:3] == " ["]
     legacy = [m.group(1) for line in lines if (m := TRACKER_LEGACY_LINE.match(line))]
@@ -190,8 +192,8 @@ def check_tracker(filepath: Path) -> tuple[list[str], list[str]]:
         errors.append(f"{at}: no phase checkboxes; zero is a hard error, never 'all "
                       f"phases complete' — reading an empty tracker as finished would "
                       f"finalise a plan whose work never ran")
-    # Every `phase-*.md` ENTRY, whatever kind it is: filtering to regular files here let an
-    # unlisted symlink or directory — a phase that would never be executed — pass unnoticed.
+    # Every `phase-*.md` ENTRY, whatever kind it is: filtering to regular files here would let
+    # an unlisted symlink or directory — a phase that would never be executed — pass unnoticed.
     # Listed rather than globbed, and an unlistable directory is an ERROR. `Path.glob`
     # swallows the OSError from a directory it cannot read and returns nothing, which this
     # rule would read as "every phase document is linked" — the one answer that makes a
@@ -223,8 +225,8 @@ def run_tracker_check(target: Path) -> int:
     exit code.
 
     A directory scan inspects **only** files named ``execution.md``. Anything looser and
-    every phase document is examined as a candidate tracker — and a v1 ``phases.md``, now
-    the same checkbox shape, would be dragged into a suite that has no business reading it.
+    every phase document is examined as a candidate tracker — and a v1 ``phases.md``, which
+    has the same checkbox shape, would be dragged into a suite that has no business reading it.
     An explicit file path is checked whatever it is called, which is how ``plan-phase``
     verifies a tracker it has just written.
     """
@@ -259,7 +261,7 @@ def run_tracker_check(target: Path) -> int:
         errors.extend(found)
         notices.extend(noted)
     # Printed, never silent: a skipped file the operator cannot see is indistinguishable
-    # from a checked one, which is the failure this whole redesign is against.
+    # from a checked one, which is the failure this whole checker is against.
     for notice in notices:
         print(notice)
     if errors:

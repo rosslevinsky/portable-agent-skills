@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """One answer to "which files belong to a skill", asserted against every consumer.
 
-Eleven functions in ``validate_cross_runtime.py`` and four test files each answered that
-question independently, and they disagreed. The disagreement is the defect, not any single
-answer: a file the ratchet counts but no rule scans still ships, costing word budget while
-being governed by nothing.
+Every function in ``validate_cross_runtime.py`` and every test file that walks a skill has
+to give that answer, and answered independently they disagree. The disagreement is the
+defect, not any single answer: a file the ratchet counts but no rule scans still ships,
+costing word budget while being governed by nothing.
 
-Measured on a fixture skill carrying one file of each shape, against the unfixed validator:
+With discovery globbing ``references/*.md`` while the ratchet uses ``references/**/*.md``, a
+fixture skill carrying one file of each shape comes out like this:
 
 ===========================  ====================  ====================
 file in the skill            a prose rule sees it  the budget counts it
@@ -18,17 +19,16 @@ file in the skill            a prose rule sees it  the budget counts it
 ``references/helper.py``     no                    -- (engines unbudgeted)
 ===========================  ====================  ====================
 
-Row 2 is the whole phase in one line. Discovery stopped at ``references/*.md`` while the
-ratchet used ``references/**/*.md``, so the two named different file sets and nothing
-compared them.
+Row 2 is the whole problem in one line: the two name different file sets and nothing
+compares them.
 
-**Most of these are defect demonstrations**, run against the unfixed validator first and
-failing there. The rest are **regression guards** that pass the moment they are written, and
-each says so in its own docstring.
+**Most of these are defect demonstrations**, which fail against a validator whose consumers
+answer the question separately. The rest are **regression guards** that pass the moment they
+are written, and each says so in its own docstring.
 
 The equality assertion in :class:`TheBudgetAndTheRulesAgree` is the one that must never be
-deleted. The individual cases can each be satisfied by a local fix, and a local fix is how
-this defect regenerated at whichever site the last fix had not touched.
+deleted. The individual cases can each be satisfied by a local fix, and a local fix lets
+the disagreement reappear at whichever site the fix did not touch.
 """
 import ast
 import contextlib
@@ -103,9 +103,9 @@ def _counted(skill_dir: Path, relative: str) -> bool:
 class TheBudgetAndTheRulesAgree(unittest.TestCase):
     """The assertion that outlives every local fix.
 
-    Each case in the classes below can be satisfied on its own, and that is how this defect
-    kept coming back: a fix was local by construction, so the disagreement reappeared at
-    whichever site the last fix had not touched. This test compares the two sets directly, so
+    Each case in the classes below can be satisfied on its own, and a fix that is local by
+    construction lets the disagreement reappear at whichever site it did not touch. This
+    test compares the two sets directly, so
     it fails whenever any consumer is widened without the other.
     """
 
@@ -131,7 +131,7 @@ class TheBudgetAndTheRulesAgree(unittest.TestCase):
 
 
 class DiscoveryReachesEveryShippedFile(unittest.TestCase):
-    """Three traversal gaps, each demonstrated, each failing against the unfixed file."""
+    """Traversal gaps a narrower discovery leaves open, each demonstrated."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -151,9 +151,8 @@ class DiscoveryReachesEveryShippedFile(unittest.TestCase):
     def test_an_uppercase_suffix_is_still_markdown(self):
         """Case folded once, in the walk, so no caller can forget it.
 
-        `GUIDE.MD` is invisible to both mechanisms today -- note this contradicts the parked
-        branch's docstring, which claimed it "was discovered and budgeted". Measured against
-        the unfixed file, it is neither.
+        A case-sensitive suffix test leaves `GUIDE.MD` invisible to both discovery and the
+        budget: it is neither discovered nor budgeted.
         """
         self.assertIn("GUIDE.MD", self.discovered)
 
@@ -164,15 +163,13 @@ class DiscoveryReachesEveryShippedFile(unittest.TestCase):
 
 
 class DiscoveryNamesEachArtifactOnce(unittest.TestCase):
-    """A duplicate in a list of clean artifacts is silent, and it stayed silent.
+    """A duplicate in a list of clean artifacts is silent.
 
-    Without this, `skills/plan-duel` yields `judge-schema.json` SIX times — once per file
-    walked — and every existing test went on passing, because each rule ran six times over a
-    file that produces no findings.
+    A discovery that listed one file more than once would pass every other test: a rule
+    run twice over a file with no findings reports nothing twice.
 
     The cost is not cosmetic. Per-artifact rules run per entry, so the day that file does
-    produce a finding the operator gets it six times. And the list is the inventory every
-    whole-tree check is driven from.
+    produce a finding the operator gets it once per duplicate.
     """
 
     def test_the_real_tree_discovers_no_artifact_twice(self):
@@ -203,9 +200,8 @@ class DiscoveryNamesEachArtifactOnce(unittest.TestCase):
 class BuildResidueIsExcludedOnce(unittest.TestCase):
     """A REGRESSION GUARD, and the filter CI can never exercise.
 
-    It passes today only by accident: discovery's glob is too narrow to reach into
-    `__pycache__` at all. A shared `rglob("*")` walk removes that immunity, so this guard
-    starts carrying real load exactly when the traversal is unified.
+    A discovery glob too narrow to reach into `__pycache__` passes it by accident. The
+    shared walk reaches everywhere, so this guard is what keeps residue out of it.
 
     `__pycache__` is gitignored, so a fresh checkout never has one — but any machine that has
     run `plan_duel.py` does. A broken residue filter is therefore green on every runner and
@@ -250,16 +246,17 @@ class SymlinksAreRefusedNotFollowed(unittest.TestCase):
 
 
 class ASymlinkedSkillRootIsRefused(unittest.TestCase):
-    """"Which skills exist" is a separate question, and it had no guard at all.
+    """"Which skills exist" is a separate question, and it needs a guard of its own.
 
-    Six call sites asked it, every one spelled ``glob("*/SKILL.md")``, and none refused a
-    link. So the file walk could refuse every symlink *inside* a skill while the skill itself
-    was a symlink pointing out of the repository.
+    A call site spelled ``glob("*/SKILL.md")`` refuses no link, so the file walk could refuse
+    every symlink *inside* a skill while the skill itself is a symlink pointing out of the
+    repository.
 
-    Demonstrated against the unfixed file: a ``skills/sneaky`` linked to a directory outside
-    the tree had both its ``SKILL.md`` and its ``references/payload.md`` discovered and
-    counted, so the validator's guarantees silently became claims about files the repository
-    does not contain.
+    ``iter_skill_roots`` refuses a ``skills/sneaky`` linked to a directory outside the tree,
+    and the walk refuses a linked root a second time by raising rather than walking it.
+    With neither, its ``SKILL.md`` and its ``references/payload.md`` would be discovered and
+    counted, so the validator's guarantees would silently become claims about files the
+    repository does not contain.
     """
 
     def _tree(self, root: Path) -> Path:
@@ -304,8 +301,8 @@ class TheDepthDistinctionSurvivesTheWalk(unittest.TestCase):
         """A REGRESSION GUARD: it passes today, and must keep passing.
 
         The discriminating case is a SINGLE `../`. Two levels escape from either depth, so a
-        `../../` fixture proves nothing about the parameter -- a draft of this test
-        used one and could not have detected a flattening refactor at all.
+        `../../` fixture proves nothing about the parameter, and could not detect a
+        flattening refactor at all.
 
         One `../` from the skill root leaves the skill. One `../` from `references/` arrives
         at the skill root, still inside. If a shared walk stops supplying `at_skill_root`,
@@ -331,8 +328,8 @@ class TheDepthDistinctionSurvivesTheWalk(unittest.TestCase):
 # function absent from this map may not call `glob`, `rglob`, `iterdir`, `os.walk`,
 # `os.scandir` or `os.listdir` -- it must go through the shared traversal instead.
 #
-# The reasons are part of the data, not decoration: the failure this whole phase exists to
-# remove is a second answer to a question that already had one, and the only way to see that
+# The reasons are part of the data, not decoration: the failure this file exists to
+# prevent is a second answer to a question that already has one, and the only way to see that
 # a new walker is a second answer is to read what question it thinks it is asking.
 DIRECT_FILESYSTEM_WALKERS = {
     "_walk_tree":
@@ -349,12 +346,11 @@ DIRECT_FILESYSTEM_WALKERS = {
 
 
 class TheConsumerSetIsClosed(unittest.TestCase):
-    """The test the parked branch could not have had, and the one its claim needed.
+    """"Every consumer is covered" as an assertion over the source, not a claim.
 
-    That branch stated it had covered every consumer. It had covered five of six it named,
-    named one function that exists nowhere in the repository, and missed six that do — and
-    nothing failed, because "did we reach them all" was a claim in a docstring rather than an
-    assertion over the source.
+    A docstring can claim every consumer is covered while naming a function that exists
+    nowhere and missing several that do — and nothing fails, because "did we reach them all"
+    is then a claim in a docstring rather than an assertion over the source.
 
     So the closure is asserted as an enumerated list rather than a default: a new walker
     FAILS this test until someone writes down which question it asks. Widening the allowlist
@@ -366,8 +362,8 @@ class TheConsumerSetIsClosed(unittest.TestCase):
 
         ``ast.walk`` is deliberately not counted: it walks a syntax tree.
         ``check_engine_portability`` calls it, and a name-only match reports that function as
-        a filesystem consumer -- a test that did exactly that, which is a
-        false positive that teaches a reader to widen the allowlist.
+        a filesystem consumer -- a false positive that teaches a reader to widen the
+        allowlist.
         """
         found = {}
         tree = ast.parse(VALIDATOR.read_text(encoding="utf-8"))
@@ -425,16 +421,16 @@ class TheConsumerSetIsClosed(unittest.TestCase):
 class TheRefusalReachesTheReport(unittest.TestCase):
     """A refusal nobody reports is indistinguishable from no refusal at all.
 
-    Demonstrated: without the pairing, `iter_skill_roots`
-    refused a symlinked skill and `walk_tree_files` refused a symlinked file, both correctly
-    and both in silence, while `symlinked_skill_roots` and `walk_tree_symlinks` -- the two
-    generators whose entire purpose is to say so -- were called by no production code. A test
-    called them, so the wiring looked present. A real run skipped the skill and printed
-    nothing, and the count of validated skills is not printed anywhere a reader would notice
-    one missing.
+    `iter_skill_roots` refuses a symlinked skill and `walk_tree_files` refuses a symlinked
+    file, both correctly and both in silence. `symlinked_skill_roots` and
+    `walk_tree_symlinks` -- the two generators whose entire purpose is to say so -- report
+    the refusal only because production code calls them, through `check_refused_symlinks`.
+    Without that call, a test that calls them makes the wiring look present while a real run
+    skips the skill and prints nothing, and the count of validated skills is not printed
+    anywhere a reader would notice one missing.
 
-    That is the phase's own defect shape, reintroduced by the phase's own fix: a guard whose
-    report exists but is reachable from nothing.
+    That is the same defect shape one level up: a guard whose report exists but is reachable
+    from nothing.
     """
 
     def _tree(self, root: Path) -> Path:
@@ -476,23 +472,22 @@ class ASymlinkedDirectoryIsNotDescended(unittest.TestCase):
     every one passes — the refusal has to happen at the descent, which is why the walk prunes
     `dirnames` rather than testing what it yields.
 
-    A REGRESSION GUARD: it passes against the unfixed file, so its non-vacuity was
-    established by mutation. Setting ``followlinks=True`` alone left it GREEN, because the
-    walk holds two independent locks and either is sufficient: `os.walk`'s own refusal, and
-    the explicit `dirnames` prune. It goes red only when both are removed together.
+    A REGRESSION GUARD, whose non-vacuity rests on mutation. Setting ``followlinks=True``
+    alone leaves it GREEN, because the walk holds two independent locks and either is
+    sufficient: `os.walk`'s own refusal, and the explicit `dirnames` prune. It goes red only
+    when both are removed together.
 
     That limit is stated rather than papered over: this asserts the PROPERTY — prose behind a
     link is not the skill's — and cannot see the loss of either lock alone.
     """
 
     def test_a_link_pointing_back_INSIDE_the_skill_is_still_refused_and_reported(self):
-        """The regression a containment test introduced, caught by review before it landed.
+        """Descent is not decided by whether a link resolves outside the tree.
 
-        A first attempt decided descent by asking whether the link resolved outside the tree.
-        `demo/alias -> references` resolves INSIDE, so it passed that test and was treated as
-        an ordinary directory: neither refused nor reported, with its contents reachable under
-        two names. On Windows the same test let a junction resolving to its own parent be
-        descended until the path length gave out.
+        `demo/alias -> references` resolves INSIDE, so a containment test passes it and
+        treats it as an ordinary directory: neither refused nor reported, with its contents
+        reachable under two names. On Windows the same test lets a junction resolving to its
+        own parent be descended until the path length gives out.
 
         A real directory resolves to exactly where it sits. That is the property, and it does
         not care whether a link points in or out.
@@ -537,14 +532,14 @@ class ASymlinkedDirectoryIsNotDescended(unittest.TestCase):
 
 
 class ALinkedRootIsRefusedToo(unittest.TestCase):
-    """The guard was on the descendants and not on the thing they descend from.
+    """A guard on the descendants must also sit on the thing they descend from.
 
-    `followlinks=False` governs what the walk descends INTO; `is_dir()` dereferences, so a
-    root that was itself a link was walked in full. `iter_skill_roots` refused a linked
-    *skill*, but the two consumers that walk `skills/` whole and the hygiene sweep that walks
-    the repository had no such guard -- and a validator whose guarantees quietly become
-    claims about a different tree is the failure this phase exists to remove, one level above
-    where it was fixed.
+    `followlinks=False` governs what the walk descends INTO, and `is_dir()` dereferences, so
+    the walk checks its ROOT separately and raises `UnreadableTree` for one that is a link.
+    `iter_skill_roots` refuses a linked *skill*; this check covers the two consumers that walk
+    `skills/` whole and the hygiene sweep that walks the repository -- a validator whose
+    guarantees quietly become claims about a different tree is the failure this file exists
+    to prevent, one level up.
     """
 
     def test_a_linked_root_raises_rather_than_walking_the_target(self):
@@ -564,8 +559,9 @@ class ALinkedRootIsRefusedToo(unittest.TestCase):
 
         Refusing a real directory is the more damaging direction of this rule: it stops the
         run rather than letting something through, and the operator's only clue is the word
-        "link" about a directory that plainly is not one. `Path(".")` compared `/cwd` with
-        `/cwd/.` and was refused; a trailing separator and a `..` component did the same.
+        "link" about a directory that plainly is not one. Without the `abspath` in
+        `_expected_real_path`, `Path(".")` sets `/cwd` against `/cwd/.` and is refused; the
+        other spellings below hold the same comparison to the same standard.
         """
         refused = []
         with tempfile.TemporaryDirectory() as tmp:
@@ -674,12 +670,12 @@ class AnUnreadableDirectoryIsReportedNotSwallowed(unittest.TestCase):
             locked = skill / "references"
             try:
                 locked.chmod(0o000)
-                honoured = False
+                honored = False
                 try:
                     list(locked.iterdir())
                 except PermissionError:
-                    honoured = True
-                if not honoured:
+                    honored = True
+                if not honored:
                     self.skipTest("this platform/user can read a 0o000 directory")
                 with self.assertRaises(UnreadableTree):
                     list(walk_tree_files(skill))
@@ -688,43 +684,44 @@ class AnUnreadableDirectoryIsReportedNotSwallowed(unittest.TestCase):
 
 
 class RelativePathsAreResolvedNotCounted(unittest.TestCase):
-    """Counting ``../`` is not resolving a path, and it was wrong in both directions.
+    """Counting ``../`` is not resolving a path, and it is wrong in both directions.
 
-    Measured against the two regexes this replaced (`\\.\\./` at the skill root,
-    `\\.\\./\\.\\./` below it): three of eight probes were false negatives and one was a
-    false positive. The false positive matters most for the rule's future -- a check that
-    flags a path which stays inside the skill is one an author learns to write around, and a
-    rule authors route around has stopped being enforcement.
+    Against two counting regexes (`\\.\\./` at the skill root, `\\.\\./\\.\\./` below
+    it), four of the first eight rows are false negatives and one is a false positive. The
+    false positive matters most for the rule's future -- a check that flags a path which
+    stays inside the skill is one an author learns to write around, and a rule authors
+    route around has stopped being enforcement.
 
-    Every row below FAILS against the unfixed file in the direction its comment names.
+    Every row marked "counting" below FAILS against those regexes in the direction its
+    comment names.
     """
 
     CASES = [
         # (written on the line, the file's depth below its skill root, does it leave)
-        ("../sibling.md", 0, True),              # unchanged: the plain case both agree on
-        ("../sibling.md", 1, False),             # unchanged: one `../` from references/
-        ("../..", 1, True),                      # was passed: no trailing slash to match
-        (".././../x.md", 1, True),               # was passed: the `..`s are not adjacent
-        ("..\\..\\outside.md", 1, True),         # was passed: backslashes are separators too
-        ("..\\outside.md", 0, True),             # was passed: same, at the skill root
-        ("sub/../../SKILL.md", 1, False),        # was FLAGGED: resolves to the skill root
-        ("tmp/../../outside.md", 0, True),       # unchanged: the phase document's own case
+        ("../sibling.md", 0, True),              # both agree: the plain case
+        ("../sibling.md", 1, False),             # both agree: one `../` from references/
+        ("../..", 1, True),                      # counting passes: no trailing slash
+        (".././../x.md", 1, True),               # counting passes: the `..`s are not adjacent
+        ("..\\..\\outside.md", 1, True),         # counting passes: backslash separators
+        ("..\\outside.md", 0, True),             # counting passes: same, at the skill root
+        ("sub/../../SKILL.md", 1, False),        # counting FLAGS: resolves to the skill root
+        ("tmp/../../outside.md", 0, True),       # both agree: descends, then climbs out
         ("references/deep/x.md", 0, False),      # no `..` at all
         ("https://example.com/a/../b", 0, False),   # a server resolves this, not the disk
         ("dots ... and wait.. no", 0, False),       # prose that is not a path segment
-        # Depth 2, the case widening discovery created. `references/deep/guide.md` linking
-        # to its own skill root was reported as escaping while the caller had only a
-        # boolean to describe where the file sat.
+        # Depth 2, the case discovery at any depth creates. `references/deep/guide.md`
+        # linking to its own skill root reads as escaping if the caller has only a boolean
+        # to describe where the file sits.
         ("../../SKILL.md", 2, False),
         ("../../../outside.md", 2, True),
-        # A path glued to command syntax. The token is one run of characters, so its first
-        # segment was `--output=..`, which is not `..`, and nothing was counted.
+        # A path glued to command syntax. The token is one run of characters, so unsplit its
+        # first segment is `--output=..`, which is not `..`, and nothing is counted.
         ("--output=../../outside.md", 1, True),
         ("TARGET=../outside.md", 0, True),
         ("C:..\\outside.md", 0, True),           # Windows drive-relative
         # Percent-encoded dot segments: `%2e%2e/` is `../` to whatever resolves the link.
         ("%2e%2e/%2e%2e/outside.md", 1, True),
-        # Absolute paths are not relative to the skill at all, and were SKIPPED on the
+        # Absolute paths are not relative to the skill at all, and cannot be skipped on the
         # reasoning that the private-path patterns catch them. They do not.
         ("/tmp/../../outside.md", 0, True),
         ("C:\\work\\..\\outside.md", 0, True),

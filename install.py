@@ -9,6 +9,9 @@ there so it can take it away again. Install, update, uninstall, verify.
     python3 install.py --verify        # is the install intact?
     python3 install.py --target DIR    # one directory instead of the defaults
 
+A default install also creates `~/.portable-agent-skills/backends.json` from
+`backends.default.json` when it is missing, and never touches an existing one.
+
 One implementation rather than a shell/PowerShell pair, so there is no parity to maintain.
 Python is already a hard requirement of the pack, so requiring it here surfaces an existing
 constraint at install time instead of at first use.
@@ -16,7 +19,7 @@ constraint at install time instead of at first use.
 Four design decisions:
 
 **Copy only; no symlink mode.** A linked install lets an agent edit the instructions it is
-executing, and a directory junction let `--force` delete the pack's own `skills/`.
+executing, and a directory junction would let `--force` delete the pack's own `skills/`.
 
 **Replace a skill wholesale; never merge into a live directory.** Nothing merges, so
 nothing has to decide what to keep.
@@ -37,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -49,6 +53,16 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
 SKILLS_SRC = REPO_ROOT / "skills"
+# The backends file a default install seeds, and where the agents' supervisor reads it:
+# `review_runner.backends_path()` answers the same question and the two must agree.
+DEFAULT_BACKENDS = REPO_ROOT / "backends.default.json"
+BACKENDS_ENV_VAR = "PORTABLE_AGENT_SKILLS_BACKENDS"
+# Kept out of git in the settings folder, which a user may sync as a git repository.
+KEY_FILES_IGNORE = "keys.env\nkeys.ps1\n"
+# The key file a default install creates when there is none: every variable empty. The
+# installer never reads one or writes into one that exists — a key reaches an agent only
+# through the environment of the shell that launched it.
+KEY_FILE = "keys.ps1" if os.name == "nt" else "keys.env"
 
 # Three states, because two cannot carry the meaning: "nothing is installed" and "the
 # install is broken" need opposite responses, and a check claiming to confirm a match must
@@ -184,9 +198,9 @@ def is_recordable_name(name: str) -> bool:
     target?
 
     This is what **ownership** needs, and it is deliberately narrower than what a source pack
-    may ship. Tightening the source grammar once silently disowned already-installed skills:
-    a name that stopped being recordable was dropped from the manifest, never pruned, and no
-    longer removable.
+    may ship. Applied to the manifest, a narrower source grammar would silently disown
+    already-installed skills: a name that stopped being recordable would drop from the
+    manifest, never pruned, and no longer removable.
 
     A name qualifies when it survives the round trip through the manifest — no control
     character, no leading ``#``, no surrounding whitespace — and when it cannot leave the
@@ -294,9 +308,9 @@ def write_manifest(target: Path, names: list[str], version: str) -> None:
     try:
         # Through the DESCRIPTOR wherever the platform allows it. `mkstemp` creates at 0600,
         # which is right for a secret and wrong for a record of what is installed — a shared
-        # install left a manifest the owning user could not read, and an unreadable manifest
-        # was treated as no manifest. Doing it by path opens a window for another writer to
-        # swap in a symlink.
+        # install would leave a manifest the owning user cannot read, and every later
+        # install, uninstall or verify by that user refuses on it. Doing it by path opens a
+        # window for another writer to swap in a symlink.
         if os.chmod in os.supports_fd:
             try:
                 os.chmod(fd, mode)
@@ -597,7 +611,7 @@ def do_install(targets: list[Path], source: Path, force: bool = False) -> int:
 
         # 4. RETIRED skills. A skill dropped from the pack has to leave the user's machine
         #    too: discovery globs for SKILL.md with no allowlist, so one left behind keeps
-        #    loading for ever. Only names the PREVIOUS manifest claimed are pruned, read from
+        #    loading forever. Only names the PREVIOUS manifest claimed are pruned, read from
         #    `previously_owned`, captured before step 2 replaced the file on disk.
         survived_prune: list[str] = []
         for name in retained:
@@ -715,6 +729,144 @@ def do_uninstall(targets: list[Path]) -> int:
     return 1 if failed else 0
 
 
+def backends_path() -> Path:
+    override = os.environ.get(BACKENDS_ENV_VAR)
+    if override:
+        return Path(override)
+    return Path.home() / ".portable-agent-skills" / "backends.json"
+
+
+def _ignored_names(text: str) -> set[str]:
+    """The key file names a `.gitignore` certainly leaves ignored. Git obeys the last line
+    that matches, and a `!` line un-ignores whatever its pattern matches, in a syntax this
+    does not reimplement. So a name counts only where a line is exactly that name, with one
+    leading `/` allowed, and no `!` line of any kind follows it. A line ends only at a
+    newline; one CR before it is dropped, then trailing spaces, as git drops them. A trailing
+    tab, a bare CR and a leading space stay in the pattern, as they do for git. Erring this
+    way appends a line that was not needed; it never leaves a key file committable."""
+    names = set(KEY_FILES_IGNORE.split())
+    listed: set[str] = set()
+    for line in text.split("\n"):
+        line = line.removesuffix("\r").rstrip(" ")
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("!"):
+            listed.clear()
+            continue
+        if line.startswith("/") and not line.startswith("//"):
+            line = line[1:]
+        if line in names:
+            listed.add(line)
+    return listed
+
+
+def ensure_key_files_ignored(ignore: Path) -> bool:
+    """Make the settings folder's `.gitignore` name both key files; False where it cannot.
+
+    Written whole when there is none. An existing one is the user's, and gains only the key
+    file names it does not already list, appended at the end, where they also override an
+    earlier `!` line: a filled key file beside an ignore file that misses it is one ordinary
+    commit away from publishing the keys. Nothing already in the file is changed.
+
+    **A `.gitignore` that is a symbolic link cannot protect anything**, because git does not
+    read one. It is left alone, target included, and False tells the caller not to create a
+    key file beside it. Checked before anything else: a link to a missing file answers False
+    to `exists()`, and writing to it would create its target.
+    """
+    if os.path.islink(ignore):
+        print(f"warning: {ignore} is a symbolic link, which git does not read, so it cannot "
+              f"keep a key file out of a commit. No {KEY_FILE} was created. Replace the link "
+              f"with a real file naming {' and '.join(KEY_FILES_IGNORE.split())}, then run "
+              f"the installer again, or keep your keys somewhere git never sees.",
+              file=sys.stderr)
+        return False
+    if not ignore.exists():
+        ignore.write_text(KEY_FILES_IGNORE, encoding="utf-8")
+        return True
+    text = ignore.read_bytes().decode("utf-8", errors="replace")
+    listed = _ignored_names(text)
+    missing = [name for name in KEY_FILES_IGNORE.split() if name not in listed]
+    if not missing:
+        return True
+    lead = "" if not text or text.endswith("\n") else "\n"
+    with open(ignore, "a", encoding="utf-8", newline="") as out:
+        out.write(lead + "".join(f"{name}\n" for name in missing))
+    print(f"  backends: added {', '.join(missing)} to your {ignore}")
+    return True
+
+
+def seed_backends(default: Path = DEFAULT_BACKENDS) -> None:
+    """Create the user's backends file, and in the pack's own folder the key file, when missing.
+
+    An existing file is the user's and is never rewritten, on install or upgrade. Nothing
+    depends on either: an agent launched without a backend runs on its own sign-in, so a
+    failure here is reported and does not fail the skills install that already happened.
+    """
+    path = backends_path()
+    # Only in the pack's own folder: an overridden path may sit in a user's repository, whose
+    # ignore rules are theirs and where a key file does not belong.
+    own_folder = not os.environ.get(BACKENDS_ENV_VAR)
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # Before the key file, so there is never a moment it could be committed, and never
+        # a key file where the ignore rule could not be made to hold.
+        protected = own_folder and ensure_key_files_ignored(path.parent / ".gitignore")
+        if path.exists():
+            print(f"  backends: kept your {path}")
+        else:
+            # Exclusive create, so a file that appeared since the check is not replaced.
+            with open(path, "xb") as out:
+                out.write(default.read_bytes())
+            print(f"  backends: created {path} (see BACKENDS.md)")
+    except OSError as exc:
+        print(f"warning: backends file {path} not created: {exc}", file=sys.stderr)
+        return
+    if protected:
+        try:
+            seed_key_file(path.parent, default)
+        except (OSError, ValueError) as exc:
+            print(f"warning: key file not created: {exc}", file=sys.stderr)
+
+
+def key_file_text(default: Path = DEFAULT_BACKENDS) -> str:
+    """Every key variable the default backends read, each set to an empty string."""
+    backends = json.loads(default.read_text(encoding="utf-8"))
+    # A name starting `//` is an entry set aside, as the supervisor reads the file.
+    names = sorted({parent for name, entry in backends.items() if not name.startswith("//")
+                    for parent in entry.get("env_from_parent", {}).values()})
+    if os.name == "nt":
+        lines = [f'$env:{name} = ""' for name in names]
+        load = f". $HOME\\.portable-agent-skills\\{KEY_FILE}   # in $PROFILE"
+    else:
+        lines = [f'export {name}=""' for name in names]
+        load = f"[ -f ~/.portable-agent-skills/{KEY_FILE} ] && . ~/.portable-agent-skills/{KEY_FILE}"
+    return "\n".join([
+        "# Provider keys for the backends in backends.json. Put each key between its quotes.",
+        "# Load this file from your shell startup file:",
+        f"#   {load}",
+        "# An empty line here still sets its variable, to empty, over any value set earlier.",
+        "# Never commit this file; the .gitignore beside it names it.",
+        *lines, ""])
+
+
+def seed_key_file(folder: Path, default: Path = DEFAULT_BACKENDS) -> None:
+    """Create the key file, readable only by the user, when it is missing; never rewrite one.
+
+    On Windows the mode bits do nothing and the file takes the home folder's permissions,
+    which admit only the user by default.
+    """
+    path = folder / KEY_FILE
+    if path.exists():
+        print(f"  keys: kept your {path}")
+        return
+    # Exclusive create, with the mode set at creation, so the file is never briefly readable.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with open(fd, "w", encoding="utf-8", newline="\n") as out:
+        out.write(key_file_text(default))
+    print(f"  keys: created {path} with every key empty. Fill it in, and load it from your "
+          f"shell startup file; a program started before that never sees the keys")
+
+
 def _is_link(path: Path) -> bool:
     """True when ``path`` is a symlink or a Windows junction.
 
@@ -733,15 +885,15 @@ def _is_link(path: Path) -> bool:
     fails on a skill that is perfectly installable. A user whose skills sit under a synced
     home directory meets that on every skill they have.
 
-    It matters because a junction is the Windows shape of the hazard `--link` was removed
-    over: a skill root pointing at the source means editing the installed instructions edits
-    the source.
+    It matters because a junction is the Windows shape of the hazard the installer copies
+    rather than links to avoid: a skill root pointing at the source means editing the
+    installed instructions edits the source.
 
     **An error that is not ENOENT is raised, never read as "no".** Every caller acts on a
     False here: the removal hands the path to a recursive delete, the walk descends it, and
     ``--verify`` compares what is behind it and reports a link as a clean installed copy —
-    the condition ``--link`` was removed to prevent, reached through the command whose job is
-    to certify it has not happened.
+    the condition copying rather than linking exists to prevent, reached through the command
+    whose job is to certify it has not happened.
     """
     try:
         st = path.lstat()
@@ -928,9 +1080,9 @@ def do_verify(targets: list[Path], source: Path) -> int:
                     missing.append(name)
                 # A skill root that is a LINK is not an installed copy, whatever is behind
                 # it — walking through it and comparing the referent reports a clean install
-                # of a tree pointed at the source, which is the condition `--link` was
-                # removed to prevent, reached through the command that certifies. `_is_link`
-                # covers the Windows junction spelling too.
+                # of a tree pointed at the source, which is the condition copying rather
+                # than linking exists to prevent, reached through the command that
+                # certifies. `_is_link` covers the Windows junction spelling too.
                 elif _is_link(path):
                     linked.append(name)
                 else:
@@ -1006,10 +1158,10 @@ MINIMUM_PYTHON = (3, 10)
 def python_too_old(version_info=None) -> str:
     """The refusal for an interpreter below :data:`MINIMUM_PYTHON`, or ``""``.
 
-    The floor is pack-wide and not this function's doing; what was missing is the *check*.
-    Without it, an older interpreter copies every skill and then dies at ``write_manifest``
-    on a keyword it does not have, leaving the directories on disk with **no manifest** —
-    the orphaned state the ownership ordering exists to prevent.
+    The floor is pack-wide and not this function's doing; what it adds is the *check*.
+    Without it, an older interpreter would run until it reached something it lacks and
+    fail part-way through, leaving a partial install to repair. Refused up front, it changes
+    nothing.
 
     ``version_info`` is injectable so both branches are testable from either interpreter.
     """
@@ -1076,10 +1228,18 @@ def main(argv=None) -> int:
     targets = args.target if args.target else default_targets()
 
     if args.uninstall:
-        return do_uninstall(targets)
+        code = do_uninstall(targets)
+        if not args.target and backends_path().exists():
+            print(f"  backends: left your {backends_path()} in place")
+        return code
     if args.verify:
         return do_verify(targets, args.source)
-    return do_install(targets, args.source, force=args.force)
+    code = do_install(targets, args.source, force=args.force)
+    # Only a default install touches the home folder: `--target` names where skills go and
+    # nothing else, so a run aimed at a scratch directory leaves the user's settings alone.
+    if not args.target:
+        seed_backends()
+    return code
 
 
 if __name__ == "__main__":

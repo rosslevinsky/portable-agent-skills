@@ -93,54 +93,56 @@ classify it as **Degraded** (not broken) when parallelism is unavailable.
 ## Independent Verification
 
 Parallel execution is about speed. **Independence is about who judges**, and they are not
-the same requirement: a skill can fan out ten readers and still have every finding graded by
-the context that produced it. Where a skill asks for something to be checked, say which of
+the same requirement. A skill can run ten readers at once and still have every finding graded
+by the context that produced it. Where a skill asks for something to be checked, say which of
 the two it needs.
 
-A verifier's independence has three rungs, strongest first:
+A verifier's independence comes in three levels, which this pack calls **rungs**, strongest
+first:
 
 1. **A different model** — different blind spots, not merely a different context.
 2. **A fresh unit in the same runtime** — free of the finder's sunk cost; same blind spots.
-3. **A deliberate in-context reset** — read it as an outsider, ignoring the rationale that
-   produced it. Weakest, and the only rung always available.
+3. **A deliberate in-context reset** — the same context reads the work as an outsider would,
+   ignoring the reasoning that produced it. Weakest, and the only rung always available.
 
-State the ladder, never a single rung: name the strongest rung the skill wants and what it
-falls back to. Coverage is preserved all the way down — only the strength of the judgment
-varies with what the host offers. A skill that *requires* rung 1 or 2 is not portable,
-because no runtime is obliged to provide either.
+State the ladder (the rungs a skill tries, strongest first), never a single rung: name the
+strongest rung the skill wants and what it falls back to. Every rung checks the same things;
+only the strength of the judgment changes with what the host offers. A skill that *requires*
+rung 1 or 2 is not portable, because no runtime is obliged to provide either.
 
 **One exception, and the test for it is narrow.** A skill may require a rung when
-independence is the **product** rather than a quality gate over it. The rule above assumes a
-skill that does something useful and has its work checked: strip the checking and a weaker
-but real answer survives, which is what makes degrading correct. Where the checking *is* the
-answer, there is nothing underneath to degrade to, and the fallback is not a weaker version
-of the skill — it is a different and misleading one.
+independence is the **product** rather than a quality check on it. The rule above assumes a
+skill that does something useful and has its work checked. Remove the checking and a weaker
+but real answer is still there, which is why falling back is correct. Where the checking *is*
+the answer, nothing is left to fall back to. The fallback is then not a weaker version of the
+skill; it is a different and misleading one.
 
 `review-panel` is the case. Its whole claim is that a finding was raised by one reader and
-judged by a stranger; at rung 3 one context does both, so the run cannot say the only thing
-it exists to say. It therefore requires two spawnable workers and **refuses** a host that
-cannot supply them, naming the lane that landed nothing. A refusal a caller can act on is
-the truthful answer; a document whose own text has to disclaim it is not.
+judged by a stranger. At rung 3 one context does both, so the run cannot make the one claim it
+exists to make. It therefore requires two workers it can spawn and **refuses** a host that
+cannot supply them, naming the lane (one of `review-panel`'s two sides, each with its own
+runtime and model) that returned no result for any of its units. A refusal the caller can act on
+is the truthful answer. A document whose own text has to disclaim itself is not.
 
 The test is whether the degraded output is *the same kind of thing*, weaker. A review with
 one less pair of eyes is. A review with no second pair of eyes at all is not a review.
 
 Independence provides the one thing prose cannot: a verifier who is not the finder. Prose
-can ask a context to refute its own finding; it cannot make that a second opinion. What
-prose *can* carry is the burden of proof, and that half belongs in the skill whatever rung
+can ask a context to refute its own finding, but no prose can make that a second opinion.
+What prose *can* set is the burden of proof, and that part belongs in the skill whatever rung
 it reaches. A finding stands on a stated mechanism (for code, the input that produces the
 wrong result; for prose, the reader who is misled and what they do next), not on the
 reviewer's confidence.
 
 Where this pack implements it: `diff-review` states the full ladder and reports which rung
-it reached; `plan-run`'s phase gate reaches it by calling that skill; `plan-duel` spawns the
-judge as a third role, so the verdict comes from a spawn that authored neither plan — rung 2
-against the controller's own agent, rung 1 against the other runtime's.
+it reached. `plan-run`'s phase gate gets it by calling that skill. `plan-duel` spawns the
+judge as a third role, so the verdict comes from an agent that wrote neither plan. That is
+rung 2 for the controller's own agent's plan, and rung 1 for the other runtime's.
 
 `security-review-codebase`'s deep mode deliberately does **not**, and it is the useful
-counter-example. It fans out per-component sub-agents and then synthesizes their reports;
-no verifier stands between a finding and the final document. That is breadth, not
-independence: a skill that fans out is not thereby verified.
+counter-example. It runs one sub-agent per component and then merges their reports. No
+verifier checks a finding before it reaches the final document. That is breadth, not
+independence: running many sub-agents does not verify anything.
 
 ## Autonomous Fallback
 
@@ -171,48 +173,46 @@ Rules for adapter notes:
 - The surrounding instructions must be runtime-neutral
 - Adapter notes and classification declarations are the only places where
   banned phrases may appear
-- **A spawned command states its own file permission — it never inherits one.** Derive
-  the permission from what that role is *required* to do: write-scoped for an agent that
-  must produce a file, read-only for one that must not. `codex exec` defaults are
-  directory-trust dependent (read-only in an untrusted directory, writable in a trusted
-  one), so an unflagged command silently behaves differently on each user's machine —
-  and an agent that cannot write still exits 0, so the failure surfaces late and looks
-  like something else.
+- **A spawned command states its own file permission — it never inherits one.** Derive the
+  permission from what that role is *required* to do: write access limited to its working
+  directory for an agent that must produce a file, read-only for one that must not. `codex exec`
+  defaults depend on whether the user trusts the directory (read-only in an untrusted directory,
+  writable in a trusted one). So a command without the flag silently behaves differently on each
+  user's machine. An agent that cannot write still exits 0, so the failure shows up late and
+  looks like something else.
 - **State the sandbox *and* pin `approval_policy=never`.** The sandbox governs the
   model's *shell commands* — under `-s read-only` a shell redirect fails with
   `Read-only file system`. A built-in patch/edit tool is not a shell command, so the
   approval policy governs it instead: a `-s read-only` spawn with approvals at their
-  default still wrote a file, and wrote nothing once the policy was pinned to `never`.
+  default can still write a file, and pinning the policy to `never` stops it.
   Two write paths, two controls — state both. These spawns are non-interactive anyway,
   so there is no human present to answer an approval request.
   `scripts/validate_cross_runtime.py` enforces both halves for `codex exec`; `claude -p`
   is exempt only because its default withholds edit permission deterministically rather
   than by directory.
 
-**At-parity accelerators (additive, never required).** Tool *capacity* is now roughly
-at parity across runtimes — both offer subagents, a native review, and parallel work
-units. An adapter note MAY *use* these as accelerators, but they are never a prerequisite:
-the sequential, single-agent path stays the correct default and must remain fully
-specified. Two accelerator shapes recur:
+**At-parity accelerators (additive, never required).** The runtimes offer roughly the same
+tools: both have subagents, a native review, and parallel work units. An adapter note MAY *use*
+these as accelerators, but they are never a prerequisite: the sequential, single-agent path
+stays the correct default and must remain fully specified. Two accelerator shapes recur:
 
 - **Concurrency** — running approved independent phases or a review as parallel work units
   (e.g. "Codex may run an approved independent phase or its review as a subagent; otherwise
-  execute sequentially"). This improves wall-clock only.
+  execute sequentially"). This only makes the run finish sooner.
 - **Context hygiene (fresh-context-per-phase delegation)** — an orchestrator hands each
-  unit of work to a *fresh* sub-agent so context doesn't accumulate across units and later
-  work isn't influenced by earlier units' after-the-fact justifications. For this to be
-  sound the durable
-  state must live on disk (so the fresh worker needs no conversation memory), and the
-  orchestrator must keep shared-state writes, the independent review, and the commit for
-  itself — never delegating them to the worker.
+  unit of work to a *fresh* sub-agent. Context then doesn't build up across units, and later
+  work isn't swayed by earlier units' after-the-fact justifications. For this to work, the
+  state that must persist has to live on disk, so the fresh worker needs no conversation
+  memory. The orchestrator must also keep shared-state writes, the independent review, and
+  the commit for itself, and never hand them to the worker.
 
-**Classification hinges on whether the accelerator is essential to the skill's value, not
-on whether it happens to be used.** If the in-context, single-agent path yields an
-*equivalent outcome* — the accelerator only improves speed or context hygiene — the skill
-stays **Full** (e.g. `plan-run`: the plan still executes correctly in-context, just
+**Classification depends on whether the accelerator is essential to the skill's value, not
+on whether it happens to be used.** If the in-context, single-agent path gives an
+*equivalent outcome* (the accelerator only improves speed or context hygiene), the
+skill stays **Full** (e.g. `plan-run`: the plan still executes correctly in-context, just
 with context accumulating). If the accelerator is *core to the skill's value* so its
-absence changes the outcome, classify **Degraded** (e.g. `diff-review`, whose
-fresh-context independence is the whole point).
+absence changes the outcome, classify **Degraded** (e.g. `diff-review`, which exists to
+have a reviewer with fresh context judge the change).
 
 ---
 
@@ -229,9 +229,9 @@ live progress channel. Two postures are allowed:
   observe and no progress file is used (`security-review-codebase`).
 
 Use `observable` only when the dispatched job is long-running **and** otherwise opaque to
-the dispatcher until it returns. A bounded job that returns its result in one shot gains
-nothing from a progress file, and a file added "for consistency" only costs overhead, an
-artifact to clean up, and a false sense of live monitoring. Likewise skip it where the
+the dispatcher until it returns. A bounded job that returns its result in one step gains
+nothing from a progress file. A file added "for consistency" only adds overhead, a file to
+clean up, and the false impression that someone is watching the job live. Likewise skip it where the
 runtime already streams the worker's output.
 
 **Invariants for an `observable` progress file.** It exists for the reader's convenience
@@ -241,11 +241,11 @@ and must never become a new way for the run to fail:
    it safe when several workers share one log, and a crash leaves a readable partial trail.
 2. **Off the correctness path — read by nothing.** No control-flow decision may depend on
    its contents; the run must complete identically whether or not anyone reads it. Code
-   that reads it back to decide what to do next has turned it into a correctness
-   dependency and lost the safety this pattern buys.
+   that reads it back to decide what to do next makes the run's correctness depend on it,
+   and loses the safety of keeping it unread.
 3. **Dispatcher-owned boundaries, best-effort detail.** The reliable signal is the two
-   lines the dispatcher controls — one before spawning, one after the job returns. Any
-   intermediate lines the worker appends are a bonus; monitoring must not assume they are
+   lines the dispatcher controls: one before spawning, one after the job returns. Any
+   lines the worker appends in between are extra. Monitoring must not assume they are
    complete, nor read a missing one as trouble.
 4. **Separate from results** — the log lives apart from the tracker, evidence records, and
    any committed artifact; gitignore its directory so a stale log never lands in a diff.
@@ -254,18 +254,18 @@ and must never become a new way for the run to fail:
    returned status.
 
 **Emit from code where you can.** Where a bundled engine owns the dispatch (`plan-duel`),
-emit the boundary lines from the spawn wrapper itself, as a side effect of spawning, so
-emission is structurally guaranteed and does not depend on a model remembering to log.
+emit the boundary lines from the spawn wrapper itself, as a side effect of spawning. The
+lines are then written on every spawn, and do not depend on a model remembering to log.
 Where the dispatch is prose (`plan-run` may hand a phase to a fresh worker), the boundary
 lines the orchestrator writes are reliable and the worker's intermediate lines are
 best-effort; that skill's Delegation section documents the per-phase path convention and
 the orchestrator/worker split.
 
-This is a **declaration contract, not a runtime guarantee.** A progress file is
-deliberately off the correctness path, so nothing verifies at runtime that a prose worker
-actually appended its lines — the point of the contract is that every dispatching skill
-has *consciously chosen* the posture that fits its job shape. The validator flags any
-sub-agent-dispatching skill that lacks a valid `_Progress:` declaration.
+This is a **declaration contract, not a runtime guarantee.** A progress file is deliberately off
+the correctness path, so nothing checks at runtime that a prose worker actually appended its
+lines. The contract is there so that every dispatching skill has *consciously chosen* the
+posture that fits the kind of job it dispatches. The validator flags any sub-agent-dispatching
+skill that lacks a valid `_Progress:` declaration.
 
 ---
 
@@ -273,7 +273,7 @@ sub-agent-dispatching skill that lacks a valid `_Progress:` declaration.
 
 A skill MAY ship an executable helper (for example a Python engine) alongside its
 `SKILL.md`. The installer copies the whole skill directory, so any file next to
-`SKILL.md` travels with it. Two rules keep a bundled executable portable:
+`SKILL.md` is installed with it. Two rules keep a bundled executable portable:
 
 - **No branded CLI names hardcoded in the executable.** Any runtime CLI the helper
   shells out to (`claude`, `codex`, …) must be supplied as **argv data** from the
@@ -298,11 +298,11 @@ an installed skill cannot assume any interpreter is present.
 
 ## Windows Link Hazards in Bundled Tooling
 
-Any shipped program that *deletes*, *walks* or *resolves* a path must assume a reparse point
-— Windows' term for a junction or a symlink — may be standing on it. The obvious API is
-wrong in every case below. Some fail with no error at all; the rest fail with a message
-naming something the user never created, on the one platform they are least likely to be
-able to reproduce on. `install.py` implements each of these, with the reason beside the
+Any shipped program that *deletes*, *walks* or *resolves* a path must assume the path may be
+a reparse point, Windows' term for a junction or a symlink. The obvious API is wrong in
+every case below. Some fail with no error at all. The rest fail with a message naming
+something the user never created, on the one platform they are least likely to be able to
+reproduce it on. `install.py` implements each of these, with the reason beside the
 code.
 
 - **Asking whether a path is a link takes three questions, not one.** `is_symlink()` answers
@@ -334,8 +334,8 @@ code.
 
 - **`exists()` is the wrong occupancy test, because it is false for a dangling link.** A
   link whose target is gone still holds the name and still has to be removed, but `exists()`
-  follows it and reports nothing there — so a cleanup skips it and a collision check waves
-  it through. Ask `exists()` **or the link test above** wherever the question is "does
+  follows it and reports nothing there. So a cleanup skips it, and a collision check lets
+  it pass. Ask `exists()` **or the link test above** wherever the question is "does
   something hold this name". Not `exists() or is_symlink()`: on Windows the link holding
   that name is most likely a junction, which is the one thing `is_symlink()` does not see.
 
@@ -359,10 +359,10 @@ recursive operation decide for you.
 
 When a skill *parses* a model's output rather than showing it to a human, pin the shape
 with a **JSON Schema** passed to the runtime's structured-output flag — not with a text
-format the prompt asks the model to follow. A text contract is unenforced by
-construction, and it degrades in ways that are hard to see: the pre-schema `plan-duel`
-judge was scraped for a `SCORE:` line that also appeared in its own prompt as a template,
-so parsing a raw transcript could match the *instruction* instead of the answer.
+format the prompt asks the model to follow. Nothing can enforce a text contract, and it
+fails in ways that are hard to see: a judge scraped for a `SCORE:` line that also appears
+in its own prompt as a template can, when a raw transcript is parsed, match the
+*instruction* instead of the answer.
 
 - **One schema file per contract, shipped as a skill companion.** It travels with the
   skill like any other file next to `SKILL.md`.
@@ -374,12 +374,12 @@ so parsing a raw transcript could match the *instruction* instead of the answer.
   Making the caller shell out to `cat` instead is not portable — a native-Windows caller
   has no `$(...)`.
 - **The prompt stays byte-identical across runtimes.** The per-runtime difference belongs
-  in the adapter argv, which is the whole point of the adapter boundary. A schema that
-  forces two prompts has been designed wrong.
+  in the adapter argv, which is what the adapter boundary is for. A schema that forces two
+  prompts has been designed wrong.
 - **Parse defensively and keep the prior contract as a fallback.** Read the schema's JSON
   first, fall back to whatever the contract was before, and degrade rather than crash on
-  either — artifacts written before the schema landed must still resume, and a runtime
-  with no schema flag still answers in JSON because the prompt asks it to.
+  either. Artifacts written before the schema was added must still resume. A runtime with
+  no schema flag still answers in JSON, because the prompt asks it to.
 - **Omit `$schema`.** A draft-2020-12 `$schema` ref that one runtime accepts is rejected
   outright by another (`no schema with key or ref …`), before any model call. Drop the
   key; both then accept the document. `minimum` / `maximum` / `enum` /
@@ -391,8 +391,8 @@ so parsing a raw transcript could match the *instruction* instead of the answer.
   required` / `text.format.schema`), and both accept a union nested one level down under a
   wrapper key. That one wrapper is the difference between exclusivity the schema
   *enforces* and exclusivity only prose can ask for: asked to emit an illegal mixture of
-  two branches, a model under a nested union is forced into one valid branch instead
-  (verified on both). Prefer it over a flat object of nullable fields, which accepts
+  two branches, a model under a nested union is forced into one valid branch instead,
+  on both runtimes. Prefer it over a flat object of nullable fields, which accepts
   contradictory results — `plan-run`'s `DONE` / `BLOCKED` worker result is the worked
   example.
 - **Validate shipped schemas at build time.** `scripts/validate_cross_runtime.py` parses
@@ -409,10 +409,10 @@ its result formatting.
 **Check what enforcement does to the narrative before enabling it.** Where a skill
 returns a reviewer's or judge's *reasoning* as well as a verdict, a schema flag can
 destroy the reasoning instead of structuring it. This is measurable, so measure it. In
-this pack, one runtime returns the validated object on its terminal result event while
-its assistant messages stay prose (two channels; enforcement is free), while another
-coerces **every** message to the schema, replacing running narration with a series of
-stub objects (one channel; enforcement costs the whole narrative). Enable the flag on the
+this pack, one runtime returns the validated object on its final result event while its
+assistant messages stay prose (two channels; enforcement costs nothing). Another forces
+**every** message into the schema, replacing the running narration with a series of stub
+objects (one channel; enforcement costs the whole narrative). Enable the flag on the
 first, omit it on the second and extract the object from the closing message. Where only
 a final message is captured — `plan-duel`'s judge — there is no narrative to lose and
 enforcement is unconditionally correct.
@@ -442,16 +442,15 @@ other cross-platform CLIs invoked with plain arguments; anything shell-specific
 belongs behind an adapter note or an intent description. The Python interpreter
 is **not** one of those CLIs, for the reason below.
 
-**Spelling the interpreter takes host knowledge, so no single spelling belongs on
-that list.** Prefer `python3`: macOS has shipped no bare `python` since 12.3, and
-on Debian and Ubuntu a bare `python` needs `python-is-python3`. Native Windows is
-generation-dependent — older python.org installers provide `python.exe` and
-`py.exe` and no `python3`, while the current Python Install Manager does ship a
-`python3` command. So where a snippet must run verbatim on a host you do not
-know, give the `py -3` launcher beside `python3`. Everywhere else — a command run
-in a known checkout, prose, a CI file — plain `python3` stands alone and needs no
-pairing. Bare `python` is legitimate only inside a documented **probe** that
-confirms the version it found, never as the invocation a reader is told to run.
+**The right command name for the interpreter depends on the host, so no single name belongs on
+that list.** Prefer `python3`: macOS has shipped no bare `python` since 12.3, and on Debian and
+Ubuntu a bare `python` needs `python-is-python3`. Native Windows depends on the installer: older
+python.org installers provide `python.exe` and `py.exe` and no `python3`, while the current
+Python Install Manager does ship a `python3` command. So where a snippet must run verbatim on a
+host you do not know, give the `py -3` launcher beside `python3`. Everywhere else (a command run
+in a known checkout, prose, a CI file), plain `python3` is enough on its own. Bare `python` is
+legitimate only inside a documented **probe** that confirms the version it found, never as the
+invocation a reader is told to run.
 
 **A probe that runs on Windows must try `py -3` before `python3`, and must
 require a version string rather than a successful resolution.** A Windows machine
@@ -536,7 +535,7 @@ guard**: `plan-phase-v1` / `plan-run-v1` may detect a `Format: v2` plan solely t
 point the user at `/plan-phase` / `/plan-run`, never to act on it.
 
 **Inside a v1 skill, a reference to a sibling — or to the skill itself — must be
-`-v1`-qualified**, because the unqualified names now belong to the v2 suite. A **forward
+`-v1`-qualified**, because the unqualified names belong to the v2 suite. A **forward
 redirect** to that suite must be **unqualified**, because canonical means v2. The two are
 told apart by paragraph: a block mentioning `Format: v2` is a redirect context and every
 other block is intra-suite. `check_v1_suite_routing` enforces both directions, and its

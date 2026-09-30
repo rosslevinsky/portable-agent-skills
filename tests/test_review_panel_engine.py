@@ -957,7 +957,8 @@ class MeasuringAndSnapshotting(_TreeCase):
         # there still keeps the path out of the copy.
         self.assertEqual(data["context"], [])
         # The one field here that is about the MOMENT rather than about the tree, and the
-        # only reason two runs over one tree no longer write identical run directories.
+        # only reason two plans over one tree do not write identical run directories. Later
+        # stages add clocks of their own, such as the report's stamp in `report-stamp.json`.
         # Empty where the caller stated no clock, which is every call but `plan`'s.
         self.assertEqual(data["taken"], "")
         self.assertEqual(data["source"], "walk")
@@ -1070,8 +1071,8 @@ class TheSnapshotRecordsWhatCommitItCameFrom(_TreeCase):
         self.assertEqual(record["state"], "commit")
         # Strict ISO-8601, so it sorts and parses with no format to agree on — and the
         # zone is `Z` or an offset depending on the committer's timezone, which is the
-        # machine's and not this suite's. A pattern that admitted only the offset passed
-        # on a developer's box and failed on a CI runner set to UTC.
+        # machine's and not this suite's. A pattern admitting only the offset would pass
+        # where the committer's zone is not UTC and fail where it is.
         self.assertRegex(
             record["committed"],
             r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:\d{2})$")
@@ -1285,8 +1286,8 @@ class TheInventoryRecordsHowTheScopeAndTheRepositoryDiffer(_TreeCase):
 
 
 class AJobMayNameAnExplicitFileList(_TreeCase):
-    """Spec 12: reviewing part of a large repository takes a list of files, not a copy of
-    the subset into a mirror directory."""
+    """Reviewing part of a large repository takes a list of files, not a copy of the
+    subset into a mirror directory."""
 
     def test_only_the_listed_files_are_inventoried_from_the_tree_where_they_lie(self):
         job = self.job(files=["run.py", "engine/core.py"])
@@ -1934,10 +1935,9 @@ class TheAuditorGetsADefinedAnswerOrDoesNotRun(_TreeCase):
         self.assertNotIn("not in scope", proc.stdout)
 
     def test_a_tree_git_cannot_be_asked_about_reports_the_scope_as_unknown(self):
-        """The fourth answer, and the one the request did not have. Outside a repository
-        nothing here knows whether tests exist beyond the reviewed set, and saying "no test
-        file was found" would be this bug in its original form: an empty inventory reported
-        as a claim about the code."""
+        """The fourth answer. Outside a repository nothing here knows whether tests exist
+        beyond the reviewed set, and saying "no test file was found" would report an empty
+        inventory as a claim about the code."""
         shutil.rmtree(self.root / "tests")
         proc, rundir = self.plan()
         self.assertEqual([u for u in self.units_of(rundir) if u.startswith("audit-")], [])
@@ -1954,10 +1954,8 @@ class TheAuditorGetsADefinedAnswerOrDoesNotRun(_TreeCase):
         self.assertFalse(list((rundir / "units").glob("audit-*")))
 
     def test_an_area_with_no_test_of_its_own_gets_no_auditor_and_the_preview_says_so(self):
-        """The auditor was the one unit that was not bounded: it received every path in the
-        tree. Two auditors given that list and that question returned thirty-seven findings
-        and nine with no code site in common — a question that wide has no stopping rule in
-        it. Bounded to an area, it is answerable the same way twice, and an area with no
+        """The auditor is bounded like every other unit. Handed every path in the tree, its
+        question would have no stopping rule in it. Bounded to an area, it is answerable the same way twice, and an area with no
         test of its own is told apart from a run with no tests at all."""
         proc, rundir = self.plan(SUBJECT_JOB)
         planned = json.loads((rundir / "areas.json").read_text(encoding="utf-8"))["areas"]
@@ -2013,41 +2011,40 @@ class TheAuditorGetsADefinedAnswerOrDoesNotRun(_TreeCase):
 
 
 class ATestIsResolvedToTheCodeItIsAbout(unittest.TestCase):
-    """What the coverage auditor has to be planned around, and what nothing computed.
+    """What the coverage auditor has to be planned around, and how it is computed.
 
-An area that HOLDS a test file is not the same thing as an area holding tested code,
-    and dispatching an auditor to the first reaches the second only by luck. Over one run of
-    twelve source files and ten tests, seven of the ten sat in an area that did not contain
-    the class they test: an auditor sent to those areas is asked about files no test in
-    scope targets, which it can only answer at length and in the negative — 206 of 315
-    findings amounting to "this file has no tests". The area holding the class four of
-    those tests are about holds no test file, so that rule reaches it never.
+    An area that HOLDS a test file is not the same thing as an area holding tested code,
+    and dispatching an auditor to the first reaches the second only by luck. A test often
+    sits in an area that does not contain the class it tests: an auditor sent to that area
+    is asked about files no test in scope targets, which it can only answer at length and
+    in the negative — one "this file has no tests" finding per file. The area holding the
+    tested class may hold no test file at all, so that rule never reaches it.
 
     The subject of a test is derived here, from the two things that can say it: the test's
     name, and the names it mentions.
     """
 
-    # The twelve source files and ten tests of that run, with the areas dropped: what is
-    # under test is the mapping, and the areas are what the mapping will go on to fix.
-    SOURCES = ["api/EngineService.java", "api/LeaseAutoPayService.java",
-               "api/LeaseService.java", "api/LedgerService.java",
+    # Source files and the tests about them, with the areas dropped: what is under test
+    # is the mapping, and the areas are what the mapping will go on to fix.
+    SOURCES = ["api/EngineService.java", "api/OrderRenewalService.java",
+               "api/OrderService.java", "api/LedgerService.java",
                "api/PaymentService.java", "api/PaymentTransactionService.java",
-               "api/StripePaymentsService.java", "api/PaymentMethodService.java"]
+               "api/GatewayPaymentsService.java", "api/PaymentMethodService.java"]
     TESTS = {
         "src/test/EngineServiceTest.java": "api/EngineService.java",
-        "src/test/LeaseAutoPayServiceTest.java": "api/LeaseAutoPayService.java",
-        "src/test/LeaseServiceAutoPayTest.java": "api/LeaseService.java",
-        "src/test/LeaseServicePaidStateTest.java": "api/LeaseService.java",
+        "src/test/OrderRenewalServiceTest.java": "api/OrderRenewalService.java",
+        "src/test/OrderServiceRenewalTest.java": "api/OrderService.java",
+        "src/test/OrderServiceShippedStateTest.java": "api/OrderService.java",
         "src/test/LedgerServiceTest.java": "api/LedgerService.java",
-        "src/test/LeaseServiceOverlockWebhookTest.java": "api/LeaseService.java",
-        "src/test/LeaseServiceMoveOutTest.java": "api/LeaseService.java",
+        "src/test/OrderServiceHoldWebhookTest.java": "api/OrderService.java",
+        "src/test/OrderServiceCancelTest.java": "api/OrderService.java",
         "src/test/LedgerServiceDeleteTest.java": "api/LedgerService.java",
-        "src/test/StripePaymentsServicePayoutScheduleTest.java":
-            "api/StripePaymentsService.java",
+        "src/test/GatewayPaymentsServiceSettlementScheduleTest.java":
+            "api/GatewayPaymentsService.java",
         "src/test/LedgerServiceReversalTest.java": "api/LedgerService.java",
     }
 
-    def test_every_test_of_the_run_this_came_from_resolves_by_name(self):
+    def test_every_test_in_the_fixture_resolves_by_name(self):
         for test, subject in self.TESTS.items():
             with self.subTest(test=test):
                 self.assertEqual(review_panel.subjects_by_name(test, self.SOURCES),
@@ -2055,12 +2052,12 @@ An area that HOLDS a test file is not the same thing as an area holding tested c
 
     def test_several_tests_of_one_subject_all_reach_it(self):
         """The direction that worried nobody and works: the map is computed per test and
-        inverted, so four LeaseService tests give four links to one file rather than one
+        inverted, so four OrderService tests give four links to one file rather than one
         link that overwrites the other three."""
-        for_lease = [t for t, s in self.TESTS.items() if s == "api/LeaseService.java"]
+        for_lease = [t for t, s in self.TESTS.items() if s == "api/OrderService.java"]
         self.assertEqual(len(for_lease), 4)
         resolved = {review_panel.subjects_by_name(t, self.SOURCES)[0] for t in for_lease}
-        self.assertEqual(resolved, {"api/LeaseService.java"})
+        self.assertEqual(resolved, {"api/OrderService.java"})
 
     def test_the_naming_shapes_of_the_ecosystems_in_range(self):
         sources = ["api/Foo.java", "install.py", "web/foo.ts", "go/foo.go",
@@ -2079,12 +2076,12 @@ An area that HOLDS a test file is not the same thing as an area holding tested c
                 self.assertEqual(review_panel.subjects_by_name(test, sources), (subject,))
 
     def test_the_longest_stem_wins_over_a_shorter_one_that_also_fits(self):
-        """`Lease.java` begins `LeaseServiceMoveOut` as surely as `LeaseService.java` does,
+        """`Order.java` begins `OrderServiceCancel` as surely as `OrderService.java` does,
         and it is a coincidence of spelling rather than the subject."""
-        sources = ["api/Lease.java", "api/LeaseService.java"]
+        sources = ["api/Order.java", "api/OrderService.java"]
         self.assertEqual(
-            review_panel.subjects_by_name("src/test/LeaseServiceMoveOutTest.java", sources),
-            ("api/LeaseService.java",))
+            review_panel.subjects_by_name("src/test/OrderServiceCancelTest.java", sources),
+            ("api/OrderService.java",))
 
     def test_the_same_language_outranks_a_longer_stem_in_another(self):
         """A stem match across languages is a coincidence. It is a PREFERENCE and not a
@@ -2130,10 +2127,10 @@ An area that HOLDS a test file is not the same thing as an area holding tested c
         rather than only when it finds nothing. One test file exercising two classes can
         name one of them in its own name; the second is in the text or nowhere, and a
         subject nobody reaches is a file audited by nobody."""
-        text = "class LeaseServiceTest { LeaseService a; LedgerService b; }"
+        text = "class OrderServiceTest { OrderService a; LedgerService b; }"
         self.assertEqual(
-            review_panel.subjects_by_name("src/test/LeaseServiceTest.java", self.SOURCES),
-            ("api/LeaseService.java",))
+            review_panel.subjects_by_name("src/test/OrderServiceTest.java", self.SOURCES),
+            ("api/OrderService.java",))
         self.assertIn("api/LedgerService.java",
                       review_panel.subjects_by_mention(text, self.SOURCES))
 
@@ -2154,11 +2151,11 @@ An area that HOLDS a test file is not the same thing as an area holding tested c
         what it exercises — so every link says which rule produced it. The preview prints
         it and the auditor payload marks it, because that is what makes the looser rule
         safe to run."""
-        text = "class LeaseServiceTest { LeaseService a; LedgerService mocked; }"
-        mapped = review_panel.subject_map(["src/test/LeaseServiceTest.java"],
+        text = "class OrderServiceTest { OrderService a; LedgerService mocked; }"
+        mapped = review_panel.subject_map(["src/test/OrderServiceTest.java"],
                                           self.SOURCES, lambda _p: text)
-        self.assertEqual(mapped["src/test/LeaseServiceTest.java"],
-                         (("api/LeaseService.java", review_panel.SUBJECT_BY_NAME),
+        self.assertEqual(mapped["src/test/OrderServiceTest.java"],
+                         (("api/OrderService.java", review_panel.SUBJECT_BY_NAME),
                           ("api/LedgerService.java", review_panel.SUBJECT_BY_MENTION)))
 
     def test_a_test_that_resolves_to_nothing_is_kept_with_an_empty_answer(self):
@@ -2169,21 +2166,20 @@ An area that HOLDS a test file is not the same thing as an area holding tested c
         self.assertEqual(mapped, {"src/test/RefundScenarios.java": ()})
 
     def test_a_class_a_test_only_mocks_is_not_a_subject_of_it(self):
-        """The link that is always wrong. `LeaseServiceAutoPayTest` declares
+        """The link that is always wrong. `OrderServiceRenewalTest` declares
         `@Mock private PaymentService paymentService` and never builds one, so it exercises
-        `LeaseService` and says nothing whatever about `PaymentService`. Handed that link,
+        `OrderService` and says nothing whatever about `PaymentService`. Handed that link,
         an auditor either answers nothing — the brief tells it a mocking test is evidence of
-        nothing — or answers at length in the negative, which is what one lane did: 30
-        findings, every one resting on "the test never instantiates or executes
-        PaymentService"."""
-        text = ("class LeaseServiceAutoPayTest {\n"
+        nothing — or answers at length in the negative, one finding after another, every
+        one resting on "the test never instantiates or executes PaymentService"."""
+        text = ("class OrderServiceRenewalTest {\n"
                 "  @Mock private PaymentService paymentService;\n"
-                "  LeaseService subject = new LeaseService(paymentService);\n"
+                "  OrderService subject = new OrderService(paymentService);\n"
                 "}\n")
         self.assertNotIn("api/PaymentService.java",
                          review_panel.subjects_by_mention(text, self.SOURCES))
         # The subject it really is about is untouched.
-        self.assertIn("api/LeaseService.java",
+        self.assertIn("api/OrderService.java",
                       review_panel.subjects_by_mention(text, self.SOURCES))
 
     def test_a_mocked_class_the_test_also_builds_is_still_a_subject(self):
@@ -2220,17 +2216,17 @@ An area that HOLDS a test file is not the same thing as an area holding tested c
                       review_panel.subjects_by_mention(text, ["api/PaymentService.java"]))
 
     def test_inject_mocks_elsewhere_does_not_rescue_a_purely_mocked_class(self):
-        """The commonest Mockito shape there is, and the one the run actually hit:
+        """The commonest Mockito shape there is:
         collaborators under `@Mock`, the subject under `@InjectMocks`. `@InjectMocks` says
         which class is exercised — it does not say every mock beside it is. Read as a
         file-wide signal it rescues exactly the links this rule exists to drop."""
-        text = ("class LeaseServiceAutoPayTest {\n"
+        text = ("class OrderServiceRenewalTest {\n"
                 "  @Mock private PaymentService paymentService;\n"
-                "  @InjectMocks private LeaseService subject;\n"
+                "  @InjectMocks private OrderService subject;\n"
                 "}\n")
         found = review_panel.subjects_by_mention(text, self.SOURCES)
         self.assertNotIn("api/PaymentService.java", found)
-        self.assertIn("api/LeaseService.java", found)
+        self.assertIn("api/OrderService.java", found)
 
     def test_a_spied_class_is_exercised_and_keeps_its_link(self):
         """A spy is a REAL instance with some methods stubbed: its unstubbed code runs, so
@@ -2653,7 +2649,7 @@ class TheMockRuleSpeaksMoreThanOneLanguage(unittest.TestCase):
 
     def test_a_language_with_no_entry_filters_nothing(self):
         """The property that makes the table safe to grow one row at a time: an unlisted
-        language behaves exactly as it did before this rule existed."""
+        language behaves exactly as if the table did not exist."""
         text = "PaymentService mocked = Mock.of(PaymentService)\n"
         self.assertTrue(self.mentioned(text, "app/PaymentService.rb",
                                        "spec/checkout_spec.rb"))
@@ -2671,17 +2667,17 @@ class TheMockRuleSpeaksMoreThanOneLanguage(unittest.TestCase):
 class TheAuditorGoesWhereTheTestedCodeIs(_TreeCase):
     """Where a coverage auditor is dispatched, and what it is handed once it gets there.
 
-Dispatching by which area holds a test file reaches the tested code only by luck. Over
-    one run, seven of ten tests sat in an area that did not contain the class they test:
-    five areas are then asked about code no test in scope targets — 206 of 315 findings
-    amounting to "this file has no tests" — and the area holding the class four of those
-    tests are about holds no test file, so that rule reaches it never.
+    Dispatching by which area holds a test file reaches the tested code only by luck. A
+    test often sits in an area that does not contain the class it tests: that area is then
+    asked about code no test in scope targets — one "this file has no tests" finding per
+    file — and the area holding the tested class may hold no test file, so that rule
+    never reaches it.
     """
 
     # Sized so the packing puts the test and its subject in different areas under SMALL,
-    # which is the ordinary case and was the whole defect.
-    SIZES = {"api/LeaseService.java": 60, "api/PaymentService.java": 60,
-             "src/test/LeaseServiceMoveOutTest.java": 50}
+    # which is the ordinary case and the one this rule exists for.
+    SIZES = {"api/OrderService.java": 60, "api/PaymentService.java": 60,
+             "src/test/OrderServiceCancelTest.java": 50}
 
     def plan(self, data=FILE_JOB, rundir=None, **over):
         job = self.write(dict(copy.deepcopy(data), **over))
@@ -2692,18 +2688,18 @@ Dispatching by which area holds a test file reaches the tested code only by luck
 
     def planned(self, subjects=None, **sizes):
         """Areas over a tree where the test and its subject are packed apart, which is the
-        ordinary case and was the whole defect: a Java test lives under `src/test` and its
+        ordinary case this rule exists for: a Java test lives under `src/test` and its
         subject under `api`, and the packing puts them in different areas."""
         inv = _inv({**self.SIZES, **sizes})
         return review_panel.partition(self.job(), inv, SMALL, subjects=subjects or {
-            "src/test/LeaseServiceMoveOutTest.java": (("api/LeaseService.java", "name"),)})
+            "src/test/OrderServiceCancelTest.java": (("api/OrderService.java", "name"),)})
 
     def test_the_area_holding_the_tested_file_is_audited_and_the_one_holding_the_test_is_not(self):
         areas = {a.id: a for a in self.planned()}
         holding_subject = next(a for a in areas.values()
-                               if "api/LeaseService.java" in a.files)
+                               if "api/OrderService.java" in a.files)
         holding_test = next(a for a in areas.values()
-                            if "src/test/LeaseServiceMoveOutTest.java" in a.files)
+                            if "src/test/OrderServiceCancelTest.java" in a.files)
         self.assertNotEqual(holding_subject.id, holding_test.id, "the premise of this test")
         self.assertTrue(holding_subject.audited)
         self.assertFalse(holding_test.audited)
@@ -2712,26 +2708,26 @@ Dispatching by which area holds a test file reaches the tested code only by luck
 
     def test_an_untested_file_in_an_audited_area_is_not_listed(self):
         """`PaymentService.java` sits beside a tested file and no test in scope is about it.
-        Listing it is what produced 72 findings of the form "no test constructs this input",
-        every one of them true because the file has no test at all."""
+        Listing it produces a finding of the form "no test constructs this input" for each
+        input, every one of them true because the file has no test at all."""
         area = next(a for a in self.planned() if a.audited)
-        self.assertEqual([entry.path for entry in area.tested], ["api/LeaseService.java"])
+        self.assertEqual([entry.path for entry in area.tested], ["api/OrderService.java"])
         payload = review_panel.render_auditor_payload(
             review_panel.load_brief("coverage-auditor"), "the problem", area,
             _inv({**self.SIZES}))
-        self.assertIn("api/LeaseService.java", payload)
+        self.assertIn("api/OrderService.java", payload)
         self.assertNotIn("api/PaymentService.java", payload)
 
     def test_the_payload_says_how_each_test_was_matched(self):
         areas = self.planned(subjects={
-            "src/test/LeaseServiceMoveOutTest.java": (("api/LeaseService.java", "name"),),
-            "src/test/OtherTest.java": (("api/LeaseService.java", "mention"),)},
+            "src/test/OrderServiceCancelTest.java": (("api/OrderService.java", "name"),),
+            "src/test/OtherTest.java": (("api/OrderService.java", "mention"),)},
             **{"src/test/OtherTest.java": 10})
         area = next(a for a in areas if a.audited)
         payload = review_panel.render_auditor_payload(
             review_panel.load_brief("coverage-auditor"), "the problem", area,
             _inv({**self.SIZES, "src/test/OtherTest.java": 10}))
-        self.assertIn("LeaseServiceMoveOutTest.java (50 lines) — named for it", payload)
+        self.assertIn("OrderServiceCancelTest.java (50 lines) — named for it", payload)
         self.assertIn("OtherTest.java (10 lines) — mentions it", payload)
         # A mention is the weaker claim, and the brief the payload carries says what to do
         # with it rather than leaving the auditor to guess what the label means.
@@ -2739,10 +2735,10 @@ Dispatching by which area holds a test file reaches the tested code only by luck
 
     def test_several_tests_of_one_file_all_reach_its_auditor(self):
         areas = self.planned(subjects={
-            f"src/test/LeaseService{n}Test.java": (("api/LeaseService.java", "name"),)
-            for n in ("MoveOut", "AutoPay", "PaidState")},
-            **{f"src/test/LeaseService{n}Test.java": 10
-               for n in ("MoveOut", "AutoPay", "PaidState")})
+            f"src/test/OrderService{n}Test.java": (("api/OrderService.java", "name"),)
+            for n in ("Cancel", "Renewal", "ShippedState")},
+            **{f"src/test/OrderService{n}Test.java": 10
+               for n in ("Cancel", "Renewal", "ShippedState")})
         area = next(a for a in areas if a.audited)
         self.assertEqual(len(area.tested), 1)
         self.assertEqual(len(area.tested[0].tests), 3)
@@ -2770,24 +2766,23 @@ Dispatching by which area holds a test file reaches the tested code only by luck
     def _audited(self, sizes, ceiling=SMALL):
         areas = review_panel.partition(
             self.job(), _inv(sizes), ceiling,
-            subjects={"src/test/LeaseServiceMoveOutTest.java":
-                      (("api/LeaseService.java", "name"),)})
+            subjects={"src/test/OrderServiceCancelTest.java":
+                      (("api/OrderService.java", "name"),)})
         return areas, next(a for a in areas if a.audited)
 
     def test_an_auditor_reading_more_than_an_areas_ceiling_is_not_flagged_for_that(self):
         """An audit load is not an area's load, and measuring it against the area's ceiling
-        made the flag meaningless. A class of 2,988 lines against a 2,000-line ceiling is
-        the ORDINARY case for the trees this is pointed at, and its tests are read beside
-        it — so that rule fired on nearly every job, and a flag that always fires is one the
-        eye learns to skip.
+        is the wrong measure. A class longer than the area ceiling is an ORDINARY subject,
+        and its tests are read beside it, so the area's ceiling flags the common case — and
+        a flag that fires on the common case is one the eye learns to skip.
 
         An auditor reads one subject and the tests about it: one large file and a small one,
         where an area is many files chosen to fit. It gets its own ceiling, and the flag
         means what it says again."""
-        sizes = {"api/LeaseService.java": 90, "src/test/LeaseServiceMoveOutTest.java": 40}
+        sizes = {"api/OrderService.java": 90, "src/test/OrderServiceCancelTest.java": 40}
         areas, area = self._audited(sizes)
         # 130 lines: over the 100-line AREA ceiling and under the auditor's own, which is
-        # where nearly every real job sits.
+        # three times it.
         self.assertFalse(area.oversize)
         self.assertEqual(area.audit_lines, 130)
         self.assertFalse(area.audit_oversize)
@@ -2798,7 +2793,7 @@ Dispatching by which area holds a test file reaches the tested code only by luck
         """Refusing would mean the one file most worth auditing is the one file that cannot
         be — so the answer is the readers' own answer for a single oversize file: flag it,
         never split it, run it."""
-        sizes = {"api/LeaseService.java": 400, "src/test/LeaseServiceMoveOutTest.java": 40}
+        sizes = {"api/OrderService.java": 400, "src/test/OrderServiceCancelTest.java": 40}
         areas, area = self._audited(sizes)
         self.assertEqual(area.audit_lines, 440)
         self.assertTrue(area.audit_oversize)
@@ -2840,7 +2835,7 @@ Dispatching by which area holds a test file reaches the tested code only by luck
     def test_a_test_that_resolves_to_nothing_is_named_rather_than_left_out(self):
         job, inv = self.job(), _inv({**self.SIZES, "src/test/Unmatched.java": 10})
         areas = review_panel.partition(job, inv, SMALL, subjects={
-            "src/test/LeaseServiceMoveOutTest.java": (("api/LeaseService.java", "name"),),
+            "src/test/OrderServiceCancelTest.java": (("api/OrderService.java", "name"),),
             "src/test/Unmatched.java": ()})
         text = review_panel.preview(job, inv, areas)
         self.assertIn("src/test/Unmatched.java → test in scope, subject not in scope: "
@@ -2876,13 +2871,13 @@ Dispatching by which area holds a test file reaches the tested code only by luck
 class AJobCanDeclineTheCoverageQuestionAndADirectoryIsWeakEvidence(_TreeCase):
     """Two ways a run gets auditors nobody asked for.
 
-    A security review does not want the question asked at all: over one tree it produced
-    348 "tests to write" entries beside the defects it was run for, and no tuning of the
-    placement rule gets that to zero for a job that never wanted it.
+    A job run for security defects alone does not want the question asked at all, and no
+    tuning of the placement rule removes the "tests to write" entries for a job that never
+    wanted them.
 
-    And a path segment named `tests` is not by itself evidence that a file is a test.
-    Dev controllers living in a `tests` PACKAGE were read as tests, which both hid them
-    from the readers' subject set and mention-linked them to real classes. The rule is
+    And a path segment named `tests` is not by itself evidence that a file is a test. A
+    `tests` PACKAGE can hold application code, and read as tests those files would drop out
+    of the coverage auditors' subjects and be mention-linked to real classes. The rule is
     narrowed and not removed: in most Python trees `tests/helpers.py` genuinely is test
     support, and dropping the directory signal would regress every tree following the
     ordinary convention.
@@ -3370,8 +3365,8 @@ class PlanWritesTheUnits(_TreeCase):
                                                  excluded=(), tree_sha256="0" * 64)))
 
     def test_the_reader_brief_carries_the_three_rules_and_both_lenses(self):
-        # The rules that took the experiment from 3 of 9 to 8 of 9; a brief without them
-        # has thrown the experiment away.
+        # The rules that make a reader report each distinct defect rather than one per
+        # root cause; a brief without them finds far fewer.
         brief = review_panel.load_brief("reader").lower()
         for fragment in ("every distinct defect", "share a root cause",
                          "helper", "call site",
@@ -3379,6 +3374,10 @@ class PlanWritesTheUnits(_TreeCase):
                          "cites as proof"):
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, brief)
+        # One mistake per finding: a site that carries two problems is two findings, or the
+        # grouping stage has one record it cannot place beside either mistake's other sites.
+        self.assertIn("two problems at one place are two findings",
+                      " ".join(brief.split()))
         for level in ("blocker", "major", "minor", "nit"):
             self.assertIn(level, brief)
         for name in ("result.json", "schema.json", "error.txt"):
@@ -3464,11 +3463,9 @@ class TheEngineMintsARunDirectoryWhenItIsNotGivenOne(_TreeCase):
     def test_omitting_rundir_asks_the_engine_to_mint_one(self):
         """`--rundir` is optional, and omitting it is how a caller says "you pick".
 
-        A caller choosing the name is a caller choosing ANOTHER run's name: two runs on one
-        box picked the same one, and the second wrote its job file into the first's
-        directory before the emptiness check could refuse it. The guard fired, but after a
-        write. A minted name is stamped from the clock and the job's own digest, and the
-        directory is claimed by being created, so there is nothing left to refuse.
+        A caller choosing the name can choose ANOTHER run's name. A minted name is claimed
+        by an exclusive `mkdir`, with a numbered suffix when it is taken, so there is
+        nothing left to refuse.
         """
         home, env = self.minted_under()
         job = self.write(FILE_JOB)
@@ -3566,16 +3563,19 @@ class TheCommandLineRefusesWithUsage(unittest.TestCase):
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
         self.assertIn("usage", proc.stderr.lower())
 
-    def test_the_stage_is_named_route_and_merge_is_gone(self):
-        # After verify-first the stage merges nothing; it routes each finding to a verifier
-        # that did not raise it. Asserted through the command line, which is the only
-        # interface the skill's prose invokes.
+    def test_the_stage_after_reading_is_route_and_merge_comes_after_clustering(self):
+        # The stage after reading merges nothing; it routes each finding to a verifier that
+        # did not raise it. Merging is the round after clustering, over sites that were
+        # already verified. Asserted through the command line, which is the only interface
+        # the skill's prose invokes.
         proc = _run("merge")
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
-        self.assertIn("invalid choice", proc.stderr)
+        self.assertIn("rundir", proc.stderr)
+        self.assertNotIn("invalid choice", proc.stderr)
         usage = _run("--help").stdout
-        self.assertIn("route", usage)
-        self.assertNotIn("merge", usage)
+        order = [usage.index(name) for name in ("plan,", "route,", "cluster,", "merge,",
+                                                "synthesize,")]
+        self.assertEqual(order, sorted(order), usage)
 
 
 # --------------------------------------------------------------------------- #
@@ -3719,7 +3719,7 @@ class ReadingResultsAreParsedStrictly(_RouteCase):
                             "missing", f"'{field}'", "findings[0].reproduction")
 
     def test_the_fields_the_report_needs_and_no_reader_used_to_produce_are_required(self):
-        # Spec section 8: the plain-language consequence the report uses as a heading, the
+        # The plain-language consequence the report uses as a heading, the
         # fix size it orders work by, and the source the reader read at the cited lines.
         # Each is a whole field, never prose for a later stage to regex back out.
         findings = self.parse({"findings": [FINDING], "summary": "one"})
@@ -3907,9 +3907,9 @@ class EveryUnitIsExactlyOneState(_RouteCase):
         all, and JSON that is not the object the protocol names — in both the engine cannot
         say what it is holding, so reading findings out of it would be guesswork.
 
-        A finding that breaks a rule is a different case and is no longer here: it costs
-        itself, the unit stands, and `AFindingThatBreaksARuleCostsItselfAndNoOther` is
-        where that is asserted.
+        A finding that breaks a rule is a different case: it costs itself, the unit
+        stands, and `AFindingThatBreaksARuleCostsItselfAndNoOther` is where that is
+        asserted.
         """
         self.plan()
         (self.unit_dir("area-01-B1") / "result.json").write_text("{not json", encoding="utf-8")
@@ -4162,7 +4162,7 @@ class RoutingSendsEveryCandidateToAStranger(_RouteCase):
         for unit in self.verifiers():
             for cid in unit["candidates"]:
                 with self.subTest(batch=unit["id"], candidate=cid):
-                    # Spec §0's rule, read off the routing record: the lane a batch is
+                    # The routing rule, read off the routing record: the lane a batch is
                     # addressed to raised none of the candidates in it. This holds at every
                     # rung, because routing is the engine's and who answers is the
                     # dispatcher's.
@@ -4171,9 +4171,9 @@ class RoutingSendsEveryCandidateToAStranger(_RouteCase):
                     self.assertNotIn(unit["lane"], raisers)
 
     def test_identical_findings_from_both_lanes_are_two_batches_each_to_the_other_lane(self):
-        # The case the deleted shared batch existed to handle. Two lanes reporting the same
-        # defect produce two candidates, and each goes to the lane that did not raise it —
-        # two independent cross-model checks of one defect rather than one.
+        # Two lanes reporting the same defect produce two candidates, and each goes to the
+        # lane that did not raise it — two independent cross-model checks of one defect
+        # rather than one shared batch.
         self.plan(SUBJECT_JOB)
         self.land("area-01-A1", [FINDING, {**FINDING, "line_start": 5, "line_end": 5}])
         self.land("area-01-B1", [FINDING])
@@ -4191,9 +4191,9 @@ class RoutingSendsEveryCandidateToAStranger(_RouteCase):
             self.assertNotIn("both", unit["routing"])
 
     def test_no_shared_batch_machinery_survives(self):
-        # The branch existed only to patch merge-first: once two readers' findings are one
-        # candidate, there is no stranger left among two models. Verify-first makes it
-        # unreachable, so it is gone rather than dead.
+        # A shared batch is needed only when two readers' findings are merged into one
+        # candidate before verification, which leaves no stranger among two models.
+        # Verifying first makes it unreachable, so it must not exist rather than sit dead.
         for name in ("BOTH_LANES", "choose_lane"):
             with self.subTest(name=name):
                 self.assertFalse(hasattr(review_panel, name), f"{name} should be deleted")
@@ -4208,8 +4208,8 @@ class RoutingSendsEveryCandidateToAStranger(_RouteCase):
         placed = [cid for unit in self.verifiers() for cid in unit["candidates"]]
         self.assertEqual(sorted(placed), sorted(c["id"] for c in self.candidates()["candidates"]))
         self.assertEqual(len(placed), len(set(placed)))
-        # Six findings, six candidates: the two readers who both reported FINDING used to
-        # collapse into one candidate with one verdict, and now each is checked separately.
+        # Six findings, six candidates: the two readers who both reported FINDING are two
+        # candidates, each checked separately, not one candidate with one verdict.
         self.assertEqual(len(placed), 6)
 
     def test_no_reading_result_means_no_verification_unit_and_still_a_merge(self):
@@ -4554,8 +4554,8 @@ class VerdictsAreAcceptedByRule(unittest.TestCase):
 
     def refuse(self, verdicts, *fragments, batch=None):
         """A rule biting ONE verdict: its candidate resolves unresolved, the rejection
-        names why, and every other verdict in the batch stands. The rules are unchanged —
-        what changed is that one unreadable verdict no longer costs the twenty beside it."""
+        names why, and every other verdict in the batch stands. A rule rejects the verdict
+        that breaks it and nothing else: one unreadable verdict costs none beside it."""
         parsed, rejected = self.call(verdicts, batch)
         self.assertEqual(len(rejected), 1, f"expected one rejection, got {rejected}")
         message = rejected[0]
@@ -4628,12 +4628,11 @@ class VerdictsAreAcceptedByRule(unittest.TestCase):
 
     def test_a_documentary_run_stands_beside_a_reading(self):
         """Reading, then grepping to check the reading, is what verifiers actually do, and
-        until now it had no status: `reproduced` is a run of the code, and the engine
-        refused evidence on `confirmed_by_reading`. Two verdicts in one run were rejected
-        for exactly this and their candidates fell to unresolved with nothing wrong with
-        the claims. A search over the tree is part of the reading, so it rides with it."""
+        `reproduced` does not describe it: that is a run of the code. A search over the tree
+        is part of the reading, so `confirmed_by_reading` accepts evidence whose `run_kind`
+        says `documentary`, and refuses only a run of the code or an unstated kind."""
         documentary = {**self.EVIDENCE, "run_kind": "documentary",
-                       "argv": ["grep", "-rn", "handleDispute(", "api/"]}
+                       "argv": ["grep", "-rn", "cancelOrder(", "api/"]}
         verdicts = self.parse([self.verdict("cand-001", "confirmed_by_reading", documentary),
                                self.verdict("cand-002", "unresolved")])
         self.assertEqual(verdicts[0].status, "confirmed_by_reading")
@@ -4687,7 +4686,7 @@ class VerdictsAreAcceptedByRule(unittest.TestCase):
         self.assertEqual(verdicts[0].revision, {"severity": "minor", "rationale": "Only the CLI path."})
 
     def test_an_established_verdict_names_the_test_that_should_be_red_first(self):
-        # Spec section 8: the one field that turns a finding two models agreed on by reading
+        # The one field that turns a finding two models agreed on by reading
         # into something a third person can check.
         for status in review_panel.ESTABLISHED_STATUSES:
             with self.subTest(status=status):
@@ -4713,8 +4712,8 @@ class VerdictsAreAcceptedByRule(unittest.TestCase):
                 self.assertEqual(verdicts[0].test_first, test_first)
 
     def test_unresolved_says_which_of_four_things_would_settle_it(self):
-        # Section 9 groups the unresolved set by this, and section 7 keeps an environment
-        # failure out of the same heap as an open question about the code. Neither is
+        # The report groups the unresolved set by this, and keeps an environment failure
+        # out of the same heap as an open question about the code. Neither is
         # guessable, so an unresolved verdict that names nothing is invalid.
         self.refuse([self.verdict("cand-001", "unresolved", unresolved_reason=None),
                      self.verdict("cand-002", "unresolved")],
@@ -4853,7 +4852,7 @@ def _verdict(candidate, status, evidence=None, rationale="Lines 2-3 index withou
 VERIFY_TABLE = {
     # Lane A raised cand-001 and cand-003, so lane B checks both; lane B raised cand-002 and
     # cand-004, so lane A checks those. cand-001 and cand-002 are one defect described twice
-    # and are confirmed independently — which is the evidence merge-first destroyed.
+    # and are confirmed independently — the evidence that merging them first destroys.
     "verify-area-01-A": {"verdicts": [_verdict("cand-001", "confirmed_by_reading"),
                                       _verdict("cand-003", "reproduced", EVIDENCE,
                                                rationale="The run raised as claimed.",
@@ -4912,25 +4911,90 @@ SYNTH_TABLE = {
     "synth-A": {
         "tiers": ["A run stops instead of finishing", "The total comes out wrong"],
         "defects": [
-            {"defect": "D1", "tier": "A run stops instead of finishing",
+            {"defect": "D1", "heading": "An empty input stops the run with a traceback.",
+             "tier": "A run stops instead of finishing",
              "what_goes_wrong": "The index runs off the end of an empty list and the whole "
                                 "call dies where it should have returned nothing.",
              "fix": "Return early on an empty input instead of indexing it.",
-             "cross_references": ["D3"]},
-            {"defect": "D2", "tier": "A run stops instead of finishing",
+             "site_notes": [], "cross_references": ["D3"]},
+            {"defect": "D2", "heading": "The tool fails when started with no arguments.",
+             "tier": "A run stops instead of finishing",
              "what_goes_wrong": "Started with no arguments the tool raises instead of "
                                 "printing the help it has.",
              "fix": "Print the usage text when the argument list is empty.",
-             "cross_references": []},
-            {"defect": "D3", "tier": "The total comes out wrong",
+             "site_notes": [], "cross_references": []},
+            {"defect": "D3", "heading": "A missing value makes the total too large.",
+             "tier": "The total comes out wrong",
              "what_goes_wrong": "A missing value is doubled rather than skipped, so the "
                                 "total is quietly too large.",
              "fix": "Skip a missing value instead of arithmetic on it.",
-             "cross_references": []},
+             "site_notes": [], "cross_references": []},
         ],
         "summary": "Two tiers: the run stopping, and the arithmetic being wrong.",
     },
 }
+
+
+# Merge round: ONE unit over every site in the run, proposing which sites are one mistake.
+# Over CLUSTER_TABLE the sites are S1 (cand-001 and cand-002), S2 (cand-003) and S3
+# (cand-004); S1 and S2 are proposed as one mistake here, which is a claim for the merge
+# check to test and not something the report shows as one defect on the unit's say-so.
+MERGE_UNIT = "merge-A"
+
+
+def _single(site):
+    return {"sites": [site], "mechanism": None, "instances": None, "reason_kept_apart": None}
+
+
+def _merge_reply(groups, compound=(), summary="grouped by mechanism"):
+    return {"groups": list(groups), "compound": list(compound), "summary": summary}
+
+
+MERGE_PAIR = {
+    "sites": ["S1", "S2"],
+    "mechanism": "An empty input is indexed before it is checked; check it first.",
+    "instances": [{"site": "S1", "instance": "core indexes the last row of an empty list."},
+                  {"site": "S2", "instance": "run.py indexes an argument list that is empty."}],
+    "reason_kept_apart": None,
+}
+
+
+def _identity_merge(rundir):
+    """A real answer for every merge unit the run lists: each site in a group of its own."""
+    doc = json.loads((rundir / "units.json").read_text(encoding="utf-8"))
+    return {unit["id"]: _merge_reply([_single(site) for site in unit["sites"]],
+                                     summary="Nothing here is one mistake twice.")
+            for unit in doc["units"] if unit["kind"] == "merger"}
+
+
+# Merge check: the other lane's unit, handed every group of several sites the merge round
+# proposed and asked, site by site, whether each is that one mistake. Its answer is records
+# naming their sites, never a map keyed by site id.
+CHECK_UNIT = "mergecheck-B"
+
+
+def _check_group(group, sites, misfit=(), hidden=(), refuted=()):
+    """One group's entry in a merge check reply: every site fits unless named in
+    ``misfit``, a hidden claim for each site in ``hidden``."""
+    return {"group": group,
+            "sites": [{"site": site, "verdict": "does_not_fit" if site in misfit else "fits",
+                       "reason": f"{site} {'is' if site not in misfit else 'is not'} "
+                                 f"this mistake."} for site in sites],
+            "hidden_claims": [{"site": site, "claim": f"{site} also leaks a handle."}
+                              for site in hidden],
+            "fix_touches_refuted": {"value": bool(refuted), "sites": list(refuted)}}
+
+
+def _check_reply(groups, summary="Checked every group against its mechanism."):
+    return {"groups": list(groups), "summary": summary}
+
+
+def _upholding_check(rundir):
+    """A real answer for every merge check unit the run lists: every site fits."""
+    doc = json.loads((rundir / "units.json").read_text(encoding="utf-8"))
+    return {unit["id"]: _check_reply([_check_group(group["group"], group["sites"])
+                                      for group in unit["groups"]])
+            for unit in doc["units"] if unit["kind"] == "merge-checker"}
 
 
 def stub_dispatch(rundir, table, dispatch=None, order="sequential", seed=0):
@@ -4978,10 +5042,11 @@ def _tree_bytes(top):
 # spelled it by hand would go quietly vacuous the day either moved: the heading above it
 # would stop claiming an anchor, and an assertion that no link exists would pass for the
 # wrong reason.
+# The line the writer puts under a defect of one site's heading, which is what confirms the
+# heading as a defect's.
 _META_LINE = review_panel.DEFECT_META_SEP.join(
-    f"**{label}** {value}" for label, value in zip(
-        review_panel.DEFECT_META_LABELS[:4],
-        ("major", "one model", "`core.py:1`", "1 line")))
+    ('<a id="S1-src"></a>**Site** [S1](#S1)', "`core.py:1`", "**Outcome** established", "**Severity** major",
+     "**Fix size** 1 line"))
 
 
 # A defect id in a table's first cell, linked into its own anchor or bare where nothing
@@ -5209,20 +5274,15 @@ def _legend_rows(markdown):
 
 class WhatWouldSettleAClaimIsAPathAndNotASentence(unittest.TestCase):
     """``needs_files`` is added up into a table pricing each file outside the scope by the
-    defects it would settle. A verifier answered it with a description of a file instead —
-    `<caller of StripePaymentsService.handleDispute (Stripe dispute webhook handler) - not
-    present in the reviewed set; locate with grep -rn 'handleDispute(' api/>` — and the
-    engine accepted it, because normalizing separators is the whole of what it checked.
-    That stood as a row in the report beside real paths, where it can be neither opened nor
-    counted.
-
-    The parser's own docstring had always claimed it refused a sentence. This is the check
-    that makes the claim true.
+    defects it would settle. A verifier can answer it with a description of a file instead —
+    `<caller of OrderService.cancelOrder (order cancel handler) - not present in the
+    reviewed set; locate with grep -rn 'cancelOrder(' api/>` — and normalizing separators
+    alone does not refuse that. Refused here, it never stands as a row in the report beside
+    real paths, where it could be neither opened nor counted.
     """
 
-    SENTENCE = ("<caller of StripePaymentsService.handleDispute (Stripe dispute webhook "
-                "handler) - not present in the reviewed set; locate with grep -rn "
-                "'handleDispute(' api/>")
+    SENTENCE = ("<caller of OrderService.cancelOrder (order cancel handler) - not present "
+                "in the reviewed set; locate with grep -rn 'cancelOrder(' api/>")
 
     def parse(self, entries):
         return review_panel._parse_needs_files(entries, "verdicts[0].needs_files")
@@ -5230,8 +5290,8 @@ class WhatWouldSettleAClaimIsAPathAndNotASentence(unittest.TestCase):
     def test_a_sentence_is_refused_and_a_path_beside_it_is_kept(self):
         """Dropped rather than raised on: one bad entry beside a good one costs the bad one
         alone, which is the difference between losing a row and losing a verdict."""
-        kept, refused = self.parse([self.SENTENCE, "api/StripePaymentsService.java"])
-        self.assertEqual(kept, ("api/StripePaymentsService.java",))
+        kept, refused = self.parse([self.SENTENCE, "api/GatewayPaymentsService.java"])
+        self.assertEqual(kept, ("api/GatewayPaymentsService.java",))
         self.assertEqual(refused, (self.SENTENCE,))
 
     def test_a_path_that_climbs_out_or_is_absolute_is_refused_not_raised_on(self):
@@ -5276,7 +5336,7 @@ class WhatWouldSettleAClaimIsAPathAndNotASentence(unittest.TestCase):
             {"verdicts": verdicts, "summary": "one open"}, "verify-area-01-A", batch)
         self.assertEqual(len(rejected), 1, rejected)
         self.assertIn("refused as prose rather than a path", rejected[0])
-        self.assertIn("handleDispute", rejected[0])
+        self.assertIn("cancelOrder", rejected[0])
         # The other verdict stands, as it does for every other per-verdict rule.
         self.assertEqual([v.status for v in parsed if v.candidate == "cand-002"],
                          ["confirmed_by_reading"])
@@ -5331,8 +5391,54 @@ class _ReportCase(_RouteCase):
         self.cluster(rundir)
         stub_dispatch(rundir, grouping, None, order)
 
+    def merge(self, rundir=None, expect=0):
+        proc = _run("merge", str(rundir or self.rundir))
+        self.assertEqual(proc.returncode, expect, proc.stdout + proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        return proc
+
+    def mergers(self, rundir=None):
+        doc = json.loads(((rundir or self.rundir) / "units.json").read_text(encoding="utf-8"))
+        return [u for u in doc["units"] if u["kind"] == "merger"]
+
+    def merged(self, rundir=None, table=None, order="sequential"):
+        """The round between clustering and synthesis: write the merge units and land them,
+        each with a real answer that puts every site in a group of its own unless ``table``
+        says otherwise."""
+        rundir = rundir or self.rundir
+        self.merge(rundir)
+        stub_dispatch(rundir, _identity_merge(rundir) if table is None else table, None, order)
+
+    def merge_check(self, rundir=None, expect=0):
+        proc = _run("merge-check", str(rundir or self.rundir))
+        self.assertEqual(proc.returncode, expect, proc.stdout + proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        return proc
+
+    def checkers(self, rundir=None):
+        doc = json.loads(((rundir or self.rundir) / "units.json").read_text(encoding="utf-8"))
+        return [u for u in doc["units"] if u["kind"] == "merge-checker"]
+
+    def merge_checked(self, rundir=None, table=None, order="sequential"):
+        """The round between the merge and synthesis: write the merge check units and land
+        them, each with a real answer upholding every group unless ``table`` says
+        otherwise."""
+        rundir = rundir or self.rundir
+        self.merge_check(rundir)
+        stub_dispatch(rundir, _upholding_check(rundir) if table is None else table, None,
+                      order)
+
     def synthesize(self, rundir=None, expect=0):
-        proc = _run("synthesize", str(rundir or self.rundir))
+        """Synthesis reads the run after the merge check, so a run still at ``clustered``
+        or ``merged`` goes through the rounds between first, as the driver takes it."""
+        rundir = rundir or self.rundir
+        doc = json.loads((rundir / "units.json").read_text(encoding="utf-8"))
+        if doc.get("stage") == review_panel.CLUSTERED_STAGE:
+            self.merged(rundir)
+            doc = json.loads((rundir / "units.json").read_text(encoding="utf-8"))
+        if doc.get("stage") == review_panel.MERGED_STAGE:
+            self.merge_checked(rundir)
+        proc = _run("synthesize", str(rundir))
         self.assertEqual(proc.returncode, expect, proc.stdout + proc.stderr)
         self.assertNotIn("Traceback", proc.stderr)
         return proc
@@ -5343,11 +5449,12 @@ class _ReportCase(_RouteCase):
 
     def run_all(self, rundir=None, order="sequential", reading=READING_TABLE, verify=VERIFY_TABLE,
                 grouping=CLUSTER_TABLE, synthesis=None, dispatch=DISPATCH, data=FILE_JOB,
-                expect=0, after_plan=None, **over):
+                expect=0, after_plan=None, merge=None, check=None, **over):
         """The whole pipeline. ``synthesis`` is opt-in and defaults to the round not being
         run at all: an absent round is a complete run, and the round renders nothing yet.
         ``{}`` runs the stage and lands no result, which is the round dispatched and never
-        answered.
+        answered. ``merge`` is the same for the merge round, which always runs, and
+        ``check`` for the merge check after it, which upholds every group by default.
 
         ``after_plan`` is called with the run directory once ``plan`` has committed, for the
         files the DRIVER puts there rather than the engine — ``job-notes.json`` is copied in
@@ -5362,6 +5469,10 @@ class _ReportCase(_RouteCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         stub_dispatch(rundir, verify, None, order)
         self.clustered(rundir, grouping, order)
+        # Every run goes through the merge round, as the driver takes it. ``merge`` is the
+        # merge units' table, defaulting to each site in a group of its own.
+        self.merged(rundir, merge, order)
+        self.merge_checked(rundir, check, order)
         if synthesis is not None:
             self.synthesize(rundir)
             stub_dispatch(rundir, synthesis, None, order)
@@ -5373,8 +5484,8 @@ class _ReportCase(_RouteCase):
     def statuses(self, text=None, rundir=None):
         """``{candidate id: status}`` from the structure the report renders from.
 
-        Spec section 10 moved candidate ids out of the defect bodies, so a candidate is
-        named in the provenance appendix and nowhere else. Passing the report text asserts
+        Candidate ids are kept out of the defect bodies, so a candidate is named in the
+        provenance appendix and nowhere else. Passing the report text asserts
         exactly that.
 
         The appendix is a table of TRACES, one row per report of a candidate, so a
@@ -5399,9 +5510,9 @@ class _ReportCase(_RouteCase):
         return out
 
     def defects(self, rundir=None):
-        """``{cluster id: cluster record}``, the unit the report is now organized by."""
+        """``{defect id: defect record}``, the unit the report is organized by."""
         doc = json.loads(((rundir or self.rundir) / "findings.json").read_text(encoding="utf-8"))
-        return {c["id"]: c for c in doc["clusters"]}
+        return {c["id"]: c for c in doc["defects"]}
 
     def reads_as(self, rundir=None):
         """The prose as a reader sees it: the writer's Markdown escaping undone and the
@@ -5414,7 +5525,7 @@ class _ReportCase(_RouteCase):
         """The one defect entry naming this cluster, cut at the next heading of any level.
 
         Cut on the HEADING, which carries the id: a defect heads its entry with its own id
-        and a full stop, and the metadata line under it no longer names the defect at all.
+        and a full stop, and the metadata line under it does not name the defect at all.
         Two defects may still share the clusterer's prose, and the id in front of it is
         what tells them apart \u2014 which is why the match is anchored on the id rather than
         made anywhere in the chunk.
@@ -5422,8 +5533,20 @@ class _ReportCase(_RouteCase):
         for chunk in re.split(r"(?m)^#{3,4} ", text)[1:]:
             chunk = re.split(r"(?m)^#{2,4} ", chunk)[0]
             if re.match(rf"{cluster_id}\. ", chunk):
-                return chunk
+                # The entry, then the evidence of every site it names: what a defect of one
+                # site carried in one place before sites existed is now in two.
+                sites = re.findall(r'(?m)^- <a id="(S\d+)-src"></a>', chunk)
+                return chunk + "".join(self.site_block(text, sid) for sid in sites)
         self.fail(f"{cluster_id} has no entry in the report")
+
+    def site_block(self, text, site_id):
+        """One site's evidence entry, from its heading to the next heading."""
+        found = re.search(rf"(?m)^### {site_id} · .*\n", text)
+        if found is None:
+            self.fail(f"{site_id} has no evidence entry")
+        rest = text[found.end():]
+        end = re.search(r"(?m)^#", rest)
+        return found.group(0) + rest[:end.start() if end else len(rest)]
 
     def body(self, text, heading):
         """One section of the report, by heading, whatever level it sits at now."""
@@ -5431,7 +5554,7 @@ class _ReportCase(_RouteCase):
 
 
 class OneDefectFoundTwiceGetsTwoVerdicts(_ReportCase):
-    """Spec §1, end to end: when both lanes describe one defect, the run produces two
+    """End to end: when both lanes describe one defect, the run produces two
     candidates, routes each to the lane that did not raise it, and renders two verdicts.
     Under merge-first this was one candidate, one verification, and the fact of independent
     co-discovery was unrecoverable from the artifacts."""
@@ -5468,11 +5591,11 @@ class OneDefectFoundTwiceGetsTwoVerdicts(_ReportCase):
             "summary": "One defect, found by both."}})
         self.report()
         self.assertEqual(len(self.statuses(self.text())), 2, "two candidates render two verdicts")
-        self.assertIn("- Defects: 1 from 2 candidates", self.text())
+        self.assertIn("- Defects: 1 at 1 site from 2 candidates", self.text())
 
 
 class TheCapabilityProbeIsPlannedReadAndFoldedIn(_ReportCase):
-    """Spec section 7. One unit of round one asks whether this tree can be built and whether
+    """One unit of round one asks whether this tree can be built and whether
     its tests can be run, so a report can never read as validation when nothing was executed.
     Its answer reaches every verifier payload as a declared input, and a probe that failed or
     never landed contributes the word unknown rather than nothing or a `no`."""
@@ -5939,9 +6062,9 @@ class TheClusteringRoundGroupsWhatVerificationSettled(_ReportCase):
         self.assertEqual(first.consequence, FINDING["consequence"])
         self.assertTrue(first.grouped)
         # Ids are the engine's, assigned in a fixed order, so two runs over one tree name
-        # the same defect the same way whatever order the clusterer listed them in.
+        # the same site the same way whatever order the clusterer listed them in.
         self.assertEqual([c.id for c in clustering.clusters],
-                         ["D1", "D2", "D3"])
+                         ["S1", "S2", "S3"])
         self.assertEqual(clustering.clusters[0].members, ("cand-001", "cand-002"))
 
     def test_cluster_ids_follow_the_engines_order_not_the_order_the_unit_listed(self):
@@ -5960,7 +6083,7 @@ class TheClusteringRoundGroupsWhatVerificationSettled(_ReportCase):
         self.assertEqual([c.members for c in clustering.clusters],
                          [("cand-001", "cand-002"), ("cand-003",), ("cand-004",)])
         self.assertEqual([c.id for c in clustering.clusters],
-                         ["D1", "D2", "D3"])
+                         ["S1", "S2", "S3"])
         self.assertEqual([c.consequence for c in clustering.clusters],
                          ["First.", "Second.", "Third."])
 
@@ -6047,7 +6170,7 @@ class TheClusteringRoundGroupsWhatVerificationSettled(_ReportCase):
 
     def test_the_report_states_the_arithmetic(self):
         self.run_all()
-        self.assertIn("- Defects: 3 from 4 candidates", self.text())
+        self.assertIn("- Defects: 3 at 3 sites from 4 candidates", self.text())
 
 
 class AClusteringResultMustBeAPartition(_ReportCase):
@@ -6112,8 +6235,9 @@ class AClusteringResultMustBeAPartition(_ReportCase):
         self.refuse([self.one("cand-001", "cand-002", "cand-003", split_reason=surrogate)], "UTF-8")
 
     def test_every_candidate_in_one_cluster_passes_the_check(self):
-        # The arithmetic is satisfied by the answer §0 fears most. Recorded here so nobody
-        # later reads a green partition check as evidence that nothing was over-merged.
+        # The arithmetic is satisfied by the worst over-merge there is. Recorded here so
+        # nobody later reads a green partition check as evidence that nothing was
+        # over-merged.
         parsed = self.parse([self.one("cand-001", "cand-002", "cand-003")])
         self.assertEqual(len(parsed["clusters"]), 1)
 
@@ -6196,11 +6320,11 @@ class AClusteringUnitThatDidNotComeBackLeavesTheAreaUnmerged(_ReportCase):
         # The run finished and every candidate is still in it.
         self.assertEqual(set(self.statuses(text)),
                          {"cand-001", "cand-002", "cand-003", "cand-004"})
-        self.assertIn("- Defects: 4 from 4 candidates", text)
+        self.assertIn("- Defects: 4 at 4 sites from 4 candidates", text)
 
 
 class TheOverMergeCasesThePartitionCheckCannotCatch(_ReportCase):
-    """Spec section 0's stated fear is OVER-merging, because it deletes a real defect and
+    """The worse clustering failure is OVER-merging, because it deletes a real defect and
     leaves no trace. The partition check does not touch it — a clusterer returning every
     candidate in one cluster passes — so these three cases are where the rule actually
     lives, and each asserts three things: the right answer is carried through, the
@@ -6431,12 +6555,11 @@ class VerificationResultsAreReadStrictly(_ReportCase):
     def test_one_unreadable_verdict_costs_its_own_candidate_and_no_other(self):
         """The blast radius, which is the whole of this rule.
 
-        A batch is one dispatch of many independent judgments. A verifier omitted a field
-        on 18 verdicts of one real unit and the engine rejected all of them: that run would
-        have reported 87 established / 52 unresolved against a true 105 / 34, a fifth of
-        the headline lost to a contract error on other candidates. The rule that rejected
-        the bad verdict is unchanged and still bites — `reproduced` with no evidence does
-        not stand — it just no longer takes its neighbours with it.
+        A batch is one dispatch of many independent judgments. Rejecting all of them over
+        a field omitted from some would drop every candidate in the batch to unresolved,
+        losing established results to a contract error on other candidates. The rule that
+        rejects the bad verdict still bites — `reproduced` with no evidence does not stand
+        — it just does not take its neighbors with it.
         """
         broken = {**VERIFY_TABLE,
                   "verify-area-01-A": {"verdicts": [_verdict("cand-001", "confirmed_by_reading"),
@@ -6447,7 +6570,7 @@ class VerificationResultsAreReadStrictly(_ReportCase):
         statuses = self.statuses(text)
         self.assertEqual(statuses["cand-003"], "unresolved", "the rule stopped biting")
         self.assertTrue(statuses["cand-001"].startswith("confirmed_by_reading"),
-                        f"a neighbour lost its answer: {statuses['cand-001']}")
+                        f"a neighbor lost its answer: {statuses['cand-001']}")
         self.assertTrue(statuses["cand-002"].startswith("confirmed_by_reading"))
         # Nothing is quietly downgraded: coverage names the rejection and its reason, and
         # the unit does not get to claim it returned a valid result.
@@ -6460,8 +6583,8 @@ class VerificationResultsAreReadStrictly(_ReportCase):
         """The honesty half, on a run where NOTHING else went wrong.
 
         The fixture above has a failed auditor, so that sentence is already absent from it
-        and asserting its absence there proves nothing about this rule — which a mutation
-        removing the clause showed by staying green. Every unit here returns, the probe
+        and asserting its absence there proves nothing about this rule. Every unit here
+        returns, the probe
         included, so the sentence is exactly what the rejection has to suppress.
         """
         broken = {**VERIFY_TABLE,
@@ -6510,9 +6633,9 @@ class VerificationResultsAreReadStrictly(_ReportCase):
         self.assertIn("nothing usable", _section(text, "Provenance"))
 
     def test_a_field_the_status_determines_is_filled_in_rather_than_refused(self):
-        """The case that cost the real run. `unresolved_reason` is null on anything but an
-        unresolved verdict, so an omitted key there carries no information the engine does
-        not already hold. Refusing it threw away 18 readable judgments."""
+        """`unresolved_reason` is null on anything but an unresolved verdict, so an omitted
+        key there carries no information the engine does not already hold. The engine fills
+        it in as null and keeps the judgment rather than refusing a verdict it can read."""
         missing = [dict(_verdict("cand-001", "confirmed_by_reading")),
                    dict(_verdict("cand-003", "reproduced", EVIDENCE, rationale="It ran."))]
         for verdict in missing:
@@ -6528,7 +6651,7 @@ class VerificationResultsAreReadStrictly(_ReportCase):
         # rejection line rather than for an empty section.)
         self.assertNotIn("could not be read", _section(text, "Coverage"))
         # And nowhere else either. Scoping the line above to the coverage section is what
-        # its comment means; this keeps the reach the older spelling had by accident.
+        # its comment means; this line asserts over the whole report as well.
         self.assertNotIn("could not be read", text)
 
     def test_a_field_the_status_does_NOT_determine_is_still_required(self):
@@ -6681,7 +6804,7 @@ class TheReportIsHonestAboutCoverage(_ReportCase):
         self.assertEqual(_index_rows(text), ["D2", "D1"])
         self.assertIn("D3", _section(text, "Refuted"))
         block = _section(text, "Established defects")
-        first = re.split(r"(?m)^#{3,4} ", block)[1]
+        first = self.defect_block(text, re.search(r"(?m)^#{3,4} (D\d+)\. ", block).group(1))
         self.assertIn("blocker", first)
         self.assertIn("Severity revised to blocker from major", first)
         self.assertIn("Every invocation hits it.", first)
@@ -6689,10 +6812,11 @@ class TheReportIsHonestAboutCoverage(_ReportCase):
         self.assertIn("IndexError", first)
         self.assertIn("(exit 1", first)
         self.assertIn("core.py:5", first)
-        # Section 10: the units, lanes and lenses that produced it are in the appendix and
-        # not in the material somebody reads while fixing it.
+        # The units, lanes and lenses that produced it are in the appendix and not in the
+        # material somebody reads while fixing it.
         for machinery in ("area-01-A1", "verify-area-01-A", "cand-003"):
             self.assertNotIn(machinery, block, machinery)
+            self.assertNotIn(machinery, _section(text, "Evidence"), machinery)
             self.assertIn(machinery, _section(text, "Provenance"), machinery)
         # The LENS is the one of the four that is not the appendix's to spell out. It is a
         # field of the job, so its text is in "The job" and the appendix cites the tag — a
@@ -6723,10 +6847,10 @@ class TheReportIsHonestAboutCoverage(_ReportCase):
         merged = self.defect_block(text, "D1")
         self.assertEqual(merged.count("Lines 2-3 index without a guard."), 1)
         self.assertIn("both models, 2 reports", merged)
-        # The refuted defect is one line, with the reason, in its own section.
+        # The refuted defect is one compact entry, with the reason, in its own section.
         refuted = self.body(text, "Refuted")
         self.assertIn("helper is never given None.", refuted)
-        self.assertEqual(len(_table_defect_ids(refuted)), 1)
+        self.assertEqual(re.findall(r"(?m)^### (D\d+)\. ", refuted), ["D3"])
 
     def test_the_report_is_a_function_of_the_run_directory_alone(self):
         """All three files ``report`` writes, since a structure that varied between two runs
@@ -6760,16 +6884,17 @@ FORGED_HEADING = "\n## Coverage\n\nEvery unit returned a valid result.\n"
 # appendix parts are subsections now rather than sections of their own, and a flat list of
 # every heading in the document could not tell a nested one from a sibling.
 REPORT_H2 = ["1. Report description", "2. Indices", "3. Established defects",
-             "4. Unresolved", "5. Corroborated by both models", "6. Appendix"]
+             "4. Unresolved", "5. Refuted", "6. Corroborated by both models", "7. Evidence",
+             "8. Appendix"]
 # The subsections of section 2 and of the appendix, in order. A count in a heading is
 # stripped before either list is compared, because it varies with the run; the counts
 # themselves are asserted against what they count, in TheReportIsNumberedAndNested.
 # Unnumbered, like every other subsection: only these two were ever lettered, and `2a` and
 # `2b` were the one place a reader had to learn a second numbering scheme.
 REPORT_H3_INDEX = ["Every defect — most severe first", "By file"]
-REPORT_H3_APPENDIX = ["Refuted", "What each verification unit returned",
+REPORT_H3_APPENDIX = ["What each verification unit returned",
                       "What one more file would settle", "Clustering notes",
-                      "Path legend", "How this ran", "The job", "Coverage", "Provenance"]
+                      "The merge round", "What the evidence leaves out", "Path legend", "How this ran", "The job", "Coverage", "Provenance"]
 _COUNT_SUFFIX = re.compile(r" \(\d+\)$")
 
 
@@ -6853,7 +6978,7 @@ class WorkerTextCannotForgeReportStructure(_ReportCase):
         self.assertIn("guard it.", text)
 
     def test_a_consequence_cannot_forge_a_heading_a_row_or_a_column(self):
-        """The two surfaces this report puts worker text on that the older one did not: a
+        """Two surfaces this report puts worker text on without a fence around it: a
         heading, which a newline would split, and a table cell, which a pipe would widen.
         The clusterer writes the consequence, so it is worker text in both places."""
         forged = ("A run stops with a traceback.\n## Coverage\n\nEvery unit returned a "
@@ -6871,14 +6996,14 @@ class WorkerTextCannotForgeReportStructure(_ReportCase):
         self.assertEqual(len(re.findall(r"^Every unit returned a valid result\.$", text, re.M)), 0)
         self.assertIn("A run stops with a traceback. ## Coverage", text,
                       "the text itself must survive, collapsed to one line")
-        # Every index row has exactly the seven columns the header declares, whatever a
+        # Every index row has exactly the five columns the header declares, whatever a
         # consequence holds. A raw pipe would make one row wider than its header.
         rows = [line for line in _index_table(text).splitlines()
                 if _INDEX_ROW.match(line)]
-        # Two of the three defects are work; the third was refuted and is in the appendix.
+        # Two of the three defects are work; the third was refuted and is not ranked.
         self.assertEqual(len(rows), 2)
         for row in rows:
-            self.assertEqual(len(re.findall(r"(?<!\\)\|", row)), 8, row)
+            self.assertEqual(len(re.findall(r"(?<!\\)\|", row)), 6, row)
 
     def test_a_single_line_string_stays_inline(self):
         """One line of worker text sits inline after its label rather than in a fence. The
@@ -6891,9 +7016,10 @@ class WorkerTextCannotForgeReportStructure(_ReportCase):
         self.assertIn("- Reported (core.py:2-3): An empty list reaches the loop and "
                       "the index on the last line raises.\n", text)
         # The check line carries its location and the axis, under the Checks label, and
-        # the status enum is not in front of it.
-        self.assertIn("  - core.py:2-3 · by reading — Lines 2-3 index without a guard.\n",
-                      text)
+        # the status enum is not in front of it. Both reports returned this exact line, so
+        # it prints once with their count.
+        self.assertIn("  - core.py:2-3 · by reading (2 reports) — Lines 2-3 index without a "
+                      "guard.\n", text)
 
     def test_a_dispatcher_string_cannot_forge_a_heading_either(self):
         loose = {**DISPATCH, "lanes": {**DISPATCH["lanes"],
@@ -6975,6 +7101,156 @@ class TheRungSentenceIsDerivedFromTheData(_ReportCase):
         self.assertNotIn("read every area", line)
 
 
+# Two models inside one harness: the lane records name the model, and neither adapter says
+# anything a rung's wording could be mistaken for.
+TWO_MODELS = {
+    "rung": "one-runtime-two-models",
+    "lanes": {
+        "A": {"adapter": "harness command line (model-one)", "permission": "read-only",
+              "model": "model-one"},
+        "B": {"adapter": "harness command line (model-two)", "permission": "read-only",
+              "model": "model-two"},
+    },
+}
+
+
+class TheThirdRungSaysWhatRan(_ReportCase):
+    """Two models on one runtime are neither of the other rungs: two models read and
+    checked, so the report may say "both models", and one harness ran them, so it may not
+    say two runtimes — nor the one-runtime rung's "same model" or "sub-agents"."""
+
+    def rung(self):
+        lines = [line for line in self.text().splitlines() if line.startswith("- Rung:")]
+        self.assertEqual(len(lines), 1, lines)
+        return lines[0]
+
+    def test_its_words_name_one_runtime_and_two_models(self):
+        self.run_all(dispatch=TWO_MODELS)
+        line = self.rung()
+        self.assertIn("one runtime", line)
+        self.assertIn("1 of 1 area read by both models", line)
+        self.assertIn("checked by the other model", line)
+        self.assertIn("between two different models", line)
+        text = self.text()
+        for false in ("same model", "sub-agent", "two runtimes", "both contexts"):
+            self.assertNotIn(false, text)
+        self.assertEqual(review_panel.RUNG_BREADTH["one-runtime-two-models"],
+                         ("one model", "both models"))
+
+    def test_a_record_claiming_two_models_over_one_is_refused(self):
+        same = {lane: {**record, "model": "model-one"}
+                for lane, record in TWO_MODELS["lanes"].items()}
+        with self.assertRaises(review_panel.DispatchError) as ctx:
+            review_panel.parse_dispatch({**TWO_MODELS, "lanes": same})
+        self.assertIn("same model", str(ctx.exception))
+
+    def test_the_new_rung_without_a_model_is_refused_by_name(self):
+        bare = {lane: {k: v for k, v in record.items() if k != "model"}
+                for lane, record in TWO_MODELS["lanes"].items()}
+        with self.assertRaises(review_panel.DispatchError) as ctx:
+            review_panel.parse_dispatch({**TWO_MODELS, "lanes": bare})
+        self.assertIn("lanes.A", str(ctx.exception))
+        self.assertIn("'model'", str(ctx.exception))
+
+    def test_an_existing_rung_with_no_model_still_parses_and_re_renders(self):
+        """A run directory written before lane records carried a model has none, and every
+        hand-off ends in a re-render of it."""
+        for rung in ("two-runtimes", "one-runtime"):
+            with self.subTest(rung=rung):
+                self.assertIsNone(review_panel.parse_dispatch(
+                    {**DISPATCH, "rung": rung}).lanes["A"].model)
+        self.run_all(dispatch=DISPATCH)
+        proc = _run("report", str(self.rundir), "--rerender")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("two runtimes", self.rung())
+
+    def test_one_lane_recording_a_model_is_not_a_crash_at_an_existing_rung(self):
+        one = {**DISPATCH, "rung": "two-runtimes", "lanes": {
+            **DISPATCH["lanes"], "A": {**DISPATCH["lanes"]["A"], "model": "model-one"}}}
+        record = review_panel.parse_dispatch(one)
+        self.assertEqual(record.lanes["A"].model, "model-one")
+        self.assertIsNone(record.lanes["B"].model)
+
+    def test_a_model_is_text_like_the_rest_of_the_record(self):
+        with self.assertRaises(review_panel.DispatchError) as ctx:
+            review_panel.parse_dispatch({**TWO_MODELS, "lanes": {
+                **TWO_MODELS["lanes"], "B": {**TWO_MODELS["lanes"]["B"], "model": ""}}})
+        self.assertIn("lanes.B.model", str(ctx.exception))
+
+
+# Two runtimes running one model: two different tools, one model name recorded on both lanes.
+ONE_MODEL_TWO_RUNTIMES = {
+    "rung": "two-runtimes-one-model",
+    "lanes": {
+        "A": {"adapter": "harness one command line", "permission": "read-only",
+              "model": "shared-model"},
+        "B": {"adapter": "harness two command line", "permission": "read-only",
+              "model": "shared-model"},
+    },
+}
+
+
+class TwoRuntimesRunningOneModelAreNotTwoModels(_ReportCase):
+    """Two runtimes can be pointed at the same model. The checking then came from two
+    separate sessions of one model in two tools, so the report may claim two contexts and
+    two runtimes, and never two models."""
+
+    def rung(self):
+        lines = [line for line in self.text().splitlines() if line.startswith("- Rung:")]
+        self.assertEqual(len(lines), 1, lines)
+        return lines[0]
+
+    def test_its_words_name_two_runtimes_and_one_model(self):
+        self.run_all(dispatch=ONE_MODEL_TWO_RUNTIMES)
+        line = self.rung()
+        self.assertIn("two runtimes running one model", line)
+        self.assertIn("1 of 1 area read by both contexts", line)
+        self.assertIn("same model", line)
+        text = self.text()
+        for false in ("both models", "other model", "two different models", "sub-agent"):
+            self.assertNotIn(false, text)
+        self.assertEqual(review_panel.RUNG_BREADTH["two-runtimes-one-model"],
+                         ("one context", "both contexts"))
+        self.assertIn("two-runtimes-one-model", review_panel.RUNGS)
+
+    def test_two_runtimes_recording_one_model_is_refused(self):
+        with self.assertRaises(review_panel.DispatchError) as ctx:
+            review_panel.parse_dispatch({**ONE_MODEL_TWO_RUNTIMES, "rung": "two-runtimes"})
+        self.assertIn("same model", str(ctx.exception))
+        self.assertIn("'shared-model'", str(ctx.exception))
+
+    def test_the_rung_with_two_different_models_is_refused(self):
+        lanes = {**ONE_MODEL_TWO_RUNTIMES["lanes"],
+                 "B": {**ONE_MODEL_TWO_RUNTIMES["lanes"]["B"], "model": "another-model"}}
+        with self.assertRaises(review_panel.DispatchError) as ctx:
+            review_panel.parse_dispatch({**ONE_MODEL_TWO_RUNTIMES, "lanes": lanes})
+        self.assertIn("different models", str(ctx.exception))
+
+    def test_the_rung_without_a_model_is_refused_by_name(self):
+        for lane in ("A", "B"):
+            with self.subTest(lane=lane):
+                lanes = {**ONE_MODEL_TWO_RUNTIMES["lanes"], lane: {
+                    k: v for k, v in ONE_MODEL_TWO_RUNTIMES["lanes"][lane].items()
+                    if k != "model"}}
+                with self.assertRaises(review_panel.DispatchError) as ctx:
+                    review_panel.parse_dispatch({**ONE_MODEL_TWO_RUNTIMES, "lanes": lanes})
+                self.assertIn(f"lanes.{lane}", str(ctx.exception))
+                self.assertIn("'model'", str(ctx.exception))
+
+    def test_the_same_adapter_on_both_lanes_is_refused(self):
+        lanes = {lane: {**record, "adapter": "one harness"}
+                 for lane, record in ONE_MODEL_TWO_RUNTIMES["lanes"].items()}
+        with self.assertRaises(review_panel.DispatchError) as ctx:
+            review_panel.parse_dispatch({**ONE_MODEL_TWO_RUNTIMES, "lanes": lanes})
+        self.assertIn("same adapter", str(ctx.exception))
+
+    def test_two_runtimes_with_two_models_still_parse(self):
+        lanes = {**ONE_MODEL_TWO_RUNTIMES["lanes"],
+                 "B": {**ONE_MODEL_TWO_RUNTIMES["lanes"]["B"], "model": "another-model"}}
+        record = review_panel.parse_dispatch({"rung": "two-runtimes", "lanes": lanes})
+        self.assertEqual(record.rung, "two-runtimes")
+
+
 class ContainmentIsWhatTheDispatcherRecorded(_ReportCase):
 
     def test_a_record_stating_unrestricted_access_renders_as_such(self):
@@ -7028,8 +7304,8 @@ class TheAdapterLinesRenderAlikeWhateverTheDispatcherTyped(_ReportCase):
                 self.assertEqual(lines[at + 2].strip(), text.strip())
 
     def test_the_two_lanes_look_alike_when_only_one_holds_markup(self):
-        """The case that was reported: one lane a code block, the other inline, for no
-        reason a reader of the report can see."""
+        """The case that matters: one lane a code block, the other inline, for no reason a
+        reader of the report can see."""
         ran = self.ran(self.SHAPES["angle"], self.SHAPES["backtick"])
         lines = ran.splitlines()
         shapes = []
@@ -7075,7 +7351,9 @@ class DispatchJsonIsParsedStrictly(_ReportCase):
         self.assertEqual(record.rung, "two-runtimes")
         self.assertEqual(record.lanes["A"].adapter, "runtime-one sub-agent")
         self.assertEqual(record.lanes["B"].permission, "read-only sandbox")
-        self.assertEqual(set(review_panel.RUNGS), {"two-runtimes", "one-runtime"})
+        self.assertEqual(set(review_panel.RUNGS),
+                         {"two-runtimes", "one-runtime", "one-runtime-two-models",
+                          "two-runtimes-one-model"})
 
     def test_a_run_with_no_independent_check_is_not_a_rung_this_engine_accepts(self):
         """One context as both finder and verifier is a refusal, not a weaker report. Rule
@@ -7172,8 +7450,8 @@ class DispatchJsonIsParsedStrictly(_ReportCase):
 
 
 class NoShippedTextOffersARungTheRunCannotReach(unittest.TestCase):
-    """The skill ships two rungs and the engine accepts two. A third named in prose is a
-    promise nothing can keep: a reader configures for it, the driver never derives it, and
+    """The skill ships four rungs and the engine accepts four. A fifth named in prose is
+    a promise nothing can keep: a reader configures for it, the driver never derives it, and
     `report` refuses the record they were told to write.
 
     Read off the shipped files rather than a list kept here, so a new reference file is
@@ -7235,22 +7513,17 @@ class TheRunDirectoryRecordsMustAgree(_ReportCase):
 class NothingIsWrittenIntoTheAuditedTree(_ReportCase):
 
     def test_no_git_this_engine_runs_may_tidy_the_repository_it_reads(self):
-        """Asking git a question is enough to make git write.
+        """No git this engine runs may tidy the repository it reads.
 
-        Git tidies its own storage on its own schedule, and what prompts it is having just
-        been asked something. This engine asks several times -- which files are tracked,
-        what the commit is, what is ignored -- so a run over somebody's repository can
-        leave a `maintenance.lock` and a repacked object store behind it. That is what
-        turned one CI job red: a test asserting the audited tree comes back byte-identical
-        found a file git had written to itself.
+        Git can tidy its own storage on its own schedule, and this engine asks it several
+        questions -- which files are tracked, what the commit is, what is ignored -- so
+        every invocation carries the flags that turn that housekeeping off, as a
+        precaution: a run must not leave a `maintenance.lock` or a repacked object store in
+        somebody's repository. This engine snapshots the tree precisely so it never touches
+        the original, and an inspection that mutates what it inspects is not one.
 
-        Nothing is damaged by it; git does the same after `git status`. What it costs is
-        the promise being exactly true instead of nearly true -- this engine snapshots the
-        tree precisely so it never touches the original, and an inspection that mutates
-        what it inspects is not one.
-
-        Asserted over every invocation rather than the ones known today, because phase 5
-        adds subcommands and a new call site that forgot the flags would be invisible.
+        Asserted over every invocation rather than the ones known today, because a new
+        subcommand adds call sites, and one that forgot the flags would be invisible.
         """
         seen = []
         real = subprocess.run
@@ -7737,8 +8010,8 @@ class GitIsAskedAboutRootNotAboutTheEnvironment(_TreeCase):
 
 
 class AJobOrATreeTheEngineCannotUseIsRefusedByName(_TreeCase):
-    """Inputs that once ended plan in a traceback, or in a message offering a way out that
-    does not work."""
+    """Inputs that must not end plan in a traceback, or in a message offering a way out
+    that does not work."""
 
     def test_a_job_nested_too_deep_or_holding_a_huge_number_is_refused(self):
         for label, text in (("deep", "[" * 100000 + "]" * 100000),
@@ -8310,12 +8583,15 @@ class _FindingsCase(_ReportCase):
         # the comparison passes for the wrong reason.
         findings = review_panel.Findings(
             rung=doc["rung"], commit=doc["commit"],
-            candidates=tuple(doc["candidates"]), clusters=tuple(doc["clusters"]),
+            candidates=tuple(doc["candidates"]), sites=tuple(doc["sites"]),
+            defects=tuple(doc["defects"]),
             clustering=tuple(doc["clustering"]), synthesis=doc["synthesis"],
             coverage=tuple(doc["coverage"]),
-            coverage_clusters=tuple(doc["coverage_clusters"]),
+            coverage_sites=tuple(doc["coverage_sites"]),
+            coverage_defects=tuple(doc["coverage_defects"]),
             verification=tuple(doc["verification"]),
-            outside_scope=tuple(doc["outside_scope"]))
+            outside_scope=tuple(doc["outside_scope"]), merge=doc["merge"],
+            merge_check=doc["merge_check"])
         routed = review_panel._read_candidates(rundir)
         units_doc = json.loads((rundir / "units.json").read_text(encoding="utf-8"))
         batches = [u for u in units_doc["units"] if u["kind"] == "verifier"]
@@ -8333,7 +8609,7 @@ class _FindingsCase(_ReportCase):
             batches, states, routed["probe"],
             job_notes=review_panel._read_job_notes(rundir),
             report_notes=review_panel._read_report_notes(
-                rundir, [c["id"] for c in findings.clusters]),
+                rundir, [c["id"] for c in findings.defects]),
             rundir=rundir, generated=generated)
 
 
@@ -8388,7 +8664,7 @@ class TheReportSaysWhenNoAuditorRan(_FindingsCase):
 
 
 class ReportMdAndFindingsJsonCannotDisagree(_FindingsCase):
-    """Spec section 4. Every status, severity and location the prose states is in the
+    """Every status, severity and location the prose states is in the
     structure with the same value, because the prose is rendered from it. A report that
     computed a field twice could drift on one of the two paths and nothing would say so."""
 
@@ -8411,33 +8687,36 @@ class ReportMdAndFindingsJsonCannotDisagree(_FindingsCase):
                      else f"{legend[record['file']]}:"
                           f"{record['line_start']}-{record['line_end']}")
             self.assertEqual(cells[1], record["consequence"].rstrip("."). rstrip() + ".")
-            # Severity and status are terms from the engine's own vocabulary, so they are
-            # rendered with a capital. Compared through the same function the writer uses:
-            # a hand-typed expectation here would be a second spelling of the rule.
+            # Severity is a term from the engine's own vocabulary, so it is rendered with a
+            # capital. Compared through the same function the writer uses: a hand-typed
+            # expectation here would be a second spelling of the rule.
             self.assertEqual(cells[2], review_panel._term_cell(record["severity"]))
-            self.assertEqual(cells[3], review_panel._term_cell(record["status"]))
-            self.assertEqual(cells[4], where)
-            self.assertEqual(cells[5], record["fix_size"])
+            counts = ", ".join(f"{n} {k}" for k, n in record["outcomes"].items() if n)
+            self.assertEqual(cells[3], f"{len(record['sites'])} ({counts})")
+            self.assertEqual(cells[4], review_panel._term_cell(record["fix_size"]))
+            # Where it is, is the entry's to say, under its site line.
+            self.assertIn(f"`{where}` · **Outcome** {record['status']}",
+                          self.defect_block(text, record["id"]))
 
     def test_the_defect_count_the_summary_states_is_the_number_of_cluster_records(self):
         self.run_all()
         doc = self.findings()
-        self.assertIn(f"- Defects: {len(doc['clusters'])} from "
+        self.assertIn(f"- Defects: {len(doc['defects'])} at {len(doc['sites'])} sites from "
                       f"{len(doc['candidates'])} candidates", self.text())
         # The index ranks the WORK. A refuted defect is in the appendix, so the two counts
         # differ by exactly the refuted ones and the summary states the total either way —
         # which is what stops the move hiding anything.
-        work = [c for c in doc["clusters"] if c["status"] != review_panel.DEFECT_REFUTED]
+        work = [c for c in doc["defects"] if c["status"] != review_panel.DEFECT_REFUTED]
         self.assertEqual(len(_index_rows(self.text())), len(work),
                          "the index enumerates every defect that is work, and nothing else")
-        self.assertLess(len(work), len(doc["clusters"]), "the fixture refutes nothing, so "
+        self.assertLess(len(work), len(doc["defects"]), "the fixture refutes nothing, so "
                                                          "this cannot tell the two apart")
 
 
 class TheProseIsRenderedFromTheStructure(_FindingsCase):
-    """The rule the phase exists to establish: no field is computed twice, once for the file
-    and once for the prose. Mutating a record and re-rendering is what proves it — a renderer
-    that recomputed the field from ``candidates.json`` would ignore the change."""
+    """No field is computed twice, once for the file and once for the prose. Mutating a
+    record and re-rendering is what proves it — a renderer that recomputed the field from
+    ``candidates.json`` would ignore the change."""
 
     def test_changing_a_severity_in_the_structure_changes_what_the_prose_says(self):
         """On D1, which is work and therefore in the ranked table. D3 is
@@ -8456,7 +8735,8 @@ class TheProseIsRenderedFromTheStructure(_FindingsCase):
         # The verdict line carries the AXIS and not the status enum beside it. The two said
         # one thing twice — `confirmed_by_reading (by reading)` — on every member line in
         # the report, and the status is what the section the defect sits in already states.
-        self.assertIn(" · by reading — ", self.text())
+        # D1's two reports share the line, so it carries their count after the axis.
+        self.assertIn(" · by reading (2 reports) — ", self.text())
         self.assertNotIn("confirmed_by_reading (by reading)", self.text())
         # A status change moves the defect out of the established section, which is the
         # surface that now carries it.
@@ -8466,7 +8746,7 @@ class TheProseIsRenderedFromTheStructure(_FindingsCase):
 
     def _mutating_cluster(self, cid, field, value):
         def mutate(doc):
-            next(c for c in doc["clusters"] if c["id"] == cid)[field] = value
+            next(c for c in doc["defects"] if c["id"] == cid)[field] = value
         return mutate
 
     def _mutating(self, cid, field, value):
@@ -8475,8 +8755,8 @@ class TheProseIsRenderedFromTheStructure(_FindingsCase):
         return mutate
 
     def test_the_whole_report_follows_a_field_changed_in_the_structure(self):
-        """The claim the phase exists to establish, tested on ``render_report`` itself
-        rather than on one helper: hand it a changed record and the document changes.
+        """The same claim, tested on ``render_report`` itself rather than on one
+        helper: hand it a changed record and the document changes.
         A renderer that recomputed the field from ``candidates.json`` would not move."""
         self.run_all()
         # No clock is part of the structure, so both sides are compared with the stamps
@@ -8486,13 +8766,12 @@ class TheProseIsRenderedFromTheStructure(_FindingsCase):
         self.assertEqual(_without_the_clock(self, self.rerender()),
                          _without_the_clock(self, self.text()),
                          "an unchanged structure re-renders as itself")
-        # Both surfaces a consequence reaches: the ranked table, and the appendix row a
-        # refuted defect renders as. The ranked cell links into the defect's own entry;
-        # the refuted row claims that anchor itself, so its id cell is bare.
+        # Both surfaces a consequence reaches: the ranked table, and the heading of a
+        # refuted defect's entry, which is in no ranked view.
         ranked = self.rerender(self._mutating_cluster("D1", "consequence", "A forged line."))
         self.assertIn("| [D1](#D1) | A forged line. |", ranked)
         moved = self.rerender(self._mutating_cluster("D3", "consequence", "A forged line."))
-        self.assertIn("| D3 | A forged line. | core.py:8 |", moved)
+        self.assertIn("\n### D3. A forged line.\n", moved)
 
     def test_the_summary_counts_follow_a_status_changed_in_the_structure(self):
         """Not only the defect bodies: the counted lines above them read the same records,
@@ -8506,7 +8785,7 @@ class TheProseIsRenderedFromTheStructure(_FindingsCase):
 
 
 class EveryQualifierIsCarriedAsItsOwnField(_FindingsCase):
-    """Spec section 4's corollary: a heading that can read ``blocker (proposed major)`` is
+    """A heading that can read ``blocker (proposed major)`` is
     two facts, and the structure carries them as two, so nothing downstream parses the
     qualifier back out of the string."""
 
@@ -8519,8 +8798,8 @@ class EveryQualifierIsCarriedAsItsOwnField(_FindingsCase):
         self.assertIn(f"  - Severity revised to {record['severity_final']} from "
                       f"{record['severity_proposed']}: ", self.text())
         # The defect ranks by the revised value, and the index states it as its own cell.
-        self.assertIn(f"| {record['cluster_id']} |", self.text())
-        self.assertEqual(self.defects()[record["cluster_id"]]["severity"], "blocker")
+        self.assertIn(f"| {record['defect']} |", self.text())
+        self.assertEqual(self.defects()[record["defect"]]["severity"], "blocker")
 
     def test_an_unrevised_finding_carries_the_same_value_in_both_fields(self):
         self.run_all()
@@ -8539,7 +8818,7 @@ class AClusterShowsItsAggregateWithoutHidingAMember(_FindingsCase):
     def mixed(self):
         self.run_all(reading=MIXED_READING, verify=MIXED_VERIFY, grouping=MIXED_CLUSTER)
         doc = self.findings()
-        return doc, next(c for c in doc["clusters"] if len(c["members"]) == 3)
+        return doc, next(c for c in doc["defects"] if len(c["members"]) == 3)
 
     def test_the_cluster_aggregates_over_its_established_member_alone(self):
         doc, cluster = self.mixed()
@@ -8602,7 +8881,7 @@ class AClusterShowsItsAggregateWithoutHidingAMember(_FindingsCase):
                               "consequence": FINDING["consequence"], "split_reason": None}],
                 "summary": "One defect, two reports."}})
         doc = self.findings()
-        return doc["clusters"][0], {r["id"]: r for r in doc["candidates"]}
+        return doc["defects"][0], {r["id"]: r for r in doc["candidates"]}
 
     def test_the_strongest_member_is_taken_whichever_position_it_holds(self):
         """A refuted member that RAN contributes ``by running``, and the aggregate is the
@@ -8627,7 +8906,7 @@ class AClusterShowsItsAggregateWithoutHidingAMember(_FindingsCase):
 
 
 class TheTwoAxesAreStoredSeparatelyAndNeitherImpliesTheOther(_FindingsCase):
-    """Spec section 3. Axis A is discovery breadth and Axis B is verification strength, and
+    """Axis A is discovery breadth and Axis B is verification strength, and
     a both-lanes finding confirmed only by reading is still only read. Axis A is stored as
     the lane fact — ``one`` or ``both`` — never as a rung's vocabulary, which is the
     renderer's and is what a run at a lower rung is not allowed to claim."""
@@ -8649,7 +8928,7 @@ class TheTwoAxesAreStoredSeparatelyAndNeitherImpliesTheOther(_FindingsCase):
         self.run_all()
         for record in self.findings()["candidates"]:
             self.assertIn(record["axis_a"], ("one", "both"))
-        for cluster in self.findings()["clusters"]:
+        for cluster in self.findings()["defects"]:
             self.assertIn(cluster["axis_a"], ("one", "both"))
 
     def test_a_refuted_candidate_that_ran_is_still_by_running(self):
@@ -8666,7 +8945,7 @@ class TheTwoAxesAreStoredSeparatelyAndNeitherImpliesTheOther(_FindingsCase):
         self.assertEqual(record["axis_b"], "by running")
 
     def test_an_unresolved_candidate_that_ran_still_reads_unresolved(self):
-        """The value spec section 3 gives Axis B for a candidate nothing settled. A
+        """The value Axis B takes for a candidate nothing settled. A
         verifier may run something and still be unable to say; the run it made is carried
         as ``evidence`` and ``unresolved_reason``, and the axis says what it says — that
         no verification was reached — so no cluster inherits a strength from it."""
@@ -8680,7 +8959,7 @@ class TheTwoAxesAreStoredSeparatelyAndNeitherImpliesTheOther(_FindingsCase):
         self.assertEqual(record["axis_b"], "unresolved")
         self.assertIsNotNone(record["evidence"], "the run it made is still on the record")
         self.assertEqual(record["unresolved_reason"], "needs_a_product_decision")
-        cluster = next(c for c in self.findings()["clusters"] if "cand-002" in c["members"])
+        cluster = next(c for c in self.findings()["defects"] if "cand-002" in c["members"])
         self.assertEqual(cluster["axis_b"], "by reading",
                          "the cluster claimed a strength no member established")
 
@@ -8708,7 +8987,7 @@ class TheTwoAxesAreStoredSeparatelyAndNeitherImpliesTheOther(_FindingsCase):
         records = {r["id"]: r for r in doc["candidates"]}
         self.assertEqual(set(records[cid]["status"] for cid in records),
                          {"refuted", "unresolved"}, "no member is established")
-        cluster = doc["clusters"][0]
+        cluster = doc["defects"][0]
         self.assertEqual(cluster["severity"], "blocker")
         # Axis B is still the strongest any member reached, and two members were refuted by
         # reading: a verdict reached by reading is what that is. What the cluster does NOT
@@ -8807,7 +9086,7 @@ class AReportPublishesUnderALockNoRerenderCanTake(_FindingsCase):
 
 
 class TheDefectListHasExactlyThreeViews(_FindingsCase):
-    """Spec section 9. One index table, one by-file table, and a body grouped by status —
+    """One index table, one by-file table, and a body grouped by status —
     and no fourth view of the same list. The clustering notes, the coverage sections and the
     provenance appendix are not views of the defect list and do not count against the three.
     Neither does the path legend: it decodes a name, and it neither ranks, gathers nor
@@ -8824,9 +9103,9 @@ class TheDefectListHasExactlyThreeViews(_FindingsCase):
     def test_only_the_index_ranks_or_classifies_the_defect_list(self):
         """Four tables, and only one of them is a view a reader works from.
 
-        The bound was a COUNT of tables, and a count cannot say which table is the problem:
-        the legend was never a view of the defect list and the corroborated set is not one
-        either. What section 9 refuses is a second table somebody could work down — one
+        A bound on the COUNT of tables cannot say which table is the problem: the legend
+        is not a view of the defect list and the corroborated set is not one either. What
+        the report refuses is a second table somebody could work down — one
         that ranks the list again, or classifies it by severity, status or cost — because
         then the document holds two orders of one piece of work. So the tables are named,
         and no column a reader would triage by appears in more than one of them.
@@ -8836,11 +9115,9 @@ class TheDefectListHasExactlyThreeViews(_FindingsCase):
         lines = text.splitlines()
         headers = [lines[n - 1] for n, line in enumerate(lines) if line.startswith("|---")]
         self.assertEqual(headers, [
-            "| Defect | Consequence | Severity | Status | Location | Fix size | "
-            "Corroboration |",
-            "| File | Defects | Most severe | Lines |",
+            "| Defect | Heading | Severity | Sites | Fix size |",
+            "| File | Most severe | Sites (defect) |",
             "| Defect | Consequence |",
-            "| Defect | Consequence | Location | Why it was dismissed |",
             # A view of the RUN rather than of the defect list, which is why it ranks
             # nothing: one row per verification unit. The table beside it, of files outside
             # the scope, has no header here because this run has none — it renders one
@@ -8858,17 +9135,13 @@ class TheDefectListHasExactlyThreeViews(_FindingsCase):
             # audit data, and the reason it is not spelled `Severity`.
             "| Defect | Candidate | Raised by | Proposed | Answered by |"],
             "a table appeared, vanished or moved; name it here or nothing checks it")
-        for column in ("Severity", "Status", "Fix size", "Corroboration", "Most severe"):
+        for column in ("Severity", "Sites", "Fix size", "Most severe"):
             carrying = [h for h in headers if f"| {column} |" in h]
             self.assertEqual(len(carrying), 1,
                              f"{column} is in {len(carrying)} tables, so two of them rank")
-        # Location is the one column in two tables, and the second is the refuted one —
-        # whose rows are in no ranked view, so the fact is not repeated anywhere else. A
-        # third table carrying it would be a second order of one piece of work.
-        self.assertEqual([h for h in headers if "| Location |" in h],
-                         ["| Defect | Consequence | Severity | Status | Location | Fix "
-                          "size | Corroboration |",
-                          "| Defect | Consequence | Location | Why it was dismissed |"])
+        # Where each defect is, is its entry's to say: no table of the defect list carries
+        # a location a reader could re-sort by.
+        self.assertEqual([h for h in headers if "| Location |" in h], [])
 
     def test_the_body_groups_by_status_and_sorts_by_severity_inside(self):
         self.run_all()
@@ -8880,12 +9153,14 @@ class TheDefectListHasExactlyThreeViews(_FindingsCase):
         # The id is the heading's and the severity is the metadata line's, so the pair is
         # read across the two rather than off one bullet. The lazy span cannot reach the
         # next defect: every entry carries a metadata line of its own.
-        ids = re.findall(r"(?ms)^#+ (D\d+)\. .*?^- \*\*Severity\*\* ([a-z]+) ", established)
+        ids = re.findall(r"(?m)^#+ (D\d+)\. .*\n\n- <a id=[^>]*></a>\*\*Site\*\* .*? "
+                         r"\*\*Severity\*\* ([a-z]+) ",
+                         established)
         self.assertEqual(ids, [("D2", "blocker"), ("D1", "major")])
 
     def test_a_run_that_raised_nothing_renders_the_same_sections(self):
         """The document's shape must not depend on what the run found. A report whose
-        tables vanish when there is nothing to put in them gives phase 7's contents a
+        tables vanish when there is nothing to put in them gives the contents list a
         different skeleton per run, and gives a reader nothing to tell 'no defects' from
         'this section was dropped'."""
         quiet = {name: {"findings": [], "summary": "nothing"}
@@ -8905,9 +9180,9 @@ class TheDefectListHasExactlyThreeViews(_FindingsCase):
         self.assertEqual(_index_rows(text), [])
 
     def test_no_defect_heading_is_a_bare_identifier_a_path_or_a_severity(self):
-        """Section 8: the heading is what a person experiences. A heading that was an id,
-        a file name or a severity would make the index unreadable without opening each
-        entry, which is the document this plan exists to stop producing."""
+        """The heading is what a person experiences. A heading that was an id, a file
+        name or a severity would make the index unreadable without opening each entry,
+        which is the document this report exists not to be."""
         self.run_all()
         body = _section(self.text(), "Established defects")
         headings = re.findall(r"(?m)^#{3,4} (.+)$", body)
@@ -8928,8 +9203,8 @@ _NAME_TAIL = re.compile(r"[A-Za-z0-9_\-/]")
 
 
 class EveryPathIsSpelledTheOneWayThroughout(_FindingsCase):
-    """Section 9: one spelling of a file, document-wide — and that spelling is the SHORT
-    name, with a legend that decodes it.
+    """One spelling of a file, document-wide — and that spelling is the SHORT name, with
+    a legend that decodes it.
 
     A report that cites ``engine/core.py`` in its index and ``core.py`` in a defect body
     asks the reader to decide whether those are one file. Both halves of the rule are
@@ -9023,11 +9298,10 @@ class EveryPathIsSpelledTheOneWayThroughout(_FindingsCase):
     # in the rest of the document, where every full path in it reads as a second spelling.
     LEGEND_OPENS = {"report.md": "\n### Path legend\n",
                     "report.html": "Path legend</h3>"}
-    # Where it ENDS: the next heading at its own level or above. While the legend sat in
-    # section 1 the next thing in the document was always a `## `, so the section boundary
-    # alone cut it; in the appendix its neighbour is a sibling `### `, and cutting only at
-    # `## ` swallowed every section after it into the legend — where every short name then
-    # reads as decoding a name nobody prints.
+    # Where it ENDS: the next heading at its own level or above. The legend sits in the
+    # appendix beside sibling `### ` sections, so the cut is at the first `## ` or `### `,
+    # whichever comes first. The sections after it stay out of the legend, where every
+    # short name in them would read as decoding a name nobody prints.
     LEGEND_ENDS = {"report.md": ("\n## ", "\n### "), "report.html": ("<h2", "<h3")}
 
     def documents(self):
@@ -9109,8 +9383,8 @@ class EveryPathIsSpelledTheOneWayThroughout(_FindingsCase):
     def without_quoted_worker_prose(self, text):
         """``text`` with the worker sentences the report reproduces blanked out of it.
 
-        The rule is over the locations the RENDERER composes — `plan.md` says the short form
-        is used everywhere *a location renders*. A `test_first` sentence is reproduced as the
+        The rule is over the locations the RENDERER composes — the short form is used
+        everywhere *a location renders*. A `test_first` sentence is reproduced as the
         worker wrote it, and naming a file is what such a sentence is FOR, so a full path
         inside one is the worker's spelling and not a second spelling of the renderer's.
         Shortening it would mean editing a quotation.
@@ -9133,10 +9407,11 @@ class EveryPathIsSpelledTheOneWayThroughout(_FindingsCase):
         `engine/core.py` and nothing else — blanking it takes that path out of the scan
         everywhere, including somewhere the renderer composed it. Telling the two apart
         needs the renderer's own boundary inside a line, which is not recoverable from the
-        bytes; every rule that tried to find it was wrong for some other legal document.
+        bytes alone for every legal document.
         The exchange is a narrow blind spot for a rule with no moving parts, and it costs
-        only a run where an agent answered "what test should fail first?" with a bare file
-        name.
+        only a run where an agent's answer to "what test should fail first?" matches a
+        phrase the renderer composes around a path -- a bare location, say, or a
+        skipped-file line.
         """
         # Longest first, and deterministically: one sentence can be a prefix of another, and
         # blanking the shorter one first leaves the tail of the longer still in the scan.
@@ -9262,7 +9537,6 @@ class EveryPathIsSpelledTheOneWayThroughout(_FindingsCase):
                 continue
             if self.is_decode_line(name, lines[n], lines[n - 1]):
                 out.append(n)
-        self.assertTrue(out, f"{name}: no defect entry was found, so nothing is exempted")
         return out
 
     @staticmethod
@@ -9344,57 +9618,37 @@ class EveryPathIsSpelledTheOneWayThroughout(_FindingsCase):
                          "the decode became a nested list instead of the entry's own line")
         self.assertIn("- dir/core.py", html.unescape(page))
 
-    def test_each_defect_decodes_its_own_location_in_place(self):
-        """The other half of the exemption. A line cut out of the scan above has to be
-        that one defect's own location and the tree it was read from — otherwise
-        ``without_the_decode_lines`` is a hole any wrong path could be printed through."""
+    def test_no_line_decodes_a_location_in_place_and_the_commit_is_at_the_top(self):
+        """The line that spelled each defect's path in full under its metadata is gone: a
+        site's commit is the run's, stated once at the top, and its path is the legend's to
+        decode. So neither document has a line the scan above exempts."""
         self.run_all()
-        text = self.text()
         commit = review_panel._commit_words(self.findings()["commit"], True)
-        found = 0
-        for cluster in self.defects().values():
-            heading = re.search(rf"(?m)^#+ {cluster['id']}\. .*$", text)
-            if heading is None:
-                continue            # refuted: one line in the appendix, no entry of its own
-            entry = text[heading.end():].split("\n#", 1)[0].split("\n")
-            meta = next(n for n, line in enumerate(entry)
-                        if line.startswith("- ")
-                        and review_panel._MD_DEFECT_ENTRY.match(line[2:]))
-            where = (str(cluster["line_start"])
-                     if cluster["line_start"] == cluster["line_end"]
-                     else f"{cluster['line_start']}-{cluster['line_end']}")
-            self.assertEqual(self.decoded(entry[meta + 1].strip()),
-                             f"{cluster['file']}:{where} — {commit}")
-            found += 1
-        self.assertTrue(found, "no defect had an entry of its own, so this asserted nothing")
-        # And the page exempts the same lines, one per written-up defect. The two documents
-        # carry these two lines differently — a bullet and its indented continuation here, a
-        # list item and a `<br>` there — so the finder is written twice and could match too
-        # much or too little on the side this loop does not read.
-        self.assertEqual(
-            {name: len(self.decode_line_positions(name, raw))
-             for name, raw, _ in self.raw_documents()},
-            {"report.md": found, "report.html": found})
+        self.assertIn(f"refers to {commit}",
+                      _section(self.text(), review_panel.SECTION_DESCRIPTION))
+        self.assertEqual({name: self.decode_line_positions(name, raw)
+                          for name, raw, _ in self.raw_documents()},
+                         {"report.md": [], "report.html": []})
 
     def test_a_full_path_the_renderer_composed_elsewhere_is_still_caught(self):
         """The exemption cuts line positions out of the scan, not a string out of the
         document.
 
-        The probe is the reviewer's: a full path with its commit suffix, printed where the
-        renderer would print a location and where no decode line sits. It is taken from the
-        document's own decode line byte for byte, because "text that happens to equal a
-        legal decode line" was the whole of the hole — a full path WITHOUT the suffix was
-        caught throughout, so nothing weaker than this shows the difference.
+        The probe is a full path with its commit suffix, printed where the renderer would
+        print a location. It has the shape of a decode line under a defect's metadata,
+        because text that happens to equal a legal decode line is the one case the
+        exemption could wrongly pass — a full path WITHOUT the suffix is caught throughout,
+        so nothing weaker than this shows the difference.
 
         Each document is polluted on its own, so neither is proved by the other failing.
         """
         self.run_all()
         clean = {name: raw for name, raw, _ in self.raw_documents()}
-        probe = clean["report.md"].split("\n")[
-            self.decode_line_positions("report.md", clean["report.md"])[0]].strip()
+        probe = (f"engine/core.py:2-3 — "
+                 f"{review_panel._commit_words(self.findings()['commit'], True)}")
         self.assertIn("engine/core.py", probe, "the probe does not spell a path in full")
         # The heading is found in the document rather than spelled here: it carries a
-        # section number and a count now, and a marker that no longer matches would leave
+        # section number and a count, and a marker that does not match would leave
         # the document unpolluted and the test green over a scan nothing had exercised.
         head = {name: re.search(pattern, clean[name]).group(0) for name, pattern in (
             ("report.md", r"(?m)^## \d+\. Established defects \(\d+\)$"),
@@ -9451,8 +9705,8 @@ class EveryPathIsSpelledTheOneWayThroughout(_FindingsCase):
 
     def test_a_directory_the_reachability_line_names_is_short_too(self):
         """The one list that spells a path against the repository root follows the same
-        rule. Left full, the document would mix the two spellings section 9 forbids
-        whichever of its two options is taken."""
+        rule. Left full, the document would mix the two spellings the one-spelling rule
+        forbids whichever of its two options is taken."""
         (self.root / "engine" / "sub" / "other.py").write_text("x = 1\n", encoding="utf-8")
         self.make_repo()
         self.run_all(data=FILE_JOB, exclude=["engine/sub/deep.py"])
@@ -9545,10 +9799,10 @@ class EveryPathIsSpelledTheOneWayThroughout(_FindingsCase):
                             review_panel._spelled("a/ file.py"))
 
     def test_only_the_member_that_needs_a_longer_name_carries_one(self):
-        """`plan.md`: the shortest suffix that separates *them*, decided per file.
+        """The shortest suffix that separates *them*, decided per file.
 
         `b/c.py` already tells the third file apart from the other two, so spelling it in
-        full because its neighbours had to be is a directory a reader reads for nothing.
+        full because its neighbors had to be is a directory a reader reads for nothing.
         """
         self.assertEqual(review_panel._short_names(["x/a/c.py", "y/a/c.py", "z/b/c.py"]),
                          {"x/a/c.py": "x/a/c.py", "y/a/c.py": "y/a/c.py",
@@ -9635,7 +9889,7 @@ class EveryPathIsSpelledTheOneWayThroughout(_FindingsCase):
 
     def test_the_legend_is_where_a_short_name_is_decoded(self):
         """The legend is not optional furniture: shortening without it is the half of
-        section 9 that loses information a reader cannot get back."""
+        the one-spelling rule that loses information a reader cannot get back."""
         self.run_all()
         for name, doc, _ in self.documents():
             self.assertIn("Path legend", doc, name)
@@ -9644,9 +9898,9 @@ class EveryPathIsSpelledTheOneWayThroughout(_FindingsCase):
 
 
 class TheBodyCarriesFixMaterialAndNotASupersededGuess(_FindingsCase):
-    """Section 9's size discipline, which is a feature rather than a nicety.
+    """The report's size discipline, which is a feature rather than a nicety.
 
-    147 defects at full detail is a document nobody reads to the end. A PROPOSED
+    A hundred defects at full detail is a document nobody reads to the end. A PROPOSED
     reproduction is a reader's suggestion for how to check a claim; once a verifier ran
     something, the evidence is what the claim rests on and the suggestion is a superseded
     guess. Where nothing ran it is the opposite — the most actionable line on the defect,
@@ -9666,7 +9920,7 @@ class TheBodyCarriesFixMaterialAndNotASupersededGuess(_FindingsCase):
         """
         self.run_all()
         text = self.text()
-        body = _section(text, "Established defects")
+        body = _section(text, "Evidence")
         appendix = _section(text, "Provenance")
         self.assertIn("Evidence (executed): ", body, "the run that settled it must stay")
         self.assertNotIn("Proposed reproduction", body)
@@ -9689,7 +9943,8 @@ class TheBodyCarriesFixMaterialAndNotASupersededGuess(_FindingsCase):
             _verdict("cand-003", "unresolved", rationale="The sandbox forbids it.",
                      unresolved_reason="blocked_by_the_environment")], "summary": "one"}})
         text = self.text()
-        body = _section(text, "Unresolved")
+        # In the site's evidence, which is where each report's own lines are.
+        body = _section(text, "Evidence")
         self.assertIn("Proposed reproduction, not run:", body)
         self.assertIn(json.dumps(REPRO["argv"]), body)
 
@@ -9712,19 +9967,21 @@ class TheBodyCarriesFixMaterialAndNotASupersededGuess(_FindingsCase):
 
 
 class TheHonestyOfTheCountSurvivesEveryRearrangement(_FindingsCase):
-    """The thing the acceptance run said was better than the hand-built report, pinned so
-    a later rearrangement cannot quietly cost it.
+    """The breakdown beside the count, pinned so a later rearrangement cannot quietly cost
+    it.
 
-    "0 reproduced, 153 confirmed by reading" stated in the same breath as the count is what
+    A line such as "0 reproduced, 12 confirmed by reading", stated in the same breath as the
+    count, is what
     stops a reader taking `N established` for `N validated`. It is one line among a dozen
     counted ones, it reads as bookkeeping, and every edit that moves the summary around is
-    an edit that could drop it. Nothing else in the suite would notice.
+    an edit that could drop it or move it away from the count it qualifies.
     """
 
     def test_the_breakdown_sits_with_the_count_it_qualifies(self):
         self.run_all()
         summary = _section(self.text(), review_panel.SECTION_DESCRIPTION)
-        self.assertRegex(summary, r"- By status: \d+ established")
+        self.assertRegex(summary, r"- Defects by placement: \d+ established")
+        self.assertRegex(summary, r"- Sites by outcome: \d+ established")
         self.assertRegex(summary,
                          r"- Candidates behind them: \d+ — \d+ reproduced, \d+ confirmed "
                          r"by reading, \d+ refuted, \d+ unresolved\.")
@@ -9732,7 +9989,7 @@ class TheHonestyOfTheCountSurvivesEveryRearrangement(_FindingsCase):
         # a breakdown the reader has already stopped needing.
         lines = [ln for ln in summary.splitlines() if ln.startswith("- ")]
         self.assertEqual(lines.index([l for l in lines if "Candidates behind" in l][0]),
-                         lines.index([l for l in lines if "By status" in l][0]) + 1)
+                         lines.index([l for l in lines if "Sites by outcome" in l][0]) + 1)
 
     def test_a_run_that_executed_nothing_says_so_beside_the_count(self):
         """The case the sentence exists for. Nothing ran, and the number of established
@@ -9755,10 +10012,11 @@ class TheHonestyOfTheCountSurvivesEveryRearrangement(_FindingsCase):
 
 
 class ALabelIsOneLineAndTheHeadingCarriesIt(_FindingsCase):
-    """Section 8's sentence is the win, and no heading and no table cell can hold it.
+    """The consequence sentence is the entry's point, and no heading and no table cell
+    can hold it.
 
     A consequence is written to say what a person experiences, and the good ones run long —
-    200 characters and more in a real run. Wherever that text has to fit on a line — a
+    often 200 characters and more. Wherever that text has to fit on a line — a
     table cell, a one-line list entry, and now the defect's own heading — the label is the
     first sentence, and a second only where the first locates nothing on its own.
 
@@ -9766,13 +10024,13 @@ class ALabelIsOneLineAndTheHeadingCarriesIt(_FindingsCase):
     carries the sentence on the line under the heading, which is what lets the heading be
     the id and a label a reader can scan on arriving from the index. Both halves are
     asserted below: a heading cut to a label with the sentence nowhere under it loses the
-    line section 8 exists to produce, and a sentence left in the heading is a heading that
-    runs to 248 characters.
+    one line the entry exists to produce, and a sentence left in the heading is a heading
+    that runs to hundreds of characters.
     """
 
-    # ONE long sentence, which is the shape real consequences take. Measured on 99 of them
-    # from a live run: not one had a second sentence, so a fixture built out of two proved
-    # a branch the input never reaches and left truncation doing all the work unexamined.
+    # ONE long sentence, which is the usual shape of a consequence. With no second
+    # sentence to fall back on, the label has to come from cutting this one, so the
+    # tests that use it examine the cut rather than the two-sentence branch.
     LONG = ("When the connection to the payment gateway drops mid-charge, a payment the "
             "processor actually took is later reversed instead of being applied, so the "
             "tenant is debited and refunded and still owes the money.")
@@ -9800,8 +10058,8 @@ class ALabelIsOneLineAndTheHeadingCarriesIt(_FindingsCase):
 
     def test_the_body_heading_is_the_label_and_the_sentence_is_under_it(self):
         """Both halves, or one of them is free. A heading cut to a label with the sentence
-        nowhere below it loses the line section 8 exists to produce; a sentence kept in the
-        heading is the 248-character heading this replaced."""
+        nowhere below it loses the one line the entry exists to produce; a sentence kept in
+        the heading is a heading hundreds of characters long."""
         text = self.with_consequence(self.LONG)
         self.assertIn(f"### D1. {review_panel._short(self.LONG)}\n", text)
         self.assertNotIn(f"### D1. {self.LONG}\n", text, "the heading kept the sentence")
@@ -9809,10 +10067,10 @@ class ALabelIsOneLineAndTheHeadingCarriesIt(_FindingsCase):
         self.assertIn(self.LONG, entry, "the entry lost the sentence")
 
     def test_the_index_cell_is_cut_where_it_still_reads_as_finished(self):
-        """The common shape, and the one the first version of this got wrong. A long
-        consequence names an effect and then explains it; the effect alone is the label,
-        and it ends in a full stop rather than trailing off. Measured across 99 real
-        headings, cutting at a clause break took complete labels from 17 to 92."""
+        """The common shape. A long consequence names an effect and then explains it; the
+        effect alone is the label, and it ends in a full stop rather than trailing off.
+        Cutting at a clause break, not at a character count, is what keeps a label
+        complete."""
         cell = self.index_cell(self.with_consequence(self.LONG))
         self.assertLessEqual(len(cell), review_panel._LABEL_LIMIT)
         self.assertTrue(cell.endswith("."), cell)
@@ -9832,10 +10090,9 @@ class ALabelIsOneLineAndTheHeadingCarriesIt(_FindingsCase):
         names no effect — "The nightly batch stalls." — which is worse than a marked cut,
         so the truncation runs instead.
 
-        The fixture has to CARRY a break that early, and the first one written here did
-        not: its comma was followed by a word the pattern does not list, so there was no
-        break at all and the floor was never reached. Removing the floor left the test
-        green, which is the only reason that was found.
+        The fixture has to CARRY a break that early. A comma followed by a word the
+        pattern does not list is no break at all, so the floor is never reached and
+        removing it leaves the test green.
         """
         early = ("The nightly batch stalls, and every pending charge in the queue for that "
                  "facility is silently reversed while the tenant is left owing money they "
@@ -9859,7 +10116,7 @@ class ALabelIsOneLineAndTheHeadingCarriesIt(_FindingsCase):
 
     def test_a_consequence_that_already_fits_is_untouched(self):
         """Anti-vacuity. Most consequences are one sentence of a sane length, and a rule
-        that rewrote those would be changing the thing section 8 got right."""
+        that rewrote those would be changing sentences that are already right."""
         text = self.with_consequence(FINDING["consequence"])
         self.assertEqual(self.index_cell(text), FINDING["consequence"])
 
@@ -9884,20 +10141,21 @@ _DEFECT_HEADING = re.compile(r"(?m)^#+ (D\d+)\. (.+)$")
 
 
 class TheDefectEntryIsAHeadingALineAndTheMaterial(_FindingsCase):
-    """Section 8's entry, in the shape a person fixes from: the id and a one-line label as
+    """A defect entry, in the shape a person fixes from: the id and a one-line label as
     the heading, the sentence under it, then ONE line of metadata and the material the
     claim rests on.
 
-    What this replaces is eight bullets, two of which said what the line below now says in
-    a third of the space. The heading carried the whole consequence — 248 characters in a
-    real run — which is a heading nobody scans and a contents list nobody reads.
+    One line of metadata carries the fields that a bullet per field would spread down the
+    page. A heading that carries the whole consequence — often hundreds of characters — is
+    a heading nobody scans and a contents list nobody reads.
     """
 
     def entry(self, cid, text=None):
         """One defect's entry: its heading AND everything under it up to the next.
 
-        ``defect_block`` cuts the heading off, and half of what this phase changed is the
-        heading, so the tests below need it in the slice.
+        ``defect_block`` drops the heading's `#` marker and appends the evidence of every
+        site the defect names. The tests below assert on the heading line as written and on
+        the entry under it, so they slice from the heading to the next one.
         """
         lines = (self.text() if text is None else text).split("\n")
         start = next(n for n, line in enumerate(lines)
@@ -9907,7 +10165,8 @@ class TheDefectEntryIsAHeadingALineAndTheMaterial(_FindingsCase):
         return "\n".join(lines[start:end])
 
     def meta_line(self, cid, text=None):
-        entry = self.entry(cid, text)
+        """The metadata line of the defect's one site, which heads the site's evidence."""
+        entry = self.defect_block(self.text() if text is None else text, cid)
         lines = [line for line in entry.split("\n") if line.startswith("- **Severity**")]
         self.assertEqual(len(lines), 1, f"{cid} has {len(lines)} metadata lines")
         return lines[0]
@@ -9979,7 +10238,7 @@ class TheDefectEntryIsAHeadingALineAndTheMaterial(_FindingsCase):
         self.run_all()
 
         def rename(doc):
-            for record in [*doc["candidates"], *doc["clusters"]]:
+            for record in [*doc["candidates"], *doc["sites"], *doc["defects"]]:
                 if record["file"] == "engine/core.py":
                     record["file"] = "engine/a · b.py"
 
@@ -9997,7 +10256,7 @@ class TheDefectEntryIsAHeadingALineAndTheMaterial(_FindingsCase):
         self.run_all()
 
         def rename(doc):
-            for record in [*doc["candidates"], *doc["clusters"]]:
+            for record in [*doc["candidates"], *doc["sites"], *doc["defects"]]:
                 if record["file"] == "engine/core.py":
                     record["file"] = "engine/a`b.py"
 
@@ -10036,7 +10295,7 @@ class TheDefectEntryIsAHeadingALineAndTheMaterial(_FindingsCase):
 
     def test_the_heading_is_the_id_and_the_label_and_the_sentence_is_under_it(self):
         """Both halves. Shortening the heading without giving the sentence a home loses
-        the one line section 8 exists to produce."""
+        the one line the entry exists to produce."""
         long = self.LONG_CONSEQUENCE
         self.run_all(grouping={"cluster-area-01": {"clusters": [
             {"members": ["cand-001", "cand-002"], "consequence": long, "split_reason": None},
@@ -10059,7 +10318,7 @@ class TheDefectEntryIsAHeadingALineAndTheMaterial(_FindingsCase):
         many times one sentence appears is not something any other test here asks for. A
         reader is the only thing that catches it, which is what this one replaces.
 
-        Both directions are asserted, or the repair is a licence to lose the sentence
+        Both directions are asserted, or the repair is a license to lose the sentence
         altogether: a short consequence appears exactly ONCE, and a long one's full text is
         still in the entry under a heading that does not carry it. And the rule is the
         truncation, not the round: a degraded run keeps the sentence on the same terms as a
@@ -10076,13 +10335,17 @@ class TheDefectEntryIsAHeadingALineAndTheMaterial(_FindingsCase):
                                  "this proves nothing about duplication")
                 entry = self.entry("D2", text)
                 # The level moves with the grouping — a tier heading pushes a defect one
-                # deeper — so the assertion is on the heading's text, not on its depth.
-                self.assertRegex(entry, rf"\A#+ D2\. {re.escape(consequence)}\n")
+                # deeper — so the assertion is on the heading's text, not on its depth. A
+                # complete round heads the defect with its own heading, and the consequence
+                # is then the line under it, still once.
+                heading = self.defects(rundir)["D2"]["heading"] or consequence
+                self.assertEqual(heading != consequence, table is not None)
+                self.assertRegex(entry, rf"\A#+ D2\. {re.escape(heading)}\n")
                 self.assertEqual(entry.count(consequence), 1,
                                  f"the consequence is printed twice under its own "
                                  f"heading:\n{entry}")
         # The other direction: where the heading had to cut, the line below is the only
-        # place the whole sentence lives, and dropping it would lose section 8's one line.
+        # place the whole sentence lives, and dropping it would lose the entry's one line.
         long = self.LONG_CONSEQUENCE
         rundir = self.tmp / "run-long-sentence"
         self.run_all(rundir, grouping={"cluster-area-01": {"clusters": [
@@ -10096,18 +10359,19 @@ class TheDefectEntryIsAHeadingALineAndTheMaterial(_FindingsCase):
         self.assertNotIn(long, entry.split("\n")[0], "the heading was not cut after all")
         self.assertIn(f"\n{long}\n", entry, "the entry lost the whole sentence")
 
-    def test_the_full_path_and_the_short_commit_are_on_the_line_below(self):
-        """What makes the short name safe inside an entry: the decode is right there. The
-        sha is cut to ten characters, which is what a person types and what the target
-        report prints; the whole of it is in the appendix, once."""
+    def test_the_short_commit_is_at_the_top_and_the_full_path_in_the_legend(self):
+        """Every site is at the one commit, so the commit is stated once at the top rather
+        than on a line under each site, and the legend decodes the short name. The sha is
+        cut to ten characters, which is what a person types; the whole of it is in the
+        appendix, once."""
         self.make_repo()
         self.run_all()
         sha = self.findings()["commit"]["commit"]
         self.assertEqual(len(sha), 40)
-        below = self.entry("D1").split("\n")
-        where = below.index(self.meta_line("D1"))
-        self.assertEqual(below[where + 1].strip(),
-                         f"engine/core.py:2-3 — commit {sha[:review_panel.COMMIT_ABBREV]}")
+        self.assertIn(f"refers to commit {sha[:review_panel.COMMIT_ABBREV]};",
+                      _section(self.text(), review_panel.SECTION_DESCRIPTION))
+        self.assertNotIn("engine/core.py:2-3 —", self.defect_block(self.text(), "D1"))
+        self.assertEqual(_legend_rows(self.text())["engine/core.py"], "core.py")
         self.assertEqual(self.text().count(sha), 1, "the full sha is not stated once")
         self.assertIn(sha, self.body(self.text(), "How this ran"))
 
@@ -10119,23 +10383,21 @@ class TheDefectEntryIsAHeadingALineAndTheMaterial(_FindingsCase):
         self.run_all()
         self.assertEqual(self.records()["cand-003"]["quote_check"], review_panel.QUOTE_DIFFERS)
         entry = self.entry("D2")
+        evidence = self.site_block(self.text(), "S2")
         sha = self.findings()["commit"]["commit"][:review_panel.COMMIT_ABBREV]
+        # The snippet stays with the defect, where the lines to change are; the commit is
+        # stated once at the top; the run and the warning are the site's evidence.
         self.assertIn("def helper(y):", entry)                     # the snippet
-        # The commit rides on the decode line that names the path, and the snippet sits
-        # directly under it with no label of its own. A "Source:" bullet between the two
-        # would repeat the path and the commit a reader has just read, on every defect in
-        # the report — so what is asserted is that the commit is still THERE, above the
-        # code it pins, and that nothing reintroduced the label.
-        self.assertIn(f"— commit {sha}", entry)                    # the commit line
+        self.assertIn(f"refers to commit {sha};", self.text())     # the commit
         self.assertNotIn("- Source, from", entry)
-        self.assertIn("- Evidence (executed): ", entry)                      # the evidence block
-        self.assertIn(review_panel.QUOTE_FLAG, entry)              # the warning
+        self.assertIn("- Evidence (executed): ", evidence)         # the evidence block
+        self.assertIn(review_panel.QUOTE_FLAG, evidence)           # the warning
 
     def test_every_defect_still_anchors_in_the_page(self):
-        """The entry line is what the conversion reads a defect's id off, and this phase
-        changed its shape. A pattern left behind leaves every defect unanchored while a
-        test whose fixture moved with it still passes, so this asserts the anchoring
-        itself — over findings.json's ids, refuted entries included."""
+        """The entry line is what the conversion reads a defect's id off. If its shape
+        changes and the pattern does not, every defect is left unanchored while a test
+        whose fixture moved with it still passes, so this asserts the anchoring itself —
+        over findings.json's ids, refuted entries included."""
         self.run_all()
         page = (self.rundir / "report.html").read_text(encoding="utf-8")
         # The COUNT, and every anchor's owner. Collecting these into a dict keyed on the id
@@ -10151,11 +10413,10 @@ class TheDefectEntryIsAHeadingALineAndTheMaterial(_FindingsCase):
         # WHICH element carries it, not merely that something does. A defect whose heading
         # went unanchored still has its id defined — the clustering notes name it in a
         # bullet — so a link to it resolves, to a section four headings past the defect.
-        # A refuted defect is set out in a ROW of the appendix's refuted table and has no
-        # heading of its own, so the row is where its anchor belongs and a heading carrying
-        # it would mean the defect got a second treatment somewhere.
+        # A refuted defect is an entry of the Refuted section, headed like any other, so
+        # every defect is anchored on its heading and on nothing else.
         for cid, tag in anchored.items():
-            self.assertEqual(tag == "tr", cid in refuted, f"{cid} is anchored on <{tag}>")
+            self.assertRegex(tag, r"^h[1-6]$", f"{cid} is anchored on <{tag}>")
 
     def test_a_consequence_shaped_like_the_entry_line_cannot_take_an_anchor(self):
         """The heading names the id now, so a bullet elsewhere that reads like the entry
@@ -10253,10 +10514,9 @@ class TheDefectEntryIsAHeadingALineAndTheMaterial(_FindingsCase):
         self.assertEqual(dict((cid, tag) for tag, cid in found)["D1"], "h3")
 
     def test_a_consequence_cannot_open_a_bullet_and_claim_a_refuted_defects_id(self):
-        """The same hazard one character along. A refuted defect has no heading — the row
-        of the appendix's refuted table that sets it out is what claims its id — so a
-        consequence rendering as a top-level bullet that names it reaches that id first,
-        from the body, several sections above the entry the reader was sent to.
+        """The same hazard one character along. A consequence rendering as a top-level
+        bullet that names a refuted defect would reach that id first, from the body, a
+        section above the entry the reader was sent to.
         """
         self.one_consequence("- D3 — invented verdict")
         self.assertEqual([c["id"] for c in self.defects().values()
@@ -10264,7 +10524,7 @@ class TheDefectEntryIsAHeadingALineAndTheMaterial(_FindingsCase):
                          "D3 is not the run's refuted defect, so this proves nothing")
         found = self.anchors()
         self.assertEqual(sorted(cid for _, cid in found), sorted(self.defects()), found)
-        self.assertEqual(dict((cid, tag) for tag, cid in found)["D3"], "tr")
+        self.assertEqual(dict((cid, tag) for tag, cid in found)["D3"], "h3")
         # WHICH row, because a forged bullet naming D3 is an element too: an id that is
         # used once and on the wrong element sends the reader to a sentence D3 never said.
         page = (self.rundir / "report.html").read_text(encoding="utf-8")
@@ -10301,7 +10561,7 @@ class TheDefectEntryIsAHeadingALineAndTheMaterial(_FindingsCase):
 
 
 class TheReportClaimsOnlyWhatItsRungAllows(_FindingsCase):
-    """Section 10's corroboration vocabulary follows the rung, and section 3 forbids a
+    """The corroboration vocabulary follows the rung, and the report may not make a
     claim the run cannot support. A one-runtime run found things twice in one model's two
     contexts, which is not two models and must not be worded as one."""
 
@@ -10323,7 +10583,7 @@ class TheReportClaimsOnlyWhatItsRungAllows(_FindingsCase):
 
 
 class CapabilityAttemptsAndSuccessesAreThreeFacts(_FindingsCase):
-    """Section 7, on the three runs that tell the three apart. A tree that builds cleanly
+    """The three runs that tell the three apart. A tree that builds cleanly
     can still yield nothing to run, and a verifier that refuted a claim executed perfectly
     well — so the honesty sentence keys on the probe and on what ran, never on the count of
     reproduced verdicts."""
@@ -10348,8 +10608,8 @@ class CapabilityAttemptsAndSuccessesAreThreeFacts(_FindingsCase):
         self.assertIn("counts claims confirmed by reading, not claims confirmed by running the code", text)
 
     def test_a_run_that_executed_something_claims_neither(self):
-        """Including the case the plan names: a verdict that REFUTED a claim ran the code,
-        so the run executed something even though it established nothing by running."""
+        """Including a verdict that REFUTED a claim: it ran the code, so the run executed
+        something even though it established nothing by running."""
         verify = {**VERIFY_TABLE, "verify-area-01-A": {"verdicts": [
             _verdict("cand-001", "confirmed_by_reading"),
             _verdict("cand-003", "refuted", EVIDENCE, rationale="The run does not do it.")],
@@ -10586,10 +10846,11 @@ class TheSettlingReasonIsStatedInTheReadersWords(_FindingsCase):
                  "split_reason": None},
                 {"members": ["cand-004"], "consequence": FINDING_B["consequence"],
                  "split_reason": None}], "summary": "three"}})
-        body = self.body(self.text(), "Unresolved")
-        # The defect's own reason is mixed, so the heading says so and BOTH members state
-        # theirs — neither matches the heading, so neither can be suppressed by it.
-        self.assertIn(review_panel.MIXED_SETTLING, body)
+        text = self.text()
+        self.assertIn(review_panel.MIXED_SETTLING, self.body(text, "Unresolved"))
+        # BOTH members state their reason, in the site's evidence, where no heading stands
+        # above them to say it for them.
+        body = self.body(text, "Evidence")
         for reason in ("needs_a_run", "needs_a_product_decision"):
             self.assertIn(f"What would settle it: {review_panel._settling(reason)}", body,
                           reason)
@@ -10599,20 +10860,19 @@ class AFindingThatBreaksARuleCostsItselfAndNoOther(_FindingsCase):
     """The reading round's blast radius, which is the whole of this rule.
 
     A reading unit is one dispatch of many independent observations. One finding the engine
-    cannot read says nothing about the thirteen beside it, and failing the unit over it
-    threw all of them away and reported the area as unread — a far larger claim than the
-    error supports. On one real run a single optional sub-field on a single finding cost 27
-    findings, about nine percent of that run's candidates.
+    cannot read says nothing about the findings beside it. So the engine drops that one
+    finding, keeps its neighbors and names the dropped one under coverage; it does not fail
+    the unit and report the area as unread, a far larger claim than the error supports.
 
-    This is the treatment a verification batch already had, and these are deliberately the
+    This is the treatment a verification batch gets, and these are deliberately the
     same shape as `VerificationResultsAreReadStrictly`'s: the rule still bites, the
-    neighbours survive, coverage names what was thrown away, and the run stops claiming
+    neighbors survive, coverage names what was thrown away, and the run stops claiming
     every unit returned a valid result. That the RULES are unchanged is asserted by
     `ReadingResultsAreParsedStrictly`; the two are separate properties, and a test that
     conflated them could not tell a relaxed rule from a narrowed radius.
     """
 
-    # One finding of area-01-A1's two is broken by a rule that has always rejected —
+    # One finding of area-01-A1's two is broken by a rule that rejects it in every case —
     # a severity outside the four levels. Its sibling, and both of area-01-B1's, are
     # untouched, so the run raises three candidates instead of four.
     BAD = "catastrophic"
@@ -10671,8 +10931,7 @@ class AFindingThatBreaksARuleCostsItselfAndNoOther(_FindingsCase):
         """The honesty half, on a run where NOTHING else went wrong.
 
         The shipped fixture has a failed auditor, so that sentence is already absent from it
-        and asserting its absence there would prove nothing about this rule — the trap the
-        verifier's own version of this test records, after a mutation stayed green.
+        and asserting its absence there would prove nothing about this rule.
         """
         self.run_with_a_bad_finding(**{"audit-area-01-B": {"findings": [], "summary": "no gap"}})
         coverage = _section(self.text(), "Coverage")
@@ -10744,28 +11003,25 @@ class AFindingInAnExcludedFileIsDroppedAndOnlyCounted(_FindingsCase):
 
 
 class RefutedIsOneLineAndUnresolvedIsGroupedByWhatWouldSettleIt(_FindingsCase):
-    """Section 9's separation and its highest-value triage."""
+    """Refuted kept apart from unresolved, and the unresolved triaged by what settles it."""
 
-    def test_a_refuted_defect_is_one_row_carrying_its_reason(self):
-        """A row, not a body. The four facts a refuted claim leaves behind — which defect,
-        what it said, where, and why it was dismissed — fit across one line, and this is
-        the only place in the report they appear: a refuted defect is not work, so it is
-        in no ranked view. None of the apparatus a live defect carries comes with it.
-        """
+    def test_a_refuted_defect_is_one_compact_entry_carrying_its_reason(self):
+        """A compact entry, not a body. The facts a refuted claim leaves behind — which
+        defect, what it said, where, and why it was dismissed — are its heading, its site
+        line and its reason; none of the account a live defect carries comes with it, and
+        it is in no ranked view."""
         self.run_all()
-        refuted = self.body(self.text(), "Refuted")
-        rows = [ln for ln in refuted.splitlines()
-                if ln.startswith("| ") and not ln.startswith("|---")
-                and _TABLE_DEFECT_ROW.match(ln)]
-        self.assertEqual(len(rows), 1, refuted)
-        self.assertEqual(_table_defect_ids(refuted),
+        refuted = self.body(self.text(), review_panel.SECTION_REFUTED)
+        self.assertEqual(re.findall(r"(?m)^### (D\d+)\. ", refuted),
                          [c["id"] for c in self.defects().values()
                           if c["status"] == review_panel.DEFECT_REFUTED])
-        # The reason is the checker's own sentence and is spelled as it was written. Only
-        # the engine's own vocabularies are sentence-cased, because a rule that decided
-        # from the shape of the text changed what a worker said.
-        self.assertIn("helper is never given None.", rows[0])
-        self.assertIn("core.py:8", rows[0])
+        # The reason is the checker's own sentence and is spelled as it was written.
+        self.assertIn(f"- **{review_panel.REFUTED_LABEL}** helper is never given None.",
+                      refuted)
+        self.assertIn("`core.py:8` · **Outcome** refuted", refuted)
+        for label in (review_panel.WHAT_GOES_WRONG_LABEL, review_panel.FIX_LABEL,
+                      review_panel.TEST_FIRST_LABEL):
+            self.assertNotIn(label, refuted)
 
     def test_every_unresolved_defect_sits_under_exactly_one_settling_group(self):
         verify = {"verify-area-01-A": {"verdicts": [
@@ -10825,8 +11081,8 @@ class RefutedIsOneLineAndUnresolvedIsGroupedByWhatWouldSettleIt(_FindingsCase):
 
 
 class ReportRerendersOnRequestAndNeverBySurprise(_FindingsCase):
-    """Section 5. Somebody may have annotated the report, so a bare second run refuses it by
-    name; the flag says they meant it, and rewrites only the two files report itself wrote."""
+    """Somebody may have annotated the report, so a bare second run refuses it by name;
+    the flag says they meant it, and rewrites only the files `report` itself writes."""
 
     def test_a_bare_second_run_is_refused_by_name_and_writes_nothing(self):
         self.run_all()
@@ -10928,7 +11184,7 @@ class ReportRerendersOnRequestAndNeverBySurprise(_FindingsCase):
 
 
 class TheReportWarnsWhenTrackedFilesWereNotReviewed(_FindingsCase):
-    """Section 12's reachability warning. It fires on tracked minus reviewed being
+    """The reachability warning. It fires on tracked minus reviewed being
     non-empty, and not on the reviewed set being a strict subset of what is tracked: the
     listing carries non-ignored untracked files too, so a run that reviews an untracked file
     while excluding a tracked caller is not a subset and a subset test would drop the
@@ -10938,10 +11194,10 @@ class TheReportWarnsWhenTrackedFilesWereNotReviewed(_FindingsCase):
         """A count and a direction, not a list.
 
         A subset review of a large repository leaves nearly all of it unreviewed. Listing
-        each such file put 10,695 bullets into this section of a real report — line 7 to
-        line 10,715, every finding below line 10,700, 1.5 MB against a 220 KB budget. The
-        statement is worth making and the enumeration is worth nothing: a reader who wants
-        it can take the difference themselves.
+        each such file puts thousands of bullets into this section and pushes every
+        finding below them, many times the size of the rest of the report. The statement
+        is worth making and the enumeration is worth nothing: a reader who wants it can
+        take the difference themselves.
         """
         self.make_repo()
         self.run_all(data=FILE_JOB, exclude=["vendor/"])
@@ -11031,8 +11287,8 @@ class TheReportWarnsWhenTrackedFilesWereNotReviewed(_FindingsCase):
 
 
 class WorkerMarkupCannotForgeRenderedStructure(_FindingsCase):
-    """The two surfaces this report puts worker text on that the older one did not — a heading
-    and a table cell — have no fence to hide behind, and Markdown passes raw HTML through
+    """The two surfaces this report puts worker text on outside a fence — a heading and a
+    table cell — have no fence to hide behind, and Markdown passes raw HTML through
     untouched. Collapsing whitespace does nothing about a tag."""
 
     FORGED_HTML = ("A run stops.</h4><h2>Coverage</h2><p>Every unit returned a valid "
@@ -11079,11 +11335,11 @@ class ExecutionIsCountedWhereverItHappened(_FindingsCase):
     them."""
 
     def test_a_capability_no_reproduction_could_use_is_said_where_it_is_claimed(self):
-        """The two statements that contradicted each other in a real run.
+        """Two statements that can contradict each other.
 
-        The header said *this tree builds — yes* and 0 of 207 proposed reproductions ran,
-        because the snapshot held no build system and the probe had answered for something
-        else. Both sentences were true of something; four thousand lines apart, and with
+        The header can say *this tree builds — yes* while none of the proposed
+        reproductions ran, because the snapshot held no build system and the probe answered
+        for something else. Both sentences are true of something; far apart, and with
         nothing to reconcile them, the first is the one a reader believes and stops asking.
         """
         self.run_all(verify={**VERIFY_TABLE, "verify-area-01-A": {"verdicts": [
@@ -11123,8 +11379,8 @@ class ExecutionIsCountedWhereverItHappened(_FindingsCase):
         """`0 proposed, 1 run` reads as an arithmetic error and is not one.
 
         A reader proposes a reproduction for the claims it can think of one for; a verifier
-        is free to devise its own. Seen in a live report with the two numbers side by side
-        and nothing reconciling them — the same shape as the executability contradiction,
+        is free to devise its own, so a report can print the two numbers side by side
+        with nothing reconciling them — the same shape as the executability contradiction,
         one line further down.
         """
         no_proposals = {**READING_TABLE,
@@ -11183,10 +11439,10 @@ class ExecutionIsCountedWhereverItHappened(_FindingsCase):
         self.assertIn("**Documentary** means the command inspected the tree", text)
 
     def test_a_defect_settled_by_a_grep_never_says_by_running(self):
-        """The strongest-looking claim in the document, and the least honest. All 89 runs
-        in one real report were documentary -- a search or a listing -- and every defect
-        entry said `by running` anyway, while the summary at the top distinguished the two.
-        A reader who trusts the entry is told the code was executed when it was grepped."""
+        """The strongest-looking claim in the document, and the least honest. When every
+        run behind a report is documentary -- a search or a listing -- an entry that says
+        `by running` anyway, while the summary at the top distinguishes the two, tells a
+        reader who trusts the entry that the code was executed when it was grepped."""
         self.run_all(verify={**VERIFY_TABLE, "verify-area-01-A": {"verdicts": [
             _verdict("cand-001", "reproduced", DOCUMENTARY,
                      rationale="The file never names the key."),
@@ -11215,11 +11471,11 @@ class ExecutionIsCountedWhereverItHappened(_FindingsCase):
     def test_a_verdict_that_states_no_kind_is_counted_apart_rather_than_assumed(self):
         """A result written before the field existed says nothing about which kind it was,
         and the engine does not decide for it. Counted in its own part, so the parts still
-        sum to the number beside them and no run is labelled by a guess."""
+        sum to the number beside them and no run is labeled by a guess."""
         older = {k: v for k, v in EVIDENCE.items() if k != "run_kind"}
         self.run_all(verify={**VERIFY_TABLE, "verify-area-01-A": {"verdicts": [
             _verdict("cand-001", "confirmed_by_reading"),
-            _verdict("cand-003", "reproduced", older)], "summary": "one, unlabelled"}})
+            _verdict("cand-003", "reproduced", older)], "summary": "one, unlabeled"}})
         text = self.text()
         self.assertIn("1 proposed, 1 run — 1 of a kind the verdict did not state.", text)
         self.assertIn("- Evidence: ", text)
@@ -11351,13 +11607,14 @@ class ARerenderLeavesOneConsistentPairOrTheOneItFound(_FindingsCase):
 
 class ADefectBodyCarriesNoUnitIdEvenWhenNothingAnswered(_FindingsCase):
     """``resolve`` writes a diagnostic naming the unit that failed, which is coverage's
-    material; printed into a defect body it is exactly the run machinery section 10 moves
-    out."""
+    material; printed into a defect body it is exactly the run machinery that belongs in
+    the appendix."""
 
     def test_a_missing_verdict_reads_as_plain_words_in_the_body(self):
         self.run_all(verify={**VERIFY_TABLE, "verify-area-01-B": None})
         text = self.text()
-        body = self.body(text, "Unresolved")
+        # A site's checks are its evidence, under its number.
+        body = self.body(text, "Evidence")
         # The line is the plain sentence alone, and not `unresolved (unresolved) — ` in
         # front of it: that says one thing twice and then a third time in the sentence.
         self.assertIn("no verdict came back; the unit that would have answered it", body)
@@ -11402,7 +11659,7 @@ class TwoReportsOfNearlyOneSiteKeepBothLocations(_FindingsCase):
 
 
 class PriorityWithinASeverityIsFixSizeThenLocation(_FindingsCase):
-    """Section 9's ordering, on a fixture that can tell its keys apart. Every other fixture
+    """The ranking order, on a fixture that can tell its keys apart. Every other fixture
     here proposes ``1 line`` for everything, so fix size decides nothing in them and an
     implementation that ignored it would pass."""
 
@@ -11525,7 +11782,7 @@ class TheGroupedAndGatheredViewsPlaceEveryDefect(_FindingsCase):
         self.assertEqual(sorted(rows), ["core.py", "util.py"],
                          "a defect reported in two files was listed under one")
         for path, row in rows.items():
-            self.assertIn("| 1 |", row, path)
+            self.assertIn("[S1](#S1-src) ([D1](#D1))", row, path)
 
     def test_the_clustering_notes_render_the_split_reason_the_clusterer_gave(self):
         reason = "Too weak at line 2 and too strong at line 3; two defects at one site."
@@ -11541,9 +11798,9 @@ class TheGroupedAndGatheredViewsPlaceEveryDefect(_FindingsCase):
         notes = self.body(self.text(), "Clustering notes")
         kept = _section(notes, "Kept apart at one location")
         self.assertEqual(kept.count(reason), 2)
-        self.assertIn("D1 (cand-001)", kept)
-        self.assertIn("D2 (cand-002)", kept)
-        # Section 2 asks for the arithmetic in the report, not only in the code.
+        self.assertIn("S1 (cand-001)", kept)
+        self.assertIn("S2 (cand-002)", kept)
+        # The arithmetic is stated in the report, not only done in the code.
         self.assertIn("4 candidates in 4 clusters, none dropped and none counted twice", notes)
 
     def test_the_largest_clusters_are_listed_largest_first(self):
@@ -11580,7 +11837,7 @@ class TheGroupedAndGatheredViewsPlaceEveryDefect(_FindingsCase):
             "summary": "three"}})
         notes = self.body(self.text(), "Clustering notes")
         largest = _section(notes, "The largest clusters")
-        listed = re.findall(r"(?m)^- (D\d+) — (\d+) candidates", largest)
+        listed = re.findall(r"(?m)^- (S\d+) — (\d+) candidates", largest)
         self.assertEqual([n for _, n in listed], ["3", "2"], largest)
         self.assertEqual(len(self.defects()), 3, "the fixture has no singleton to exclude")
         self.assertNotIn("D3", largest,
@@ -11653,7 +11910,7 @@ NASTY = ('x = "<script>alert(1)</script>"  # | pipe & ampersand\n'
 
 
 class SourceIsExtractedFromThePinnedTreeNotQuoted(_FindingsCase):
-    """Section 6. A quotation is a worker's account of the source; a snippet is the source.
+    """A quotation is a worker's account of the source; a snippet is the source.
     The engine reads it from the snapshot at the range the finding cites, and says which
     commit it read."""
 
@@ -11706,24 +11963,22 @@ class SourceIsExtractedFromThePinnedTreeNotQuoted(_FindingsCase):
         head = subprocess.run(["git", "-C", str(self.root), "rev-parse", "HEAD"],
                               capture_output=True, text=True, check=True).stdout.strip()
         short = head[:review_panel.COMMIT_ABBREV]
-        # The commit rides on the line that decodes the path, directly above the code it
-        # pins. There is no label of its own between the two any more.
-        self.assertIn(f"— commit {short}", text)
+        # The short commit is stated once at the top, for every site.
+        self.assertIn(f"refers to commit {short};", text)
         self.assertNotIn(f"— commit {head}", text, "the snippet carries the whole sha")
         self.assertEqual(text.count(head), 1, "the whole sha is not stated exactly once")
         self.assertIn(f"- Pinned at: commit {head}", self.body(text, "How this ran"))
 
     def test_a_tree_that_is_no_repository_says_so_rather_than_omitting_the_line(self):
         text = self.run_with(self.matching(1, 2, "def core(x):\n    return x + 1"))
-        self.assertIn("— a tree that is not a repository", text)
+        self.assertIn("refers to a tree that is not a repository;", text)
 
 
 class AnAbbreviatedQuotationIsWhatTheSchemaPermits(_TreeCase):
-    """The reader schema lets a long range be quoted by its first and last lines, and for
-    as long as the comparator has existed it has demanded the whole range instead. Every
-    abbreviated quotation was therefore reported as a wrong range: in one run, 29 defects
-    carried a warning sending a reader to re-check a location that was right, and the 7
-    that meant something were buried among them.
+    """The reader schema lets a long range be quoted by its first and last lines. A
+    comparator that demands the whole range instead reports every abbreviated quotation
+    as a wrong range: its warnings send a reader to re-check locations that are right, and
+    bury the ones that mean something among them.
 
     Two conditions, and the second is why the check is still worth running: every quoted
     line appears in the range in the order given, AND the range's first and last lines are
@@ -11791,11 +12046,11 @@ class AnAbbreviatedQuotationIsWhatTheSchemaPermits(_TreeCase):
                 self.assertNotEqual(checked.quoted_line, checked.found_line)
 
     def test_when_the_two_texts_are_equal_their_positions_are_not(self):
-        """The case the assertion above cannot reach, and the one a real run hit: the
-        comparison is IN ORDER, so a quotation asking for a line more times than the range
-        holds it stalls on a line spelled exactly like the one it could not account for.
-        Several mismatches printed as `quoted: }` over `found:  }` — two identical lines
-        and no information, which is what naming the differing line was meant to prevent.
+        """The case the assertion above cannot reach: the comparison is IN ORDER, so a
+        quotation asking for a line more times than the range holds it stalls on a line
+        spelled exactly like the one it could not account for. Printed as text alone, the
+        mismatch reads `quoted: }` over `found:  }` — two identical lines and no
+        information, which is what naming the differing line is meant to prevent.
 
         Indentation is not the cause and cannot be: `_comparable` strips every line BEFORE
         the comparison, so a difference that is only indentation matches and never reaches
@@ -11866,7 +12121,7 @@ class AnAbbreviatedQuotationIsWhatTheSchemaPermits(_TreeCase):
 
 
 class AQuotationThatDoesNotMatchIsFlaggedAndNeverRepaired(_FindingsCase):
-    """Section 6's point. Snippets are extracted mechanically, so a range off by twenty
+    """Snippets are extracted mechanically, so a range off by twenty
     lines prints twenty lines of innocent code under the heading of a real defect. The
     quotation is what makes the range checkable — and the engine records what it found
     rather than moving the range to fit, because only the reader knows what it saw."""
@@ -11929,10 +12184,10 @@ class AQuotationThatDoesNotMatchIsFlaggedAndNeverRepaired(_FindingsCase):
 
 
 class NeitherRenderingCanBeForgedByWorkerTextOrSource(_FindingsCase):
-    """Section 12 across both documents. HTML has no fenced block that contains a tag the
-    way a Markdown fence contains a heading, so every string the engine did not write is
-    escaped — including SOURCE, which this phase renders into the page for the first time
-    and which nobody wrote for this report at all."""
+    """Across both documents. HTML has no fenced block that contains a tag the way a
+    Markdown fence contains a heading, so every string the engine did not write is
+    escaped — including SOURCE, which the page quotes and which nobody wrote for this
+    report at all."""
 
     def run_nasty(self):
         (self.root / "engine" / "nasty.py").write_text(NASTY, encoding="utf-8")
@@ -12558,6 +12813,8 @@ class ThePageIsTheProseConverted(_FindingsCase):
             if infence or not line.strip():
                 continue
             content = re.sub(r"^#{1,6} |^ *- |^> ", "", line.strip())
+            # The writer's anchors are markup a reader never sees on the page.
+            content = review_panel._MD_ANCHOR.sub("", content)
             # A defect's id cell is a link into its own anchor. The page shows the link
             # TEXT, so the prose is read the same way — otherwise every index row reads as
             # missing from a page that carries it.
@@ -12567,6 +12824,8 @@ class ThePageIsTheProseConverted(_FindingsCase):
             # so a reader that kept the target reports the pointer as missing from a page that
             # carries it.
             content = review_panel._MD_SECTION_LINK.sub(r"\1", content)
+            # And a link to a site, to its evidence or to its quoted source.
+            content = review_panel._MD_SITE_LINK.sub(r"\1", content)
             content = review_panel._unescape(content)
             # Bold and code spans are markup the page turns into tags and `visible()`
             # then strips, so the prose is read with both taken off. The location is set
@@ -12649,7 +12908,7 @@ class ASnippetNamesItsLanguageAndJavaIsPainted(_FindingsCase):
     markup — which does not produce a wrong page, it produces a refusal, because the
     headings the snippet appears to open take the anchors the defects needed.
 
-    The colour is baked in at render time. `report.html` is one file somebody opens out of
+    The color is baked in at render time. `report.html` is one file somebody opens out of
     a run directory, so a highlighter fetched from a CDN renders plain wherever there is no
     network. Only Java has a tokenizer; every other language falls through and renders
     exactly as it did before, which is the honest failure rather than a wrong one.
@@ -12691,13 +12950,13 @@ class ASnippetNamesItsLanguageAndJavaIsPainted(_FindingsCase):
         """The gutter is a per-line prefix, so source reaches the painter one line at a
         time and a comment spanning two of them was two lines of ordinary code. Java
         carries multi-line comments as a matter of course, and every keyword inside one
-        came out coloured as though it ran."""
+        came out colored as though it ran."""
         painted = review_panel._painted("/*\nreturn null;\n*/\nint x = 1;", "java")
         lines = painted.split("\n")
         self.assertEqual(len(lines), 4)
         for line in lines[:3]:
             self.assertIn("hl-c", line, line)
-            self.assertNotIn("hl-k", line, "a keyword inside a comment was coloured")
+            self.assertNotIn("hl-k", line, "a keyword inside a comment was colored")
         # And the code after the comment closes is code again.
         self.assertIn("hl-k", lines[3])
 
@@ -12712,7 +12971,7 @@ class ASnippetNamesItsLanguageAndJavaIsPainted(_FindingsCase):
             self.assertIn("hl-g", line, "a line lost its number")
 
     def test_painting_escapes_exactly_once(self):
-        """The colour is spans around escaped text, never around raw text: a source line
+        """The color is spans around escaped text, never around raw text: a source line
         holding a tag must not become one, and must not show the reader `&amp;lt;`."""
         painted = review_panel._painted('String s = "<b>" + a & b;', "java")
         self.assertIn("&lt;b&gt;", painted)
@@ -12916,7 +13175,7 @@ class TheReportSaysWhatItIsOfUnderItsTitle(_FindingsCase):
 
 class TheHeadingsAreAWayBackToTheContents(_FindingsCase):
     """Presentation the conversion adds, and the rule it adds it under: it may add
-    behaviour and may never drop content. A four-thousand-line report is read by jumping,
+    behavior and may never drop content. A four-thousand-line report is read by jumping,
     and a reader who has jumped into it has no way back that does not involve scrolling.
     """
 
@@ -12955,8 +13214,8 @@ class TheHeadingsAreAWayBackToTheContents(_FindingsCase):
 
 
 class TheConversionAddsNavigationAndNothingElse(_FindingsCase):
-    """What the conversion is allowed to add, and the one rule about how. Section 11 wants
-    an explicit id on every defect — never one derived from heading text, because a heading
+    """What the conversion is allowed to add, and the one rule about how. Every defect
+    gets an explicit id — never one derived from heading text, because a heading
     is the clusterer's prose and two defects may legitimately be described in one phrase."""
 
     def page(self):
@@ -12982,22 +13241,16 @@ class TheConversionAddsNavigationAndNothingElse(_FindingsCase):
         for heading in re.findall(r"<h[34] [^>]*id=\"D\d+\"[^>]*>.*?</h[34]>", page):
             self.assertIn('href="#index"', heading, "a defect has no way back to the index")
 
-    def test_a_refuted_defect_is_identified_on_the_row_that_sets_it_out(self):
-        """A refuted defect has no heading of its own — it is one row of the appendix's
-        refuted table — so the ROW carries the anchor, which is what keeps a link to it
-        from anywhere in the document resolving.
-
-        The way back is the section heading above it rather than a link in the cell. A
-        table row is four facts across, and a fifth column holding the same link on every
-        row would be the table carrying navigation instead of the run's findings.
-        """
+    def test_a_refuted_defect_is_identified_on_its_own_heading(self):
+        """A refuted defect is an entry of the Refuted section like any other defect, so its
+        HEADING carries the anchor, and a link to it from anywhere in the document lands on
+        the entry that sets it out, not on a row of another table naming it."""
         self.run_all()
         page = self.page()
         refuted = next(c for c, r in self.defects().items() if r["status"] == "refuted")
-        row = next(line for line in page.splitlines() if f'id="{refuted}"' in line)
-        self.assertTrue(row.startswith(f'<tr id="{refuted}">'), row[:120])
-        self.assertIn(f"<td> {refuted} </td>", row, "the row does not name the defect")
-        self.assertIn('<h3 id="refuted">', page, "the section the row sits in is unheaded")
+        line = next(line for line in page.splitlines() if f'id="{refuted}"' in line)
+        self.assertTrue(line.startswith(f'<h3 id="{refuted}">{refuted}. '), line[:120])
+        self.assertIn('<h2 id="refuted">', page, "the section it sits in is unheaded")
 
     def test_a_file_whose_short_name_reads_as_a_defect_id_is_not_a_link(self):
         """A cell outside the defect column is not a defect id, whatever it looks like.
@@ -13031,15 +13284,14 @@ class TheConversionAddsNavigationAndNothingElse(_FindingsCase):
             {"members": ["cand-004"], "consequence": same, "split_reason": None}],
             "summary": "three"}})
         page = self.page()
-        # Any heading level: a defect sits one below whatever heads its section, and a
-        # refuted one is a list item rather than a heading at all.
+        # Any heading level: a defect sits one below whatever heads its section.
         ids = [i for i in re.findall(r'<(?:h[1-6]|li|tr) id="([^"]+)"', page)
                if re.fullmatch(r"D\d+", i)]
         self.assertEqual(sorted(ids), ["D1", "D2", "D3"])
         # And the three LABELS really are the same words, or the test proves nothing: it
         # is the label an id derived from heading text would have been derived from.
         self.assertEqual(
-            len(re.findall(rf"(?m)^#+ D\d+\. {re.escape(same)}$", self.text())), 2)
+            len(re.findall(rf"(?m)^#+ D\d+\. {re.escape(same)}$", self.text())), 3)
 
     def test_a_consequence_naming_fix_size_cannot_steal_its_own_anchor(self):
         """The clustering notes name every merged cluster, and their bullet carries the
@@ -13064,7 +13316,7 @@ class TheConversionAddsNavigationAndNothingElse(_FindingsCase):
                 {"members": ["cand-003", "cand-004"], "consequence": FINDING_B["consequence"],
                  "split_reason": None}], "summary": "two"}})
         # The notes really do name it, or the decoy is not in the document.
-        self.assertIn("D1 — 2 candidates", self.body(self.text(), "Clustering notes"))
+        self.assertIn("S1 — 2 candidates", self.body(self.text(), "Clustering notes"))
         page = (self.rundir / "report.html").read_text(encoding="utf-8")
         carrier = next(line for line in page.splitlines() if 'id="D1"' in line)
         self.assertIn(thief, carrier, "the id went to a heading that merely named the defect")
@@ -13159,7 +13411,7 @@ class TheConversionAddsNavigationAndNothingElse(_FindingsCase):
 
 
 class TheDefectIdIsShortAndStable(_FindingsCase):
-    """Section 4's identity rule. A defect is ``D<n>`` — short enough to cite in a sentence
+    """The identity rule. A defect is ``D<n>`` — short enough to cite in a sentence
     and to type into a search box — and its number is minted when the clusters are formed,
     so nothing that re-ranks the index can move it.
 
@@ -13195,7 +13447,7 @@ class TheDefectIdIsShortAndStable(_FindingsCase):
 
     def _demoting(self, cid):
         def mutate(doc):
-            next(c for c in doc["clusters"] if c["id"] == cid)["severity"] = "nit"
+            next(c for c in doc["defects"] if c["id"] == cid)["severity"] = "nit"
         return mutate
 
     def test_an_id_still_names_the_same_defect_after_the_index_is_reordered(self):
@@ -13255,7 +13507,7 @@ class TheDefectIdIsShortAndStable(_FindingsCase):
 
         # The ranked index: one severity, one fix size, one file and one line, so the id
         # is the only key left and the order it produces is the order under test.
-        tied = [{"id": cid, "severity": "major", "fix_size": "small",
+        tied = [{"id": cid, "severity": "major", "fix_size": "small", "sites": ["S1"],
                  "file": "a.py", "line_start": 1} for cid in reversed(ids)]
         self.assertEqual([c["id"] for c in sorted(tied, key=review_panel._defect_order)], ids)
 
@@ -13284,11 +13536,12 @@ class EveryFactInTheStructureReachesTheProse(_FindingsCase):
         # Machinery the prose states in words instead: a reader sees "both models, 2
         # reports", not "both", and a status rank rather than a sibling count.
         "axis_a", "siblings", "answered", "grouped", "listed",
-        # Structural keys: the reader sees the grouping, not the pointer.
-        "cluster_id", "members", "id",
+        # Structural keys: the reader sees the grouping, not the pointer. A site is named by
+        # its defect until a defect can hold more than one, so its own id is structure.
+        "site", "defect", "sites", "severity_site", "members", "id",
         # Stated as a heading, a group name or a line number rather than as a value.
         "line_start", "line_end", "first_line", "cites_from", "cites_to", "truncated",
-        "state", "rung", "kind", "lens", "lane", "unit", "area",
+        "state", "rung", "kind", "lens", "lane", "unit", "area", "areas",
         # The quotation is what the source is CHECKED against, never printed: the report
         # shows the pinned tree's own lines instead, which is the point of having it.
         "quote", "quote_check", "dirty",
@@ -13333,10 +13586,10 @@ class EveryFactInTheStructureReachesTheProse(_FindingsCase):
             yield key, node
 
     def rendered_leaves(self, doc):
-        refuted = {cid for cluster in doc["clusters"]
+        refuted = {cid for cluster in doc["defects"]
                    if cluster["status"] == review_panel.DEFECT_REFUTED
                    for cid in cluster["members"]}
-        yield from self.leaves({"clusters": doc["clusters"],
+        yield from self.leaves({"defects": doc["defects"],
                                 "clustering": doc["clustering"]},
                                unrendered=self.UNRENDERED)
         for record in doc["candidates"]:
@@ -13397,7 +13650,7 @@ class EveryFactInTheStructureReachesTheProse(_FindingsCase):
         """
         self.rich()
         one = self.reads_as()
-        entried = [c for c in self.findings()["clusters"]
+        entried = [c for c in self.findings()["defects"]
                    if c["status"] == review_panel.DEFECT_ESTABLISHED]
         self.assertEqual(len({c["axis_b"] for c in entried}), 1,
                          "the fixture no longer settles everything one way")
@@ -13409,7 +13662,7 @@ class EveryFactInTheStructureReachesTheProse(_FindingsCase):
         varied = self.tmp / "run-two-axes"
         self.run_all(varied)
         two = self.reads_as(varied)
-        axes = {c["axis_b"] for c in self.findings(varied)["clusters"]
+        axes = {c["axis_b"] for c in self.findings(varied)["defects"]
                 if c["status"] == review_panel.DEFECT_ESTABLISHED}
         self.assertEqual(len(axes), 2, "the second fixture settles everything one way too")
         for axis in axes:
@@ -13460,13 +13713,12 @@ class EveryFactInTheStructureReachesTheProse(_FindingsCase):
 
 
 class TheThingsThatMustNotHaveBroken(_FindingsCase):
-    """Spec section 0, re-read as a group against the finished pipeline.
+    """The pipeline's core guarantees, asserted together over one finished run.
 
-    Each of these held before the upgrade and is asserted again here because the work
-    rewrote the code paths they live in and rewrote several of the tests that covered them.
-    A suite that passes is not evidence for any of them: the assertions that proved them
-    were changed by the same hands that changed the code. These are stated once more,
-    together, over one finished run.
+    Each is also covered by a narrower test. A change that rewrites a code path can rewrite
+    the narrower test beside it, and a suite that passes is then no evidence for the
+    guarantee. Stating them again here, over one finished run, gives each a check that the
+    same change is unlikely to have rewritten.
     """
 
     def test_blindness_survives_as_a_property_of_the_payload_bytes(self):
@@ -13556,7 +13808,7 @@ class TheThingsThatMustNotHaveBroken(_FindingsCase):
         its own status, its own axis and its own settling reason."""
         self.run_all(reading=MIXED_READING, verify=MIXED_VERIFY, grouping=MIXED_CLUSTER)
         doc = self.findings()
-        cluster = next(c for c in doc["clusters"] if len(c["members"]) == 3)
+        cluster = next(c for c in doc["defects"] if len(c["members"]) == 3)
         records = {r["id"]: r for r in doc["candidates"]}
         self.assertEqual(cluster["status"], "established")
         self.assertEqual(records["cand-003"]["status"], "unresolved")
@@ -13730,7 +13982,7 @@ class TheConversionHandlesEveryShapeTheWriterEmits(_FindingsCase):
         row = next(line for line in page.splitlines()
                    if "D1" in line and "<td>" in line and "Totals" in line)
         cells = re.findall(r"<td>(.*?)</td>", row)
-        self.assertEqual(len(cells), 7, "a pipe in prose added a column")
+        self.assertEqual(len(cells), 5, "a pipe in prose added a column")
         self.assertIn("Totals | counts disagree.", cells[1])
         # A severity is a term from the engine's own vocabulary, so it starts with a
         # capital and reads as a word rather than as the fragment of a sentence nobody
@@ -13743,7 +13995,7 @@ class TheConversionHandlesEveryShapeTheWriterEmits(_FindingsCase):
         span changes what gets run, and silently."""
         # The EVIDENCE argv, which is the command the body prints and the one a reader
         # copies. A proposal superseded by a run is left to findings.json, so asserting on
-        # that one would assert on a line the report no longer writes.
+        # that one would assert on a line the report does not write.
         evidence = {**EVIDENCE, "argv": ["sh", "-c", "echo `whoami`"]}
         self.run_all(verify={**VERIFY_TABLE, "verify-area-01-A": {"verdicts": [
             _verdict("cand-001", "confirmed_by_reading"),
@@ -13799,8 +14051,8 @@ class TheConversionHandlesEveryShapeTheWriterEmits(_FindingsCase):
         self.assertIn(4, levels)
 
     def test_an_id_is_claimed_once_even_when_a_cluster_is_named_again(self):
-        """A refuted defect takes its id from its own one-line entry, and the clustering
-        notes name that same cluster further down. Only the first may carry the id, or the
+        """A refuted defect takes its id from its own entry, and the clustering notes name
+        that same cluster further down. Only the first may carry the id, or the
         document defines it twice and a link resolves to whichever a viewer picks."""
         # No finding here proposes a reproduction: a refuted verdict on one that does is
         # refused, which fails the whole unit and leaves everything unresolved — the path
@@ -13821,12 +14073,11 @@ class TheConversionHandlesEveryShapeTheWriterEmits(_FindingsCase):
             {"members": ["cand-003", "cand-004"], "consequence": FINDING_B["consequence"],
              "split_reason": None}], "summary": "two merged, both refuted"}})
         page = (self.rundir / "report.html").read_text(encoding="utf-8")
-        # The defects really are in the compact refuted form, which is where a bullet rather
-        # than a heading carries the id.
+        # The defects really are refuted, and set out in the Refuted section.
         self.assertEqual({c["status"] for c in self.defects().values()}, {"refuted"})
         # And the clustering notes name them again, or this proves nothing.
         notes = self.body(self.text(), "Clustering notes")
-        self.assertIn("D1 — 2 candidates", notes)
+        self.assertIn("S1 — 2 candidates", notes)
         ids = re.findall(r'id="(D\d+)"', page)
         self.assertEqual(sorted(ids), ["D1", "D2"])
         self.assertEqual(len(ids), len(set(ids)), "an id is defined twice")
@@ -13910,7 +14161,7 @@ class TheReportIsNumberedAndNested(_ReportCase):
         # And the table each of them heads is under it, not somewhere else.
         ranked = _section(text, review_panel.SUBSECTION_RANKED)
         self.assertIn(f"| {review_panel.DEFECT_COLUMN} |", ranked)
-        self.assertIn("| File | Defects |", _section(text, review_panel.SUBSECTION_BY_FILE))
+        self.assertIn("| File | Most severe |", _section(text, review_panel.SUBSECTION_BY_FILE))
         # Unnumbered, like every other subsection in the report: these two were the only
         # lettered headings in it, so `2a` and `2b` were the one place a reader had to
         # learn a second scheme, and they named nothing the titles did not.
@@ -13951,7 +14202,8 @@ class TheReportIsNumberedAndNested(_ReportCase):
         for word in ("defect", "Established", "Unresolved", "Refuted", "appendix"):
             self.assertIn(word, opening, f"the opening section never mentions {word}")
         # The counts the summary always carried are still here, in the same section.
-        self.assertIn("- By status:", opening)
+        self.assertIn("- Defects by placement:", opening)
+        self.assertIn("- Sites by outcome:", opening)
         self.assertIn("- Rung:", opening)
 
     def test_each_heading_count_equals_what_it_counts(self):
@@ -13965,7 +14217,7 @@ class TheReportIsNumberedAndNested(_ReportCase):
                          "the fixture's three statuses do not have three different counts")
         self.assertIn(f"\n## 3. Established defects ({len(by_status['established'])})\n", text)
         self.assertIn(f"\n## 4. Unresolved ({len(by_status['unresolved'])})\n", text)
-        self.assertIn(f"\n### Refuted ({len(by_status['refuted'])})\n", text)
+        self.assertIn(f"\n## 5. Refuted ({len(by_status['refuted'])})\n", text)
         self.assert_corroborated_count(text, expect_rows=False)
         # And each unresolved sub-group counts the defects under that group alone.
         groups = _section(text, "Unresolved")
@@ -13978,12 +14230,12 @@ class TheReportIsNumberedAndNested(_ReportCase):
                              f"the count on {name} is not the number of defects under it")
 
     def assert_corroborated_count(self, text, expect_rows):
-        """The corroborated heading counts too, and nothing else asserted it: its count was
-        mutated to 999 in review and every test in this file still passed.
+        """The corroborated heading counts too, and this is the only place in this file that
+        asserts the number in it: the section's other tests read its rows, not its heading.
 
         ``expect_rows`` is the anti-vacuity half. This section is empty in the counts
         fixture — every cluster there is a singleton — so asserting it only there compares
-        nought with nought, which is how the gap got in.
+        nought with nought and proves nothing.
         """
         both = review_panel.RUNG_BREADTH[DISPATCH["rung"]][1]
         heading = re.search(rf"(?m)^## \d+\. {re.escape(review_panel.SECTION_CORROBORATED)}"
@@ -14018,11 +14270,10 @@ class TheReportIsNumberedAndNested(_ReportCase):
 class TheReportSaysWhatJobItAnswers(_ReportCase):
     """The job the run answers is on the page, and a reader meeting the statement is told so.
 
-    A report carried the statement verbatim under its title and said nowhere that the
-    statement was one field of a job with several. A reader who had not written the job could
-    not tell from the page how the tree was divided, what each reader was told to read for,
-    which files were in scope, or where the file is that reruns the audit — and two of those
-    were on the page nowhere at all.
+    A report that carries the statement verbatim under its title, and says nowhere that
+    the statement is one field of a job with several, leaves a reader who had not written
+    the job unable to tell from the page how the tree was divided, what each reader was told
+    to read for, which files were in scope, or where the file is that reruns the audit.
 
     The detail sits in the APPENDIX, by the same rule as the path legend: nothing in it is
     needed to fix a defect. What keeps that a move rather than a burial is the pointer under
@@ -14316,7 +14567,7 @@ class TheDefectsBothModelsRaisedAreNamedTogether(_ReportCase):
         self.run_all(dispatch={"rung": "one-runtime", "lanes": DISPATCH["lanes"]})
         text = self.text()
         self.assertNotIn(review_panel.SECTION_CORROBORATED + "both models", text)
-        self.assertIn("5. Corroborated by both contexts", _h2s(text))
+        self.assertIn("6. Corroborated by both contexts", _h2s(text))
 
 
 
@@ -14419,14 +14670,13 @@ class _CoverageCase(_ReportCase):
 
 
 class TheAppendixPricesTheOpenWorkAndShowsTheVerifierSpread(_FindingsCase):
-    """Two facts a run already held and no rendering stated.
+    """Two facts a run holds that no other rendering states.
 
-    A third of one run's 47 unresolved defects hung on the same three or four files outside
-    the scope, and every verdict named its file in prose, where nothing can add it up. And
-    the established count over one set of files swung by a third between two runs, entirely
-    inside verification, with one unit answering `unresolved` to 15 of 26 while another
-    answered it to none of 20 — visible in the per-candidate table only to somebody
-    counting rows.
+    Many unresolved defects can hang on the same few files outside the scope, and every
+    verdict names its file in prose, where nothing can add it up. And the established count
+    over one set of files can swing between two runs entirely inside verification, with one
+    unit answering `unresolved` to most of its batch while another answers it to none —
+    visible in the per-candidate entries of `findings.json` only to somebody counting them.
     """
 
     OUTSIDE = "src/TransactionService.java"
@@ -14480,9 +14730,9 @@ class TheAppendixPricesTheOpenWorkAndShowsTheVerifierSpread(_FindingsCase):
 
     def test_two_guesses_at_one_class_are_one_row(self):
         """A verifier cannot open a file outside the scope, so where it names one it is
-        guessing at the path. One run named a controller under `api/server/...` with 12
-        defects hanging on it and the same class under `api/lib/...` with 2, and the table
-        priced them as two files worth 12 and 2 rather than one worth 14.
+        guessing at the path. The table groups by class, so a controller guessed under
+        `api/server/...` for some defects and under `api/lib/...` for others is one row
+        that carries every defect on it, rather than two rows that split the count.
 
         The paths are both kept in the row, so the merge shows its working: a reader who
         thinks these are two real files can see both spellings.
@@ -14543,9 +14793,9 @@ class TheAppendixPricesTheOpenWorkAndShowsTheVerifierSpread(_FindingsCase):
                       "100% (verify-area-01-A, 2 of 2).", table)
 
     def test_the_per_unit_table_names_the_lane_whose_findings_each_unit_was_handed(self):
-        """The unresolved share runs from 0% to 62% across the units of one run, and the
+        """The unresolved share can vary widely across the units of one run, and the
         question that invites is whether one model's findings are harder to settle. Routing
-        keys a batch on its finder, so the answer is one column wide and was already in
+        keys a batch on its finder, so the answer is one column wide and is already in
         `units.json`."""
         text = self.run_open()
         rows = {row["unit"]: row for row in self.findings()["verification"]}
@@ -14603,10 +14853,10 @@ class TheAppendixPricesTheOpenWorkAndShowsTheVerifierSpread(_FindingsCase):
 
 class CoverageFindingsTravelTheirOwnPath(_CoverageCase):
     """The auditor asks what input no test constructs. A defect verifier is asked whether a
-    claimed failure is real. Routed together, every coverage finding came back refuted for
-    the only reason it could — a missing test is not a failure — and the report filed real,
-    named, missing tests under a heading saying nothing there is work. Both agents were
-    right by their briefs; the pipeline put one question to the other's.
+    claimed failure is real. Routed together, a coverage finding is liable to come back
+    refuted — a missing test is not a failure — and the report would file real, named,
+    missing tests under a heading saying nothing there is work. Both agents are right by
+    their briefs, so each finding goes to the question that fits it.
     """
 
     def test_coverage_candidates_get_their_own_batches_and_reader_batches_are_untouched(self):
@@ -14633,7 +14883,7 @@ class CoverageFindingsTravelTheirOwnPath(_CoverageCase):
     def test_a_coverage_batch_carries_its_own_brief_schema_and_the_tests_in_scope(self):
         """The question is which test constructs the input, so the tests are an input to
         the payload. A verifier left to guess which files are tests answers something
-        vaguer, which is how this failed in the first place."""
+        vaguer."""
         self.routed()
         batch = self.batches("coverage")[0]
         payload = (self.rundir / batch["payload"]).read_text(encoding="utf-8")
@@ -14652,8 +14902,8 @@ class CoverageFindingsTravelTheirOwnPath(_CoverageCase):
 
     def test_each_question_refuses_the_other_s_verdicts(self):
         """The rule that makes the split enforceable rather than advisory. A defect status
-        on a gap is the old pipeline in one verdict, and a coverage status on a defect is
-        the same mistake mirrored."""
+        on a gap merges the two questions back into one verdict, and a coverage status on a
+        defect is the same mistake mirrored."""
         self.routed()
         coverage = self.batches("coverage")[0]
         defect = self.batches("defect")[0]
@@ -14765,20 +15015,20 @@ class CoverageFindingsLeaveTheDefectLadder(_CoverageCase):
         self.assertFalse({r["id"] for r in doc["candidates"]} & gaps,
                          "a gap is on the defect ladder")
         self.assertEqual({r["id"] for r in doc["coverage"]}, gaps)
-        self.assertEqual(len(doc["coverage_clusters"]), len(gaps))
+        self.assertEqual(len(doc["coverage_defects"]), len(gaps))
         # The arithmetic the description states is over defects and stays true.
-        self.assertIn(f"- Defects: {len(doc['clusters'])} from "
+        self.assertIn(f"- Defects: {len(doc['defects'])} at {len(doc['sites'])} sites from "
                       f"{len(doc['candidates'])} candidates", text)
         self.assertIn(f"- Coverage gaps: {len(gaps)}", text)
         self.assertIn("counted apart from the line above", text)
         # And no gap id appears in the ranked index.
         index = text.partition("### Every defect")[2].partition("\n## ")[0]
-        for cluster in doc["coverage_clusters"]:
+        for cluster in doc["coverage_defects"]:
             self.assertNotIn(f"| {cluster['id']} |", index)
 
     def test_a_gap_that_stands_is_a_test_to_write_and_not_a_refuted_defect(self):
         text = self.run_with_gaps()
-        self.assertIn(f"6. {review_panel.SECTION_COVERAGE_GAPS}", _h2s(text))
+        self.assertIn(f"7. {review_panel.SECTION_COVERAGE_GAPS}", _h2s(text))
         section = text.partition(review_panel.SECTION_COVERAGE_GAPS)[2].partition("\n## ")[0]
         self.assertIn("No test constructs", section)
         self.assertIn("The auditor proposed", section)
@@ -14787,7 +15037,7 @@ class CoverageFindingsLeaveTheDefectLadder(_CoverageCase):
         self.assertIn("None of these says the code is wrong", section)
         # Refuted holds claims a check dismissed as wrong about the code. A gap that
         # stands is not one, so nothing from this run is filed there.
-        self.assertIn("### Refuted (0)", text)
+        self.assertIn(f"## 5. {review_panel.SECTION_REFUTED} (0)", text)
 
     def test_a_gap_a_test_covers_is_settled_in_the_appendix_and_names_the_test(self):
         self.plan_into(self.rundir)
@@ -14912,7 +15162,7 @@ class TestsToWriteAreGroupedByTheTestClassThatOwesThem(_CoverageCase):
 
     The batch-wide paragraph is the other half. A verifier asked to put what it found
     across the whole batch into each gap's rationale writes it ten times; `summary` is the
-    field for it, and until now the engine parsed that field and threw it away.
+    field for it, and the engine renders it rather than parsing it and throwing it away.
     """
 
     THIRD = {**GAP, "line_start": 8, "line_end": 8,
@@ -15084,8 +15334,8 @@ class CheckRunsTheParseTheStageWillRun(_RouteCase):
         self.assertIn("accepts this result", out)
 
     def test_it_refuses_what_the_stage_would_refuse_an_hour_later(self):
-        """The cases the old landing check could not see. Each is a rule that needs the RUN
-        to evaluate, or a shape the stage refuses, and none is visible to a check for
+        """The cases a parse-only landing check cannot see. Each is a rule that needs the
+        RUN to evaluate, or a shape the stage refuses, and none is visible to a check for
         "it parses and holds its count"."""
         self.plan()
         for label, obj, fragment in (
@@ -15204,11 +15454,11 @@ class CheckRunsTheParseTheStageWillRun(_RouteCase):
         return "\n".join(text.split("\n")[lo - 1:hi])
 
     def test_it_compares_every_quotation_while_the_unit_can_still_be_sent_back(self):
-        """The one check the engine ran too late to act on. `route` compares every
+        """The one check `route` runs too late to act on. `route` compares every
         quotation with the pinned tree, and `route` runs after every reading unit has
         landed — by which time the single re-dispatch the protocol allows is gone, so a
-        unit that cited thirteen wrong ranges could only be flagged. Here the dispatcher
-        still has the choice."""
+        unit that cites many wrong ranges can only be flagged. Here the dispatcher still
+        has the choice."""
         self.plan()
         matching = {**FINDING, "quote": self.quoted("engine/core.py", 2, 3)}
         self.reply("area-01-A1", {"findings": [matching, FINDING], "summary": "s"})
@@ -15607,6 +15857,468 @@ class ClusterRedoTakesTheLastTwoRoundsBackOffTheRun(_ReportCase):
         self.assertTrue(lock.exists())
 
 
+# --------------------------------------------------------------------------- #
+# merge — which sites are one mistake, proposed by one unit over the whole run
+# --------------------------------------------------------------------------- #
+class AMergeReplyIsAPartitionOrNothing(unittest.TestCase):
+    """The merge round's engine checks, one per rule. A reply that breaks any of them is
+    refused whole: part of a grouping is not a smaller grouping, and believing the groups
+    that parsed would give the report a set of defects nobody proposed."""
+
+    KINDS = {"S1": "defect", "S2": "defect", "S3": "defect", "S4": "coverage"}
+    GOOD = _merge_reply([MERGE_PAIR, _single("S3"), _single("S4")])
+
+    def parse(self, reply):
+        return review_panel.parse_merger_result(reply, MERGE_UNIT, self.KINDS)
+
+    def refused(self, reply, fragment):
+        with self.assertRaises(review_panel.ResultError) as caught:
+            self.parse(reply)
+        self.assertIn(MERGE_UNIT, str(caught.exception))
+        self.assertIn(fragment, str(caught.exception))
+
+    def test_the_briefs_example_is_a_reply_the_engine_accepts(self):
+        """A model copies the example's shape before it reads the rules, so an example the
+        engine would refuse costs the whole round."""
+        brief = review_panel.load_brief("merger")
+        example = json.loads(brief.split("```json", 1)[1].split("```", 1)[0])
+        sites = [site for group in example["groups"] for site in group["sites"]]
+        parsed = review_panel.parse_merger_result(
+            example, MERGE_UNIT, {site: "defect" for site in sites})
+        self.assertEqual(len(parsed["groups"]), len(example["groups"]))
+
+    def test_a_reply_that_keeps_every_rule_is_read_as_records(self):
+        parsed = self.parse(_merge_reply(
+            [MERGE_PAIR, {**_single("S3"), "reason_kept_apart": "A different cause."},
+             _single("S4")],
+            compound=[{"site": "S3", "second_claim": "It also leaks a handle."}]))
+        self.assertEqual([group["sites"] for group in parsed["groups"]],
+                         [["S1", "S2"], ["S3"], ["S4"]])
+        self.assertEqual(parsed["groups"][0]["mechanism"], MERGE_PAIR["mechanism"])
+        self.assertEqual(parsed["groups"][0]["instances"], MERGE_PAIR["instances"])
+        self.assertEqual(parsed["groups"][1]["reason_kept_apart"], "A different cause.")
+        self.assertEqual(parsed["compound"],
+                         [{"site": "S3", "second_claim": "It also leaks a handle."}])
+        self.assertEqual(parsed["summary"], "grouped by mechanism")
+
+    def test_a_site_in_no_group_is_refused(self):
+        self.refused(_merge_reply([MERGE_PAIR, _single("S3")]), "in no group")
+
+    def test_a_site_in_two_groups_is_refused(self):
+        self.refused(_merge_reply([MERGE_PAIR, _single("S2"), _single("S3"), _single("S4")]),
+                     "in two groups")
+
+    def test_a_site_the_unit_was_not_handed_is_refused(self):
+        self.refused(_merge_reply([*self.GOOD["groups"], _single("S9")]), "was not handed")
+
+    def test_an_empty_group_is_refused(self):
+        self.refused(_merge_reply([*self.GOOD["groups"], {**_single("S3"), "sites": []}]),
+                     "no site")
+
+    def test_a_group_of_several_sites_needs_a_mechanism(self):
+        for mechanism in (None, "   "):
+            with self.subTest(mechanism=mechanism):
+                self.refused(_merge_reply([{**MERGE_PAIR, "mechanism": mechanism},
+                                           _single("S3"), _single("S4")]), "mechanism")
+
+    def test_a_group_of_several_sites_needs_one_instance_per_site(self):
+        one = [MERGE_PAIR["instances"][0]]
+        for name, instances, fragment in (
+            ("none", None, "one instance per site"),
+            ("short", one, "one instance per site"),
+            ("repeated", one + one, "twice"),
+            ("a site outside the group", one + [{"site": "S3", "instance": "x"}],
+             "not in this group"),
+        ):
+            with self.subTest(instances=name):
+                self.refused(_merge_reply([{**MERGE_PAIR, "instances": instances},
+                                           _single("S3"), _single("S4")]), fragment)
+
+    def test_a_group_may_not_mix_a_defect_with_a_coverage_gap(self):
+        mixed = {"sites": ["S3", "S4"], "mechanism": "One rule broken twice.",
+                 "instances": [{"site": "S3", "instance": "here"},
+                               {"site": "S4", "instance": "there"}],
+                 "reason_kept_apart": None}
+        self.refused(_merge_reply([_single("S1"), _single("S2"), mixed]), "mix")
+
+    def test_a_compound_site_in_a_group_of_several_is_refused(self):
+        self.refused(_merge_reply(self.GOOD["groups"],
+                                  compound=[{"site": "S1", "second_claim": "It also leaks."}]),
+                     "compound")
+
+    def test_a_compound_record_naming_an_unknown_or_repeated_site_is_refused(self):
+        claim = {"site": "S3", "second_claim": "It also leaks."}
+        self.refused(_merge_reply(self.GOOD["groups"],
+                                  compound=[{**claim, "site": "S9"}]), "was not handed")
+        self.refused(_merge_reply(self.GOOD["groups"], compound=[claim, claim]), "twice")
+
+    def test_a_reply_whose_shape_is_not_the_schema_is_refused(self):
+        for name, reply in (
+            ("not an object", ["S1"]),
+            ("an unknown key", {**self.GOOD, "verdict": "fine"}),
+            ("a map where records belong", {**self.GOOD, "compound": {"S3": "leaks"}}),
+            ("instances as a map", _merge_reply([{**MERGE_PAIR, "instances": {
+                "S1": "a", "S2": "b"}}, _single("S3"), _single("S4")])),
+        ):
+            with self.subTest(reply=name):
+                with self.assertRaises(review_panel.ResultError):
+                    self.parse(reply)
+
+
+class ADiscardedMergeReplyLeavesEverySiteItsOwnDefect(_CoverageCase):
+    """A merge reply that fails any check is discarded whole, every site it was handed
+    becomes its own defect — the report as if the round had not run — and the
+    report says so. Clustering is left unanswered, so every candidate is a site: S1-S4 are
+    defects and S5-S6 gaps."""
+
+    def merged_run(self):
+        self.routed()
+        stub_dispatch(self.rundir, self.verify_table())
+        self.cluster()
+        self.merge()
+        units = self.mergers()
+        self.assertEqual([unit["id"] for unit in units], [MERGE_UNIT])
+        self.assertEqual(units[0]["sites"], ["S1", "S2", "S3", "S4", "S5", "S6"])
+        self.assertEqual(units[0]["lane"], review_panel.LANES[0])
+
+    def land_merge(self, reply):
+        path = self.rundir / "units" / MERGE_UNIT / "result.json"
+        path.write_text(json.dumps(reply), encoding="utf-8")
+
+    def render(self, again):
+        proc = _run("report", str(self.rundir), *(("--rerender",) if again else ()))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        doc = json.loads((self.rundir / "findings.json").read_text(encoding="utf-8"))
+        section = " ".join(review_panel._unescape(_section(
+            self.text(), review_panel.SUBSECTION_MERGE)).split())
+        return doc, section
+
+    def assert_one_defect_per_site(self, doc):
+        for defect in (*doc["defects"], *doc["coverage_defects"]):
+            self.assertEqual(len(defect["sites"]), 1, defect["id"])
+        self.assertEqual(len(doc["defects"]) + len(doc["coverage_defects"]), 6)
+
+    GAPS = {"sites": ["S5", "S6"], "mechanism": "No test sends a value below zero.",
+            "instances": [{"site": "S5", "instance": "a"}, {"site": "S6", "instance": "b"}],
+            "reason_kept_apart": None}
+
+    def bad_replies(self):
+        rest = [_single("S3"), _single("S4"), self.GAPS]
+        return (
+            ("a site in no group", _merge_reply([MERGE_PAIR, self.GAPS]), "in no group"),
+            ("a site in two groups", _merge_reply([MERGE_PAIR, _single("S1"), *rest]),
+             "in two groups"),
+            ("an unknown site", _merge_reply([MERGE_PAIR, *rest, _single("S9")]),
+             "was not handed"),
+            ("an empty group", _merge_reply([MERGE_PAIR, *rest, {**_single("S1"), "sites": []}]),
+             "no site"),
+            ("no mechanism", _merge_reply([{**MERGE_PAIR, "mechanism": None}, *rest]),
+             "mechanism"),
+            ("an instance short", _merge_reply([{**MERGE_PAIR,
+                                                 "instances": MERGE_PAIR["instances"][:1]},
+                                                *rest]), "one instance per site"),
+            ("an instance for another group's site",
+             _merge_reply([{**MERGE_PAIR, "instances": [*MERGE_PAIR["instances"],
+                                                        {"site": "S3", "instance": "x"}]},
+                           *rest]), "not in this group"),
+            ("a defect with a gap", _merge_reply([MERGE_PAIR, _single("S3"), _single("S6"), {
+                **self.GAPS, "sites": ["S4", "S5"],
+                "instances": [{"site": "S4", "instance": "a"}, {"site": "S5", "instance": "b"}]}]),
+             "mix"),
+            ("a compound site merged", _merge_reply(
+                [MERGE_PAIR, *rest], compound=[{"site": "S2", "second_claim": "It leaks."}]),
+             "compound"),
+            ("a compound record repeated", _merge_reply(
+                [MERGE_PAIR, *rest], compound=[{"site": "S3", "second_claim": "x"}] * 2),
+             "twice"),
+        )
+
+    def test_each_check_discards_the_whole_reply_and_the_report_names_it(self):
+        self.merged_run()
+        for n, (name, reply, fragment) in enumerate(self.bad_replies()):
+            with self.subTest(check=name):
+                self.land_merge(reply)
+                doc, section = self.render(again=n > 0)
+                record = doc["merge"]["units"][0]
+                self.assertEqual(record["state"], review_panel.UNIT_FAILED)
+                self.assertIn(fragment, record["reason"])
+                self.assertEqual(record["groups"], [], "a refused reply left groups behind")
+                self.assert_one_defect_per_site(doc)
+                self.assertIn(f"{MERGE_UNIT} — failed", section)
+                self.assertIn(fragment, section)
+                self.assertIn(review_panel.MERGE_DEGRADED, section)
+
+    def test_a_merge_that_never_came_back_is_named_too(self):
+        self.merged_run()
+        doc, section = self.render(again=False)
+        self.assertEqual(doc["merge"]["units"][0]["state"], review_panel.UNIT_MISSING)
+        self.assert_one_defect_per_site(doc)
+        self.assertIn(f"{MERGE_UNIT} — missing", section)
+        self.assertIn(review_panel.MERGE_DEGRADED, section)
+        self.assertNotIn(review_panel.EVERY_UNIT_RETURNED, self.text())
+
+    def test_an_accepted_reply_is_held_and_not_yet_shown_as_one_defect(self):
+        """Until a unit that did not propose a group has checked it, the groups are kept in
+        the structure and every site is still reported as its own defect."""
+        self.merged_run()
+        self.land_merge(_merge_reply([MERGE_PAIR, _single("S3"), _single("S4"), self.GAPS],
+                                     compound=[{"site": "S3", "second_claim": "It leaks."}]))
+        doc, section = self.render(again=False)
+        record = doc["merge"]["units"][0]
+        self.assertEqual(record["state"], review_panel.UNIT_COMPLETE)
+        self.assertIsNone(record["reason"])
+        self.assertEqual([group["sites"] for group in record["groups"]],
+                         [["S1", "S2"], ["S3"], ["S4"], ["S5", "S6"]])
+        self.assertEqual(record["groups"][0]["instances"], MERGE_PAIR["instances"])
+        self.assertEqual(record["compound"], [{"site": "S3", "second_claim": "It leaks."}])
+        self.assertFalse(doc["merge"]["batched"])
+        self.assert_one_defect_per_site(doc)
+        self.assertIn(f"{MERGE_UNIT} — complete", section)
+        self.assertIn(review_panel.MERGE_HELD, section)
+        self.assertNotIn(review_panel.MERGE_DEGRADED, section)
+
+
+class TheMergeRoundIsOneReadOnlyUnitOverEverySite(_ReportCase):
+    """One unit, on the first lane, over every site in the run. Its payload
+    carries each site's record and nothing that says who raised or checked it: no unit id,
+    no lane, no lens and no verdict — the merge decides identity, not truth."""
+
+    def clustered_only(self):
+        self.plan_into(self.rundir)
+        stub_dispatch(self.rundir, READING_TABLE, DISPATCH)
+        self.assertEqual(_run("route", str(self.rundir)).returncode, 0)
+        stub_dispatch(self.rundir, VERIFY_TABLE)
+        self.clustered()
+
+    def test_one_unit_on_the_first_lane_records_its_payload_size(self):
+        self.clustered_only()
+        self.merge()
+        self.assertEqual(self.units()["stage"], review_panel.MERGED_STAGE)
+        [unit] = self.mergers()
+        self.assertEqual(unit["id"], MERGE_UNIT)
+        self.assertEqual(unit["lane"], review_panel.LANES[0])
+        self.assertEqual(unit["sites"], ["S1", "S2", "S3"])
+        raw = (self.rundir / unit["payload"]).read_bytes()
+        self.assertEqual(unit["payload_bytes"], len(raw))
+        self.assertEqual(unit["payload_lines"], raw.count(b"\n"))
+        schema = json.loads((self.rundir / unit["schema"]).read_text(encoding="utf-8"))
+        self.assertEqual(schema, review_panel.load_schema(review_panel.MERGER_SCHEMA_NAME))
+
+    def test_the_payload_carries_each_site_and_nothing_about_who_found_or_checked_it(self):
+        self.clustered_only()
+        self.merge()
+        text = (self.rundir / self.mergers()[0]["payload"]).read_text(encoding="utf-8")
+        records = text.split(review_panel.TO_MERGE_HEADING, 1)[1]
+        records = records.split(review_panel.RESULT_SCHEMA_HEADING, 1)[0]
+        for site, consequence in (("S1", CLUSTER_TABLE["cluster-area-01"]["clusters"][0]),
+                                  ("S2", CLUSTER_TABLE["cluster-area-01"]["clusters"][1]),
+                                  ("S3", CLUSTER_TABLE["cluster-area-01"]["clusters"][2])):
+            self.assertIn(f"### {site}\n", records)
+            self.assertIn(consequence["consequence"], records)
+        self.assertIn("Area: area-01", records)
+        self.assertIn(FINDING["failure"], records)
+        self.assertIn(FINDING["direction"], records)
+        self.assertIn("The run raised as claimed.", records)
+        for absent in ("cand-0", "verify-area", "area-01-A1", "Lane", "lane ",
+                       *FILE_JOB["lenses"], "confirmed_by_reading", "reproduced", "refuted",
+                       "blocker", "major", "minor"):
+            self.assertNotIn(absent, records, absent)
+
+    def test_a_run_with_fewer_than_two_sites_plans_no_unit_and_moves_on(self):
+        self.plan_into(self.rundir)
+        stub_dispatch(self.rundir, {**READING_TABLE,
+                                    "area-01-A1": {"findings": [FINDING], "summary": "A"},
+                                    "area-01-B1": {"findings": [], "summary": "B"}}, DISPATCH)
+        self.assertEqual(_run("route", str(self.rundir)).returncode, 0)
+        [batch] = self.verifiers()
+        stub_dispatch(self.rundir, {batch["id"]: {"verdicts": [
+            _verdict(cid, "confirmed_by_reading") for cid in batch["candidates"]],
+            "summary": "read"}})
+        self.cluster()
+        self.merge()
+        self.assertEqual(self.mergers(), [])
+        self.assertEqual(self.units()["stage"], review_panel.MERGED_STAGE)
+        self.synthesize()
+        self.assertEqual(self.units()["stage"], review_panel.SYNTHESIZED_STAGE)
+
+    def test_merge_runs_once_after_clustering_and_a_refusal_writes_nothing(self):
+        self.plan_into(self.rundir)
+        stub_dispatch(self.rundir, READING_TABLE, DISPATCH)
+        self.assertEqual(_run("route", str(self.rundir)).returncode, 0)
+        stub_dispatch(self.rundir, VERIFY_TABLE)
+        before = _tree_bytes(self.rundir)
+        proc = self.merge(expect=2)
+        self.assertIn("'verification'", proc.stderr)
+        self.assertEqual(_tree_bytes(self.rundir), before)
+        self.clustered()
+        self.merge()
+        before = _tree_bytes(self.rundir)
+        proc = self.merge(expect=2)
+        self.assertIn("merge runs once", proc.stderr)
+        self.assertEqual(_tree_bytes(self.rundir), before)
+
+    def test_synthesis_reads_the_run_after_the_merge(self):
+        self.clustered_only()
+        proc = _run("synthesize", str(self.rundir))
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("'clustered'", proc.stderr)
+        self.assertIn("'merge-checked'", proc.stderr)
+        self.assertEqual(self.synthesizers(), [])
+
+    def test_check_runs_the_merge_parse_before_a_reply_is_landed(self):
+        self.clustered_only()
+        self.merge()
+        reply = self.rundir / "dispatch" / MERGE_UNIT / "reply.json"
+        reply.parent.mkdir(parents=True)
+        reply.write_text(json.dumps(_merge_reply([MERGE_PAIR, _single("S3")])), encoding="utf-8")
+        proc = _run("check", str(self.rundir), MERGE_UNIT)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("the engine accepts this result", proc.stdout)
+        reply.write_text(json.dumps(_merge_reply([MERGE_PAIR])), encoding="utf-8")
+        proc = _run("check", str(self.rundir), MERGE_UNIT)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("in no group", proc.stderr)
+
+    def test_a_listing_that_is_not_this_engines_is_refused_by_name(self):
+        self.clustered_only()
+        self.merge()
+        clustering = self.clustering()
+        row = dict(self.mergers()[0])
+        for name, edit, fragment in (
+            ("short", [{**row, "sites": ["S1", "S2"]}], "not this run's sites"),
+            ("foreign", [{**row, "sites": ["S1", "S2", "S3", "S9"]}], "not this run's sites"),
+            ("twice", [row, {**row, "id": "merge-B"}], "two merge units"),
+            ("null list", [{**row, "sites": None}], "no list of site ids"),
+        ):
+            with self.subTest(listing=name):
+                with self.assertRaises(review_panel.RunDirError) as caught:
+                    review_panel.check_merge(clustering, edit)
+                self.assertIn(fragment, str(caught.exception))
+                self.assertIn("units.json", str(caught.exception))
+        review_panel.check_merge(clustering, [row])
+
+
+def _merge_site(sid, file, asks="defect"):
+    """One site as the merge payload states it, for planning without a run directory."""
+    return {"id": sid, "area": "area-01", "asks": asks, "consequence": f"{sid} goes wrong.",
+            "split_reason": None,
+            "members": [{"file": file, "line_start": 1, "line_end": 1,
+                         "failure": f"{sid} fails.", "directions": ["Fix it."],
+                         "rationale": None}]}
+
+
+class OverTheMergeCeilingTheSitesBatchByDirectory(unittest.TestCase):
+    """Over either of the merge's ceilings, the sites are split by the directory of their file and merged within each batch. A site is in exactly
+    one batch, and a directory is split only when it alone is over the ceiling."""
+
+    SITES = (_merge_site("S1", "a/x.py"), _merge_site("S2", "a/y.py"),
+             _merge_site("S3", "b/z.py"), _merge_site("S4", "c/w.py"))
+
+    def size(self, sites):
+        return review_panel.measure_payload(
+            review_panel.render_merger_payload("B", "P", list(sites)))
+
+    def plan(self, sites, lines=None, reply=None):
+        ceiling = None if lines is None else review_panel.Ceiling(lines=lines, bytes=10 ** 9)
+        return [(unit.id, unit.sites) for unit in review_panel.plan_merge(
+            "B", "P", list(sites), ceiling=ceiling, reply_ceiling=reply)]
+
+    def test_everything_under_both_ceilings_is_one_unit(self):
+        self.assertEqual(self.plan(self.SITES), [(MERGE_UNIT, ("S1", "S2", "S3", "S4"))])
+
+    def test_fewer_than_two_sites_is_no_unit(self):
+        self.assertEqual(self.plan(self.SITES[:1]), [])
+        self.assertEqual(self.plan(()), [])
+
+    def test_over_the_input_ceiling_the_batches_follow_directories(self):
+        two = self.size(self.SITES[:2])[0]
+        self.assertEqual(self.plan(self.SITES, lines=two),
+                         [("merge-A-1", ("S1", "S2")), ("merge-A-2", ("S3", "S4"))])
+
+    def test_a_directory_is_never_split_while_it_fits_a_batch_of_its_own(self):
+        sites = (_merge_site("S1", "a/x.py"), _merge_site("S2", "b/y.py"),
+                 _merge_site("S3", "b/z.py"))
+        two = self.size(sites[:2])[0]
+        self.assertEqual(self.plan(sites, lines=two),
+                         [("merge-A-1", ("S1",)), ("merge-A-2", ("S2", "S3"))])
+
+    def test_a_directory_over_the_ceiling_alone_is_split_in_site_order(self):
+        sites = (_merge_site("S1", "a/x.py"), _merge_site("S2", "a/y.py"),
+                 _merge_site("S3", "a/z.py"), _merge_site("S4", "b/w.py"))
+        two = self.size(sites[:2])[0]
+        batches = self.plan(sites, lines=two)
+        self.assertEqual(batches, [("merge-A-1", ("S1", "S2")), ("merge-A-2", ("S3", "S4"))])
+
+    def test_over_the_reply_ceiling_the_batches_follow_directories_too(self):
+        reply = 2 * review_panel.MERGE_REPLY_BYTES_PER_SITE
+        self.assertEqual(self.plan(self.SITES, reply=reply),
+                         [("merge-A-1", ("S1", "S2")), ("merge-A-2", ("S3", "S4"))])
+
+    def test_the_ceilings_are_stated_beside_the_others(self):
+        self.assertIsInstance(review_panel.MERGE_CEILING, review_panel.Ceiling)
+        self.assertGreater(review_panel.MERGE_CEILING.bytes, 235 * 1024,
+                           "the ceiling is under the payload the trial already ran")
+        self.assertGreater(review_panel.MERGE_REPLY_CEILING,
+                           149 * review_panel.MERGE_REPLY_BYTES_PER_SITE)
+
+
+class ABatchedMergeSaysWhatItDidNotAttempt(_ReportCase):
+    """Over the ceiling the report states that merges across batches were not attempted: a
+    mistake copied into two batches is shown once per batch, and a reader has to know that
+    count is not the whole story."""
+
+    def test_the_report_says_the_sites_were_merged_in_batches(self):
+        self.plan_into(self.rundir)
+        stub_dispatch(self.rundir, READING_TABLE, DISPATCH)
+        self.assertEqual(_run("route", str(self.rundir)).returncode, 0)
+        stub_dispatch(self.rundir, VERIFY_TABLE)
+        self.clustered()
+        with mock.patch.object(review_panel, "MERGE_REPLY_CEILING",
+                               2 * review_panel.MERGE_REPLY_BYTES_PER_SITE):
+            code, err = _capture(lambda: review_panel.main(["merge", str(self.rundir)]))
+        self.assertEqual(code, 0, err)
+        self.assertEqual([(u["id"], u["sites"]) for u in self.mergers()],
+                         [("merge-A-1", ["S1", "S2"]), ("merge-A-2", ["S3"])])
+        stub_dispatch(self.rundir, _identity_merge(self.rundir))
+        self.report()
+        doc = json.loads((self.rundir / "findings.json").read_text(encoding="utf-8"))
+        self.assertTrue(doc["merge"]["batched"])
+        section = " ".join(review_panel._unescape(_section(
+            self.text(), review_panel.SUBSECTION_MERGE)).split())
+        self.assertIn(review_panel.MERGE_BATCHED.format(batches=2), section)
+
+
+class ARedoFromTheMergedStageTakesTheMergeBack(_ReportCase):
+    """A site's id is its position in the clustering, so a merge kept across a regrouping
+    would group sites that are no longer those sites. Both redo commands take it back."""
+
+    def merged_run(self):
+        self.plan_into(self.rundir)
+        stub_dispatch(self.rundir, READING_TABLE, DISPATCH)
+        self.assertEqual(_run("route", str(self.rundir)).returncode, 0)
+        stub_dispatch(self.rundir, VERIFY_TABLE)
+        self.clustered()
+        self.merged()
+        self.assertEqual(self.units()["stage"], review_panel.MERGED_STAGE)
+        self.assertTrue((self.rundir / "units" / MERGE_UNIT / "result.json").is_file())
+
+    def test_cluster_redo_from_merged_removes_the_merge_unit(self):
+        self.merged_run()
+        proc = _run("cluster", str(self.rundir), "--redo")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.mergers(), [])
+        self.assertFalse((self.rundir / "units" / MERGE_UNIT).exists())
+        self.assertEqual(self.units()["stage"], review_panel.CLUSTERED_STAGE)
+
+    def test_route_redo_from_merged_removes_the_merge_unit(self):
+        self.merged_run()
+        proc = _run("route", str(self.rundir), "--redo")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.mergers(), [])
+        self.assertFalse((self.rundir / "units" / MERGE_UNIT).exists())
+        self.assertEqual(self.units()["stage"], review_panel.VERIFICATION_STAGE)
+
+
 class TheSynthesisRoundIsOneUnitWithOneVocabulary(_ReportCase):
     """The fifth round: one unit, handed every defect in the run, asked to name the tiers
     once and place every defect under one of them.
@@ -15620,13 +16332,16 @@ class TheSynthesisRoundIsOneUnitWithOneVocabulary(_ReportCase):
     UNIT = "synth-A"
 
     def clustered_only(self, verify=VERIFY_TABLE):
-        """plan, land reading, verification and clustering, and stop before synthesize."""
+        """plan, land reading, verification, clustering, the merge and its check, and stop
+        before synthesize."""
         self.plan_into(self.rundir)
         stub_dispatch(self.rundir, READING_TABLE, DISPATCH)
         proc = _run("route", str(self.rundir))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         stub_dispatch(self.rundir, verify)
         self.clustered()
+        self.merged()
+        self.merge_checked()
 
     def test_a_round_that_did_not_come_back_is_not_a_unit_that_returned(self):
         """The coverage line and the appendix note have to agree.
@@ -15669,7 +16384,15 @@ class TheSynthesisRoundIsOneUnitWithOneVocabulary(_ReportCase):
                       "cand-003": "The run raised as claimed.",
                       "cand-004": "helper is never given None."}
         return clustering, review_panel.synthesis_material(
-            clustering, self.candidates()["candidates"], rationales)
+            clustering, self.candidates()["candidates"], rationales,
+            review_panel.group_sites(clustering), {})
+
+    @staticmethod
+    def index(clustering):
+        """Every defect's id and heading: one defect per site, headed by that site's."""
+        site_of = {c.id: c for c in clustering.clusters}
+        return [{"id": d.id, "consequence": site_of[d.sites[0]].consequence}
+                for d in review_panel.group_sites(clustering)]
 
     def test_one_unit_carries_every_defect_and_the_stage_moves(self):
         self.clustered_only()
@@ -15778,7 +16501,7 @@ class TheSynthesisRoundIsOneUnitWithOneVocabulary(_ReportCase):
         clustering, material = self.material()
         expected = review_panel.render_synthesizer_payload(
             review_panel.load_brief("synthesizer"), FILE_JOB["problem"],
-            [{"id": c.id, "consequence": c.consequence} for c in clustering.clusters],
+            self.index(clustering),
             material,
             schema=review_panel.load_schema(review_panel.SYNTHESIZER_SCHEMA_NAME))
         unit = self.synthesizers()[0]
@@ -15841,7 +16564,7 @@ class TheSynthesisRoundIsOneUnitWithOneVocabulary(_ReportCase):
         clustering, material = self.material()
         rebuilt = review_panel.render_synthesizer_payload(
             review_panel.load_brief("synthesizer"), FILE_JOB["problem"],
-            [{"id": c.id, "consequence": c.consequence} for c in clustering.clusters],
+            self.index(clustering),
             material,
             schema=review_panel.load_schema(review_panel.SYNTHESIZER_SCHEMA_NAME))
         text = (self.rundir / self.synthesizers()[0]["payload"]).read_text(encoding="utf-8")
@@ -15914,7 +16637,7 @@ class TheSynthesisRoundIsOneUnitWithOneVocabulary(_ReportCase):
         self.assertIn(self.UNIT, proc.stderr)
         self.assertIn("already exists", proc.stderr)
         self.assertTrue(target.is_symlink(), "the refusal removed it anyway")
-        self.assertEqual(self.units()["stage"], "clustered")
+        self.assertEqual(self.units()["stage"], "merge-checked")
         self.assertEqual(_tree_bytes(self.rundir), before)
 
     def test_a_unit_holding_both_a_result_and_an_error_refuses_the_run(self):
@@ -15936,12 +16659,12 @@ class TheSynthesisRoundIsOneUnitWithOneVocabulary(_ReportCase):
         stub_dispatch(self.rundir, VERIFY_TABLE)
         proc = self.synthesize(expect=2)
         self.assertIn("verification", proc.stderr)
-        self.assertIn("cluster", proc.stderr)
+        self.assertIn("merge", proc.stderr)
         self.assertEqual(self.synthesizers(), [])
 
     def test_report_still_runs_on_a_run_directory_this_round_never_touched(self):
-        # The round is optional: a run that stops after clustering reports exactly as it
-        # did before this stage existed. The marker it ends at is the terminal one either
+        # The round is optional: a run that stops after clustering reports exactly as if
+        # this stage did not exist. The marker it ends at is the terminal one either
         # way — `reported` says the run finished, not which rounds it ran.
         self.clustered_only()
         self.report()
@@ -15956,7 +16679,7 @@ class TheSynthesisRoundIsOneUnitWithOneVocabulary(_ReportCase):
         # per-unit check while the report showed a grouping over a different defect list.
         self.clustered_only()
         self.synthesize()
-        clusters = self.clustering().clusters
+        clusters = review_panel.group_sites(self.clustering())
         row = dict(self.synthesizers()[0])
         for name, edit, fragment in (
             ("short", [{**row, "defects": ["D1", "D2"]}], "not this run's defects"),
@@ -15976,7 +16699,8 @@ class TheSynthesisRoundIsOneUnitWithOneVocabulary(_ReportCase):
         # The anchor: every refusal above is only meaningful if the real listing passes.
         self.clustered_only()
         self.synthesize()
-        review_panel.check_synthesis(self.clustering().clusters, self.synthesizers())
+        review_panel.check_synthesis(review_panel.group_sites(self.clustering()),
+                                     self.synthesizers())
 
     def test_report_refuses_a_synthesis_listing_that_is_not_this_engines(self):
         self.clustered_only()
@@ -16002,13 +16726,16 @@ class ASynthesisResultMustBeAPartition(_ReportCase):
 
     def one(self, defect, tier=None, what="The call runs off the end of the list.",
             fix="Bound the index before it is used.", refs=()):
-        return {"defect": defect, "tier": self.TIERS[0] if tier is None else tier,
-                "what_goes_wrong": what, "fix": fix, "cross_references": list(refs)}
+        return {"defect": defect, "heading": "The call runs off the end of the list.",
+                "tier": self.TIERS[0] if tier is None else tier,
+                "what_goes_wrong": what, "fix": fix, "site_notes": [],
+                "cross_references": list(refs)}
 
     def parse(self, defects, tiers=None, handed=None, summary="s"):
+        handed = handed or self.HANDED
         return review_panel.parse_synthesizer_result(
             {"tiers": self.TIERS if tiers is None else tiers, "defects": defects,
-             "summary": summary}, "synth-A", handed or self.HANDED)
+             "summary": summary}, "synth-A", handed, [[f"S{did[1:]}"] for did in handed])
 
     def refuse(self, defects, *fragments, tiers=None, handed=None):
         with self.assertRaises(review_panel.ResultError) as caught:
@@ -16055,10 +16782,11 @@ class ASynthesisResultMustBeAPartition(_ReportCase):
         with self.assertRaises(review_panel.ResultError):
             review_panel.parse_synthesizer_result(
                 {"tiers": self.TIERS, "defects": "all one", "summary": "s"},
-                "synth-A", self.HANDED)
+                "synth-A", self.HANDED, [["S1"], ["S2"], ["S3"]])
         with self.assertRaises(review_panel.ResultError):
             review_panel.parse_synthesizer_result(
-                {"tiers": self.TIERS, "defects": []}, "synth-A", self.HANDED)
+                {"tiers": self.TIERS, "defects": []}, "synth-A", self.HANDED,
+                [["S1"], ["S2"], ["S3"]])
 
     def test_a_tier_the_engine_cannot_write_in_utf8_fails_the_unit(self):
         # The tier list is the run's, not one defect's, so a string it cannot write is a
@@ -16082,12 +16810,14 @@ class AnEntryTheEngineCannotReadCostsItsOwnDefect(_ReportCase):
     TIERS = ["A run stops instead of finishing", "The wrong number comes out"]
 
     def entry(self, defect, tier, refs=()):
-        return {"defect": defect, "tier": tier, "what_goes_wrong": "It runs off the end.",
-                "fix": "Bound the index.", "cross_references": list(refs)}
+        return {"defect": defect, "heading": "It runs off the end.", "tier": tier,
+                "what_goes_wrong": "It runs off the end.", "fix": "Bound the index.",
+                "site_notes": [], "cross_references": list(refs)}
 
     def parse(self, defects):
         return review_panel.parse_synthesizer_result(
-            {"tiers": self.TIERS, "defects": defects, "summary": "s"}, "synth-A", self.HANDED)
+            {"tiers": self.TIERS, "defects": defects, "summary": "s"}, "synth-A", self.HANDED,
+            [["S1"], ["S2"], ["S3"]])
 
     def test_the_defect_is_rejected_by_name_and_the_rest_stand(self):
         parsed = self.parse([self.entry("D1", self.TIERS[0]),
@@ -16131,8 +16861,8 @@ class AnEntryTheEngineCannotReadCostsItsOwnDefect(_ReportCase):
             ("references not a list", {**self.entry("D2", self.TIERS[0]),
                                        "cross_references": "D1"}),
             # The element type the schema also declares. A reference that is not a defect
-            # id names nothing the engine could look up, and the schema permitting it was
-            # a mutation seven contract tests survived.
+            # id names nothing the engine could look up, so it is refused like any other
+            # malformed entry.
             ("a reference that is not a string", {**self.entry("D2", self.TIERS[0]),
                                                   "cross_references": [{}]}),
             ("an empty reference", {**self.entry("D2", self.TIERS[0]),
@@ -16180,12 +16910,284 @@ class AnEntryTheEngineCannotReadCostsItsOwnDefect(_ReportCase):
         self.assertEqual(record["state"], "complete")
         self.assertEqual(len(record["rejected"]), 1)
         self.assertIn("D2", record["rejected"][0])
-        defects = {c["id"]: c for c in doc["clusters"]}
+        defects = {c["id"]: c for c in doc["defects"]}
         self.assertIsNone(defects["D2"]["tier"])
         self.assertIsNone(defects["D2"]["what_goes_wrong"])
         self.assertEqual(defects["D1"]["tier"], SYNTH_TABLE["synth-A"]["tiers"][0])
         # Nothing was dropped: the defect is still in the run and still counted.
         self.assertEqual(sorted(defects), ["D1", "D2", "D3"])
+
+
+def _words(count, word="word"):
+    return " ".join([word] * count)
+
+
+class ASynthesisEntryIsHeldToItsLengthLimits(unittest.TestCase):
+    """Each defect's heading, account, fix and site notes are held to a length, by the
+    engine and not the brief alone: a reply is re-parsed by hand, so a schema limit a
+    runtime did not enforce would otherwise reach the page. An entry over a limit costs
+    its own defect and no other, and the refusal is recorded by name."""
+
+    HANDED = ("D1", "D2", "D3")
+    SITES = (["S1", "S2"], ["S3"], ["S4"])
+    TIERS = ["A run stops instead of finishing", "The wrong number comes out"]
+
+    def entry(self, defect, **over):
+        return {"defect": defect, "heading": "An empty input stops the run.",
+                "tier": self.TIERS[0], "what_goes_wrong": "The index runs off the end.",
+                "fix": "Bound the index.", "site_notes": [], "cross_references": [], **over}
+
+    def parse(self, defects):
+        return review_panel.parse_synthesizer_result(
+            {"tiers": self.TIERS, "defects": defects, "summary": "s"}, "synth-A",
+            self.HANDED, self.SITES)
+
+    def assert_refused_alone(self, broken, *fragments):
+        parsed = self.parse([broken, self.entry("D2"), self.entry("D3", tier=self.TIERS[1])])
+        self.assertIsNone(parsed["assignments"]["D1"])
+        self.assertEqual(len(parsed["rejected"]), 1, parsed["rejected"])
+        self.assertIn("D1", parsed["rejected"][0])
+        for fragment in fragments:
+            self.assertIn(fragment, parsed["rejected"][0])
+        self.assertEqual(parsed["assignments"]["D2"]["tier"], self.TIERS[0])
+        self.assertEqual(parsed["assignments"]["D3"]["tier"], self.TIERS[1])
+
+    def test_an_entry_at_every_limit_is_accepted(self):
+        at = self.entry("D1", heading="x" * review_panel.SYNTHESIS_HEADING_CHARS,
+                        what_goes_wrong=_words(review_panel.SYNTHESIS_ACCOUNT_WORDS),
+                        fix=_words(review_panel.SYNTHESIS_FIX_WORDS),
+                        site_notes=[{"site": "S2", "note": _words(review_panel.SYNTHESIS_NOTE_WORDS)},
+                                    {"site": "S1", "note": "The first reads a file."}])
+        parsed = self.parse([at, self.entry("D2"), self.entry("D3")])
+        self.assertEqual(parsed["rejected"], [])
+        judged = parsed["assignments"]["D1"]
+        self.assertEqual(judged["heading"], "x" * review_panel.SYNTHESIS_HEADING_CHARS)
+        # The engine builds the map from the records, in the defect's own site order.
+        self.assertEqual(list(judged["site_notes"].items()),
+                         [("S1", "The first reads a file."),
+                          ("S2", _words(review_panel.SYNTHESIS_NOTE_WORDS))])
+        self.assertEqual(parsed["assignments"]["D2"]["site_notes"], {})
+
+    def test_each_limit_refuses_its_own_defect_alone(self):
+        long_word = "x" * 15
+        for name, over, fragment in (
+            ("heading", {"heading": "x" * (review_panel.SYNTHESIS_HEADING_CHARS + 1)},
+             f"{review_panel.SYNTHESIS_HEADING_CHARS} characters"),
+            ("account", {"what_goes_wrong": _words(review_panel.SYNTHESIS_ACCOUNT_WORDS + 1)},
+             f"{review_panel.SYNTHESIS_ACCOUNT_WORDS + 1} words"),
+            ("fix", {"fix": _words(review_panel.SYNTHESIS_FIX_WORDS + 1)},
+             f"{review_panel.SYNTHESIS_FIX_WORDS + 1} words"),
+            ("site note", {"site_notes": [
+                {"site": "S1", "note": _words(review_panel.SYNTHESIS_NOTE_WORDS + 1)}]},
+             f"{review_panel.SYNTHESIS_NOTE_WORDS + 1} words"),
+            # Under the word limit and over the schema's character limit: the engine holds
+            # the schema's bound as well, so a runtime that enforces it and one that does
+            # not reach one answer.
+            ("account in characters", {"what_goes_wrong": _words(40, long_word)},
+             "characters"),
+        ):
+            with self.subTest(limit=name):
+                self.assert_refused_alone(self.entry("D1", **over), fragment)
+
+    def test_a_site_note_naming_a_site_outside_its_defect_or_twice_is_refused(self):
+        for name, notes, fragment in (
+            ("an unknown site", [{"site": "S9", "note": "It differs."}], "S9"),
+            ("another defect's site", [{"site": "S3", "note": "It differs."}], "S3"),
+            ("one site twice", [{"site": "S1", "note": "It differs."},
+                                {"site": "S1", "note": "It differs again."}], "twice"),
+            ("a map keyed by site", {"S1": "It differs."}, "list"),
+            ("an extra key", [{"site": "S1", "note": "It differs.", "why": "x"}], "why"),
+            ("an empty note", [{"site": "S1", "note": ""}], "note"),
+        ):
+            with self.subTest(notes=name):
+                self.assert_refused_alone(self.entry("D1", site_notes=notes), fragment)
+
+    def test_the_schema_and_the_brief_state_the_limits_the_engine_holds(self):
+        schema = review_panel.load_schema(review_panel.SYNTHESIZER_SCHEMA_NAME)
+        entry = schema["properties"]["defects"]["items"]["properties"]
+        note = entry["site_notes"]["items"]["properties"]["note"]
+        self.assertEqual(entry["heading"]["maxLength"], review_panel.SYNTHESIS_HEADING_CHARS)
+        self.assertEqual(entry["what_goes_wrong"]["maxLength"],
+                         review_panel.SYNTHESIS_ACCOUNT_CHARS)
+        self.assertEqual(entry["fix"]["maxLength"], review_panel.SYNTHESIS_FIX_CHARS)
+        self.assertEqual(note["maxLength"], review_panel.SYNTHESIS_NOTE_CHARS)
+        brief = " ".join(review_panel.load_brief("synthesizer").split())
+        for field, words in (("what_goes_wrong", review_panel.SYNTHESIS_ACCOUNT_WORDS),
+                             ("fix", review_panel.SYNTHESIS_FIX_WORDS)):
+            with self.subTest(field=field):
+                self.assertIn(f"At most {words} words", entry[field]["description"])
+                self.assertIn(f"`{field}`", brief)
+        self.assertIn(f"at most {review_panel.SYNTHESIS_NOTE_WORDS} words",
+                      note["description"])
+        self.assertIn(f"{review_panel.SYNTHESIS_HEADING_CHARS} characters",
+                      entry["heading"]["description"])
+        for limit in (f"{review_panel.SYNTHESIS_ACCOUNT_WORDS} words",
+                      f"{review_panel.SYNTHESIS_NOTE_WORDS} words",
+                      f"{review_panel.SYNTHESIS_HEADING_CHARS} characters"):
+            self.assertIn(limit, brief)
+
+
+class ASynthesisFromBeforeSitesIsReadInTheShapeItWasAskedFor(unittest.TestCase):
+    """A listing written before a defect could have several sites records no sites, and
+    the reply to it has no heading and no site notes. It is read in that shape, with no
+    length limit it was never asked to keep, so an old run re-renders with its narrative;
+    a listing that records sites is read in the new shape only."""
+
+    TIERS = ["A run stops instead of finishing"]
+    OLD = {"defect": "D1", "tier": "A run stops instead of finishing",
+           "what_goes_wrong": _words(70), "fix": "Bound the index.",
+           "cross_references": []}
+
+    def parse(self, entry, sites):
+        return review_panel.parse_synthesizer_result(
+            {"tiers": self.TIERS, "defects": [entry], "summary": "s"}, "synth-A", ("D1",),
+            sites)
+
+    def test_the_old_shape_is_read_from_a_listing_with_no_sites(self):
+        parsed = self.parse(self.OLD, None)
+        self.assertEqual(parsed["rejected"], [])
+        judged = parsed["assignments"]["D1"]
+        self.assertIsNone(judged["heading"], "the heading falls back to the site's consequence")
+        self.assertEqual(judged["site_notes"], {})
+        self.assertEqual(judged["what_goes_wrong"], self.OLD["what_goes_wrong"])
+
+    def test_each_listing_is_read_in_its_own_shape_only(self):
+        new = {**self.OLD, "what_goes_wrong": "It runs off the end.",
+               "heading": "An empty input stops the run.", "site_notes": []}
+        for name, entry, sites in (("new shape, no sites recorded", new, None),
+                                   ("old shape, sites recorded", self.OLD, [["S1"]])):
+            with self.subTest(case=name):
+                parsed = self.parse(entry, sites)
+                self.assertIsNone(parsed["assignments"]["D1"])
+                self.assertEqual(len(parsed["rejected"]), 1)
+        self.assertEqual(self.parse(new, [["S1"]])["rejected"], [])
+
+
+# The merge round over the standard run, upheld: D1 is S1 and S2, one mistake; D2 is S3.
+MERGED_PAIR = {MERGE_UNIT: _merge_reply([MERGE_PAIR, _single("S3")])}
+SYNTH_MERGED = {
+    "synth-A": {
+        "tiers": ["A run stops instead of finishing", "The total comes out wrong"],
+        "defects": [
+            {"defect": "D1", "heading": "An empty input stops the run with a traceback.",
+             "tier": "A run stops instead of finishing",
+             "what_goes_wrong": "An empty input is indexed before anything checks it, so "
+                                "the call dies where it should have done nothing.",
+             "fix": "Check for an empty input before indexing, at both sites.",
+             "site_notes": [{"site": "S2", "note": "Here the empty input is the argument "
+                                                   "list, at start-up."}],
+             "cross_references": []},
+            {"defect": "D2", "heading": "A missing value doubles the total.",
+             "tier": "The total comes out wrong",
+             "what_goes_wrong": "A missing value is doubled rather than skipped.",
+             "fix": "Skip a missing value.", "site_notes": [], "cross_references": []},
+        ],
+        "summary": "Two tiers; one mistake made at two sites.",
+    },
+}
+
+
+class ADefectOfSeveralSitesIsNarratedOnce(_FindingsCase):
+    """Synthesis narrates defects, not sites: the payload hands it each defect's upheld
+    mechanism and every site's instance and material, and the reply's one heading,
+    account and fix cover the whole defect, with a note only where a site differs. Every
+    site still renders whatever the round did."""
+
+    def merged_run(self, synthesis=SYNTH_MERGED):
+        self.run_all(merge=MERGED_PAIR, synthesis=synthesis)
+        defects = self.defects()
+        self.assertEqual(defects["D1"]["sites"], ["S1", "S2"],
+                         "the merge check did not uphold the pair, so this proves nothing")
+        return defects
+
+    @staticmethod
+    def entry(text, did):
+        """A defect's entry in the body: from its heading to the next heading at its own
+        level or above."""
+        found = re.search(rf"\n(#+) {did}\. ", text)
+        assert found, f"{did} has no entry"
+        rest = text[found.end():]
+        end = re.search(rf"\n#{{1,{len(found.group(1))}}} ", rest)
+        return text[found.start():found.end() + (end.start() if end else len(rest))]
+
+    def payload(self):
+        doc = json.loads((self.rundir / "units.json").read_text(encoding="utf-8"))
+        unit = next(u for u in doc["units"] if u["kind"] == "synthesizer")
+        return (self.rundir / unit["payload"]).read_text(encoding="utf-8")
+
+    def test_the_payload_carries_the_mechanism_and_each_sites_instance(self):
+        self.merged_run()
+        text = self.payload()
+        d1 = text.split("\n### D1\n", 1)[1].split("\n### D2\n", 1)[0]
+        self.assertIn(MERGE_PAIR["mechanism"], d1)
+        for record in MERGE_PAIR["instances"]:
+            self.assertIn(f"\n#### {record['site']}\n", d1)
+            self.assertIn(record["instance"], d1)
+        self.assertIn(FINDING["failure"], d1, "each site's own material is still there")
+        d2 = text.split("\n### D2\n", 1)[1]
+        self.assertIn("\n#### S3\n", d2)
+        self.assertNotIn(MERGE_PAIR["mechanism"], d2)
+
+    def test_the_heading_and_site_notes_reach_the_structure_and_the_report(self):
+        defects = self.merged_run()
+        landed = SYNTH_MERGED["synth-A"]["defects"][0]
+        self.assertEqual(defects["D1"]["heading"], landed["heading"])
+        self.assertEqual(defects["D1"]["site_notes"], {"S2": landed["site_notes"][0]["note"]})
+        self.assertEqual(defects["D2"]["site_notes"], {})
+        prose = self.reads_as()
+        self.assertIn(landed["heading"], prose)
+        self.assertIn(landed["site_notes"][0]["note"], prose)
+
+    def test_a_note_on_a_defect_of_one_site_renders_in_its_entry(self):
+        """The round may note the one site of a defect of one site; a note accepted into
+        the structure is a note the report shows, under the defect it was written for."""
+        note = "Only a missing value reaches this line."
+        entries = [{**e, "site_notes": [{"site": "S3", "note": note}]}
+                   if e["defect"] == "D2" else e for e in SYNTH_MERGED["synth-A"]["defects"]]
+        defects = self.merged_run({"synth-A": {**SYNTH_MERGED["synth-A"], "defects": entries}})
+        self.assertEqual(defects["D2"]["site_notes"], {"S3": note})
+        entry = self.entry(self.text(), "D2")
+        self.assertIn(f"- **{review_panel.SITE_NOTE_LABEL}** {note}", entry)
+
+    def test_an_over_limit_defect_renders_with_its_mechanism_and_the_refusal_is_named(self):
+        entries = [{**e, "what_goes_wrong": _words(review_panel.SYNTHESIS_ACCOUNT_WORDS + 1)}
+                   if e["defect"] == "D1" else e
+                   for e in SYNTH_MERGED["synth-A"]["defects"]]
+        defects = self.merged_run({"synth-A": {**SYNTH_MERGED["synth-A"], "defects": entries}})
+        self.assertIsNone(defects["D1"]["what_goes_wrong"])
+        self.assertIsNone(defects["D1"]["heading"])
+        self.assertEqual(defects["D1"]["mechanism"], MERGE_PAIR["mechanism"])
+        self.assertEqual(defects["D2"]["heading"], SYNTH_MERGED["synth-A"]["defects"][1]["heading"],
+                         "the refusal cost another defect its entry")
+        text = self.text()
+        entry = self.entry(text, "D1")
+        self.assertIn(" ".join(MERGE_PAIR["mechanism"].split()), " ".join(entry.split()))
+        notes = " ".join(self.body(text, review_panel.SUBSECTION_SYNTHESIS).split())
+        self.assertIn("D1", notes)
+        self.assertIn(f"{review_panel.SYNTHESIS_ACCOUNT_WORDS + 1} words", notes)
+
+    def test_a_failed_synthesis_still_renders_every_site_of_every_defect(self):
+        defects = self.merged_run({"synth-A": "the reply was not a JSON object\n"})
+        self.assertEqual(self.findings()["synthesis"]["state"], "failed")
+        text = self.text()
+        prose = " ".join(text.split())
+        # The defect of two sites: its mechanism, and each site under it with its own
+        # consequence.
+        self.assertIn(" ".join(MERGE_PAIR["mechanism"].split()), prose)
+        sites = {s["id"]: s for s in self.findings()["sites"]}
+        for sid in ("S1", "S2", "S3"):
+            with self.subTest(site=sid):
+                self.assertIn(" ".join(sites[sid]["consequence"].split())[:60], prose)
+        entry = self.entry(text, "D1")
+        # Each site in the entry, with its source, and in the evidence under its number.
+        self.assertIn('\n- <a id="S1-src"></a>**S1** · ', entry)
+        self.assertIn('\n- <a id="S2-src"></a>**S2** · ', entry)
+        evidence = _section(text, review_panel.SECTION_EVIDENCE)
+        for sid in ("S1", "S2", "S3"):
+            self.assertRegex(evidence, rf"(?m)^### {sid} · ")
+        # A defect of one site is headed by that site's consequence.
+        self.assertIsNone(defects["D2"]["heading"])
+        self.assertEqual(defects["D2"]["consequence"], sites["S3"]["consequence"])
 
 
 class ASynthesisRoundThatDidNotComeBackLeavesTheStatusGrouping(_ReportCase):
@@ -16204,15 +17206,17 @@ class ASynthesisRoundThatDidNotComeBackLeavesTheStatusGrouping(_ReportCase):
         self.assertEqual(record["unit"], self.UNIT)
         self.assertEqual(record["state"], state)
         self.assertEqual(record["tiers"], [])
-        for cluster in doc["clusters"]:
+        for cluster in doc["defects"]:
+            self.assertIsNone(cluster["heading"], cluster["id"])
+            self.assertEqual(cluster["site_notes"], {}, cluster["id"])
             self.assertIsNone(cluster["tier"], cluster["id"])
             self.assertIsNone(cluster["what_goes_wrong"], cluster["id"])
             self.assertIsNone(cluster["fix"], cluster["id"])
             self.assertEqual(cluster["cross_references"], [])
             self.assertEqual(cluster["dropped_cross_references"], [])
         # Nothing is dropped, and the run still counts what it counted.
-        self.assertEqual([c["id"] for c in doc["clusters"]], ["D1", "D2", "D3"])
-        self.assertIn("- Defects: 3 from 4 candidates", self.text())
+        self.assertEqual([c["id"] for c in doc["defects"]], ["D1", "D2", "D3"])
+        self.assertIn("- Defects: 3 at 3 sites from 4 candidates", self.text())
 
     def test_a_unit_that_never_landed_leaves_every_defect_unjudged(self):
         doc = self.degraded(None)
@@ -16239,10 +17243,8 @@ class ASynthesisRoundThatDidNotComeBackLeavesTheStatusGrouping(_ReportCase):
 class TheSynthesisLandsInTheStructureAndInBothDocuments(_FindingsCase):
     """``findings.json`` gains the judgments and both documents render them.
 
-    The round shipped as contract, dispatch and parsing alone, and its own phase proved it
-    by rendering nothing — which is what made the parsing, the partition check and the
-    degrade provable before any of it reached a page. That claim has now been consumed:
-    the tests below assert what the documents do carry, and what a DEGRADED round still
+    Contract, dispatch and parsing can each be right while the documents render nothing,
+    so the tests below assert what the documents do carry, and what a DEGRADED round still
     leaves them.
     """
 
@@ -16259,9 +17261,12 @@ class TheSynthesisLandsInTheStructureAndInBothDocuments(_FindingsCase):
         self.assertEqual(doc["synthesis"]["state"], "complete")
         self.assertEqual(doc["synthesis"]["summary"], landed["summary"])
         self.assertEqual(doc["synthesis"]["rejected"], [])
-        defects = {c["id"]: c for c in doc["clusters"]}
+        defects = {c["id"]: c for c in doc["defects"]}
         for entry in landed["defects"]:
             record = defects[entry["defect"]]
+            self.assertEqual(record["heading"], entry["heading"])
+            self.assertEqual(record["site_notes"],
+                             {n["site"]: n["note"] for n in entry["site_notes"]})
             self.assertEqual(record["tier"], entry["tier"])
             self.assertEqual(record["what_goes_wrong"], entry["what_goes_wrong"])
             self.assertEqual(record["fix"], entry["fix"])
@@ -16269,7 +17274,8 @@ class TheSynthesisLandsInTheStructureAndInBothDocuments(_FindingsCase):
 
     def test_a_degraded_round_leaves_the_document_it_had_before_plus_the_note(self):
         """A round that failed or never landed degrades to the status grouping, and the
-        only mark it leaves is the appendix note naming the unit.
+        only marks it leaves are the appendix note naming the unit and the line at the top
+        saying the round returned nothing usable.
 
         Asserted by CUTTING that note and comparing bytes, which is the strong form: a run
         with no round at all is the document a degraded run has to reproduce, and anything
@@ -16279,8 +17285,8 @@ class TheSynthesisLandsInTheStructureAndInBothDocuments(_FindingsCase):
         **The page is asserted on separately, and not by comparing it between runs.**
         `report.html` is `render_html(report.md)` and nothing else, so two runs whose
         Markdown matches have matching pages by construction, and a fault in the conversion
-        moves both of them the same way. Measured: with every cross-reference link stripped
-        out of `_inline`, the cross-run byte comparison of `report.html` still passes. What
+        moves both of them the same way. With every cross-reference link stripped out of
+        `_inline`, the cross-run byte comparison of `report.html` still passes. What
         catches that is what the page CARRIES — the section, its id, and the way in from the
         contents list — so that is what is asserted here.
         """
@@ -16294,6 +17300,7 @@ class TheSynthesisLandsInTheStructureAndInBothDocuments(_FindingsCase):
         self.assertNotIn(review_panel.SUBSECTION_SYNTHESIS, runs["none"])
         for name, text in runs.items():
             with self.subTest(round=name):
+                text = text.replace(f"- {review_panel.GROUPING_NO_SYNTHESIS}\n", "")
                 self.assertEqual(
                     _without_the_clock(self, _without_the_run_directory_line(
                         self, _without_section(text, review_panel.SUBSECTION_SYNTHESIS))),
@@ -16327,7 +17334,7 @@ class TheSynthesisLandsInTheStructureAndInBothDocuments(_FindingsCase):
         self.assertEqual(prose.count(" ".join(landed["summary"].split())), 1)
         # A refuted defect is one line in the appendix and renders no prose at all, so its
         # judgment is not among what the body carries.
-        work = {c["id"] for c in self.findings()["clusters"] if c["status"] != "refuted"}
+        work = {c["id"] for c in self.findings()["defects"] if c["status"] != "refuted"}
         self.assertEqual(work, {"D1", "D2"}, "the fixture stopped refuting exactly one")
         judged = [e for e in landed["defects"] if e["defect"] in work]
         for value in [*landed["tiers"],
@@ -16345,7 +17352,7 @@ class TheSynthesisLandsInTheStructureAndInBothDocuments(_FindingsCase):
         self.assertNotEqual(self.documents(judged), self.documents(plain))
         doc = self.findings(judged)
         self.assertEqual(doc["synthesis"]["tiers"], SYNTH_TABLE[self.UNIT]["tiers"])
-        self.assertTrue(all(c["tier"] for c in doc["clusters"]))
+        self.assertTrue(all(c["tier"] for c in doc["defects"]))
 
     def test_the_round_adds_no_dependence_on_the_order_units_landed_in(self):
         """Two runs over one tree, one of them landing every unit concurrently, produce the
@@ -16387,7 +17394,7 @@ class TheSynthesisLandsInTheStructureAndInBothDocuments(_FindingsCase):
                 continue
             self.assertEqual(one[name], two[name], name)
         assert_same_but_for_where_and_when_it_ran(self, first, second, states)
-        self.assertTrue(all(c["tier"] for c in self.findings(first)["clusters"]),
+        self.assertTrue(all(c["tier"] for c in self.findings(first)["defects"]),
                         "the fixture judged nothing, so this compares two empty rounds")
 
     def test_rerender_rewrites_byte_identically_and_dispatches_nothing(self):
@@ -16410,11 +17417,10 @@ class TheSynthesisLandsInTheStructureAndInBothDocuments(_FindingsCase):
         reader to work the connection out of prose further down the entry -- and where one
         broad search is attached to five defects there is no single connection to find.
 
-        Rendered here rather than left for the phase that reshapes the evidence block,
-        because a value carried in the structure and absent from the prose is what
-        `EveryFactInTheStructureReachesTheProse` refuses: adding a field forces rendering
-        it, or declaring it one the report deliberately does not state. This one is meant
-        to be read."""
+        Rendered in the evidence block, because a value carried in the structure and
+        absent from the prose is what `EveryFactInTheStructureReachesTheProse` refuses:
+        adding a field forces rendering it, or declaring it one the report deliberately
+        does not state. This one is meant to be read."""
         self.run_all(synthesis=SYNTH_TABLE)
         doc = json.loads((self.rundir / "findings.json").read_text(encoding="utf-8"))
         carried = [c["evidence"]["shows"] for c in doc["candidates"] if c.get("evidence")]
@@ -16428,13 +17434,13 @@ class TheSynthesisLandsInTheStructureAndInBothDocuments(_FindingsCase):
 
     def test_the_path_legend_sits_in_the_appendix(self):
         """One row per file the report names. On a real tree that is hundreds or thousands
-        of lines, and it sat in section 1 -- between the summary a reader came for and the
-        first defect they came to fix, so reaching the findings meant scrolling past all of
-        it. It is a decoder: consulted when a short name is unfamiliar, ignored otherwise,
-        which is what the appendix is for."""
+        of lines, and in section 1 it would sit between the summary a reader came for and
+        the first defect they came to fix, so reaching the findings would mean scrolling
+        past all of it. It is a decoder: consulted when a short name is unfamiliar,
+        ignored otherwise, which is what the appendix is for."""
         self.run_all(synthesis=SYNTH_TABLE)
         report = (self.rundir / "report.md").read_text(encoding="utf-8")
-        # The HEADING, not the pointer sentence that now names it in the summary.
+        # The HEADING, not the pointer sentence that names it in the summary.
         legend = report.index(f"### {review_panel.SUBSECTION_LEGEND}")
         appendix = report.index(f". {review_panel.SECTION_APPENDIX}")
         first_defect = report.index("#### D")
@@ -16460,19 +17466,18 @@ class TheSynthesisLandsInTheStructureAndInBothDocuments(_FindingsCase):
         self.assertEqual(numbers, list(range(1, len(numbers) + 1)), numbers)
 
     def test_every_defect_labels_its_checks_and_none_is_a_bare_fragment(self):
-        """What the owner read and could not identify. Under each defect sat a run of
-        unlabelled bullets -- the verifier verdict on each report the defect merges -- and
-        where a defect merged only ONE report the engine dropped the `At <location> --`
-        prefix, so the bullet degenerated to the bare word `unresolved`, or `by reading`.
-        A fragment, duplicating the header field above it, with nothing saying what it was.
+        """A check line a reader cannot identify says nothing. Under each defect sit the
+        verifier verdicts on each report it merges. Without the `At <location> --` prefix,
+        a defect merging only ONE report would show the bare word `unresolved`, or
+        `by reading`: a fragment, duplicating the header field above it, with nothing
+        saying what it was.
 
-        The block is labelled and every line has the same shape whether the defect merges
+        The block is labeled and every line has the same shape whether the defect merges
         one report or five."""
         self.run_all(synthesis=SYNTH_TABLE)
         report = (self.rundir / "report.md").read_text(encoding="utf-8")
-        # `#### ` also opens appendix subheadings, so a defect entry is one whose heading
-        # is a defect id.
-        entries = [e for e in report.split("\n#### ")[1:] if re.match(r"D\d+\.", e)]
+        # Each site's checks are in its evidence entry, headed by the site's number.
+        entries = [e for e in report.split("\n### ")[1:] if re.match(r"S\d+ · ", e)]
         self.assertTrue(entries, "no defect entries rendered, so this asserts nothing")
         for entry in entries:
             name = entry.splitlines()[0]
@@ -16490,8 +17495,8 @@ class TheSynthesisLandsInTheStructureAndInBothDocuments(_FindingsCase):
         location is a line they cannot place."""
         self.run_all(synthesis=SYNTH_TABLE)
         report = (self.rundir / "report.md").read_text(encoding="utf-8")
-        lone = [e for e in report.split("\n#### ")[1:]
-                if re.match(r"D\d+\.", e) and e.count("**Checks.**")]
+        lone = [e for e in report.split("\n### ")[1:]
+                if re.match(r"S\d+ · ", e) and e.count("**Checks.**")]
         self.assertTrue(lone)
         for entry in lone:
             block = entry.split("**Checks.**", 1)[1].split("\n-", 1)[0]
@@ -16503,11 +17508,10 @@ class TheSynthesisLandsInTheStructureAndInBothDocuments(_FindingsCase):
                     self.assertRegex(line, r"core\.py:\d", "a check line names no location")
 
     def test_one_run_attached_to_several_reports_is_printed_once(self):
-        """The verifiers ran one broad search per batch and attached it to every verdict in
-        it. The same grep and the same output then appeared verbatim under five different
-        defects, and three times under one defect alone -- once per report. A reader called
-        the collection a random pile of greps, which is what it looks like when the same
-        block is the answer to three different questions.
+        """A verifier may run one broad search per batch and attach it to every verdict in
+        it. Printed per verdict, the same grep and the same output appear verbatim under
+        several defects, and several times under one defect -- once per report -- which
+        reads as a random pile of greps: the same block answering different questions.
 
         Asserted on the renderer directly. Through a full run the two reports of one defect
         have identical bodies and the existing body dedupe collapses them first, so a test
@@ -16518,12 +17522,9 @@ class TheSynthesisLandsInTheStructureAndInBothDocuments(_FindingsCase):
         again = "".join(review_panel._render_evidence(one, ran))
         self.assertIn("grep -c", first)
         self.assertIn("0", first)
-        # The second says which run it was and does not repeat the command or the capture.
-        self.assertNotIn("grep -c", again)
-        self.assertIn("Same run as above.", again)
-        # What it SHOWS stays on both: it is why this report rests on that run, and the
-        # second report is a different claim about the same evidence.
-        self.assertIn("Shows the key appears nowhere", again)
+        # The second adds nothing: the command, the capture and what the run shows are
+        # already under this defect, and the report is still counted on its check line.
+        self.assertEqual(again, "")
         # A different command under the same defect is not folded away.
         other = {**one, "argv": ["ls", "-la"], "shows": "Shows the directory is empty."}
         self.assertIn("ls -la", "".join(review_panel._render_evidence(other, ran)))
@@ -16532,9 +17533,9 @@ class TheSynthesisLandsInTheStructureAndInBothDocuments(_FindingsCase):
         self.assertIn("grep -c", "".join(review_panel._render_evidence(one, set())))
 
     def test_one_command_run_twice_is_two_runs(self):
-        """Keyed on the command alone, the ordinary way to show a fix works -- run it
-        before, run it after -- collapsed into one, and the second run's directory, exit
-        status and output disappeared."""
+        """A run is keyed on the whole run -- command, directory, exit status and output --
+        and not the command alone. So the ordinary way to show a fix works -- run it before,
+        run it after -- prints both, each with its own directory, exit status and output."""
         before = {**EVIDENCE, "cwd": "old", "exit_status": 1, "output": "IndexError\n",
                   "shows": "Shows it failing on the old tree."}
         after = {**EVIDENCE, "cwd": "fixed", "exit_status": 0, "output": "PASS\n",
@@ -16542,13 +17543,12 @@ class TheSynthesisLandsInTheStructureAndInBothDocuments(_FindingsCase):
         ran: set = set()
         first = "".join(review_panel._render_evidence(before, ran))
         second = "".join(review_panel._render_evidence(after, ran))
-        self.assertNotIn("Same run as above", second)
+        self.assertIn("python3 run.py", second)
         self.assertIn("PASS", second)
         self.assertIn("exit 0", second)
         self.assertIn("fixed", second)
         # The identical run still collapses, which is the rule this must not undo.
-        self.assertIn("Same run as above",
-                      "".join(review_panel._render_evidence(before, ran)))
+        self.assertEqual(review_panel._render_evidence(before, ran), [])
 
     def test_an_argument_holding_a_newline_keeps_a_form_that_preserves_it(self):
         """A code span is one line, so collapsing the whitespace turns
@@ -16562,9 +17562,10 @@ class TheSynthesisLandsInTheStructureAndInBothDocuments(_FindingsCase):
         self.assertIn("print(1)", rendered)
 
     def test_the_defect_header_names_the_run_that_earned_the_claim(self):
-        """Both documentary and executed evidence carry the same axis, so picking the first
-        member that matches it made the header depend on member order: a grep listed ahead
-        of a real run said a grep had settled the defect."""
+        """Both documentary and executed evidence carry the same axis, so the first member
+        that matches it is not necessarily the one that earned the claim. The header takes
+        its words from an executed member where there is one, in either member order, and
+        never says a grep settled a defect something was run for."""
         cluster = {"axis_b": "by running"}
         doc = {"axis_b": "by running", "evidence": {**DOCUMENTARY}}
         ran = {"axis_b": "by running", "evidence": {**EVIDENCE}}
@@ -16617,7 +17618,7 @@ class TheSynthesisLandsInTheStructureAndInBothDocuments(_FindingsCase):
         """Exit status and truncation are the supervisor keeping records. A fixer reads the
         sentence and the command first, so the numbers follow them in a parenthetical."""
         self.run_all()
-        line = next(l for l in self.text().splitlines() if "Evidence" in l)
+        line = next(l for l in self.text().splitlines() if l.startswith("- Evidence"))
         self.assertRegex(line, r"\(exit [^)]*\)\s*$")
         self.assertLess(line.index("argv" if "argv" in line else "Shows"),
                         line.index("(exit"), "the bookkeeping leads the line")
@@ -16631,17 +17632,14 @@ class TheSynthesisLandsInTheStructureAndInBothDocuments(_FindingsCase):
         self.assertIn("IndexError: list index out of range", page)
 
     def test_a_rerender_carries_the_stamp_of_the_report_it_replaces(self):
-        """What made the byte-identity above a coin flip. `--rerender` read
-        `datetime.now()` a second time, so the two renders agreed only while they landed
-        inside one minute -- and on a slow runner they did not: `14:05 UTC` against
-        `14:04 UTC`, one CI job red on a change touching no timestamp code.
+        """`--rerender` reuses the saved stamp in `report-stamp.json`, or the stamp of the
+        report it replaces, rather than reading the clock again, so the byte-identity above
+        holds however far apart the two renders land.
 
-        The engine was what was wrong, not the test: `--rerender` promises a rewrite of one
-        report from unchanged data, and a rewrite that cannot reproduce its own bytes is not
-        one. The stamp is read back from the report being replaced. It is NOT kept in
+        `--rerender` promises a rewrite of one report from unchanged data, and a rewrite
+        that cannot reproduce its own bytes is not one. The stamp is NOT kept in
         `findings.json`, which is the structure -- no clock and no path, byte-identical
-        across two runs over one tree -- and the run directory holds exactly one clock, in
-        `inventory.json`."""
+        across two runs over one tree."""
         self.run_all(synthesis=SYNTH_TABLE)
         first = (self.rundir / "report.md").read_text(encoding="utf-8")
         stamp = review_panel._GENERATED_LINE.search(first)
@@ -16668,7 +17666,7 @@ class ACrossReferenceIsCheckedAsFarAsItCanBe(_FindingsCase):
 
     What is checkable is narrow. The id must name a defect in this run, and the two defects
     must touch a file in common. Whether they are connected in the way the prose SAYS needs
-    a stage that read both, which this plan does not have — so a surviving reference is
+    a stage that read both, which the pipeline does not have — so a surviving reference is
     checked and not verified, and this class is careful not to claim otherwise.
 
     The run below raises a fifth candidate in a second file, so a defect exists that shares
@@ -16706,11 +17704,12 @@ class ACrossReferenceIsCheckedAsFarAsItCanBe(_FindingsCase):
         synthesis = {self.UNIT: {
             "tiers": SYNTH_TABLE[self.UNIT]["tiers"],
             "defects": [*entries,
-                        {"defect": "D4", "tier": SYNTH_TABLE[self.UNIT]["tiers"][1],
+                        {"defect": "D4", "heading": "A caller reads a stale value.",
+                         "tier": SYNTH_TABLE[self.UNIT]["tiers"][1],
                          "what_goes_wrong": "The helper answers the same thing whatever it "
                                             "is asked, so a caller reads a stale value.",
                          "fix": "Return the argument the caller passed.",
-                         "cross_references": []}],
+                         "site_notes": [], "cross_references": []}],
             "summary": "Two tiers over four defects."}}
         return reading, verify, grouping, synthesis
 
@@ -16768,8 +17767,8 @@ class ACrossReferenceIsCheckedAsFarAsItCanBe(_FindingsCase):
         **The page is asserted on separately, and not by comparing it between runs.**
         `report.html` is `render_html(report.md)` and nothing else, so two runs whose
         Markdown matches have matching pages by construction and a fault in the conversion
-        moves both the same way — measured, by stripping every cross-reference link out of
-        `_inline` and watching the cross-run byte comparison of `report.html` pass anyway.
+        moves both the same way: with every cross-reference link stripped out of `_inline`,
+        the cross-run byte comparison of `report.html` passes anyway.
         A reference is only worth rendering if it is a link somebody can FOLLOW, so that is
         what the page is asked for here.
         """
@@ -16828,17 +17827,28 @@ class ACrossReferenceIsCheckedAsFarAsItCanBe(_FindingsCase):
                          ([], [{"defect": "D1", "reason": review_panel.CROSS_REF_APART}]))
         self.assertEqual(keep("D1", [], files_of), ([], []))
 
-    def test_the_brief_states_the_check_the_engine_performs_and_no_other(self):
+    def test_the_brief_and_the_schema_state_every_condition_the_resolver_accepts(self):
         """A brief is read by the model every round, so it may not state as fact anything
-        the engine does not do — the rule that had the checking pulled forward into the
-        round itself, and the clause about naming a refusal held back until the stage that
-        renders one had landed."""
+        the engine does not do, nor leave out a condition it does accept: a writer told
+        that only a shared file counts withholds the cross-file links a shared tier keeps.
+        The conditions are read from the definition the resolver itself iterates, so a
+        condition added there and not to the prose fails here."""
         # Reflowed before asserting: the clause wraps across two lines in the file, and a
         # substring test against the raw bytes passes the moment a paragraph is rewrapped
         # — which is a guard that stops asserting without failing.
         brief = " ".join(review_panel.load_brief("synthesizer").split())
-        self.assertIn("drops any reference that fails either check", brief)
-        self.assertIn("touch a file in common", brief)
+        schema = json.loads((_ENGINE_DIR / "synthesizer-schema.json").read_text(
+            encoding="utf-8"))
+        described = " ".join(schema["properties"]["defects"]["items"]["properties"]
+                             ["cross_references"]["description"].split())
+        conditions = [name for name, _ in review_panel.CROSS_REF_RULE]
+        self.assertTrue(conditions)
+        for condition in conditions:
+            with self.subTest(condition=condition):
+                self.assertIn(condition, brief)
+                self.assertIn(condition, described)
+                self.assertIn(condition, review_panel.CROSS_REF_APART)
+        self.assertIn("drops any reference that fails the check", brief)
         # The reporting half landed with the rendering, so the brief may now state it —
         # and must, since it is the one thing telling the writer a refusal is visible.
         self.assertIn("naming it in the report", brief)
@@ -16956,7 +17966,7 @@ class TheBodyIsGroupedByTier(_FindingsCase):
 
 
 class UnresolvedDefectsSubGroupBySubstanceWhereTheRoundGaveOne(_FindingsCase):
-    """`plan.md`: the four settling reasons are a vocabulary, and the target splits the
+    """The four settling reasons are a vocabulary, and the synthesis round splits the
     largest of them into groups a reader can act on. The settling reason stays the primary
     grouping — it is a fact, and it is what a person does next — and the tier names the
     substance inside it.
@@ -17025,9 +18035,9 @@ class UnresolvedDefectsSubGroupBySubstanceWhereTheRoundGaveOne(_FindingsCase):
 
 
 class TheSynthesisedProseIsMarkedAsAReading(_FindingsCase):
-    """`plan.md`'s constraint: the report may not print an unchecked claim in the voice of
-    a checked one. The narrative, the fix and the cross-references trace to one agent's
-    impression, and they are the most confident-sounding sentences on the page.
+    """The report may not print an unchecked claim in the voice of a checked one. The
+    narrative, the fix and the cross-references trace to one agent's impression, and they
+    are the most confident-sounding sentences on the page.
 
     Said once, where the body begins — and NOT said at all when the round degraded, because
     a disclaimer with nothing to disclaim is a sentence a reader learns to skip.
@@ -17063,22 +18073,22 @@ class TheSynthesisedProseIsMarkedAsAReading(_FindingsCase):
                         for entry in SYNTH_TABLE["synth-A"]["defects"]]}}
         self.run_all(synthesis=table)
         self.assertEqual(self.findings()["synthesis"]["state"], "complete")
-        self.assertTrue(all(c["tier"] is None for c in self.findings()["clusters"]))
+        self.assertTrue(all(c["tier"] is None for c in self.findings()["defects"]))
         self.assertNotIn(review_panel.SYNTHESIS_DISCLAIMER.splitlines()[0], self.text())
 
 
-class NoFactLeftTheRunWhenTheAppendixStoppedReprintingThem(_FindingsCase):
+class TheFieldsTheAppendixDoesNotReprintStayInFindingsJson(_FindingsCase):
     """The three raw fields a judged defect does not render — the reader's failure text,
     the reader's direction and the checker's rationale — are in ``findings.json``, not gone.
 
-    Reprinting all three against every candidate costs 40,368 of the appendix's 59,771
-    words on a real run: a second copy, unsearchable, of fields the structure beside it
-    already holds against the same candidate id. The report does not write them at all, and
+    Reprinting all three against every candidate would make them most of the appendix: a
+    second copy, unsearchable, of fields the structure beside it already holds against the
+    same candidate id. The report does not write them at all, and
     the pointer sentence in the provenance section is what keeps that a move rather than a
     deletion.
 
     So the contract asserted here is one file over. "Every field is somewhere in the
-    report" would be the wrong one to hold now, and the cheapest way to fail the RIGHT one
+    report" would be the wrong one to hold, and the cheapest way to fail the RIGHT one
     is the same as ever: delete the raw prose and call the narrative a replacement. That is
     what this guards, and it catches it in ``findings.json`` — every field against its own
     candidate, WHATEVER the round did, the report saying in one sentence where they are,
@@ -17284,24 +18294,328 @@ class NoFactLeftTheRunWhenTheAppendixStoppedReprintingThem(_FindingsCase):
         block = self.defect_block(self.text(), "D2")
         self.assertIn(review_panel.QUOTE_FLAG, " ".join(review_panel._unescape(block).split()))
         self.assertIn("- Evidence (executed): ", block)
-        # The commit rides on the line that decodes the path, directly above the code it
-        # pins — there is no label of its own between the two.
-        self.assertIn(f"— {review_panel._commit_words(self.findings()['commit'], True)}",
-                      block)
+        # The commit is the run's, stated once at the top rather than beside each site.
+        self.assertIn(f"refers to {review_panel._commit_words(self.findings()['commit'], True)}",
+                      _section(self.text(), review_panel.SECTION_DESCRIPTION))
         self.assertRegex(block, r"(?m)^\s+\d+ \| ")
 
 
+# One defect, eight reports of one site: six the checks upheld and two they refuted. The
+# failures are numbered so the candidate ids follow them -- cand-00N says "N." -- and odd
+# numbers come from lane A, even from lane B, so each lane's verifier is handed its own four.
+_EIGHT_WAYS = [
+    "An empty list reaches the loop and the index on the last line raises.",
+    "Given no rows, the final index runs off the end of the list.",
+    "The last-row lookup raises IndexError when the input is empty.",
+    "Nothing guards the empty case, so rows[-1] throws.",
+    "An empty input makes the return statement index an empty list.",
+    "rows[-1] is evaluated with rows empty and raises.",
+    "The loop body never runs on empty input and the index after it fails.",
+    "With zero rows the function dies on its last line instead of returning.",
+]
+READING_EIGHT_REPORTS = {
+    "area-01-A1": {"findings": [{**FINDING, "failure": f"{n}. {text}"}
+                                for n, text in enumerate(_EIGHT_WAYS, 1) if n % 2],
+                   "summary": "A1 read"},
+    "area-01-B1": {"findings": [{**FINDING, "failure": f"{n}. {text}"}
+                                for n, text in enumerate(_EIGHT_WAYS, 1) if not n % 2],
+                   "summary": "B1 read"},
+    "audit-area-01-A": {"findings": [], "summary": "no gap"},
+    "audit-area-01-B": {"findings": [], "summary": "no gap"},
+    "probe-A": PROBE_RESULT,
+}
+# Two variants of the one test, worded the way two verifiers word the same thing.
+TEST_FIRST_VARIANT = ("tests/test_engine.py: call it with an empty list and assert it "
+                      "returns None rather than raising.")
+TEST_FIRST_OTHER_VARIANT = ("tests/test_engine.py: pass an empty list and assert the result "
+                            "is None.")
+# A second, distinct run under the same defect: another command, another output.
+EVIDENCE_OTHER_RUN = {**EVIDENCE, "argv": ["python3", "run.py", "--rows", "0"],
+                      "output": "IndexError: list index out of range\n",
+                      "shows": "Shows the explicit zero-row call failing the same way."}
+
+
+# What a refuted report says the SAME run shows: the run the upheld reports rest on, read
+# the other way.
+REFUTED_SHOWS = "Shows the failure only on an input no real caller passes."
+
+
+def _upheld(candidate, shows, evidence=EVIDENCE, test_first=TEST_FIRST):
+    return _verdict(candidate, "reproduced", {**evidence, "shows": shows},
+                    rationale="The run raised as claimed.", test_first=test_first)
+
+
+VERIFY_EIGHT_REPORTS = {
+    "verify-area-01-A": {"verdicts": [
+        _upheld("cand-001", "Shows the call raising IndexError on an empty argument list."),
+        _upheld("cand-003", "Shows the empty call ending in IndexError.",
+                test_first=TEST_FIRST_VARIANT),
+        _upheld("cand-005", "Shows IndexError raised on no input.",
+                test_first=TEST_FIRST_OTHER_VARIANT),
+        _upheld("cand-007", "Shows the traceback an empty input produces.")],
+        "summary": "ran four"},
+    "verify-area-01-B": {"verdicts": [
+        _upheld("cand-002", "Shows an empty argument list raising IndexError."),
+        _verdict("cand-004", "refuted", {**EVIDENCE, "shows": REFUTED_SHOWS},
+                 rationale="The caller never passes an empty list."),
+        _upheld("cand-006", EVIDENCE_OTHER_RUN["shows"], EVIDENCE_OTHER_RUN),
+        _verdict("cand-008", "refuted",
+                 {**EVIDENCE, "shows": "Shows the failure needs an input no caller builds."},
+                 rationale="Every caller checks for rows first.")],
+        "summary": "ran two, refuted two"},
+}
+CLUSTER_EIGHT_REPORTS = {
+    "cluster-area-01": {
+        "clusters": [{"members": [f"cand-00{n}" for n in range(1, 9)],
+                      "consequence": "A run over an empty input stops with a traceback "
+                                     "instead of finishing.",
+                      "split_reason": None}],
+        "summary": "One defect, reported eight times.",
+    },
+}
+SYNTH_EIGHT_REPORTS = {
+    "synth-A": {
+        "tiers": ["A run stops instead of finishing"],
+        "defects": [{"defect": "D1",
+                     "heading": SYNTH_TABLE["synth-A"]["defects"][0]["heading"],
+                     "tier": "A run stops instead of finishing",
+                     "what_goes_wrong": SYNTH_TABLE["synth-A"]["defects"][0]["what_goes_wrong"],
+                     "fix": SYNTH_TABLE["synth-A"]["defects"][0]["fix"],
+                     "site_notes": [], "cross_references": []}],
+        "summary": "One tier.",
+    },
+}
+
+
+class ACorroboratedDefectSaysEachThingOnce(_FindingsCase):
+    """One defect that eight reports describe is one thing, and its entry says each fact
+    once: every verdict is still counted, but a line eight reports share prints once with
+    the count, one test stands for its location, and one run prints once however many
+    reports rest on it."""
+
+    def setUp(self):
+        super().setUp()
+        self.run_all(reading=READING_EIGHT_REPORTS, verify=VERIFY_EIGHT_REPORTS,
+                     grouping=CLUSTER_EIGHT_REPORTS, synthesis=SYNTH_EIGHT_REPORTS)
+        self.block = self.defect_block(self.text(), "D1")
+
+    def checks(self):
+        block = self.block.split("**Checks.**", 1)[1]
+        return [line for line in block.splitlines() if line.startswith("  - ")]
+
+    def test_the_fixture_is_the_defect_it_describes(self):
+        # Without this, a change to how candidates are numbered would quietly make every
+        # assertion below about some other arrangement of reports.
+        records = self.records()
+        self.assertEqual(len(records), 8)
+        for n in range(1, 9):
+            record = records[f"cand-00{n}"]
+            self.assertTrue(record["failure"].startswith(f"{n}. "), record["failure"])
+            self.assertEqual(record["defect"], "D1")
+        self.assertEqual([r["status"] for r in records.values()].count("refuted"), 2)
+
+    def test_a_check_line_six_reports_share_prints_once_with_its_count(self):
+        lines = self.checks()
+        self.assertEqual(len(lines), len(set(lines)), f"a check line repeats: {lines}")
+        upheld = [line for line in lines if "by running" in line and "refuted" not in line]
+        self.assertEqual(len(upheld), 1, lines)
+        self.assertIn("(6 reports)", upheld[0])
+        self.assertIn("core.py:2-3", upheld[0])
+
+    def test_a_verdict_that_disagrees_keeps_its_own_line_and_count(self):
+        # Folding the refuted reports into the upheld line's count would say eight reports
+        # agreed; dropping them would hide that two checks dismissed this.
+        lines = self.checks()
+        refuted = [line for line in lines if "refuted" in line]
+        self.assertEqual(len(refuted), 1, lines)
+        self.assertIn("(2 reports)", refuted[0])
+        self.assertEqual(len(lines), 2, lines)
+
+    def test_one_test_per_location_and_the_variants_are_pointed_at(self):
+        flat = " ".join(review_panel._unescape(self.block).split())
+        self.assertEqual(flat.count(review_panel.TEST_FIRST_LABEL), 1, flat)
+        self.assertIn(f"**{review_panel.TEST_FIRST_LABEL}** (core.py:2-3) {TEST_FIRST}", flat)
+        self.assertNotIn(TEST_FIRST_VARIANT, flat)
+        self.assertNotIn(TEST_FIRST_OTHER_VARIANT, flat)
+        self.assertIn("2 other reports name a variant of this test", flat)
+        self.assertIn("`findings.json`", flat)
+        # The pointer is a move and not a loss only while the file really holds each
+        # variant under its candidate id.
+        records = self.records()
+        self.assertEqual(records["cand-003"]["test_first"], TEST_FIRST_VARIANT)
+        self.assertEqual(records["cand-005"]["test_first"], TEST_FIRST_OTHER_VARIANT)
+
+    def test_a_single_variant_is_pointed_at_in_the_singular(self):
+        def one_variant(doc):
+            for record in doc["candidates"]:
+                if record["id"] == "cand-005":
+                    record["test_first"] = TEST_FIRST
+        flat = " ".join(review_panel._unescape(self.rerender(one_variant)).split())
+        self.assertIn("One other report names a variant of this test", flat)
+        self.assertNotIn(TEST_FIRST_VARIANT, flat)
+
+    def test_a_site_row_of_a_defect_of_several_sites_counts_its_variants(self):
+        """The same pointer where the defect has several sites and the site is a row: the
+        row carries how many other reports name a variant, not a bare mention of one."""
+        def two_sites(doc):
+            first = next(s for s in doc["sites"] if s["id"] == "S1")
+            doc["sites"].append({**first, "id": "S9"})
+            defect = doc["defects"][0]
+            defect["sites"] = ["S1", "S9"]
+            defect["outcomes"] = {"established": 2, "unresolved": 0, "refuted": 0}
+            defect["mechanism"] = "An empty input is indexed before it is checked."
+        text = self.rerender(two_sites)
+        rows = [line for line in text.splitlines() if re.match(r"^\| \[S[19]\]", line)]
+        self.assertEqual(len(rows), 2, rows)
+        for row in rows:
+            self.assertIn("2 other reports name a variant of this test",
+                          review_panel._unescape(row))
+
+    def test_a_run_prints_once_however_many_reports_rest_on_it(self):
+        evidence = [line for line in self.block.splitlines() if line.startswith("- Evidence")]
+        # Two distinct runs happened: the one seven reports rest on, and the zero-row call.
+        printed = [line for line in evidence if "`python3 run.py" in line]
+        self.assertEqual(len(printed), 2, evidence)
+        self.assertTrue(any("--rows" in line for line in printed), evidence)
+        # The upheld reports that share the first run add nothing; only the refuted
+        # reading of it adds a line.
+        self.assertEqual(len(evidence), 3, evidence)
+        self.assertEqual(self.block.count("Traceback ..."), 1)
+
+    def test_a_report_that_disagrees_keeps_what_it_says_the_run_shows(self):
+        # Two checks refuted this on the same run five reports rest on. Suppressed like an
+        # agreeing report, the one sentence saying why that run dismisses the claim would be
+        # on neither page.
+        for name, text in (("report.md", self.block),
+                           ("report.html", (self.rundir / "report.html")
+                            .read_text(encoding="utf-8"))):
+            with self.subTest(document=name):
+                self.assertIn(REFUTED_SHOWS, text)
+        line = next(l for l in self.block.splitlines() if REFUTED_SHOWS in l)
+        self.assertIn("refuted", line)
+        self.assertIn("Same run as above", line)
+        self.assertNotIn("`python3 run.py`", line)
+        # The second refuted report agrees with the first, so it adds nothing.
+        self.assertNotIn("no caller builds", self.block)
+
+    DIFFERS = "does not match what the pinned tree holds at those lines"
+
+    def _warning_above_the_checks(self, text, marker, *expected):
+        block = self.defect_block(text, "D1")
+        flat = " ".join(block.split())
+        self.assertEqual(flat.count(marker), 1, block)
+        line = next(l for l in block.splitlines() if marker in l)
+        for words in expected:
+            self.assertIn(words, " ".join(line.split()))
+        # The count is in the sentence: a count followed by "this report" names one report
+        # while speaking for several.
+        self.assertNotIn("this report", line)
+        # Beside the checks and never in the evidence list, where it would sit directly
+        # above a run it may not belong to.
+        self.assertLess(block.index(marker), block.index("**Checks.**"))
+
+    def test_a_quote_warning_every_report_shares_prints_once_with_its_count(self):
+        self.assertTrue(all(r["quote_check"] == "differs" for r in self.records().values()))
+        self._warning_above_the_checks(
+            self.text(), self.DIFFERS,
+            "The source quoted with all 8 reports does not match",
+            "exactly as the reports gave it")
+
+    def test_a_quote_warning_one_report_carries_says_it_is_one(self):
+        def one_differs(doc):
+            for record in doc["candidates"]:
+                if record["id"] != "cand-002":
+                    record["quote_check"] = review_panel.QUOTE_MATCHES
+        self._warning_above_the_checks(
+            self.rerender(one_differs), self.DIFFERS,
+            "The source quoted with 1 of these 8 reports does not match",
+            "exactly as that report gave it")
+
+    def test_lines_unreadable_for_some_reports_say_how_many(self):
+        def two_unreadable(doc):
+            for record in doc["candidates"]:
+                record["quote_check"] = (review_panel.QUOTE_UNREADABLE
+                                         if record["id"] in ("cand-002", "cand-003")
+                                         else review_panel.QUOTE_MATCHES)
+        self._warning_above_the_checks(
+            self.rerender(two_unreadable), "could not read those lines",
+            "for 2 of these 8 reports, so their quotations were not checked")
+
+    def test_an_established_report_names_the_test_that_stands_for_its_location(self):
+        # A test from a report nothing settled is a guess about a claim that may not hold,
+        # and the first member's would be printed only by the accident of its id.
+        guess = "tests/test_engine.py: a test for a claim nobody settled."
+
+        def first_unsettled(doc):
+            for record in doc["candidates"]:
+                if record["id"] == "cand-001":
+                    record.update(status="unresolved", test_first=guess)
+        flat = " ".join(review_panel._unescape(self.rerender(first_unsettled)).split())
+        self.assertIn(f"**{review_panel.TEST_FIRST_LABEL}** (core.py:2-3) {TEST_FIRST}", flat)
+        self.assertNotIn(guess, flat)
+        self.assertIn("3 other reports name a variant of this test", flat)
+
+    def test_the_count_is_not_read_as_part_of_a_file_list(self):
+        def unsettled_twice(doc):
+            for record in doc["candidates"]:
+                if record["id"] in ("cand-004", "cand-008"):
+                    record.update(status="unresolved", evidence=None,
+                                  axis_b=review_panel.AXIS_B_UNRESOLVED,
+                                  needs_files=["lib/a.py", "lib/b.py"],
+                                  unresolved_reason="needs_a_file_outside_the_scope")
+        text = self.rerender(unsettled_twice)
+        self.assertRegex(text, r"\(2 reports\) · would be settled by lib/a\.py, lib/b\.py\n")
+
+    def test_the_page_says_the_same(self):
+        page = (self.rundir / "report.html").read_text(encoding="utf-8")
+        self.assertIn("(6 reports)", page)
+        self.assertIn("(2 reports)", page)
+        self.assertEqual(page.count("Same run as above"), 1)
+
+    def test_a_run_already_printed_under_this_defect_adds_nothing(self):
+        ran: set = set()
+        first = "".join(review_panel._render_evidence(EVIDENCE, ran))
+        self.assertIn("python3 run.py", first)
+        again = {**EVIDENCE, "shows": "Shows the same failure in other words."}
+        self.assertEqual(review_panel._render_evidence(again, ran), [])
+
+    def test_a_run_read_another_way_keeps_its_one_line(self):
+        """Suppressed only where the report agrees with the one already printed. A verdict
+        or a kind that differs keeps one line with its own sentence and its own label --
+        and never the output again."""
+        ran: set = set()
+        review_panel._render_evidence(EVIDENCE, ran, "reproduced")
+        refuted = {**EVIDENCE, "shows": "Shows it only fails on an input nobody passes."}
+        line = "".join(review_panel._render_evidence(refuted, ran, "refuted"))
+        self.assertIn("Shows it only fails on an input nobody passes.", line)
+        self.assertIn("refuted", line)
+        self.assertNotIn("IndexError", line)
+        self.assertEqual(line.count("\n"), 1, line)
+        # Documentary where the printed one was executed: the label is the fact.
+        documentary = {**EVIDENCE, "run_kind": "documentary"}
+        self.assertIn("(documentary)",
+                      "".join(review_panel._render_evidence(documentary, ran, "reproduced")))
+        # And a second report agreeing with the refuted one adds nothing.
+        self.assertEqual(review_panel._render_evidence(refuted, ran, "refuted"), [])
+
+    def test_the_report_a_reading_speaks_for_is_named_in_plain_words(self):
+        ran: set = set()
+        review_panel._render_evidence(EVIDENCE, ran, "reproduced")
+        for status, words in (("unresolved", "for an unresolved report"),
+                              ("confirmed_by_reading", "for a report confirmed by reading"),
+                              ("refuted", "for a refuted report")):
+            with self.subTest(status=status):
+                line = "".join(review_panel._render_evidence(EVIDENCE, ran, status))
+                self.assertIn(words, line)
+
+
 class TheReportSaysWhatItCannotTell(_ReportCase):
-    """What a panel cannot establish, written on the page instead of into a runbook.
+    """What this run did not examine, and what no run of the method can tell.
 
-    A runbook is read by whoever runs the panel, and the person who acts on a report is
-    usually neither that person nor in the room when the run ends. A reader holding a
-    long, tidy report reads thoroughness into it, and the report is the last place that
-    can say the two do not follow.
-
-    It is the same words at every rung, because it is a property of the method rather than
-    of a run: a caveat that showed up only on thin runs would read as an apology for that
-    run.
+    The first is the run's own -- the totals behind the lists the report already carries,
+    put beside the counts a reader has just taken in. The second is a property of the
+    method, the same words at every rung, and ends in the one thing a reader can do about
+    it: test a run against a bug they already know.
     """
 
     def test_it_sits_under_the_report_description_and_above_the_lists(self):
@@ -17312,37 +18626,113 @@ class TheReportSaysWhatItCannotTell(_ReportCase):
         self.assertLess(text.index(review_panel.SUBSECTION_LIMITS),
                         text.index(review_panel.SECTION_INDEX))
 
-    def test_it_says_the_two_things_that_do_not_follow(self):
-        self.run_all()
-        block = _section(self.text(), review_panel.SUBSECTION_LIMITS)
-        self.assertIn("Reporting more defects is not the same as catching more of the bugs that are", block)
-        self.assertIn("A clean sweep is not evidence this tree is sound", block)
-        self.assertIn("A long report is not a thorough one", block)
+    @staticmethod
+    def _first(facts):
+        return " ".join(review_panel._render_limits(facts)[1].split())
 
-    def test_every_rung_carries_it_word_for_word(self):
+    NONE_UNRESOLVED = {"unresolved": 0, "unresolved_in": ()}
+
+    def test_a_run_that_read_everything_says_so(self):
+        text = self._first({"files": 12, "unread": 0, "left_out": 0, **self.NONE_UNRESOLVED})
+        self.assertIn("Readers covered all 12 files in scope.", text)
+        self.assertEqual(self._first({"files": 1, "unread": 0, "left_out": 0,
+                                      **self.NONE_UNRESOLVED}),
+                         "**What this run covered.** Readers covered the one file in scope.")
+        self.assertNotIn(review_panel.SUBSECTION_COVERAGE, text, "nothing to point at")
+
+    def test_what_it_left_is_counted_and_pointed_at(self):
+        text = self._first({"files": 12, "unread": 3, "left_out": 1, "unresolved": 2,
+                            "unresolved_in": (review_panel.SECTION_UNRESOLVED,)})
+        self.assertIn("Readers covered 9 of the 12 files in scope.", text)
+        self.assertIn("No reader finished the area holding the other 3, so nobody read them.", text)
+        self.assertIn("No reader finished, so nobody read any of them.",
+                      self._first({"files": 2, "unread": 2, "left_out": 0,
+                                   **self.NONE_UNRESOLVED}))
+        self.assertIn("1 more file was excluded by the job or skipped.", text)
+        self.assertIn(f"**{review_panel.SUBSECTION_COVERAGE}**, in the appendix, names them.", text)
+        self.assertIn(f"2 sites were checked and not settled either way; see "
+                      f"**{review_panel.SECTION_UNRESOLVED}**.", text)
+
+    def test_an_unresolved_site_is_pointed_at_wherever_its_defect_is_placed(self):
+        """A defect with one established site and one unresolved one is placed under
+        Established, so the unresolved site renders there — and a pointer to Unresolved
+        alone would send a reader to a section that does not hold it."""
+        text = self._first({"files": 3, "unread": 0, "left_out": 0, "unresolved": 1,
+                            "unresolved_in": (review_panel.SECTION_ESTABLISHED,)})
+        self.assertIn(f"1 site was checked and not settled either way; see "
+                      f"**{review_panel.SECTION_ESTABLISHED}**.", text)
+        text = self._first({"files": 3, "unread": 0, "left_out": 0, "unresolved": 3,
+                            "unresolved_in": (review_panel.SECTION_ESTABLISHED,
+                                              review_panel.SECTION_UNRESOLVED)})
+        self.assertIn(f"3 sites were checked and not settled either way; see "
+                      f"**{review_panel.SECTION_ESTABLISHED}** and "
+                      f"**{review_panel.SECTION_UNRESOLVED}**.", text)
+
+    def test_the_facts_are_counted_from_the_run(self):
+        from types import SimpleNamespace
+        inventory = {"files": [{"path": p} for p in "abcde"], "excluded": ["x"],
+                     "skipped": [{"path": "y", "reason": "r"}, {"path": "z", "reason": "r"}]}
+        reader, auditor = review_panel.READER_KIND, review_panel.AUDITOR_KIND
+        complete, failed = review_panel.UNIT_COMPLETE, review_panel.UNIT_FAILED
+        reading = [
+            # A1: two lenses, one failed -- still read, by the other.
+            {"state": complete, "area": "A1", "kind": reader},
+            {"state": failed, "area": "A1", "kind": reader},
+            # A2: every reader failed -- unread.
+            {"state": failed, "area": "A2", "kind": reader},
+            {"state": failed, "area": "A2", "kind": reader},
+            # A3: read, and its auditor failed -- a lost check, not an unread file.
+            {"state": complete, "area": "A3", "kind": reader},
+            {"state": failed, "area": "A3", "kind": auditor},
+            {"state": review_panel.UNIT_MISSING, "area": None, "kind": reader}]
+        files_of = {"A1": ["a"], "A2": ["c", "d"], "A3": ["b"]}
+        unresolved, established = review_panel.DEFECT_UNRESOLVED, review_panel.DEFECT_ESTABLISHED
+        findings = SimpleNamespace(
+            sites=[{"id": "S1", "status": unresolved, "defect": "D1"},
+                   {"id": "S2", "status": established, "defect": "D2"}],
+            defects=[{"id": "D1", "status": unresolved, "sites": ["S1"]},
+                     {"id": "D2", "status": established, "sites": ["S2"]}])
+        self.assertEqual(review_panel._limit_facts(inventory, reading, files_of, findings),
+                         {"files": 5, "unread": 2, "left_out": 3, "unresolved": 1,
+                          "unresolved_in": (review_panel.SECTION_UNRESOLVED,)})
+        # A defect with mixed site outcomes: counted as its one unresolved SITE, and pointed
+        # at the section the defect is placed in.
+        findings = SimpleNamespace(
+            sites=[{"id": "S1", "status": established, "defect": "D1"},
+                   {"id": "S2", "status": unresolved, "defect": "D1"}],
+            defects=[{"id": "D1", "status": established, "sites": ["S1", "S2"]}])
+        self.assertEqual(review_panel._limit_facts(inventory, reading, files_of, findings)
+                         ["unresolved"], 1)
+        self.assertEqual(review_panel._limit_facts(inventory, reading, files_of, findings)
+                         ["unresolved_in"], (review_panel.SECTION_ESTABLISHED,))
+
+    def test_it_ends_in_the_test_a_reader_can_run(self):
+        block = "".join(review_panel._render_limits(
+            {"files": 1, "unread": 0, "left_out": 0, **self.NONE_UNRESOLVED}))
+        self.assertIn("give it one you already know about and see whether it appears", block)
+        self.assertIn("a longer report is not a more complete one", block)
+
+    def test_the_general_warning_is_word_for_word_at_every_rung(self):
         """A run that could claim least is the run whose reader most needs this, so the
-        weaker rung may not be the one that drops it."""
+        weaker rung may not be the one that drops or softens it."""
         one_runtime = {"rung": "one-runtime", "lanes": DISPATCH["lanes"]}
-        blocks = []
+        warnings = []
         for n, dispatch in enumerate((DISPATCH, one_runtime)):
             rundir = self.tmp / f"run-rung-{n}"
             self.run_all(rundir, dispatch=dispatch)
-            blocks.append(_section(self.text(rundir), review_panel.SUBSECTION_LIMITS))
-        self.assertTrue(blocks[0].strip(), "the rung-one run rendered nothing")
-        self.assertEqual(blocks[1:], blocks[:-1])
+            block = _section(self.text(rundir), review_panel.SUBSECTION_LIMITS)
+            warnings.append(block[block.index("What no run can tell you"):])
+        self.assertTrue(warnings[0].strip())
+        self.assertEqual(warnings[0], warnings[1])
 
-    def test_the_closing_caveat_is_its_own_paragraph_in_the_page(self):
-        """The page conversion is not a Markdown parser: a paragraph after a list
-        continues inside the last `<li>`. Written in that order, the general caveat
-        renders as part of "A long report is not a thorough one" and reads as scoped to
-        it. Asserted on the HTML rather than on the order of the source lines, because
-        the order is only a means to this."""
-        html = review_panel.render_html("".join(review_panel._render_limits()))
-        before = html[:html.index("This page is organized")]
-        self.assertTrue(before.rstrip().endswith("<p>"),
-                        "the closing caveat does not open its own paragraph")
-        self.assertNotIn("<li>", before.rsplit("</li>", 1)[-1],
-                         "the closing caveat rendered inside an open list item")
+    def test_both_paragraphs_render_as_paragraphs_in_the_page(self):
+        html = review_panel.render_html("".join(review_panel._render_limits(
+            {"files": 4, "unread": 1, "left_out": 1, "unresolved": 1,
+             "unresolved_in": (review_panel.SECTION_UNRESOLVED,)})))
+        html = html[html.index("<h3"):html.index("<script>")]   # the section, not the page's contents
+        self.assertNotIn("<li>", html)
+        self.assertEqual(html.count("<p>"), 2, html)
+        self.assertNotIn("*", html.replace("**", ""), "a literal star reached the reader")
 
 
 class TheShapeOfTheRunIsATableAtTheTop(_FindingsCase):
@@ -17364,7 +18754,7 @@ class TheShapeOfTheRunIsATableAtTheTop(_FindingsCase):
                 if ln.startswith("| ") and not ln.startswith("| Tier ")]
         self.assertTrue(rows, f"no tier row:\n{table}")
         total = sum(int(ln.strip("|").split("|")[-1].strip()) for ln in rows)
-        self.assertEqual(total, len(self.findings()["clusters"]),
+        self.assertEqual(total, len(self.findings()["defects"]),
                          "the cells do not add up to the run's defects")
 
     def test_it_sits_above_the_three_views(self):
@@ -17382,12 +18772,11 @@ class TheShapeOfTheRunIsATableAtTheTop(_FindingsCase):
 
 
 class ACrossReferenceSurvivesOnASharedTier(unittest.TestCase):
-    """The file test alone dropped the run's best cross-file insight.
+    """A file test alone drops cross-file connections.
 
-    22 links in one report were refused with "the two defects touch no file in common" --
-    among them a reverse endpoint with no idempotency key beside a lost-response refund
-    being retried, and a three-file refund chain. Those are exactly the connections a
-    reader wants and exactly the ones a same-file rule cannot see.
+    Related defects can sit in different files -- an endpoint beside the retry path that
+    calls it, say, or a chain of calls across three files. Those are exactly the connections
+    a reader wants and exactly the ones a same-file rule cannot see.
 
     A shared TIER is evidence of the same kind. The synthesis round assigns tiers to group
     chains like these, so two defects the round put under one theme are connected by the
@@ -17420,6 +18809,31 @@ class ACrossReferenceSurvivesOnASharedTier(unittest.TestCase):
                     "D1", ["D2"], self.FILES, tiers)
                 self.assertEqual(kept, [])
                 self.assertEqual(dropped[0]["reason"], review_panel.CROSS_REF_APART)
+
+    def test_a_reference_is_kept_exactly_when_a_named_condition_holds(self):
+        """Every combination of the two conditions, so the resolver cannot accept a pair on
+        anything the stated rule does not name — a shared directory, an absent tier on both
+        sides — and the dropped reason names the rule the pair failed."""
+        files_of = {"D1": frozenset({"pkg/a.py"})}
+        for share_file in (False, True):
+            for share_tier in (False, True):
+                with self.subTest(share_file=share_file, share_tier=share_tier):
+                    files_of["D2"] = frozenset(
+                        {"pkg/a.py" if share_file else "pkg/b.py"})
+                    tiers = {"D1": "Money moves twice",
+                             "D2": "Money moves twice" if share_tier else None}
+                    kept, dropped = review_panel.resolve_cross_references(
+                        "D1", ["D2"], files_of, tiers)
+                    if share_file or share_tier:
+                        self.assertEqual((kept, dropped), (["D2"], []))
+                    else:
+                        self.assertEqual(kept, [])
+                        self.assertEqual(dropped, [{"defect": "D2",
+                                                    "reason": review_panel.CROSS_REF_APART}])
+
+    def test_the_dropped_reason_names_both_conditions(self):
+        self.assertIn("file in common", review_panel.CROSS_REF_APART)
+        self.assertIn("tier", review_panel.CROSS_REF_APART)
 
     def test_an_id_naming_no_defect_is_still_refused_first(self):
         tiers = {"D1": "Money moves twice", "D9": "Money moves twice"}
@@ -17543,7 +18957,7 @@ class ACrossReferenceIsRenderedOrNamedAsDropped(_FindingsCase):
         text = self.refuted_cites(["D1"])
         self.assertEqual(self.defects()["D3"]["cross_references"], ["D1"],
                          "the check dropped the reference, so nothing was owed a rendering")
-        refuted = self.body(text, review_panel.SUBSECTION_REFUTED)
+        refuted = self.body(text, review_panel.SECTION_REFUTED)
         self.assertIn(f"**{review_panel.RELATED_LABEL}** [D1](#D1)", refuted)
         page = (self.rundir / "report.html").read_text(encoding="utf-8")
         self.assertIn('<a href="#D1">D1</a>', page, "the reference is not a link on the page")
@@ -17565,20 +18979,20 @@ class ACrossReferenceIsRenderedOrNamedAsDropped(_FindingsCase):
         self.assertIn(f"- D3 cited D999, which was dropped: {review_panel.CROSS_REF_ABSENT}.",
                       notes)
         self.assertIn(f"**{review_panel.RELATED_LABEL}** [D1](#D1)",
-                      self.body(text, review_panel.SUBSECTION_REFUTED))
+                      self.body(text, review_panel.SECTION_REFUTED))
 
     def test_a_refuted_defect_that_cited_nothing_carries_no_related_line(self):
         # Anti-vacuity for the two above: the line is the reference's, not something every
         # refuted entry carries.
-        refuted = self.body(self.refuted_cites([]), review_panel.SUBSECTION_REFUTED)
+        refuted = self.body(self.refuted_cites([]), review_panel.SECTION_REFUTED)
         self.assertNotIn(review_panel.RELATED_LABEL, refuted)
 
 
 class ADegradedRoundIsNamedInTheReport(_FindingsCase):
-    """`plan.md`: a round that failed, never landed or returned a non-partition degrades to
-    today's status grouping **with the report naming the unit and saying what the grouping
-    now is**. Phase 5 recorded the unit and its state in the structure and left the naming
-    to the stage that renders."""
+    """A round that failed, never landed or returned a non-partition degrades to status
+    grouping **with the report naming the unit and saying what the grouping is instead**.
+    The structure records the unit and its state, and the naming is left to the stage that
+    renders."""
 
     UNIT = "synth-A"
 
@@ -17621,7 +19035,7 @@ class ADegradedRoundIsNamedInTheReport(_FindingsCase):
 
 
 class TheRoundRendersTheSameTwoDocumentsTwice(_FindingsCase):
-    """`plan.md`'s last gate criterion, with the round included: the report is a pure
+    """Determinism, with the round included: the report is a pure
     function of run-directory data, so two runs over one tree render the same bytes
     whatever order their units landed in. A fifth round is the fifth chance for the order
     to become an input."""
@@ -17634,7 +19048,7 @@ class TheRoundRendersTheSameTwoDocumentsTwice(_FindingsCase):
                                               ("report.md", "report.html"))
         # Anti-vacuity: the documents really do carry the round.
         self.assertIn(SYNTH_TWO_TIERS["synth-A"]["tiers"][1], self.text(first))
-        self.assertTrue(all(c["tier"] for c in self.findings(first)["clusters"]))
+        self.assertTrue(all(c["tier"] for c in self.findings(first)["defects"]))
 
 class _FixedClock:
     """``review_panel.datetime`` with one answer for ``now``, so a test can put two renderings
@@ -17735,9 +19149,37 @@ class TheMarkerIsTheOnlyCommitRecord(_ReportCase):
         self.assertEqual(self.unit_bytes("cluster-"), payloads)
         self.assertNoScratch()
 
+    def test_merge_re_runs_when_its_marker_never_moved(self):
+        self.verified()
+        self.clustered()
+        marker = (self.rundir / "units.json").read_bytes()
+        self.merge()
+        payloads = self.unit_bytes("merge-")
+        self.assertTrue(payloads, "the round wrote nothing to take back")
+        self.killed_before_the_marker(marker)
+        self.merge()
+        self.assertEqual(self.units()["stage"], "merged")
+        self.assertEqual(self.unit_bytes("merge-"), payloads)
+        self.assertNoScratch()
+
+    def test_merge_check_re_runs_when_its_marker_never_moved(self):
+        self.verified()
+        self.clustered()
+        self.merged(table={MERGE_UNIT: _merge_reply([MERGE_PAIR, _single("S3")])})
+        marker = (self.rundir / "units.json").read_bytes()
+        self.merge_check()
+        payloads = self.unit_bytes("mergecheck-")
+        self.assertTrue(payloads, "the round wrote nothing to take back")
+        self.killed_before_the_marker(marker)
+        self.merge_check()
+        self.assertEqual(self.units()["stage"], "merge-checked")
+        self.assertEqual(self.unit_bytes("mergecheck-"), payloads)
+        self.assertNoScratch()
+
     def test_synthesize_re_runs_when_its_marker_never_moved(self):
         self.verified()
         self.clustered()
+        self.merged()
         marker = (self.rundir / "units.json").read_bytes()
         self.synthesize()
         payloads = self.unit_bytes("synth-")
@@ -17751,7 +19193,7 @@ class TheMarkerIsTheOnlyCommitRecord(_ReportCase):
     def test_every_stage_refuses_by_name_once_its_marker_has_moved(self):
         self.run_all(synthesis=SYNTH_TABLE)
         before = _tree_bytes(self.rundir)
-        for command in ("route", "cluster", "synthesize"):
+        for command in ("route", "cluster", "merge", "merge-check", "synthesize"):
             proc = _run(command, str(self.rundir))
             self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
             self.assertIn("units.json", proc.stderr, command)
@@ -17786,7 +19228,7 @@ class TheMarkerIsTheOnlyCommitRecord(_ReportCase):
     def test_a_round_that_planned_nothing_is_a_committed_round(self):
         """Nothing keys on a unit directory existing, so a clustering or synthesis round
         that legitimately has nothing to plan commits like any other. Keyed on a directory
-        it would be replanned for ever, and the run would never reach its report."""
+        it would be replanned forever, and the run would never reach its report."""
         self.plan_into(self.rundir)
         nothing = {d.name: {"findings": [], "summary": "nothing to raise"}
                    for d in sorted((self.rundir / "units").iterdir())
@@ -18440,9 +19882,12 @@ class ACoverageVerifierSeesTheTestsItsAuditorSaw(_CoverageCase):
     """`_read_area_tests` exists to hand a coverage verifier **the same tests the auditor was
     given** — its own words. Routing files a finding under the area that OWNS the source it
     names, and a coverage finding is usually raised from a tests area that reached that source
-    through `also_read`, so the batch's area and the raiser's area differ by design. Keyed on
-    the batch's area alone, the verifier got the source owner's tests — none — while being
-    told to check the supplied tests, and a gap a test already covered came back confirmed.
+    through `also_read`, so the batch's area and the raiser's area differ by design. The
+    payload therefore lists the tests of the batch's own area first and then those of every
+    raiser's area, so a verifier told to check the supplied tests is handed the tests the
+    gap was raised over, not only the source owner's, which here are none. Handed only the
+    source owner's tests, the verifier cannot see a test that already covers the gap, so it
+    has nothing to refute the gap with.
     """
 
     AREAS = [
@@ -18787,9 +20232,7 @@ class OperatorNotesAreReadCheckedAndRendered(_FindingsCase):
         mark = review_panel.CORRECTED_MARK
         self.assertIn(mark, self.defect_block(text, "D2"))
         self.assertNotIn(mark, self.defect_block(text, "D1"))
-        refuted = _section(text, review_panel.SUBSECTION_REFUTED)
-        row = next(ln for ln in refuted.splitlines() if ln.startswith("| D3 |"))
-        self.assertIn(mark, row)
+        self.assertIn(mark, self.defect_block(text, "D3"))
         ranked = _section(text, review_panel.SUBSECTION_RANKED)
         rows = {ln.split("|")[1].strip(): ln for ln in ranked.splitlines()
                 if ln.startswith("| [D")}
@@ -18800,7 +20243,7 @@ class OperatorNotesAreReadCheckedAndRendered(_FindingsCase):
 
     def test_no_count_and_no_finding_changes(self):
         def status_lines(text):
-            return [ln for ln in text.splitlines() if ln.startswith(("- By status:",
+            return [ln for ln in text.splitlines() if ln.startswith(("- Defects by placement:", "- Sites by outcome:",
                     "- Candidates behind them:", "- Defects:"))]
         self.with_notes(NOTES)
         text = self.text()
@@ -18847,6 +20290,2649 @@ class OperatorNotesAreReadCheckedAndRendered(_FindingsCase):
         self.assertGreater(len(payloads), 5)
         for payload in payloads:
             self.assertNotIn(self.QUESTIONS, payload.read_text(encoding="utf-8"), payload)
+
+
+# --------------------------------------------------------------------------- #
+# sites and defects — a site is what clustering found, a defect one mistake with its sites
+# --------------------------------------------------------------------------- #
+# Three sites whose facts differ on every axis a defect rolls up: S1 is FINDING raised by
+# both lanes and upheld by reading; S2 is FINDING_REPRO, run and revised to blocker; S3 is
+# refuted, and its raiser proposed a BLOCKER and a LARGE fix, so a defect that rolled up
+# over a refuted site would read blocker and large where its live site says major and
+# 1 line.
+SITES_READING = {
+    **READING_TABLE,
+    "area-01-B1": {"findings": [FINDING, {**FINDING_B, "severity": "blocker",
+                                          "fix_size": "large"}], "summary": "B1 read"},
+}
+
+
+class _SitesCase(_FindingsCase):
+
+    def setUp(self):
+        super().setUp()
+        self.run_all(reading=SITES_READING)
+
+    def built(self, grouping=None, rundir=None, merge_check=_UNSET):
+        """``build_findings`` over the run directory as ``report`` assembles it, with the
+        sites grouped as given — ``None`` is one defect per site — and, unless
+        ``merge_check`` says otherwise, a merge check upholding every group of several."""
+        if merge_check is _UNSET:
+            merge_check = _accepting(grouping or [])
+        rundir = rundir or self.rundir
+        units_doc = json.loads((rundir / "units.json").read_text(encoding="utf-8"))
+        routed = review_panel._read_candidates(rundir)
+        batches = [u for u in units_doc["units"] if u["kind"] == "verifier"]
+        reproducible = {c["id"]: any(r["reproduction"] is not None for r in c["raised_by"])
+                        for c in routed["candidates"]}
+        holder = review_panel.check_routing(routed["candidates"], batches)
+        states = review_panel.read_verification_results(rundir, batches, reproducible)
+        resolved = review_panel.resolve(routed["candidates"], holder, states)
+        cluster_units = [u for u in units_doc["units"] if u["kind"] == "clusterer"]
+        cluster_states = review_panel.read_clustering_results(rundir, cluster_units)
+        clustering = review_panel.build_clusters(routed["candidates"], cluster_units,
+                                                 cluster_states)
+        snippets = {c["id"]: None for c in routed["candidates"]}
+        return review_panel.build_findings(
+            review_panel.load_dispatch(rundir), routed["candidates"], resolved, clustering,
+            cluster_states, review_panel._read_inventory(rundir)["commit"], snippets, None,
+            states, batches, grouping=grouping, merge_check=merge_check)
+
+
+class ASiteKeepsItsOwnFactsInsideADefect(_SitesCase):
+    """A site's status, corroboration, severity and test come from its own
+    candidates, whatever defect it is grouped into, and a defect's placement, outcome
+    counts, worst severity and fix size are rolled up from its sites by rule."""
+
+    def test_clustering_names_sites_and_every_candidate_records_its_site(self):
+        doc = self.findings()
+        self.assertEqual([s["id"] for s in doc["sites"]], ["S1", "S2", "S3"])
+        self.assertEqual({r["id"]: r["site"] for r in doc["candidates"]},
+                         {"cand-001": "S1", "cand-002": "S1", "cand-003": "S2",
+                          "cand-004": "S3"})
+        self.assertEqual([c.id for c in self.clustering().clusters], ["S1", "S2", "S3"])
+
+    def test_one_site_is_one_defect_by_default_numbered_as_its_site(self):
+        doc = self.findings()
+        self.assertEqual([(d["id"], d["sites"]) for d in doc["defects"]],
+                         [("D1", ["S1"]), ("D2", ["S2"]), ("D3", ["S3"])])
+        self.assertEqual({r["id"]: r["defect"] for r in doc["candidates"]},
+                         {"cand-001": "D1", "cand-002": "D1", "cand-003": "D2",
+                          "cand-004": "D3"})
+
+    def test_a_sites_facts_do_not_move_when_it_is_grouped(self):
+        alone = {s["id"]: s for s in self.built().sites}
+        grouped = {s["id"]: s for s in self.built([["S1", "S3"], ["S2"]]).sites}
+        for sid in alone:
+            self.assertEqual({k: v for k, v in grouped[sid].items() if k != "defect"},
+                             {k: v for k, v in alone[sid].items() if k != "defect"}, sid)
+        s1, s3 = grouped["S1"], grouped["S3"]
+        self.assertEqual((s1["status"], s1["axis_a"], s1["severity"], s1["test_first"]),
+                         ("established", "both", "major", TEST_FIRST))
+        self.assertEqual((s3["status"], s3["axis_a"], s3["severity"], s3["test_first"]),
+                         ("refuted", "one", "blocker", None))
+        self.assertEqual((s1["defect"], s3["defect"], grouped["S2"]["defect"]),
+                         ("D1", "D1", "D2"))
+
+    def test_a_defect_rolls_its_sites_up_by_rule(self):
+        findings = self.built([["S1", "S3"], ["S2"]])
+        d1 = findings.defects[0]
+        self.assertEqual(d1["sites"], ["S1", "S3"])
+        self.assertEqual(d1["members"], ["cand-001", "cand-002", "cand-004"])
+        # Any site established places the defect under Established, and the counts say
+        # what the placement hides.
+        self.assertEqual(d1["status"], "established")
+        self.assertEqual(d1["outcomes"], {"established": 1, "unresolved": 0, "refuted": 1})
+        # Worst severity over the ESTABLISHED sites, naming the one that sets it: the
+        # refuted site's blocker lends the defect nothing.
+        self.assertEqual((d1["severity"], d1["severity_site"]), ("major", "S1"))
+        # The largest fix a live site needs, beside how many sites there are.
+        self.assertEqual((d1["fix_size"], len(d1["sites"])), ("1 line", 2))
+        # One of two sites was reported by both lanes: that is not "both" for the defect.
+        self.assertEqual((d1["corroborated_sites"], d1["axis_a"]), (1, "one"))
+        self.assertEqual(d1["areas"], ["area-01"])
+        self.assertIsNone(d1["axis_b"], "verification strength is shown per site")
+
+    def test_placement_is_established_then_unresolved_then_refuted(self):
+        def site(sid, status, severity="major", fix="small"):
+            return {"id": sid, "asks": "defect", "area": "area-01", "status": status,
+                    "severity": severity, "fix_size": fix, "axis_a": "one",
+                    "axis_b": "by reading", "members": [f"c-{sid}"],
+                    "consequence": f"{sid} goes wrong.", "split_reason": None,
+                    "file": "a.py", "line_start": int(sid[1:]), "line_end": int(sid[1:]),
+                    "unresolved_reasons": ["needs_a_run"] if status == "unresolved" else [],
+                    "unresolved_reason": "needs_a_run" if status == "unresolved" else None,
+                    "test_first": None}
+        cases = {
+            ("refuted", "refuted"): ("refuted", {"established": 0, "unresolved": 0,
+                                                  "refuted": 2}),
+            ("unresolved", "refuted"): ("unresolved", {"established": 0, "unresolved": 1,
+                                                        "refuted": 1}),
+            ("unresolved", "established"): ("established", {"established": 1,
+                                                             "unresolved": 1,
+                                                             "refuted": 0}),
+        }
+        for statuses, (placed, outcomes) in cases.items():
+            with self.subTest(statuses=statuses):
+                sites = [site("S1", statuses[0], "blocker", "large"),
+                         site("S2", statuses[1], "minor", "1 line")]
+                record = review_panel.defect_record("D1", sites)
+                self.assertEqual((record["status"], record["outcomes"]), (placed, outcomes))
+        # Where no site is established, every site counts toward severity, as a cluster's
+        # members always have.
+        record = review_panel.defect_record(
+            "D1", [site("S1", "unresolved", "minor"), site("S2", "unresolved", "blocker")])
+        self.assertEqual((record["severity"], record["severity_site"]), ("blocker", "S2"))
+
+    def test_a_grouping_that_is_not_a_partition_of_the_sites_is_refused(self):
+        for name, grouping in (("missing", [["S1", "S2"]]),
+                               ("twice", [["S1", "S2"], ["S2", "S3"]]),
+                               ("unknown", [["S1"], ["S2"], ["S3", "S9"]]),
+                               ("empty", [["S1"], ["S2"], ["S3"], []])):
+            with self.subTest(grouping=name):
+                with self.assertRaises(review_panel.ReviewPanelError):
+                    self.built(grouping)
+
+    def test_defect_ids_follow_the_lowest_site_whatever_order_the_groups_arrive_in(self):
+        findings = self.built([["S3", "S2"], ["S1"]])
+        self.assertEqual([(d["id"], d["sites"]) for d in findings.defects],
+                         [("D1", ["S1"]), ("D2", ["S2", "S3"])])
+
+
+class TheDefectIdsAreStableAcrossRenders(_SitesCase):
+
+    def test_two_renders_of_one_run_name_every_defect_the_same_way(self):
+        first = self.findings()
+        proc = _run("report", str(self.rundir), "--rerender")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        second = self.findings()
+        self.assertEqual([(d["id"], d["sites"]) for d in first["defects"]],
+                         [(d["id"], d["sites"]) for d in second["defects"]])
+        self.assertEqual(first, second)
+
+
+class DefectsRankBySeverityThenFixThenSiteCount(unittest.TestCase):
+    """Twelve one-line fixes do not rank as one."""
+
+    def defect(self, did, sites, severity="major", fix="1 line", file="a.py", line=1):
+        return {"id": did, "sites": [f"S{n}" for n in sites], "severity": severity,
+                "fix_size": fix, "file": file, "line_start": line}
+
+    def test_a_fix_size_tie_is_broken_on_site_count(self):
+        many = self.defect("D1", [1, 2, 3], file="a.py")
+        one = self.defect("D2", [4], file="z.py", line=9)
+        self.assertEqual([d["id"] for d in sorted([many, one], key=review_panel._defect_order)],
+                         ["D2", "D1"])
+
+    def test_severity_and_fix_size_still_come_first(self):
+        many = self.defect("D1", [1, 2, 3], severity="blocker")
+        one = self.defect("D2", [4])
+        cheap = self.defect("D3", [5, 6, 7])
+        dear = self.defect("D4", [8], fix="large")
+        self.assertEqual([d["id"] for d in sorted([one, many, dear, cheap],
+                                                  key=review_panel._defect_order)],
+                         ["D1", "D2", "D3", "D4"])
+
+
+# --------------------------------------------------------------------------- #
+# The fixture run: one mistake at three code sites in two areas, restated in a
+# document and encoded in a test's expected value; a second mistake with the same symptom
+# and a different cause; a compound site; and a test that merely does not exercise the case.
+# --------------------------------------------------------------------------- #
+
+FIVE_SITE_JOB = {
+    "problem": "Find every place a total comes out wrong, and every document and test that "
+               "says so.",
+    "root": ROOT,
+    "exclude": ["vendor/"],
+    "partition": "subject",
+    "lenses": ["bottom-up from the code", "top-down from the contract"],
+    "areas": [{"name": "core", "paths": ["engine/"]}, {"name": "cli", "paths": ["run.py"]},
+              {"name": "docs", "paths": ["README.md", "docs/"]},
+              {"name": "rest", "paths": [], "remainder": True}],
+}
+_DOUBLED = "Every total comes out twice what the contract says."
+
+
+def _found(file, lines, quote, failure, consequence=_DOUBLED, **over):
+    return {**FINDING, "file": file, "line_start": lines[0], "line_end": lines[1],
+            "quote": quote, "failure": failure, "consequence": consequence,
+            "direction": "Apply the contract's rule.", **over}
+
+
+# The one mistake, at five sites: three code sites in two areas, a document and a test.
+FIVE_SITES = {
+    "helper": _found("engine/core.py", (5, 6), "def helper(y):\n    return y * 2",
+                     "helper doubles y where the contract adds two.", reproduction=REPRO),
+    "util": _found("engine/util.py", (1, 2), "def util():\n    return \"util\"",
+                   "util doubles the total where the contract adds two."),
+    "run": _found("run.py", (1, 2), "def main():\n    return 0",
+                  "main doubles the total it prints where the contract adds two."),
+    "guide": _found("docs/guide.md", (3, 3), "How the engine is used.",
+                    "The guide says the total is doubled, which is the mistake."),
+    "test": _found("tests/test_engine.py", (5, 5), "    assert run() is not None",
+                   "The test's expected value is the doubled total.", reproduction=REPRO),
+}
+# The same symptom from a different cause, the compound site, and a second report at the
+# helper's own lines that is another mistake and quotes the same source.
+SAME_SYMPTOM = _found("engine/core.py", (1, 2), "def core(x):\n    return x + 1",
+                      "core adds one for a unit conversion the total never needed.")
+COMPOUND = _found("engine/sub/deep.py", (1, 2), "def deep():\n    return \"deep\"",
+                  "deep doubles the total, and also returns a string where a number is "
+                  "expected.")
+SAME_SOURCE = _found("engine/core.py", (5, 6), "def helper(y):\n    return y * 2",
+                     "helper's result is never rounded.",
+                     consequence="A total is printed with a long fractional tail.")
+UNEXERCISED = {**GAP, "consequence": "A negative total is never exercised."}
+FIVE_SITE_READING = {
+    "area-01-A1": {"findings": [FIVE_SITES["helper"], FIVE_SITES["util"], SAME_SYMPTOM,
+                                COMPOUND], "summary": "core read"},
+    "area-01-B1": {"findings": [SAME_SOURCE], "summary": "core read"},
+    "area-02-A1": {"findings": [FIVE_SITES["run"]], "summary": "cli read"},
+    "area-02-B1": {"findings": [], "summary": "cli read"},
+    "area-03-A1": {"findings": [FIVE_SITES["guide"]], "summary": "docs read"},
+    "area-03-B1": {"findings": [], "summary": "docs read"},
+    "area-04-A1": {"findings": [FIVE_SITES["test"]], "summary": "rest read"},
+    "area-04-B1": {"findings": [], "summary": "rest read"},
+    "audit-area-04-A": {"findings": [UNEXERCISED], "summary": "one gap"},
+    "audit-area-04-B": {"findings": [], "summary": "no gap"},
+    "probe-A": PROBE_RESULT,
+}
+MECHANISM = ("The total is doubled where the contract adds two; apply the contract's rule "
+             "wherever the total is computed, stated or asserted.")
+
+
+# What a sandbox prints when the environment stops a run: nothing about the code, so the
+# fix brief keeps the command and never this.
+BLOCKED_OUTPUT = "BLOCKED: the sandbox refused a network connection"
+BLOCKED_EVIDENCE = {"argv": ["python3", "run.py", "--total"], "cwd": ".", "exit_status": 1,
+                    "output": BLOCKED_OUTPUT + "\n", "truncated": False,
+                    "run_kind": "executed",
+                    "shows": "Shows only that the sandbox had no network."}
+
+
+class _FiveSiteCase(_FindingsCase):
+    """The fixture run: one mistake at five sites, the same symptom from another cause,
+    a compound site and an unexercised case."""
+
+    # Set, the run's site is unresolved because the environment blocked an attempt that
+    # left its output behind, rather than because nothing ran.
+    BLOCKED = False
+    # Set, the helper's report is kept apart from the other report at its lines for this
+    # reason, and the merge then puts the helper's site in the defect of five.
+    SPLIT = None
+    # Set, every report names a test of its own, so one site's test cannot pass for another's.
+    OWN_TESTS = False
+    # Set, the other report at the helper's lines is clustered into the helper's site, so
+    # that site holds two reports and its test has one variant.
+    PAIRED = False
+
+    @staticmethod
+    def own_test(record):
+        return f"tests/test_engine.py: a case showing this is fixed: {record['failure']}"
+
+    def site_by(self, candidate_file, lo, failure=None):
+        """The id of the site holding the candidate at ``candidate_file``:``lo``."""
+        doc = self.candidates()
+        cid = next(c["id"] for c in doc["candidates"]
+                   if c["file"] == candidate_file and c["line_start"] == lo
+                   and (failure is None or c["failure"] == failure))
+        return next(c.id for c in self.clustering().clusters if cid in c.members)
+
+    def verdicts(self):
+        """Every candidate checked: the run's site unresolved, util's refuted, the two
+        with a reproduction run to the same output, everything else upheld by reading."""
+        by_id = {c["id"]: c for c in self.candidates()["candidates"]}
+        table = {}
+        for batch in self.verifiers():
+            verdicts = []
+            for cid in batch["candidates"]:
+                record = by_id[cid]
+                own = {"test_first": self.own_test(record)} if self.OWN_TESTS else {}
+                if batch.get("asks") == "coverage":
+                    verdicts.append(_gap_verdict(cid))
+                elif record["file"] == "run.py":
+                    verdicts.append(_verdict(
+                        cid, "unresolved", BLOCKED_EVIDENCE if self.BLOCKED else None,
+                        test_first=None, rationale="Nothing here prints a total to run.",
+                        unresolved_reason=("blocked_by_the_environment" if self.BLOCKED
+                                           else None)))
+                elif record["file"] == "engine/util.py":
+                    verdicts.append(_verdict(cid, "refuted",
+                                             rationale="util returns a name, not a total."))
+                elif any(r["reproduction"] for r in record["raised_by"]):
+                    verdicts.append(_verdict(cid, "reproduced", EVIDENCE,
+                                             rationale="The run shows it.", **own))
+                else:
+                    verdicts.append(_verdict(cid, "confirmed_by_reading", **own))
+            table[batch["id"]] = {"verdicts": verdicts, "summary": "checked"}
+        return table
+
+    def identity_clusters(self):
+        """Every report its own site, less what ``SPLIT`` and ``PAIRED`` say."""
+        by_id = {c["id"]: c for c in self.candidates()["candidates"]}
+
+        def at_helper(cid, finding):
+            record = by_id[cid]
+            return (record["file"], record["line_start"], record["failure"]) == (
+                finding["file"], finding["line_start"], finding["failure"])
+
+        out = {}
+        for unit in self.clusterers():
+            clusters = [{"members": [cid],
+                         "consequence": by_id[cid]["raised_by"][0]["consequence"],
+                         "split_reason": None} for cid in unit["candidates"]]
+            helper = next((c for c in clusters if at_helper(c["members"][0],
+                                                              FIVE_SITES["helper"])), None)
+            other = next((c for c in clusters if at_helper(c["members"][0], SAME_SOURCE)), None)
+            if helper is not None and self.SPLIT:
+                helper["split_reason"] = self.SPLIT
+            if helper is not None and other is not None and self.PAIRED:
+                helper["members"] += other["members"]
+                clusters.remove(other)
+            out[unit["id"]] = {"clusters": clusters, "summary": "each report is its own site"}
+        return out
+
+    def run_fixture(self, synthesis=True, group=True):
+        rundir = self.plan_into(self.rundir, FIVE_SITE_JOB)
+        stub_dispatch(rundir, FIVE_SITE_READING, DISPATCH)
+        proc = _run("route", str(rundir))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        stub_dispatch(rundir, self.verdicts())
+        self.cluster(rundir)
+        return self.group_and_report(synthesis, group)
+
+    def group_and_report(self, synthesis=True, group=True):
+        """From planned clustering units to a published report. ``group`` False puts every
+        site in a group of its own, so the run has one defect per site."""
+        rundir = self.rundir
+        stub_dispatch(rundir, self.identity_clusters())
+        self.five = [self.site_by(f["file"], f["line_start"], f["failure"])
+                     for f in FIVE_SITES.values()]
+        self.same_symptom = self.site_by("engine/core.py", 1)
+        self.compound = self.site_by("engine/sub/deep.py", 1)
+        self.same_source = self.site_by("engine/core.py", 5, SAME_SOURCE["failure"])
+        self.gap = self.site_by("engine/core.py", 5, UNEXERCISED["failure"])
+        everyone = [c.id for c in self.clustering().clusters]
+        grouped = group
+        group = {"sites": self.five, "mechanism": MECHANISM,
+                 "instances": [{"site": sid, "instance": f"{sid} doubles the total."}
+                               for sid in self.five],
+                 "reason_kept_apart": None}
+        groups = ([group, *(_single(sid) for sid in everyone if sid not in self.five)]
+                  if grouped else [_single(sid) for sid in everyone])
+        self.merge(rundir)
+        stub_dispatch(rundir, {MERGE_UNIT: _merge_reply(
+            groups,
+            compound=[{"site": self.compound,
+                       "second_claim": "deep also returns a string for a number."}])})
+        self.merge_checked(rundir)
+        if synthesis:
+            proc = _run("synthesize", str(rundir))
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            unit = self.synthesizers(rundir)[0]
+            entries = []
+            for did, sites in zip(unit["defects"], unit["defect_sites"]):
+                several = len(sites) > 1
+                entries.append({
+                    "defect": did,
+                    "heading": ("A total is doubled wherever it is computed, stated or "
+                                "asserted." if several else None) or f"{did} goes wrong.",
+                    "tier": "A total is wrong",
+                    "what_goes_wrong": "The total is doubled where the contract adds two."
+                                       if several else f"{did} is wrong.",
+                    "fix": "Add two wherever the total is doubled." if several else "Fix it.",
+                    "site_notes": ([{"site": self.five[3],
+                                     "note": "Here the doubling is stated as the rule."}]
+                                   if several else []),
+                    "cross_references": []})
+            stub_dispatch(rundir, {unit["id"]: {"tiers": ["A total is wrong"],
+                                                "defects": entries,
+                                                "summary": "One mistake at five sites."}})
+        self.report(rundir)
+        self.doc = self.findings()
+        self.md = self.text()
+        self.d = next((d for d in self.doc["defects"] if len(d["sites"]) > 1), None)
+        return self.doc
+
+
+class OneMistakeAtFiveSitesIsOneDefect(_FiveSiteCase):
+    """The point of the change, end to end: the five sites of one mistake are one defect;
+    the same symptom from another cause, the compound site and the unexercised case are
+    not in it; and the report reads the defect as one mistake with every site to fix."""
+
+    def test_the_five_sites_are_one_defect_and_nothing_else_is(self):
+        doc = self.run_fixture()
+        several = [d for d in doc["defects"] if len(d["sites"]) > 1]
+        self.assertEqual([d["sites"] for d in several], [sorted(self.five, key=_site_rank)])
+        self.assertEqual(self.d["areas"], ["area-01", "area-02", "area-03", "area-04"])
+        self.assertEqual(self.d["outcomes"], {"established": 3, "unresolved": 1, "refuted": 1})
+        alone = {d["sites"][0] for d in doc["defects"] if len(d["sites"]) == 1}
+        self.assertLessEqual({self.same_symptom, self.compound, self.same_source}, alone)
+        # The unexercised case is a coverage gap and stays one: no defect holds it.
+        self.assertEqual([d["sites"] for d in doc["coverage_defects"]], [[self.gap]])
+        self.assertNotIn(self.gap, {s for d in doc["defects"] for s in d["sites"]})
+        self.assertIn(UNEXERCISED["consequence"],
+                      _section(self.md, review_panel.SECTION_COVERAGE_GAPS))
+
+    def test_the_entry_reads_as_one_mistake_with_a_row_and_source_for_each_site(self):
+        self.run_fixture()
+        entry = ADefectOfSeveralSitesIsNarratedOnce.entry(self.md, self.d["id"])
+        # One account, once.
+        self.assertEqual(entry.count(f"**{review_panel.WHAT_GOES_WRONG_LABEL}**"), 1)
+        self.assertIn("- **5 sites**: 3 established, 1 unresolved, 1 refuted", entry)
+        rows = [line for line in entry.splitlines() if re.match(r"^\| \[S\d+\]", line)]
+        self.assertEqual([re.match(r"^\| \[(S\d+)\]", r).group(1) for r in rows], self.d["sites"])
+        sites = {s["id"]: s for s in self.doc["sites"]}
+        for row in rows:
+            sid = re.match(r"^\| \[(S\d+)\]", row).group(1)
+            cells = [c.strip() for c in row.strip("|").split("|")]
+            with self.subTest(site=sid):
+                self.assertEqual((cells[2].lower(), cells[3].lower()),
+                                 (sites[sid]["status"], sites[sid]["severity"]))
+        # The note lands on its own site's row, the unsettled and refuted reasons on theirs.
+        note_row = next(r for r in rows if f"[{self.five[3]}]" in r)
+        self.assertIn("Here the doubling is stated as the rule.", note_row)
+        self.assertIn("Not settled: Nothing here prints a total to run.",
+                      next(r for r in rows if f"[{self.five[2]}]" in r))
+        self.assertIn("Refuted: util returns a name, not a total.",
+                      next(r for r in rows if f"[{self.five[1]}]" in r))
+        # Source at each site: every site, with its source or why none is quoted.
+        source = entry.split(f"**{review_panel.SITES_LABEL}**", 1)[1]
+        for sid in self.d["sites"]:
+            with self.subTest(site=sid):
+                self.assertIn(f'- <a id="{sid}-src"></a>**{sid}** · ', source)
+        self.assertIn(review_panel.NO_SOURCE_QUOTED.format(status="unresolved"), source)
+        self.assertIn(review_panel.NO_SOURCE_QUOTED.format(status="refuted"), source)
+        # The helper's lines are quoted here, or pointed at where another site quotes them.
+        self.assertRegex(source, r"  ```python\n  3 \| \n  4 \| \n  5 \| def helper|"
+                                 r"The same source as quoted for \[S\d+\]")
+        # No inner site wrapper: a site is never a heading inside its defect.
+        self.assertNotRegex(entry, r"(?m)^#+ S\d+")
+
+    def test_a_defect_of_one_site_is_one_compact_entry(self):
+        self.run_fixture()
+        entry = ADefectOfSeveralSitesIsNarratedOnce.entry(
+            self.md, self.doc["sites"][[s["id"] for s in self.doc["sites"]]
+                                       .index(self.same_symptom)]["defect"])
+        sid = self.same_symptom
+        self.assertRegex(entry, rf'\n- <a id="{sid}-src"></a>\*\*Site\*\* \[{sid}\]\(#{sid}\) · '
+                                r"`core\.py:1-2` · \*\*Outcome\*\* established · "
+                                r"\*\*Severity\*\* major · \*\*Fix size\*\* 1 line\n")
+        self.assertNotRegex(entry, r"(?m)^#+ S\d+")
+        self.assertNotIn("| Site |", entry)
+        self.assertIn("- **Source.**\n", entry)
+
+    def test_every_site_has_one_evidence_entry_in_site_order(self):
+        self.run_fixture()
+        evidence = _section(self.md, review_panel.SECTION_EVIDENCE)
+        headings = re.findall(r"(?m)^### (S\d+) · (.+)$", evidence)
+        self.assertEqual([sid for sid, _ in headings],
+                         sorted((s["id"] for s in self.doc["sites"]), key=_site_rank))
+        sites = {s["id"]: s for s in self.doc["sites"]}
+        for sid, rest in headings:
+            with self.subTest(site=sid):
+                did = sites[sid]["defect"]
+                # Number, location, outcome and defect, and nothing else.
+                self.assertRegex(rest, rf"^`[^`]+` · {sites[sid]['status']} · \[{did}\]\(#{did}\)$")
+        self.assertNotIn("part of", evidence)
+        self.assertNotIn(MECHANISM, evidence, "the merge's instances and mechanism are not "
+                                              "a site's evidence")
+        # The quoted source is in the defect entries, never here.
+        self.assertNotIn("| def helper(y):", evidence)
+
+    def test_an_identical_block_is_a_pointer_to_a_site_that_prints_it(self):
+        self.run_fixture()
+        evidence = _section(self.md, review_panel.SECTION_EVIDENCE)
+        entries = _blocks_after(evidence.splitlines(), re.compile(r"^### (S\d+) · "))
+        pointers = re.findall(r"The same output as printed under \[(S\d+)\]\(#S\d+\)", evidence)
+        self.assertTrue(pointers, "the two runs print one output, so one must point")
+        for first in pointers:
+            self.assertIn("IndexError: list index out of range", "\n".join(entries[first]))
+        body = self.md.split(f" {review_panel.SECTION_EVIDENCE} (", 1)[0]
+        sources = re.findall(r"The same source as quoted for \[(S\d+)\]\(#S\d+-src\)", body)
+        self.assertEqual(len(sources), 1, "two sites quote core.py:3-6 and one points")
+        self.assertIn(sources[0], (self.five[0], self.same_source))
+        left_out = _section(self.md, review_panel.SUBSECTION_LEFT_OUT)
+        self.assertIn("1 quoted source identical", left_out)
+        self.assertIn(f"'s output points to [{pointers[0]}](#{pointers[0]})", left_out)
+
+    def test_every_site_and_defect_link_has_an_anchor_in_the_markdown_itself(self):
+        """A plain Markdown viewer knows nothing of the page conversion's rules, so a link
+        to a defect or a site resolves there only where the Markdown carries the anchor."""
+        self.run_fixture()
+        targets = set(re.findall(r"\]\(#([DS]\d+(?:-src)?)\)", self.md))
+        self.assertTrue({f"{s}-src" for s in self.d["sites"]} <= targets)
+        anchors = set(re.findall(r'<a id="([^"]+)"></a>', self.md))
+        self.assertEqual(targets - anchors, set())
+        # And each appears once, or a viewer picks one of two.
+        found = re.findall(r'<a id="([^"]+)"></a>', self.md)
+        self.assertEqual(len(found), len(set(found)))
+
+    def test_every_link_resolves_and_every_block_is_code(self):
+        self.run_fixture()
+        page = review_panel.render_html(self.md)
+        defined = set(re.findall(r'id="([^"]+)"', page))
+        self.assertEqual(set(re.findall(r'href="#([^"]+)"', page)) - defined, set())
+        for sid in self.d["sites"]:
+            with self.subTest(site=sid):
+                self.assertRegex(page, rf'<h3 id="{sid}">')
+                self.assertRegex(page, rf'<li id="{sid}-src">')
+        # The site table and the source at each site stand on their own, not inside the
+        # defect's last bullet.
+        self.assertIn('</ul>\n<div class="scroll"><table><thead><tr><th> Site </th>', page)
+        self.assertIn(f"<p>\n<strong>{review_panel.SITES_LABEL}</strong>", page)
+        # Every fenced block renders as code, the ones inside list items included.
+        fences = len(re.findall(r"(?m)^\s*```", self.md)) // 2
+        self.assertEqual(page.count("<pre><code"), fences)
+
+    def test_the_indices_list_each_defect_once_and_each_file_once(self):
+        self.run_fixture()
+        ranked = _section(self.md, review_panel.SUBSECTION_RANKED)
+        rows = re.findall(r"(?m)^\| \[(D\d+)\]\(#D\d+\) \|.*\| (\d+) \(([^)]*)\)", ranked)
+        work = [d for d in self.doc["defects"] if d["status"] != "refuted"]
+        self.assertEqual(sorted(r[0] for r in rows), sorted(d["id"] for d in work))
+        self.assertIn((self.d["id"], "5", "3 established, 1 unresolved, 1 refuted"), rows)
+        by_file = _section(self.md, review_panel.SUBSECTION_BY_FILE)
+        files = re.findall(r"(?m)^\| ([^|]+?) \| (?:Blocker|Major|Minor|Nit) \|", by_file)
+        self.assertEqual(len(files), len(set(files)))
+        core = next(line for line in by_file.splitlines() if line.startswith("| core.py |"))
+        for sid in (self.five[0], self.same_symptom, self.same_source):
+            self.assertIn(f"[{sid}](#{sid}-src)", core)
+        self.assertIn(f"([{self.d['id']}](#{self.d['id']}))", core)
+        # A refuted site has nothing to fix, so it is in no file's row.
+        self.assertNotIn(f"[{self.five[1]}]", by_file)
+
+    def test_the_top_defines_defects_and_sites_and_counts_both(self):
+        self.run_fixture()
+        described = _section(self.md, review_panel.SECTION_DESCRIPTION)
+        self.assertIn(review_panel.DEFECTS_AND_SITES, described)
+        sites = self.doc["sites"]
+        self.assertIn(f"- Defects: {len(self.doc['defects'])} at {len(sites)} sites from "
+                      f"{len(self.doc['candidates'])} candidates", described)
+        self.assertIn("1 defect has more than one site", described)
+        count = {k: sum(1 for s in sites if s["status"] == k)
+                 for k in ("established", "refuted", "unresolved")}
+        self.assertIn(f"- Sites by outcome: {count['established']} established, "
+                      f"{count['refuted']} refuted, {count['unresolved']} unresolved.",
+                      described)
+        self.assertNotRegex(described, r"merge round's reply was not used|written before")
+
+
+def _site_rank(sid):
+    return int(sid[1:])
+
+
+def _brief_location(site):
+    lines = (str(site["line_start"]) if site["line_start"] == site["line_end"]
+             else f"{site['line_start']}-{site['line_end']}")
+    return f"`{site['file']}:{lines}`"
+
+
+class _FixBriefCase(_FiveSiteCase):
+    """The fix brief as the run directory holds it."""
+
+    def brief(self):
+        return json.loads((self.rundir / "fix-brief.json").read_text(encoding="utf-8"))
+
+    def brief_md(self):
+        return (self.rundir / "fix-brief.md").read_text(encoding="utf-8")
+
+    def per_defect(self):
+        return {path.name: path.read_text(encoding="utf-8")
+                for path in sorted((self.rundir / "fix-brief").iterdir())}
+
+    def live_sites(self):
+        return {s["id"]: s for s in self.doc["sites"] if s["status"] != "refuted"}
+
+    @staticmethod
+    def brief_sites(brief):
+        return {s["id"]: s for d in brief["defects"] for s in d["sites"]}
+
+    @staticmethod
+    def gap_sites(brief):
+        return {s["id"]: s for d in brief["tests_to_write"] for s in d["sites"]}
+
+    def on_disk(self):
+        """The run's findings as :func:`review_panel.fix_brief_document` takes them, with
+        the probe the run recorded, so a test can change one record and render again."""
+        doc = self.findings()
+        findings = review_panel.Findings(
+            rung=doc["rung"], commit=doc["commit"],
+            candidates=tuple(doc["candidates"]), sites=tuple(doc["sites"]),
+            defects=tuple(doc["defects"]), clustering=tuple(doc["clustering"]),
+            synthesis=doc["synthesis"], coverage=tuple(doc["coverage"]),
+            coverage_sites=tuple(doc["coverage_sites"]),
+            coverage_defects=tuple(doc["coverage_defects"]),
+            verification=tuple(doc["verification"]),
+            outside_scope=tuple(doc["outside_scope"]), merge=doc["merge"],
+            merge_check=doc["merge_check"])
+        return findings, review_panel._read_candidates(self.rundir)["probe"]
+
+
+class TheFixBriefCarriesWhatAnAgentNeedsToFix(_FixBriefCase):
+    """The fix brief, the second output, for an agent that will fix the defects. Every site
+    with something to fix appears once with what the run recorded about fixing it, and
+    nothing the agent cannot act on — a refuted site, or the output of a run the
+    environment stopped — appears at all."""
+
+    BLOCKED = True
+
+    def test_every_live_site_appears_once_with_its_location_and_outcome(self):
+        self.run_fixture()
+        brief, md = self.brief(), self.brief_md()
+        live = self.live_sites()
+        listed = [s["id"] for d in brief["defects"] for s in d["sites"]]
+        self.assertEqual(sorted(listed, key=_site_rank), sorted(live, key=_site_rank))
+        gaps = {s["id"]: s for s in self.doc["coverage_sites"] if s["status"] != "refuted"}
+        self.assertIn(self.gap, gaps, "the fixture has a gap that stood")
+        self.assertEqual(sorted((s["id"] for d in brief["tests_to_write"] for s in d["sites"]),
+                                key=_site_rank), sorted(gaps, key=_site_rank))
+        live = {**live, **gaps}
+        for sid, site in live.items():
+            with self.subTest(site=sid):
+                found = re.findall(rf"(?m)^### {sid} · .*$", md)
+                self.assertEqual(len(found), 1)
+                where = f"### {sid} · {_brief_location(site)} · {site['status']}"
+                if sid in gaps:
+                    self.assertRegex(found[0], rf"^{re.escape(where)}( · owed by .+)?$")
+                else:
+                    self.assertEqual(found[0], f"{where} · {site['severity']} · "
+                                               f"fix {site['fix_size']}")
+                entry = {**self.brief_sites(brief), **self.gap_sites(brief)}[sid]
+                self.assertEqual((entry["file"], entry["line_start"], entry["line_end"],
+                                  entry["outcome"]),
+                                 (site["file"], site["line_start"], site["line_end"],
+                                  site["status"]))
+
+    def test_no_refuted_site_appears(self):
+        self.run_fixture()
+        brief, md = self.brief(), self.brief_md()
+        refuted = [s["id"] for s in self.doc["sites"] if s["status"] == "refuted"]
+        self.assertIn(self.five[1], refuted, "the fixture has a refuted site inside a defect")
+        for text in (md, json.dumps(brief), *self.per_defect().values()):
+            for sid in refuted:
+                self.assertNotRegex(text, rf"\b{sid}\b")
+            self.assertNotIn("util returns a name", text)
+
+    def test_a_refuted_defect_is_left_out(self):
+        self.run_fixture(group=False)
+        refuted = [d["id"] for d in self.doc["defects"] if d["status"] == "refuted"]
+        self.assertTrue(refuted, "the ungrouped run has a defect every site of which is refuted")
+        brief, md = self.brief(), self.brief_md()
+        self.assertEqual({d["id"] for d in brief["defects"]},
+                         {d["id"] for d in self.doc["defects"] if d["status"] != "refuted"})
+        for did in refuted:
+            self.assertNotRegex(md, rf"\b{did}\b")
+            self.assertNotIn(f"{did}.md", self.per_defect())
+
+    def test_each_site_carries_its_test_reproduction_and_what_to_do(self):
+        self.run_fixture()
+        got = self.brief_sites(self.brief())
+        for sid, site in self.live_sites().items():
+            members = [r for r in self.doc["candidates"]
+                       if r["site"] == sid and r["status"] != "refuted"]
+            runnable = any(
+                (m["evidence"] and m["evidence"].get("run_kind") != "documentary")
+                or any(r["reproduction"] for r in m["raised_by"]) for m in members)
+            entry = got[sid]
+            with self.subTest(site=sid):
+                self.assertEqual(entry["test_first"], site["test_first"])
+                self.assertEqual(entry["reproduction"] is not None, runnable)
+                if site["status"] == "unresolved":
+                    self.assertTrue(entry["unsettled"]["what_to_do"])
+                    self.assertEqual(entry["unsettled"]["accounts"],
+                                     ["Nothing here prints a total to run."])
+                else:
+                    self.assertIsNone(entry["unsettled"])
+        # A site the review ran carries the run: its command, exit status, what it shows and
+        # its output.
+        helper = got[self.five[0]]["reproduction"]
+        self.assertEqual(helper["kind"], "run")
+        self.assertEqual((helper["argv"], helper["exit_status"], helper["shows"]),
+                         (EVIDENCE["argv"], 1, EVIDENCE["shows"]))
+        self.assertIn("IndexError: list index out of range", helper["output"])
+        self.assertTrue(any(got[sid]["test_first"] for sid in got))
+
+    def test_an_attempt_the_environment_blocked_keeps_its_command_and_not_its_output(self):
+        self.run_fixture()
+        brief, md = self.brief(), self.brief_md()
+        entry = self.brief_sites(brief)[self.five[2]]
+        self.assertEqual(entry["outcome"], "unresolved")
+        self.assertEqual(entry["unsettled"]["reason"], "blocked_by_the_environment")
+        repro = entry["reproduction"]
+        self.assertEqual((repro["kind"], repro["argv"]), ("blocked", BLOCKED_EVIDENCE["argv"]))
+        self.assertEqual((repro["exit_status"], repro["shows"], repro["output"]),
+                         (None, None, None))
+        self.assertIn("python3 run.py --total", md)
+        for text in (md, json.dumps(brief), *self.per_defect().values()):
+            self.assertNotIn(BLOCKED_OUTPUT, text)
+            self.assertNotIn(BLOCKED_EVIDENCE["shows"], text)
+
+    def test_each_defect_has_an_account_and_a_fix(self):
+        self.run_fixture()
+        for defect in self.brief()["defects"]:
+            with self.subTest(defect=defect["id"]):
+                self.assertEqual(defect["account"], "synthesis")
+                self.assertTrue(defect["what_goes_wrong"])
+                self.assertTrue(defect["fix"])
+
+    def test_without_synthesis_a_defect_has_the_mechanism_the_merge_check_upheld(self):
+        self.run_fixture(synthesis=False)
+        brief, md = self.brief(), self.brief_md()
+        sites_of = {d["id"]: d["sites"] for d in self.doc["defects"]}
+        several = [d for d in brief["defects"] if len(sites_of[d["id"]]) > 1]
+        self.assertEqual([(d["account"], d["what_goes_wrong"], d["fix"]) for d in several],
+                         [("merge check", MECHANISM, None)])
+        self.assertIn("**What goes wrong, as the merge check upheld it.**", md)
+        consequence = {s["id"]: s["consequence"] for s in self.doc["sites"]}
+        for defect in brief["defects"]:
+            if len(sites_of[defect["id"]]) == 1:
+                with self.subTest(defect=defect["id"]):
+                    self.assertEqual((defect["account"], defect["what_goes_wrong"]),
+                                     ("site", consequence[sites_of[defect["id"]][0]]))
+
+    def test_each_per_defect_file_has_the_setup_and_exactly_one_defect(self):
+        self.run_fixture()
+        brief, md = self.brief(), self.brief_md()
+        files = self.per_defect()
+        every = brief["defects"] + brief["tests_to_write"]
+        self.assertTrue(brief["tests_to_write"])
+        self.assertEqual(sorted(files), sorted(f"{d['id']}.md" for d in every))
+        setup = md[md.index("## Setup"):md.index("\n## D")]
+        for defect in every:
+            text = files[f"{defect['id']}.md"]
+            with self.subTest(defect=defect["id"]):
+                self.assertIn(setup, text)
+                self.assertEqual(re.findall(r"(?m)^## (D\d+)\. ", text), [defect["id"]])
+                self.assertEqual(re.findall(r"(?m)^### (S\d+) · ", text),
+                                 [s["id"] for s in defect["sites"]])
+                self.assertIn(text[text.index(f"## {defect['id']}. "):], md)
+
+    def test_the_json_and_the_markdown_carry_the_same_records(self):
+        self.run_fixture()
+        brief, md = self.brief(), self.brief_md()
+        # The Markdown is the JSON rendered, and nothing else.
+        self.assertEqual(review_panel.render_fix_brief(brief), md)
+        every = brief["defects"] + brief["tests_to_write"]
+        self.assertTrue(brief["tests_to_write"])
+        self.assertEqual(re.findall(r"(?m)^## (D\d+)\. ", md), [d["id"] for d in every])
+        self.assertEqual(re.findall(r"(?m)^### (S\d+) · ", md),
+                         [s["id"] for d in every for s in d["sites"]])
+        # And every value the JSON holds is on the page.
+        plain = " ".join(html.unescape(review_panel._unescape(md)).split())
+
+        def shown(value, where):
+            if value is None:
+                return
+            if isinstance(value, list):
+                for item in value:
+                    shown(item, where)
+                return
+            self.assertIn(" ".join(str(value).split()), plain, where)
+
+        setup = brief["setup"]
+        shown(setup["probe"]["summary"], "probe summary")
+        for step in ("build", "tests"):
+            shown(setup["probe"][step]["argv"], step)
+        for defect in brief["defects"]:
+            for key in ("heading", "severity", "related", "what_goes_wrong", "fix"):
+                shown(defect[key], f"{defect['id']} {key}")
+            for site in defect["sites"]:
+                for key in ("file", "outcome", "severity", "fix_size", "what_is_wrong_here",
+                            "note", "test_first"):
+                    shown(site[key], f"{site['id']} {key}")
+                if site["unsettled"]:
+                    for key in ("what_to_do", "accounts", "needs_files"):
+                        shown(site["unsettled"][key], f"{site['id']} {key}")
+                if site["reproduction"]:
+                    for key in ("argv", "cwd", "expect", "exit_status", "shows", "output"):
+                        shown(site["reproduction"][key], f"{site['id']} reproduction {key}")
+        for defect in brief["tests_to_write"]:
+            shown(defect["heading"], f"{defect['id']} heading")
+            for site in defect["sites"]:
+                for key in ("file", "outcome", "test_class", "uncovered",
+                            "no_test_constructs", "proposed", "test_first", "check_found"):
+                    shown(site[key], f"{site['id']} {key}")
+                if site["unsettled"]:
+                    for key in ("what_to_do", "accounts", "needs_files"):
+                        shown(site["unsettled"][key], f"{site['id']} {key}")
+
+    def test_a_heading_never_comes_from_a_refuted_site(self):
+        """Without an accepted synthesis entry a defect is headed by a site's consequence,
+        and never by a site whose every report was refuted: that heading describes code
+        the review cleared, and points an agent at it."""
+        self.run_fixture(synthesis=False)
+        findings, probe = self.on_disk()
+        target = next(d for d in findings.defects if len(d["sites"]) > 1)
+        first = target["sites"][0]
+        cleared = "CLEARED: this code was checked and is fine."
+        sites = tuple({**s, "status": "refuted", "consequence": cleared}
+                      if s["id"] == first else s for s in findings.sites)
+        defects = tuple({**d, "consequence": cleared, "heading": None}
+                        if d["id"] == target["id"] else d for d in findings.defects)
+        brief = review_panel.fix_brief_document(
+            replace(findings, sites=sites, defects=defects), probe)
+        entry = next(d for d in brief["defects"] if d["id"] == target["id"])
+        self.assertNotEqual(entry["heading"], cleared)
+        live = [s for s in sites if s["id"] in target["sites"] and s["status"] != "refuted"]
+        self.assertEqual(entry["heading"], live[0]["consequence"])
+        for text in (review_panel.render_fix_brief(brief),
+                     *review_panel.render_fix_brief_defects(brief).values()):
+            self.assertNotIn("CLEARED", text)
+
+    def test_the_tests_to_write_are_carried_and_no_covered_gap(self):
+        self.run_fixture()
+        brief, md = self.brief(), self.brief_md()
+        gap = self.gap_sites(brief)[self.gap]
+        self.assertEqual((gap["outcome"], gap["uncovered"]),
+                         ("established", UNEXERCISED["consequence"]))
+        self.assertTrue(gap["test_first"])
+        self.assertIn("## Tests to write", md)
+        self.assertIn("None of these says the code is wrong", md)
+        self.assertLess(md.index("## Tests to write"), md.index(f"### {self.gap} · "))
+        # A gap a test already covers has nothing to do, and is left out.
+        findings, probe = self.on_disk()
+        covered = tuple({**s, "status": "refuted"} for s in findings.coverage_sites)
+        covered_defects = tuple({**d, "status": "refuted"} for d in findings.coverage_defects)
+        brief = review_panel.fix_brief_document(
+            replace(findings, coverage_sites=covered, coverage_defects=covered_defects), probe)
+        self.assertEqual(brief["tests_to_write"], [])
+        self.assertNotRegex(review_panel.render_fix_brief(brief), rf"\b{self.gap}\b")
+
+    def test_a_run_whose_only_findings_are_gaps_has_something_to_do(self):
+        self.run_fixture()
+        findings, probe = self.on_disk()
+        brief = review_panel.fix_brief_document(
+            replace(findings, candidates=(), sites=(), defects=()), probe)
+        text = review_panel.render_fix_brief(brief)
+        self.assertEqual(brief["defects"], [])
+        self.assertIn(f"### {self.gap} · ", text)
+        self.assertNotIn("nothing here to fix", text)
+        self.assertEqual(sorted(review_panel.render_fix_brief_defects(brief)),
+                         [d["id"] for d in brief["tests_to_write"]])
+
+    def test_the_setup_is_the_runs_own_record(self):
+        self.run_fixture()
+        brief, md = self.brief(), self.brief_md()
+        setup = md[:md.index("\n## D")]
+        self.assertIn(review_panel._commit_words(self.doc["commit"]), setup)
+        self.assertIn("python3 -m compileall -q .", setup)
+        self.assertIn("python3 -m unittest discover", setup)
+        self.assertIn(PROBE_RESULT["summary"], setup)
+        self.assertEqual(brief["setup"]["probe"]["summary"], PROBE_RESULT["summary"])
+        self.assertEqual(brief["setup"]["commit"], self.doc["commit"])
+        # Nothing the run did not record: no list of test-suite traps, which no round makes.
+        self.assertNotIn("trap", md.lower())
+        for name in ("A defect (`D1`", "`established`", "`unresolved`"):
+            self.assertIn(name, setup)
+
+
+class TheFixBriefDirectoryIsTheEngines(_FixBriefCase):
+    """``fix-brief/`` holds one file per defect, and the engine owns it as a directory:
+    every re-render, redo and recovery removes what it wrote there before writing again,
+    and refuses anything there it did not write. A ``D7.md`` left from a grouping that has
+    since shrunk is a defect an agent would go and fix."""
+
+    def names(self):
+        return sorted(self.per_defect())
+
+    def expected(self):
+        brief = self.brief()
+        return sorted(f"{d['id']}.md" for d in brief["defects"] + brief["tests_to_write"])
+
+    def gone(self):
+        for name in ("fix-brief", "fix-brief.md", "fix-brief.json"):
+            self.assertFalse((self.rundir / name).exists(), f"{name} outlived the redo")
+
+    def left_over(self):
+        return sorted(p.name for p in self.rundir.iterdir()
+                      if p.name.startswith("fix-brief") and p.name not in
+                      ("fix-brief", "fix-brief.md", "fix-brief.json"))
+
+    def test_a_cluster_redo_after_a_regroup_that_shrinks_the_defects_leaves_no_stale_file(self):
+        self.run_fixture(synthesis=False, group=False)
+        before = self.names()
+        self.assertEqual(before, self.expected())
+        proc = _run("cluster", str(self.rundir), "--redo")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.gone()
+        self.group_and_report(synthesis=False, group=True)
+        self.assertLess(len(self.names()), len(before))
+        self.assertEqual(self.names(), self.expected())
+
+    def test_a_route_redo_takes_the_fix_brief_back_with_the_report(self):
+        self.run_fixture(synthesis=False)
+        (self.rundir / "fix-brief" / "D99.md").write_text("stale", encoding="utf-8")
+        proc = _run("route", str(self.rundir), "--redo")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.gone()
+
+    def test_a_rerender_removes_every_defect_file_before_writing(self):
+        self.run_fixture(synthesis=False)
+        (self.rundir / "fix-brief" / "D99.md").write_text("stale", encoding="utf-8")
+        (self.rundir / "fix-brief" / "D1.md.4242.tmp").write_text("half", encoding="utf-8")
+        proc = _run("report", str(self.rundir), "--rerender")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.names(), self.expected())
+        self.assertEqual(self.left_over(), [])
+
+    def test_anything_in_the_directory_the_engine_did_not_write_is_refused(self):
+        self.run_fixture(synthesis=False)
+        for planted in ("notes.txt", "D1.md.bak", "sub"):
+            path = self.rundir / "fix-brief" / planted
+            if planted == "sub":
+                path.mkdir()
+            else:
+                path.write_text("mine", encoding="utf-8")
+            before = _tree_bytes(self.rundir)
+            for argv in (("report", str(self.rundir), "--rerender"),
+                         ("cluster", str(self.rundir), "--redo"),
+                         ("route", str(self.rundir), "--redo")):
+                with self.subTest(planted=planted, command=argv[0]):
+                    proc = _run(*argv)
+                    self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                    self.assertNotIn("Traceback", proc.stderr)
+                    self.assertIn(planted, proc.stderr)
+                    self.assertEqual(_tree_bytes(self.rundir), before)
+                    self.assertTrue(path.exists())
+            if planted == "sub":
+                path.rmdir()
+            else:
+                path.unlink()
+
+    def test_a_file_or_a_link_where_the_directory_goes_is_refused(self):
+        self.run_fixture(synthesis=False)
+        shutil.rmtree(self.rundir / "fix-brief")
+        (self.rundir / "fix-brief").write_text("not a directory", encoding="utf-8")
+        before = _tree_bytes(self.rundir)
+        proc = _run("report", str(self.rundir), "--rerender")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("fix-brief", proc.stderr)
+        self.assertEqual(_tree_bytes(self.rundir), before)
+        (self.rundir / "fix-brief").unlink()
+        elsewhere = self.rundir.parent / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "D1.md").write_text("somebody's", encoding="utf-8")
+        try:
+            (self.rundir / "fix-brief").symlink_to(elsewhere, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"cannot create a symlink here: {exc}")
+        for argv in (("report", str(self.rundir), "--rerender"),
+                     ("cluster", str(self.rundir), "--redo")):
+            with self.subTest(command=argv[0]):
+                proc = _run(*argv)
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertEqual((elsewhere / "D1.md").read_text(encoding="utf-8"),
+                                 "somebody's")
+
+    def test_a_failed_rerender_puts_the_previous_fix_brief_back(self):
+        self.run_fixture(synthesis=False)
+        # A file the next render would not write, so a rollback that did nothing, or a
+        # rerender that went through, is told apart from one that restored the directory.
+        (self.rundir / "fix-brief" / "D99.md").write_text("stale", encoding="utf-8")
+        before = {name: data for name, data in _tree_bytes(self.rundir).items()
+                  if name.startswith("fix-brief")}
+        real = review_panel.write_text
+
+        def prose_fails(path, text):
+            if Path(path).name == "report.md":
+                raise review_panel.InventoryError("report.md could not be written")
+            return real(path, text)
+
+        with mock.patch.object(review_panel, "write_text", side_effect=prose_fails):
+            self.assertEqual(review_panel.main(["report", str(self.rundir), "--rerender"]), 2)
+        after = {name: data for name, data in _tree_bytes(self.rundir).items()
+                 if name.startswith("fix-brief")}
+        self.assertEqual(after, before)
+        self.assertEqual(self.left_over(), [])
+
+    def test_a_failed_first_publication_leaves_no_fix_brief(self):
+        self.run_fixture(synthesis=False)
+        for name in ("report.md", "report.html", "findings.json", "fix-brief.md",
+                     "fix-brief.json", "report-stamp.json"):
+            (self.rundir / name).unlink()
+        shutil.rmtree(self.rundir / "fix-brief")
+        real = review_panel.write_text
+
+        def prose_fails(path, text):
+            if Path(path).name == "report.md":
+                raise review_panel.InventoryError("report.md could not be written")
+            return real(path, text)
+
+        with mock.patch.object(review_panel, "write_text", side_effect=prose_fails):
+            self.assertEqual(review_panel.main(["report", str(self.rundir)]), 2)
+        self.gone()
+        self.assertEqual(self.left_over(), [])
+
+    def test_an_interrupted_publication_is_finished_by_the_next_report(self):
+        self.run_fixture(synthesis=False)
+        expected = self.names()
+        # What a kill part-way leaves: the stamp, part of the fix brief with a scratch file
+        # inside it, and none of the report's own three files.
+        for name in ("report.md", "report.html", "findings.json", "fix-brief.md"):
+            (self.rundir / name).unlink()
+        (self.rundir / "fix-brief" / expected[0]).unlink()
+        (self.rundir / "fix-brief" / "D99.md.4242.tmp").write_text("half", encoding="utf-8")
+        self.report()
+        self.assertEqual(self.names(), expected)
+        self.assertTrue((self.rundir / "report.md").is_file())
+        self.assertTrue((self.rundir / "fix-brief.md").is_file())
+        self.assertEqual(self.left_over(), [])
+
+
+class EachDegradedLayoutNamesItself(_FindingsCase):
+    """Every way the grouping or the narrative falls short of a finished run renders its
+    stated fallback and says so at the top, beside the counts it changes."""
+
+    def top(self):
+        return _section(self.text(), review_panel.SECTION_DESCRIPTION)
+
+    def assert_every_site_alone(self):
+        defects = self.defects()
+        self.assertEqual([d["sites"] for d in defects.values()], [["S1"], ["S2"], ["S3"]])
+
+    def test_a_finished_run_names_nothing(self):
+        self.run_all(merge=MERGED_PAIR, synthesis=SYNTH_MERGED)
+        top = self.top()
+        for sentence in (review_panel.GROUPING_NO_MERGE, review_panel.GROUPING_MERGE_DEGRADED,
+                         review_panel.GROUPING_HELD, review_panel.GROUPING_CHECK_DEGRADED,
+                         review_panel.GROUPING_NO_SYNTHESIS, review_panel.GROUPING_BEFORE_SITES):
+            self.assertNotIn(sentence, top)
+
+    def test_no_merge_round_yet(self):
+        self.plan_into(self.rundir)
+        stub_dispatch(self.rundir, READING_TABLE, DISPATCH)
+        self.assertEqual(_run("route", str(self.rundir)).returncode, 0)
+        stub_dispatch(self.rundir, VERIFY_TABLE)
+        self.clustered()
+        self.report()
+        self.assert_every_site_alone()
+        self.assertIn(f"- {review_panel.GROUPING_NO_MERGE}", self.top())
+
+    def test_a_merge_reply_that_was_not_used(self):
+        self.run_all(merge={MERGE_UNIT: "the reply was not a JSON object\n"})
+        self.assert_every_site_alone()
+        self.assertIn(f"- {review_panel.GROUPING_MERGE_DEGRADED}", self.top())
+        self.assertIn(review_panel.MERGE_DEGRADED,
+                      " ".join(_section(self.text(), review_panel.SUBSECTION_MERGE).split()))
+
+    def test_a_merge_check_that_was_not_used(self):
+        self.run_all(merge=MERGED_PAIR, check={CHECK_UNIT: "the reply was not a JSON object\n"})
+        self.assert_every_site_alone()
+        self.assertIn(f"- {review_panel.GROUPING_CHECK_DEGRADED}", self.top())
+
+    def test_a_synthesis_that_failed_gives_the_mechanism_as_the_account(self):
+        self.run_all(merge=MERGED_PAIR, synthesis={"synth-A": "the reply was not a JSON object\n"})
+        self.assertIn(f"- {review_panel.GROUPING_NO_SYNTHESIS}", self.top())
+        entry = " ".join(ADefectOfSeveralSitesIsNarratedOnce.entry(self.text(), "D1").split())
+        self.assertIn(f"**{review_panel.WHAT_GOES_WRONG_LABEL[:-1]}**, "
+                      f"{review_panel.MECHANISM_UPHELD}: {MERGE_PAIR['mechanism']}", entry)
+        # A defect of one site shows its site's consequence, as its heading.
+        d2 = ADefectOfSeveralSitesIsNarratedOnce.entry(self.text(), "D2")
+        self.assertIn(CLUSTER_TABLE["cluster-area-01"]["clusters"][2]["consequence"], d2)
+        self.assertNotIn(review_panel.WHAT_GOES_WRONG_LABEL, d2)
+
+    def test_one_defect_over_its_limit_is_named_at_the_top(self):
+        entries = [{**e, "fix": _words(review_panel.SYNTHESIS_FIX_WORDS + 1)}
+                   if e["defect"] == "D1" else e for e in SYNTH_MERGED["synth-A"]["defects"]]
+        self.run_all(merge=MERGED_PAIR,
+                     synthesis={"synth-A": {**SYNTH_MERGED["synth-A"], "defects": entries}})
+        self.assertIn(f"- {review_panel.synthesis_refused_note([{'id': 'D1', 'sites': ['S1', 'S2']}])}",
+                      self.top())
+        entry = " ".join(ADefectOfSeveralSitesIsNarratedOnce.entry(self.text(), "D1").split())
+        self.assertIn(MERGE_PAIR["mechanism"], entry)
+
+    def test_the_refusal_note_says_what_happened_to_the_entries_it_names(self):
+        """The note is built from the refused defects, so one entry of one site is not
+        described as several entries or as a defect of several sites."""
+        note = review_panel.synthesis_refused_note
+        one = note([{"id": "D3", "sites": ["S3"]}])
+        self.assertIn("entry for [D3](#D3) could not be used, so it is headed by its site's "
+                      "consequence;", one)
+        self.assertNotIn("each", one)
+        self.assertNotIn("mechanism", one)
+        merged = note([{"id": "D1", "sites": ["S1", "S5"]}])
+        self.assertIn("so it is headed by its first site's consequence, and gives the "
+                      "mechanism the merge check upheld as its account;", merged)
+        mixed = note([{"id": "D1", "sites": ["S1", "S5"]}, {"id": "D3", "sites": ["S3"]}])
+        self.assertIn("entries for [D1](#D1), [D3](#D3) could not be used, so each is headed "
+                      "by its first site's consequence, and [D1](#D1) gives the mechanism the "
+                      "merge check upheld as its account;", mixed)
+        two = note([{"id": "D1", "sites": ["S1", "S5"]}, {"id": "D2", "sites": ["S2", "S6"]}])
+        self.assertIn("and [D1](#D1), [D2](#D2) give the mechanism the merge check upheld as "
+                      "their account;", two)
+        for text in (one, merged, mixed, two):
+            self.assertTrue(text.endswith(
+                f"**{review_panel.SUBSECTION_SYNTHESIS}**, in the appendix, says why."))
+
+
+# --------------------------------------------------------------------------- #
+# The no-loss property: a report of sites loses nothing the report of one defect per site
+# carried. The engine does not render the one-defect-per-site shape, so the baseline is
+# the `report.md` stored in the old-run fixture, and this checker is proved by corrupting
+# the new report on purpose.
+# --------------------------------------------------------------------------- #
+
+_OLD_ENTRY = re.compile(r"^#{3,4} (D\d+)\. ")
+_ANY_HEADING = re.compile(r"^#{1,6} ")
+_FENCE_LINE = re.compile(r"^\s*(`{3,})")
+_NUMBERED = re.compile(r"^\s*\d+ \| ")
+_IN_FULL = re.compile(r"^  \S.*:\d+(?:-\d+)? — ")
+_ACCOUNT = ("- **What goes wrong.**", "- **Fix.**", "- **Related.**")
+_TEST_LINE = "- **Test that should fail first.**"
+_UNSETTLED_LINE = "- **What is not settled.**"
+_SAME_SOURCE = re.compile(r"The same source as quoted for \[(S\d+)\]\(#S\d+-src\)")
+_SAME_OUTPUT = re.compile(r"The same output as printed under \[(S\d+)\]\(#S\d+\)")
+
+
+def _flat(text):
+    return " ".join(review_panel._unescape(text).split())
+
+
+def _blocks_after(lines, pattern, stop=_ANY_HEADING):
+    """``{id: lines}`` for every entry a heading matching ``pattern`` opens, cut at the next
+    heading of any level."""
+    out, current = {}, None
+    for line in lines:
+        opened = pattern.match(line)
+        if opened:
+            current = opened.group(1)
+            out[current] = []
+            continue
+        if stop.match(line):
+            current = None
+            continue
+        if current is not None:
+            out[current].append(line)
+    return out
+
+
+def _fence_end(lines, start):
+    """The index of the line closing the fence ``lines[start]`` opens."""
+    width = len(_FENCE_LINE.match(lines[start]).group(1))
+    for n in range(start + 1, len(lines)):
+        closing = _FENCE_LINE.match(lines[n])
+        if closing and len(closing.group(1)) >= width and not lines[n].strip()[width:]:
+            return n
+    return len(lines) - 1
+
+
+def _held(block, lines):
+    """Whether ``block`` is a contiguous run of ``lines``, byte for byte."""
+    return any(lines[k:k + len(block)] == block for k in range(len(lines) - len(block) + 1))
+
+
+def _site_source_line(sid):
+    return re.compile(rf'^- (?:<a id="{sid}-src"></a>)?\*\*{sid}\*\* · ')
+
+
+def _several(entry, sid):
+    return any(_site_source_line(sid).match(line) for line in entry)
+
+
+def _source_area(entry, sid):
+    """The part of a defect's entry holding ``sid``'s quoted source: the whole entry of a
+    defect of one site, or the site's own line under the source at each site."""
+    if not _several(entry, sid):
+        return entry
+    out, inside = [], False
+    for line in entry:
+        if line.startswith("- "):
+            inside = bool(_site_source_line(sid).match(line))
+        if inside:
+            out.append(line)
+    return out
+
+
+def _site_row(entry, sid):
+    """``sid``'s own row of its defect's site table, or nothing."""
+    return next((line for line in entry if line.startswith(f"| [{sid}](#{sid}-src) |")), "")
+
+
+def _unit_text(unit, label):
+    """What a moved item says: its label and location prefix off, a fenced body's lines
+    joined, whitespace collapsed."""
+    first = re.sub(r"^\([^)]*\) ", "", unit[0][len(label):].strip())
+    body, fenced = [], False
+    for line in unit[1:]:
+        if _FENCE_LINE.match(line):
+            fenced = not fenced
+            continue
+        # Inside the fence every line is the note, whatever it looks like; outside it, a
+        # variant line is the test's metadata and is checked on its own.
+        if line.strip() and (fenced or not _VARIANTS.match(line)):
+            body.append(line.strip())
+    return _flat(" ".join([first, *body]))
+
+
+_VARIANTS = re.compile(r"^  - ((?:One|\d+) other reports? names? a variant of this test.*)$")
+
+
+def no_loss_problems(old_md, new_md, site_defect, commit_words):
+    """Every way ``new_md`` fails to carry what ``old_md`` did, or nothing.
+
+    For every old defect entry (old ``D<n>`` is site ``S<n>``), every line but its account
+    is either present, unchanged and in order, in the site's evidence entry, or is one of
+    the stated removals and moves, each checked where it went: the consequence and the
+    first test and unsettled account in the defect's entry, the quoted source under the site
+    in that entry (or a pointer to a site whose entry prints it), the commit at the top, a
+    clustering note in the appendix, and an identical block as a pointer to a site whose
+    evidence prints it. Every refuted defect's reason is in its entry. ``site_defect`` maps
+    each site to its defect in the new report.
+    """
+    old = old_md.splitlines()
+    new = new_md.splitlines()
+    evidence = _blocks_after(new, re.compile(r"^### (S\d+) · "))
+    entries = _blocks_after(new, re.compile(r"^#{3,4} (D\d+)\. "))
+    top = new_md[:new_md.index("\n## 2. ")]
+    appendix = new_md[new_md.index(" Appendix\n"):]
+    problems = []
+    for did, lines in _blocks_after(old, _OLD_ENTRY, re.compile(r"^#{2,4} ")).items():
+        sid = "S" + did[1:]
+        got = evidence.get(sid)
+        entry = entries.get(site_defect.get(sid, "?"))
+        if got is None or entry is None:
+            problems.append((sid, "no evidence entry or no defect entry"))
+            continue
+        area = _source_area(entry, sid)
+        flat_entry = _flat("\n".join(entry))
+        pos, n, seen_meta, moved_test, moved_unsettled = 0, 0, False, False, False
+
+        def find(line):
+            nonlocal pos
+            for k in range(pos, len(got)):
+                if got[k] == line:
+                    pos = k + 1
+                    return True
+            return False
+
+        while n < len(lines):
+            line = lines[n]
+            if not line.strip():
+                n += 1
+                continue
+            if line.startswith(_ACCOUNT):
+                n += 1
+                while n < len(lines) and (lines[n].startswith("  ") or not lines[n].strip()):
+                    n += 1
+                continue
+            if not seen_meta and not line.startswith(("-", " ")):
+                if _flat(line) not in flat_entry:
+                    problems.append((sid, "consequence missing from its defect entry"))
+                n += 1
+                continue
+            if line.startswith("- **Severity** "):
+                seen_meta = True
+                if not find(line):
+                    problems.append((sid, f"line missing: {line}"))
+                # The line under the metadata is always the full path and the commit; a
+                # label naming a block's lines comes after it.
+                if n + 1 < len(lines) and _IN_FULL.match(lines[n + 1]):
+                    if commit_words not in top:
+                        problems.append((sid, "commit not stated at the top"))
+                    n += 1
+                n += 1
+                continue
+            label = None
+            if (line.startswith("  ") and not line.lstrip().startswith("-")
+                    and n + 1 < len(lines) and _FENCE_LINE.match(lines[n + 1])):
+                label, n = line, n + 1
+                line = lines[n]
+            if _FENCE_LINE.match(line):
+                end = _fence_end(lines, n)
+                block = lines[n:end + 1]
+                inner = [x for x in block[1:-1] if x.strip()]
+                if inner and all(_NUMBERED.match(x) for x in inner):
+                    whole = ([label] if label is not None else []) + block
+                    held = _held(whole, area)
+                    if not held:
+                        pointer = _SAME_SOURCE.search("\n".join(area))
+                        first = pointer.group(1) if pointer else None
+                        other = entries.get(site_defect.get(first, "?")) if first else None
+                        held = other is not None and _held(block, _source_area(other, first))
+                    if not held:
+                        problems.append((sid, "quoted source missing from its defect entry"))
+                else:
+                    if label is not None and not find(label):
+                        problems.append((sid, f"line missing: {label}"))
+                    k = pos
+                    while k < len(got) and got[k:k + len(block)] != block:
+                        k += 1
+                    if k < len(got):
+                        pos = k + len(block)
+                    else:
+                        pointer = next((x for x in got[pos:] if _SAME_OUTPUT.search(x)), None)
+                        first = _SAME_OUTPUT.search(pointer).group(1) if pointer else None
+                        if first is None or not _held(block, evidence.get(first, [])):
+                            problems.append((sid, "output block missing and no valid pointer"))
+                        else:
+                            pos = got.index(pointer, pos) + 1
+                n = end + 1
+                continue
+            unit = [line]
+            while (n + len(unit) < len(lines) and lines[n + len(unit)].startswith("  ")
+                   and line.startswith((_TEST_LINE, _UNSETTLED_LINE))):
+                unit.append(lines[n + len(unit)])
+            # A moved item is checked whole, where it went for THIS site: verbatim in the
+            # entry of a defect of one site, or in the site's own row of a defect of several.
+            several = _several(entry, sid)
+            row = _flat(_site_row(entry, sid))
+            if line.startswith(_TEST_LINE) and not moved_test:
+                moved_test = True
+                if not (_held(unit, entry) if not several
+                        else _unit_text(unit, _TEST_LINE) in row):
+                    problems.append((sid, "first test moved but not in its defect entry"))
+                variants = [_VARIANTS.match(x).group(1) for x in unit if _VARIANTS.match(x)]
+                if several and variants and _flat(variants[0]) not in row:
+                    problems.append((sid, "the first test's variants dropped"))
+            elif line.startswith(_UNSETTLED_LINE) and not moved_unsettled:
+                moved_unsettled = True
+                if not (_held(unit, entry) if not several
+                        else _unit_text(unit, _UNSETTLED_LINE) in row):
+                    problems.append((sid, "what is not settled moved but not in its entry"))
+            elif line.startswith("- Kept separate") and not find(line):
+                if line[2:] not in appendix:
+                    problems.append((sid, "clustering note neither kept nor moved"))
+            else:
+                for part in unit:
+                    if not find(part):
+                        problems.append((sid, f"line missing: {part}"))
+            n += len(unit)
+    # Every refuted defect, with its reason, in its entry.
+    for row in old:
+        cells = [c.strip() for c in row.strip().strip("|").split("|")] if row.startswith("| D") else []
+        if len(cells) != 4 or not re.fullmatch(r"D\d+", cells[0]):
+            continue
+        reason = re.split(r" \*\*(?:Related\.|Corrected by the operator)\*\*", cells[3])[0]
+        entry = entries.get(site_defect.get("S" + cells[0][1:], "?"), [])
+        if _flat(reason) not in _flat("\n".join(entry)):
+            problems.append((cells[0], "refuted reason missing"))
+    return problems
+
+
+_OLD_RUN = Path(__file__).resolve().parent / "fixtures" / "review-panel" / "old-run"
+
+
+class ARunFromBeforeSitesStillRenders(unittest.TestCase):
+    """A run directory the engine wrote before a defect could have several sites: every
+    defect in it is one site, so it gets one defect per site, numbered as it was, and the
+    notes that cite those numbers still mean what they meant."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.rundir = Path(self._tmp.name).resolve() / "run"
+        shutil.copytree(_OLD_RUN, self.rundir)
+        self.notes = (self.rundir / review_panel.REPORT_NOTES_FILE_NAME).read_bytes()
+        proc = _run("report", str(self.rundir), "--rerender")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_every_old_defect_is_its_own_site_and_its_own_defect(self):
+        old = json.loads((_OLD_RUN / "findings.json").read_text(encoding="utf-8"))
+        new = json.loads((self.rundir / "findings.json").read_text(encoding="utf-8"))
+        before = {c["id"]: c for c in (*old["clusters"], *old["coverage_clusters"])}
+        after = {d["id"]: d for d in (*new["defects"], *new["coverage_defects"])}
+        sites = {s["id"]: s for s in (*new["sites"], *new["coverage_sites"])}
+        self.assertEqual(sorted(after), sorted(before))
+        for did, cluster in before.items():
+            sid = "S" + did[1:]
+            self.assertEqual(after[did]["sites"], [sid])
+            self.assertEqual(sites[sid]["members"], cluster["members"])
+            for key in ("file", "line_start", "line_end", "status", "severity"):
+                self.assertEqual(sites[sid][key], cluster[key], (did, key))
+
+    def test_its_narrative_is_intact(self):
+        """The old synthesis reply has no heading and no site notes. It is read in that
+        shape rather than refused entry by entry, so every defect keeps its account, fix
+        and tier, and its heading falls back to its site's consequence."""
+        old = json.loads((_OLD_RUN / "findings.json").read_text(encoding="utf-8"))
+        new = json.loads((self.rundir / "findings.json").read_text(encoding="utf-8"))
+        self.assertEqual(new["synthesis"]["state"], "complete")
+        self.assertEqual(new["synthesis"]["rejected"], [])
+        before = {c["id"]: c for c in (*old["clusters"], *old["coverage_clusters"])}
+        after = {d["id"]: d for d in (*new["defects"], *new["coverage_defects"])}
+        text = " ".join(review_panel._unescape(
+            (self.rundir / "report.md").read_text(encoding="utf-8")).split())
+        for did, cluster in before.items():
+            with self.subTest(defect=did):
+                for key in ("tier", "what_goes_wrong", "fix", "cross_references"):
+                    self.assertEqual(after[did][key], cluster[key], key)
+                self.assertIsNone(after[did]["heading"])
+                self.assertEqual(after[did]["site_notes"], {})
+        self.assertTrue(any(c["what_goes_wrong"] for c in before.values()),
+                        "the fixture carries no narrative, so this proves nothing")
+        # The body renders a defect's account; a coverage gap and a refuted defect render
+        # none, today as before.
+        for cluster in old["clusters"]:
+            if cluster["what_goes_wrong"] and cluster["status"] != "refuted":
+                self.assertIn(" ".join(cluster["what_goes_wrong"].split()), text)
+
+    def test_the_notes_resolve_and_are_never_rewritten(self):
+        self.assertEqual((self.rundir / review_panel.REPORT_NOTES_FILE_NAME).read_bytes(),
+                         self.notes)
+        section = _section((self.rundir / "report.md").read_text(encoding="utf-8"),
+                           review_panel.SECTION_OPERATOR)
+        self.assertIn("Cites [D2](#D2), [D7](#D7).", section)
+        self.assertIn("To [D2](#D2), marked established by the panel", section)
+        self.assertIn("To [D6](#D6), marked refuted by the panel", section)
+
+    def test_the_top_says_every_site_is_its_own_defect(self):
+        text = (self.rundir / "report.md").read_text(encoding="utf-8")
+        described = _section(text, review_panel.SECTION_DESCRIPTION)
+        self.assertIn(review_panel.GROUPING_BEFORE_SITES, described)
+        self.assertNotIn(review_panel.GROUPING_BEFORE_SITES,
+                         _without_section(text, review_panel.SECTION_DESCRIPTION))
+
+    def test_every_defect_and_site_link_has_an_anchor_in_the_markdown(self):
+        """A coverage gap is a defect a cross-reference may name, so its entry carries its
+        anchor like every other defect's."""
+        text = (self.rundir / "report.md").read_text(encoding="utf-8")
+        targets = set(re.findall(r"\]\(#([DS]\d+(?:-src)?)\)", text))
+        self.assertIn("D5", targets, "the fixture's coverage link is gone, so this proves less")
+        self.assertEqual(targets - set(re.findall(r'<a id="([^"]+)"></a>', text)), set())
+        page = review_panel.render_html(text)
+        self.assertIn('href="#D5"', page)
+
+    def test_nothing_the_old_report_carried_is_lost(self):
+        """Every line of every old defect entry is in its site's evidence, unchanged and
+        in order, or is one of the stated moves and is where it went; every refuted
+        defect keeps its reason."""
+        old = (_OLD_RUN / "report.md").read_text(encoding="utf-8")
+        new = (self.rundir / "report.md").read_text(encoding="utf-8")
+        doc = json.loads((self.rundir / "findings.json").read_text(encoding="utf-8"))
+        site_defect = {site["id"]: site["defect"] for site in doc["sites"]}
+        self.assertEqual(no_loss_problems(old, new, site_defect, "a tree that is not a "
+                                          "repository"), [])
+        self.assertIn("| D6 |", old, "the fixture has no refuted defect, so the refuted "
+                                     "half of this proves nothing")
+
+
+class TwoBlocksAreOneOnlyWhereTheyAreTheSameText(unittest.TestCase):
+    """An identical block another site printed becomes a pointer. Identical means the same
+    text; only the indentation the Markdown nests the block under is not part of it."""
+
+    @staticmethod
+    def evidence(inner, nest="  "):
+        body = "".join(f"{nest}  {line}\n" for line in inner)
+        return f"- Evidence (executed): Shows it.\n{nest}```console\n{body}{nest}```\n"
+
+    def test_indentation_inside_a_block_is_part_of_its_text(self):
+        printed = review_panel._Printed()
+        first = self.evidence(["def f():", "    return 1", "and more output here"])
+        second = self.evidence(["def f():", "return 1", "and more output here"])
+        self.assertEqual(printed.output_blocks("S1", first), first)
+        self.assertEqual(printed.output_blocks("S2", second), second,
+                         "two outputs differing in indentation were printed as one")
+        self.assertEqual(printed.pointed, [])
+
+    def test_the_same_block_under_another_indent_is_still_the_same(self):
+        printed = review_panel._Printed()
+        inner = ["def f():", "    return 1", "and more output here"]
+        printed.output_blocks("S1", self.evidence(inner))
+        nested = self.evidence(inner, nest="      ")
+        self.assertIn("The same output as printed under [S1](#S1).",
+                      printed.output_blocks("S2", nested))
+
+
+class TheNoLossCheckCatchesWhatItMust(unittest.TestCase):
+    """The no-loss check is only worth its green if it goes red. Each case corrupts the
+    re-rendered old run one way a renderer could lose something, and the check must name
+    it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory()
+        rundir = Path(cls._tmp.name).resolve() / "run"
+        shutil.copytree(_OLD_RUN, rundir)
+        proc = _run("report", str(rundir), "--rerender")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        cls.old = (_OLD_RUN / "report.md").read_text(encoding="utf-8")
+        cls.new = (rundir / "report.md").read_text(encoding="utf-8")
+        doc = json.loads((rundir / "findings.json").read_text(encoding="utf-8"))
+        cls.site_defect = {site["id"]: site["defect"] for site in doc["sites"]}
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def check(self, text):
+        return no_loss_problems(self.old, text, self.site_defect,
+                                "a tree that is not a repository")
+
+    def corrupt(self, old, new):
+        self.assertEqual(self.new.count(old), 1, f"{old!r} is not in the report once")
+        return self.new.replace(old, new)
+
+    def test_the_report_as_rendered_passes(self):
+        self.assertEqual(self.check(self.new), [])
+
+    def test_an_altered_evidence_line_is_caught(self):
+        text = self.corrupt("  - core.py:5-6 · by running\n", "  - core.py:5-6 · by walking\n")
+        self.assertIn(("S2", "line missing:   - core.py:5-6 · by running"), self.check(text))
+
+    def test_a_deleted_quoted_source_block_is_caught(self):
+        block = ("  ```python\n  1 | def main():\n  2 |     return 0\n  ```\n")
+        text = self.corrupt(block, "")
+        self.assertIn(("S4", "quoted source missing from its defect entry"), self.check(text))
+
+    def in_entry(self, did, old, new):
+        """The report with ``old`` replaced inside defect ``did``'s entry alone."""
+        found = re.search(rf"(?m)^#+ {did}\. .*$", self.new)
+        end = re.search(r"(?m)^#", self.new[found.end():])
+        stop = found.end() + (end.start() if end else len(self.new))
+        entry = self.new[found.start():stop]
+        self.assertEqual(entry.count(old), 1, f"{old!r} is not in {did}'s entry once")
+        return self.new[:found.start()] + entry.replace(old, new) + self.new[stop:]
+
+    def test_a_dropped_moved_note_is_caught(self):
+        for name, did, line, problem in (
+                ("unsettled", "D3", "- **What is not settled.** Could not run it here.\n",
+                 ("S3", "what is not settled moved but not in its entry")),
+                ("first test", "D4", "- **Test that should fail first.** tests/test\\_engine.py: "
+                                     "call helper(3) and assert it returns 5.\n",
+                 ("S4", "first test moved but not in its defect entry"))):
+            with self.subTest(note=name):
+                self.assertIn(problem, self.check(self.in_entry(did, line, "")))
+
+    def test_a_dropped_multi_line_unsettled_note_is_caught(self):
+        """A fenced "What is not settled" note is checked whole, not by the empty text
+        after its label."""
+        one = "- **What is not settled.** Could not run it here.\n"
+        fenced = ("- **What is not settled.**\n  ```\n  Could not run it here.\n"
+                  "  Nor read the caller.\n  ```\n")
+        self.assertEqual(self.old.count(one), 1)
+        old = self.old.replace(one, fenced)
+        new = self.in_entry("D3", one, fenced)
+        self.assertEqual(no_loss_problems(old, new, self.site_defect,
+                                          "a tree that is not a repository"), [])
+        dropped = no_loss_problems(old, new.replace(fenced, ""), self.site_defect,
+                                   "a tree that is not a repository")
+        self.assertIn(("S3", "what is not settled moved but not in its entry"), dropped)
+
+    def test_a_dropped_refuted_reason_is_caught(self):
+        text = self.in_entry("D6", "A description of a fixture is not a defect.",
+                             "It was dismissed.")
+        self.assertIn(("D6", "refuted reason missing"), self.check(text))
+
+
+# --------------------------------------------------------------------------- #
+# merge check — every proposed group checked, site by site, by the other lane
+# --------------------------------------------------------------------------- #
+# Over SITES_READING the sites are S1 (established), S2 (reproduced) and S3 (refuted), all
+# in engine/core.py. The merge proposes all three as one mistake; the check decides.
+MERGE_TRIPLE = {
+    "sites": ["S1", "S2", "S3"],
+    "mechanism": "An empty input is indexed before it is checked; check it first.",
+    "instances": [{"site": "S1", "instance": "core indexes the last row of an empty list."},
+                  {"site": "S2", "instance": "run.py indexes an empty argument list."},
+                  {"site": "S3", "instance": "helper indexes a value that is missing."}],
+    "reason_kept_apart": None,
+}
+PROPOSED_TRIPLE = {"group": "G1", "sites": MERGE_TRIPLE["sites"],
+                   "mechanism": MERGE_TRIPLE["mechanism"],
+                   "instances": MERGE_TRIPLE["instances"]}
+
+
+
+_SEVERAL_OLD = """#### D1. A total is doubled.
+
+- **Severity** major · **Corroboration** one model · **Location** `a.py:1` · **Fix size** 1 line
+  a.py:1 — commit 0123456789
+- **Test that should fail first.** tests/test_a.py: assert a() is 3.
+  - 2 other reports name a variant of this test; each is in `findings.json`.
+- **Checks.**
+  - a.py:1 · by reading
+
+#### D2. A total is doubled.
+
+- **Severity** major · **Corroboration** one model · **Location** `b.py:1` · **Fix size** 1 line
+  b.py:1 — commit 0123456789
+- **What is not settled.**
+  ```
+  - The caller is elsewhere.
+  - Nothing here runs it.
+  ```
+- **Test that should fail first.** tests/test_b.py: assert b() is 3.
+- **Checks.**
+  - b.py:1 · by reading
+"""
+_SEVERAL_NEW = """# Review panel report
+
+Every line number in this report refers to commit 0123456789.
+
+## 2. Indices
+
+### D1. A total is doubled.
+
+- **2 sites**: 2 established · **Worst severity** major, at [S1](#S1-src)
+
+| Site | Location | Outcome | Severity | Particular to this site | Test that should fail first |
+|---|---|---|---|---|---|
+| [S1](#S1-src) | a.py:1 | Established | Major |  | tests/test\\_a.py: assert a() is 3. (2 other reports name a variant of this test; each is in `findings.json`.) |
+| [S2](#S2-src) | b.py:1 | Established | Major | Not settled: - The caller is elsewhere. - Nothing here runs it. | tests/test\\_b.py: assert b() is 3. |
+
+**Source at each site.**
+
+- **S1** · `a.py:1` — A total is doubled. · [evidence](#S1)
+- **S2** · `b.py:1` — A total is doubled. · [evidence](#S2)
+
+## 3. Evidence
+
+### S1 · `a.py:1` · established · [D1](#D1)
+
+- **Severity** major · **Corroboration** one model · **Location** `a.py:1` · **Fix size** 1 line
+- **Checks.**
+  - a.py:1 · by reading
+
+### S2 · `b.py:1` · established · [D1](#D1)
+
+- **Severity** major · **Corroboration** one model · **Location** `b.py:1` · **Fix size** 1 line
+- **Checks.**
+  - b.py:1 · by reading
+
+## 4. Appendix
+"""
+
+
+class TheNoLossCheckReadsEachSitesOwnRow(unittest.TestCase):
+    """In a defect of several sites, what moved for a site is checked in that site's row,
+    so two sites' tests swapped between their rows is a loss, not a match."""
+
+    SITES = {"S1": "D1", "S2": "D1"}
+
+    def check(self, new):
+        return no_loss_problems(_SEVERAL_OLD, new, self.SITES, "commit 0123456789")
+
+    def test_the_document_as_written_passes(self):
+        self.assertEqual(self.check(_SEVERAL_NEW), [])
+
+    def test_two_sites_tests_swapped_between_rows_are_caught(self):
+        swapped = (_SEVERAL_NEW.replace("tests/test\\_a.py: assert a()", "@A@")
+                   .replace("tests/test\\_b.py: assert b()", "tests/test\\_a.py: assert a()")
+                   .replace("@A@", "tests/test\\_b.py: assert b()"))
+        self.assertNotEqual(swapped, _SEVERAL_NEW)
+        problems = self.check(swapped)
+        self.assertIn(("S1", "first test moved but not in its defect entry"), problems)
+        self.assertIn(("S2", "first test moved but not in its defect entry"), problems)
+
+    def test_a_dropped_variant_count_is_caught(self):
+        dropped = _SEVERAL_NEW.replace(
+            " (2 other reports name a variant of this test; each is in `findings.json`.)", "")
+        self.assertIn(("S1", "the first test's variants dropped"), self.check(dropped))
+
+    def test_a_variant_note_cut_short_is_caught(self):
+        """The whole note, not only its count: where the variants are is half of it."""
+        cut = _SEVERAL_NEW.replace("; each is in `findings.json`.)", ")")
+        self.assertNotEqual(cut, _SEVERAL_NEW)
+        self.assertIn(("S1", "the first test's variants dropped"), self.check(cut))
+
+    def test_an_unsettled_note_of_bullet_lines_deleted_from_its_row_is_caught(self):
+        """A fenced note whose lines read like bullets is still the note: deleting it from
+        its site's row is a loss."""
+        deleted = _SEVERAL_NEW.replace(
+            "Not settled: - The caller is elsewhere. - Nothing here runs it.", "")
+        self.assertNotEqual(deleted, _SEVERAL_NEW)
+        self.assertIn(("S2", "what is not settled moved but not in its entry"),
+                      self.check(deleted))
+
+
+# --------------------------------------------------------------------------- #
+# The no-loss property over the engine's own merge: one run directory rendered with every
+# site its own defect, then again with the merge accepted, and the second checked against
+# the first. The first is rendered with no block replaced by a pointer, so every quoted
+# source and output a site has is in the baseline in full.
+# --------------------------------------------------------------------------- #
+
+_ONE_SITE_LINE = re.compile(r'^- <a id="(S\d+)-src"></a>\*\*Site\*\* ')
+_ANCHOR_LINE = re.compile(r'^<a id="[^"]+"></a>$')
+_EVIDENCE_HEADING = re.compile(r"^### (S\d+) · ")
+_DEFECT_ENTRY_HEADING = re.compile(r"^#{3,4} (D\d+)\. ")
+SPLIT_NOTE = "The rounding report at these lines is another mistake."
+
+
+def _unpointed(case):
+    """The run directory's report with no block replaced by a pointer."""
+    with mock.patch.object(review_panel._Printed, "source_block",
+                           lambda self, sid, block: block), \
+            mock.patch.object(review_panel._Printed, "output_blocks",
+                              lambda self, sid, text: text):
+        return case.rerender()
+
+
+def _as_one_site_entries(md, doc):
+    """``md``, a report in which every site is its own defect, in the shape
+    ``no_loss_problems`` reads as the report before the merge: per site one ``#### D<n>.``
+    entry, ``n`` the site's number, holding its consequence, its evidence entry's metadata,
+    the line giving its full path and the commit (``doc`` is the run's findings), what its
+    defect's entry prints for it (quoted source, account, what is not settled, first test)
+    and the rest of its evidence entry. A refuted site also gets the table row a refuted
+    defect was, with its reason, and its entry leaves out the three things a defect's
+    account replaces once the site is in a defect that has one: the `Reported` and
+    `Direction` lines and the checker's rationale on its check line, which is the reason
+    the row carries."""
+    lines = md.splitlines()
+    evidence = _blocks_after(lines, _EVIDENCE_HEADING)
+    sites = {site["id"]: site for site in doc["sites"]}
+    out, refuted = [], []
+    for did, entry in _blocks_after(lines, _DEFECT_ENTRY_HEADING).items():
+        entry = [line for line in entry if not _ANCHOR_LINE.match(line)]
+        at = [k for k, line in enumerate(entry) if _ONE_SITE_LINE.match(line)]
+        if len(at) != 1:
+            raise AssertionError(f"{did} is not a defect of one site")
+        sid = _ONE_SITE_LINE.match(entry[at[0]]).group(1)
+        consequence = [line for line in entry[:at[0]] if line.strip()]
+        own = entry[at[0] + 1:]
+        got = [line for line in evidence[sid] if not _ANCHOR_LINE.match(line)]
+        dismissed = f"- **{review_panel.REFUTED_LABEL}** "
+        reason = next((line[len(dismissed):] for line in own if line.startswith(dismissed)),
+                      None)
+        if reason is not None:
+            refuted.append(f"| D{sid[1:]} | {sid} | refuted | {reason} |")
+            own = [line for line in own if not line.startswith(dismissed)]
+            kept, raw = [], False
+            for line in got:
+                if line.startswith(("- Reported", "- Direction: ")):
+                    raw = True
+                    continue
+                if raw and line.startswith("  "):
+                    continue
+                raw = False
+                kept.append(line[:-len(f" — {reason}")] if line.endswith(f" — {reason}")
+                            else line)
+            got = kept
+        # The source goes under the full-path line, where the old entry had it: after the
+        # first test, its indented lines would read as that test's own. `Source.` is the
+        # entry's label, not a line about the site.
+        cut = own.index("- **Source.**") if "- **Source.**" in own else len(own)
+        meta = next(k for k, line in enumerate(got) if line.startswith("- **Severity** "))
+        in_full = f"  {review_panel._in_full(sites[sid], doc['commit'])}"
+        out += [f"#### D{sid[1:]}. {sid}", "", *consequence, got[meta], in_full,
+                *own[cut + 1:], *own[:cut], *got[meta + 1:], ""]
+    return "\n".join([*out, "## Refuted", "", *refuted]) + "\n"
+
+
+class NothingIsLostWhenTheMergeIsAccepted(_FiveSiteCase):
+    """Nothing is lost on a report the engine merged: every line a site had as its own
+    defect is in its evidence entry, unchanged and in order, or is one of the removals
+    and moves the appendix lists and is where it went. The merged site carries a clustering note,
+    so the one move only a merge makes is checked too."""
+
+    SPLIT = SPLIT_NOTE
+    OWN_TESTS = True
+
+    def both(self):
+        """The baseline and the merged report, from one run directory."""
+        self.run_fixture(group=False)
+        self.assertFalse([d for d in self.doc["defects"] if len(d["sites"]) > 1])
+        self.assertEqual(_without_the_clock(self, self.rerender()),
+                         _without_the_clock(self, self.md),
+                         "the re-render is not the report, so its baseline proves nothing")
+        self.alone = self.md
+        baseline = _as_one_site_entries(_unpointed(self), self.doc)
+        proc = _run("cluster", str(self.rundir), "--redo")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.group_and_report(group=True)
+        self.assertEqual(len(self.d["sites"]), 5)
+        self.site_defect = {site["id"]: site["defect"] for site in self.doc["sites"]}
+        return baseline
+
+    def check(self, baseline, new):
+        return no_loss_problems(baseline, new, self.site_defect,
+                                "a tree that is not a repository")
+
+    def test_the_merged_report_loses_nothing_the_unmerged_one_carried(self):
+        baseline = self.both()
+        # The baseline holds what the check has to find somewhere: every live site of the
+        # five as an entry, the refuted one as its row, the note, and each moved kind.
+        for sid in self.d["sites"]:
+            with self.subTest(site=sid):
+                self.assertIn(f"#### D{sid[1:]}. {sid}\n", baseline)
+        self.assertIn(f"| D{self.five[1][1:]} | {self.five[1]} | refuted |", baseline)
+        self.assertEqual(len(re.findall(r"(?m)^  \S.*:\d+(?:-\d+)? — a tree that is not a "
+                                        r"repository$", baseline)), len(self.doc["sites"]))
+        for moved in (f"- Kept separate from another report at this location: {SPLIT_NOTE}",
+                      _TEST_LINE, _UNSETTLED_LINE, "  ```python", "  ```console"):
+            self.assertIn(moved, baseline)
+        self.assertEqual(self.check(baseline, self.md), [])
+
+    def test_what_the_check_must_catch_in_the_merged_report(self):
+        baseline = self.both()
+        test_of = {sid: _cell_text(self.own_test(self.records()[
+            next(s for s in self.doc["sites"] if s["id"] == sid)["members"][0]]))
+            for sid in (self.five[3], self.five[4])}
+        source = ("  test\\_engine.py:3-5 — 2 lines of context either side; the finding cites 5\n"
+                  "  ```python\n  3 | \n  4 | def test_core():\n  5 |     assert run() is not None\n"
+                  "  ```\n")
+        guide, test = self.five[3], self.five[4]
+        cases = (
+            ("an altered line", ("  - test\\_engine.py:5 · by running\n",
+                                 "  - test\\_engine.py:5 · by walking\n"),
+             (test, "line missing:   - test\\_engine.py:5 · by running")),
+            ("a deleted quoted-source block", (source, ""),
+             (test, "quoted source missing from its defect entry")),
+            ("a deleted output block", ("  ```console\n  Traceback ...\n"
+                                        "  IndexError: list index out of range\n  ```\n", ""),
+             (self.five[0], "output block missing and no valid pointer")),
+            ("a dropped clustering note",
+             (f"- Kept separate from another report at this location: {SPLIT_NOTE}\n", ""),
+             (self.five[0], "clustering note neither kept nor moved")),
+            ("a dropped first test", (test_of[guide] + " |", " |"),
+             (guide, "first test moved but not in its defect entry")),
+            ("a dropped unsettled note", ("Not settled: Nothing here prints a total to run.", ""),
+             (self.five[2], "what is not settled moved but not in its entry")),
+            ("a dropped refuted reason", ("Refuted: util returns a name, not a total.",
+                                          "Refuted: dismissed."),
+             (f"D{self.five[1][1:]}", "refuted reason missing")),
+        )
+        for name, (old, new), problem in cases:
+            with self.subTest(mutation=name):
+                self.assertEqual(self.md.count(old), 1, f"{old!r} is not in the report once")
+                self.assertIn(problem, self.check(baseline, self.md.replace(old, new)))
+        refuted = self.five[1]
+        with self.subTest(mutation="the refuted site's evidence entry emptied"):
+            body = "\n".join(_blocks_after(self.md.splitlines(), _EVIDENCE_HEADING)[refuted])
+            body = body[:body.rindex(f'<a id="{self.five[2]}"></a>')].strip("\n") + "\n"
+            self.assertEqual(self.md.count(body), 1)
+            problems = self.check(baseline, self.md.replace(body, ""))
+            self.assertTrue([p for p in problems if p[0] == refuted
+                             and p[1].startswith("line missing: ")], problems)
+        with self.subTest(mutation="the commit taken off the top"):
+            cut = self.md.index("\n## 2. ")
+            top = self.md[:cut]
+            self.assertIn("a tree that is not a repository", top)
+            gone = top.replace("a tree that is not a repository", "a tree") + self.md[cut:]
+            flagged = {p[0] for p in self.check(baseline, gone)
+                       if p[1] == "commit not stated at the top"}
+            self.assertEqual(flagged, {site["id"] for site in self.doc["sites"]})
+        with self.subTest(mutation="a quoted source's label deleted"):
+            label = source.splitlines(keepends=True)[0]
+            self.assertIn((test, "quoted source missing from its defect entry"),
+                          self.check(baseline, self.md.replace(label, "")))
+        swapped = (self.md.replace(test_of[guide], "@GUIDE@")
+                   .replace(test_of[test], test_of[guide]).replace("@GUIDE@", test_of[test]))
+        problems = self.check(baseline, swapped)
+        for sid in (guide, test):
+            self.assertIn((sid, "first test moved but not in its defect entry"), problems)
+
+    def test_a_clustering_note_on_a_merged_site_moves_to_the_appendix(self):
+        """A clustering note is kept in the site's evidence while the site is its own defect,
+        and in the appendix's list of what the evidence leaves out once the merge puts it
+        in a defect of several."""
+        self.both()
+        note = f"- Kept separate from another report at this location: {SPLIT_NOTE}"
+        helper = self.five[0]
+        alone = _blocks_after(self.alone.splitlines(), _EVIDENCE_HEADING)[helper]
+        self.assertIn(note, alone)
+        merged = _blocks_after(self.md.splitlines(), _EVIDENCE_HEADING)[helper]
+        self.assertNotIn(note, merged)
+        left_out = _section(self.md, review_panel.SUBSECTION_LEFT_OUT)
+        self.assertIn(f"\n[{helper}](#{helper}):\n\n{note}", left_out)
+        self.assertIn("- 1 clustering note on why a report was kept apart", left_out)
+        self.assertEqual(self.md.count(note), 1)
+
+
+def _cell_text(text):
+    """``text`` as a site table's cell spells it."""
+    return review_panel._cell(text)
+
+
+def _strip_nest(lines):
+    """``lines`` less the indentation the first is nested under; a line nested less deeply
+    keeps what it has, so it cannot compare equal to one that was not."""
+    nest = len(lines[0]) - len(lines[0].lstrip(" ")) if lines else 0
+    return [line[nest:] if not line[:nest].strip() else "\0" + line for line in lines]
+
+
+def _replaced(pointed, unpointed, pointer):
+    """``(site named, block)`` for every line of ``pointed`` matching ``pointer``, the block
+    being the lines ``unpointed`` prints in its place: a label line where there is one, and
+    the fenced block; and whatever of ``unpointed`` is left once ``pointed`` runs out, which
+    is a loss. Every other line of the two must be the same."""
+    out, i, j = [], 0, 0
+    while i < len(pointed):
+        found = pointer.search(pointed[i])
+        if found:
+            start = j if _FENCE_LINE.match(unpointed[j]) else j + 1
+            end = _fence_end(unpointed, start)
+            out.append((found.group(1), unpointed[j:end + 1]))
+            i, j = i + 1, end + 1
+            continue
+        if j >= len(unpointed) or pointed[i] != unpointed[j]:
+            raise AssertionError(f"the renderings differ beyond a pointer at {pointed[i]!r}")
+        i, j = i + 1, j + 1
+    return out, unpointed[j:]
+
+
+def pointer_problems(md, unpointed, site_defect):
+    """Every pointer in ``md`` naming a site that does not print, byte for byte, the block
+    ``unpointed`` prints in the pointer's place, and every entry with a pointer that ends
+    before ``unpointed``'s does; and how many pointers of each kind were checked."""
+    problems, checked = [], {"source": 0, "output": 0}
+    entries = _blocks_after(md.splitlines(), _DEFECT_ENTRY_HEADING)
+    bare = _blocks_after(unpointed.splitlines(), _DEFECT_ENTRY_HEADING)
+    evidence = _blocks_after(md.splitlines(), _EVIDENCE_HEADING)
+    bare_evidence = _blocks_after(unpointed.splitlines(), _EVIDENCE_HEADING)
+
+    def holds(block, lines):
+        want = _strip_nest(block)
+        return any(_strip_nest(lines[k:k + len(block)]) == want
+                   for k in range(len(lines) - len(block) + 1))
+
+    for sid, did in site_defect.items():
+        if did in entries and any(_SAME_SOURCE.search(line)
+                                  for line in _source_area(entries[did], sid)):
+            replaced, rest = _replaced(_source_area(entries[did], sid),
+                                       _source_area(bare[did], sid), _SAME_SOURCE)
+            if rest:
+                problems.append((sid, "unconsumed", rest[0]))
+            for first, block in replaced:
+                checked["source"] += 1
+                other = entries.get(site_defect.get(first, "?"))
+                if other is None or not holds(block, _source_area(other, first)):
+                    problems.append((sid, "source", first))
+        if any(_SAME_OUTPUT.search(line) for line in evidence.get(sid, [])):
+            replaced, rest = _replaced(evidence[sid], bare_evidence[sid], _SAME_OUTPUT)
+            if rest:
+                problems.append((sid, "unconsumed", rest[0]))
+            for first, block in replaced:
+                checked["output"] += 1
+                if not holds(block, evidence.get(first, [])):
+                    problems.append((sid, "output", first))
+    return problems, checked
+
+
+class TheEvidenceLeavesOutOnlyWhatTheAppendixLists(_FiveSiteCase):
+    """On the engine's merged fixture run: the appendix lists every
+    kind of removal and move, each pointer names a site printing the identical block, the
+    evidence and the source link to each other, and an evidence entry has no signposts of
+    its own beyond its heading."""
+
+    SPLIT = SPLIT_NOTE
+
+    def test_the_appendix_lists_each_kind_of_removal_and_every_instance(self):
+        self.run_fixture()
+        left_out = _section(self.md, review_panel.SUBSECTION_LEFT_OUT)
+        listing = re.split(r"(?m)^\[S\d+\]\(#S\d+\):$", left_out)[0]
+        kinds = [line for line in listing.splitlines() if line.startswith("- ")]
+        expected = (
+            (review_panel.WHAT_GOES_WRONG_LABEL[:-1], review_panel.FIX_LABEL[:-1],
+             review_panel.RELATED_LABEL[:-1], "account replaces them"),
+            ("full path and the commit", "stated at the top"),
+            ("The quoted source: moved to the site's place in its defect's entry.",),
+            (review_panel.TEST_FIRST_LABEL[:-1], review_panel.UNSETTLED_LABEL[:-1],
+             "shown in its defect's entry"),
+            ("1 clustering note", "moved here"),
+            ("1 quoted source identical", "1 block of output identical",
+             "replaced by a pointer"),
+        )
+        self.assertEqual(len(kinds), len(expected), kinds)
+        for line, words in zip(kinds, expected):
+            for word in words:
+                with self.subTest(kind=words[0], word=word):
+                    self.assertIn(word, line)
+        # Each instance is named: every pointer the document carries, and nothing else.
+        sites = {s["id"]: s for s in self.doc["sites"]}
+        found = set()
+        for sid, lines in _blocks_after(self.md.splitlines(), _EVIDENCE_HEADING).items():
+            found |= {(sid, "output", m.group(1)) for line in lines
+                      for m in [_SAME_OUTPUT.search(line)] if m}
+        entries = _blocks_after(self.md.splitlines(), _DEFECT_ENTRY_HEADING)
+        for sid, site in sites.items():
+            if site["defect"] in entries:
+                found |= {(sid, "quoted source", m.group(1))
+                          for line in _source_area(entries[site["defect"]], sid)
+                          for m in [_SAME_SOURCE.search(line)] if m}
+        listed = set(re.findall(r"(?m)^  - \[(S\d+)\]\(#S\d+\)'s (quoted source|output) "
+                                r"points to \[(S\d+)\]\(#S\d+\)\.$", left_out))
+        self.assertEqual(listed, found)
+        self.assertEqual({kind for _s, kind, _f in found}, {"output", "quoted source"})
+        # And every moved note, under its site.
+        moved = [s["id"] for s in self.doc["sites"] if s["split_reason"]]
+        self.assertEqual(moved, [self.five[0]])
+        self.assertEqual(re.findall(r"(?m)^\[(S\d+)\]\(#S\d+\):$", left_out), moved)
+
+    def test_every_pointer_names_a_site_printing_the_identical_block(self):
+        self.run_fixture()
+        site_defect = {site["id"]: site["defect"] for site in self.doc["sites"]}
+        bare = _unpointed(self)
+        problems, checked = pointer_problems(self.md, bare, site_defect)
+        self.assertEqual(problems, [])
+        self.assertEqual(checked, {"source": 1, "output": 1})
+        # Identical means every byte: a target whose block differs anywhere, even where
+        # the words a looser comparison looks for survive, fails.
+        for name, (old, new), kind in (
+                ("output", ("  IndexError: list index out of range\n",
+                            "  IndexError: list index out of range.\n"), "output"),
+                ("source", ("  6 |     return y * 2\n", "  6 |     return y  * 2\n"), "source")):
+            with self.subTest(pointer=name):
+                self.assertEqual(self.md.count(old), 1, f"{old!r} is not in the report once")
+                broken, _checked = pointer_problems(self.md.replace(old, new), bare,
+                                                    site_defect)
+                self.assertEqual([p[1] for p in broken], [kind])
+        # A line the report drops after a valid pointer is a loss, not the end of the entry.
+        last = re.search(r"\n## \d+\. Appendix\n", bare)
+        longer = bare[:last.start()] + "\n- A line after the last run." + bare[last.start():]
+        broken, _checked = pointer_problems(self.md, longer, site_defect)
+        self.assertIn("unconsumed", [p[1] for p in broken])
+
+    def test_each_evidence_entry_and_its_quoted_source_link_to_each_other(self):
+        """The evidence heading is the whole signpost — number, location, outcome
+        and a link to the defect — so the entry reaches its quoted source through that
+        defect, whose line for the site carries the source's anchor and links back to the
+        entry."""
+        self.run_fixture()
+        entries = _blocks_after(self.md.splitlines(), _DEFECT_ENTRY_HEADING)
+        headings = re.findall(r"(?m)^### (S\d+) · .* · \[(D\d+)\]\(#(D\d+)\)$", self.md)
+        self.assertEqual(len(headings), len(self.doc["sites"]))
+        sites = {s["id"]: s for s in self.doc["sites"]}
+        for sid, did, target in headings:
+            with self.subTest(site=sid):
+                self.assertEqual((did, target), (sites[sid]["defect"],) * 2)
+                anchor = f'<a id="{sid}{review_panel.SOURCE_ANCHOR}"></a>'
+                self.assertEqual(self.md.count(anchor), 1)
+                line = [line for line in entries[did] if anchor in line]
+                self.assertEqual(len(line), 1, f"{sid}'s source is not in {did}'s entry")
+                self.assertIn(f"(#{sid})", line[0])
+
+    def test_an_evidence_entry_has_no_instance_and_no_signpost_but_its_heading(self):
+        self.run_fixture()
+        instances = [i["instance"] for unit in self.doc["merge"]["units"]
+                     for group in unit["groups"] for i in group["instances"] or ()]
+        self.assertEqual(len(instances), len(self.five))
+        for instance in instances:
+            self.assertNotIn(instance, self.md, "an instance is the merge check's, not the "
+                                                "report's")
+        evidence = _section(self.md, review_panel.SECTION_EVIDENCE)
+        self.assertEqual(evidence.strip().splitlines()[0], review_panel.EVIDENCE_LEAD)
+        for sid, body in _blocks_after(evidence.splitlines(), _EVIDENCE_HEADING).items():
+            with self.subTest(site=sid):
+                text = "\n".join(line for line in body if not _ANCHOR_LINE.match(line))
+                self.assertNotRegex(text, r"\]\(#D\d+\)", "a line pointing at the defect")
+                self.assertNotIn(f"{review_panel.SOURCE_ANCHOR})", text,
+                                 "a line pointing at the quoted source")
+                self.assertNotRegex(text, r"(?i)\bpart of\b")
+                for line in text.splitlines():
+                    if re.search(r"\]\(#S\d+\)", line):
+                        self.assertRegex(line, _SAME_OUTPUT)
+
+
+class EachSiteRowCarriesItsOwnTest(_FiveSiteCase):
+    """In a defect of several sites, each site's row carries that site's own
+    first test and, where its reports name variants, how many."""
+
+    OWN_TESTS = True
+    PAIRED = True
+
+    def test_each_row_carries_its_own_sites_test_and_its_variant_count(self):
+        self.run_fixture()
+        entry = ADefectOfSeveralSitesIsNarratedOnce.entry(self.md, self.d["id"])
+        rows = {re.match(r"^\| \[(S\d+)\]", line).group(1): line
+                for line in entry.splitlines() if re.match(r"^\| \[S\d+\]", line)}
+        self.assertEqual(sorted(rows, key=_site_rank), self.d["sites"])
+        records = self.records()
+        sites = {s["id"]: s for s in self.doc["sites"]}
+        own = {sid: [self.own_test(records[cid]) for cid in sites[sid]["members"]]
+               for sid in rows}
+        self.assertEqual(len(own[self.five[0]]), 2, "the paired site holds two reports")
+        for sid, row in rows.items():
+            cell = _flat(row.strip().strip("|").split("|")[5])
+            site = sites[sid]
+            with self.subTest(site=sid):
+                if site["status"] != "established":
+                    self.assertEqual(cell, "")
+                    continue
+                self.assertIn(site["test_first"], own[sid])
+                self.assertTrue(cell.startswith(_flat(_cell_text(site["test_first"]))), cell)
+                for tests in own.values():
+                    for named in tests:
+                        if named != site["test_first"]:
+                            self.assertNotIn(_flat(_cell_text(named)), cell)
+                variants = len(set(own[sid])) - 1
+                if variants:
+                    self.assertEqual(variants, 1)
+                    self.assertIn("(One other report names a variant of this test", cell)
+                else:
+                    self.assertNotIn("variant", cell)
+        self.assertIn("variant", _flat(rows[self.five[0]]))
+
+
+def _check_state(unit, groups, state="complete"):
+    """What one merge check unit came back as, built without a run directory."""
+    return review_panel.MergeCheckState(
+        unit, state, None if state == "complete" else f"the unit is {state}",
+        tuple(groups) if state == "complete" else (),
+        "Checked every group." if state == "complete" else None)
+
+
+def _accepting(grouping):
+    """A merge check record that upholds every group of several sites in ``grouping`` —
+    the only way a defect of several sites can exist."""
+    proposed = review_panel.number_groups([
+        {"sites": list(group), "mechanism": "One rule broken at each site.",
+         "instances": [{"site": site, "instance": f"{site} breaks it."} for site in group]}
+        for group in grouping if len(group) > 1])
+    units = [{"id": CHECK_UNIT, "groups": proposed}]
+    states = [_check_state(CHECK_UNIT, [_check_group(g["group"], g["sites"])
+                                        for g in proposed])]
+    return review_panel.build_merge_check(units, states, proposed)
+
+
+class AMergeCheckReplyCoversEveryGroupOrNothing(unittest.TestCase):
+    """One entry per group the unit was handed, one verdict per site of it,
+    and nothing it was not handed. A reply that breaks any of these is refused whole."""
+
+    HANDED = {"G1": ("S1", "S2", "S3"), "G2": ("S4", "S5")}
+    GOOD = _check_reply([_check_group("G1", ["S1", "S2", "S3"]),
+                         _check_group("G2", ["S4", "S5"])])
+
+    def parse(self, reply):
+        return review_panel.parse_merge_checker_result(reply, CHECK_UNIT, self.HANDED)
+
+    def refused(self, reply, fragment):
+        with self.assertRaises(review_panel.ResultError) as caught:
+            self.parse(reply)
+        self.assertIn(CHECK_UNIT, str(caught.exception))
+        self.assertIn(fragment, str(caught.exception))
+
+    def test_the_briefs_example_is_a_reply_the_engine_accepts(self):
+        """A model copies the example's shape before it reads the rules, so an example the
+        engine would refuse costs the whole round."""
+        brief = review_panel.load_brief("merge-checker")
+        example = json.loads(brief.split("```json", 1)[1].split("```", 1)[0])
+        handed = {group["group"]: tuple(record["site"] for record in group["sites"])
+                  for group in example["groups"]}
+        parsed = review_panel.parse_merge_checker_result(example, CHECK_UNIT, handed)
+        self.assertEqual(len(parsed["groups"]), len(example["groups"]))
+
+    def test_a_reply_that_keeps_every_rule_is_read_as_records(self):
+        parsed = self.parse(_check_reply([
+            _check_group("G2", ["S5", "S4"], misfit=["S5"], hidden=["S4"],
+                         refuted=["S4"]),
+            _check_group("G1", ["S1", "S2", "S3"])]))
+        self.assertEqual([group["group"] for group in parsed["groups"]], ["G1", "G2"])
+        g2 = parsed["groups"][1]
+        self.assertEqual([(r["site"], r["verdict"]) for r in g2["sites"]],
+                         [("S4", "fits"), ("S5", "does_not_fit")])
+        self.assertEqual(g2["hidden_claims"], [{"site": "S4", "claim": "S4 also leaks a handle."}])
+        self.assertEqual(g2["fix_touches_refuted"], {"value": True, "sites": ["S4"]})
+        self.assertEqual(parsed["summary"], "Checked every group against its mechanism.")
+
+    def test_a_group_left_out_is_refused(self):
+        self.refused(_check_reply(self.GOOD["groups"][:1]), "no entry")
+
+    def test_a_group_answered_twice_is_refused(self):
+        self.refused(_check_reply([*self.GOOD["groups"], self.GOOD["groups"][0]]), "twice")
+
+    def test_a_group_the_unit_was_not_handed_is_refused(self):
+        self.refused(_check_reply([*self.GOOD["groups"], _check_group("G9", ["S9", "S8"])]),
+                     "was not handed")
+
+    def test_every_site_of_a_group_gets_exactly_one_verdict(self):
+        g1 = _check_group("G1", ["S1", "S2", "S3"])
+        for name, sites, fragment in (
+            ("a site without one", g1["sites"][:2], "no verdict"),
+            ("a site twice", [*g1["sites"], g1["sites"][0]], "twice"),
+            ("another group's site", [*g1["sites"], {"site": "S4", "verdict": "fits",
+                                                     "reason": "x"}], "not in this group"),
+        ):
+            with self.subTest(sites=name):
+                self.refused(_check_reply([{**g1, "sites": sites}, self.GOOD["groups"][1]]),
+                             fragment)
+
+    def test_a_verdict_is_one_of_the_two(self):
+        g1 = _check_group("G1", ["S1", "S2", "S3"])
+        g1["sites"][0]["verdict"] = "maybe"
+        self.refused(_check_reply([g1, self.GOOD["groups"][1]]), "verdict")
+
+    def test_a_hidden_claim_or_a_refuted_site_names_a_site_of_its_group_once(self):
+        for name, edit, fragment in (
+            ("hidden outside", {"hidden_claims": [{"site": "S4", "claim": "x"}]},
+             "not in this group"),
+            ("hidden twice", {"hidden_claims": [{"site": "S1", "claim": "x"}] * 2}, "twice"),
+            ("refuted outside", {"fix_touches_refuted": {"value": True, "sites": ["S4"]}},
+             "not in this group"),
+            ("refuted twice", {"fix_touches_refuted": {"value": True, "sites": ["S1", "S1"]}},
+             "twice"),
+            ("refuted not a flag", {"fix_touches_refuted": {"value": "yes", "sites": []}},
+             "value"),
+        ):
+            with self.subTest(edit=name):
+                self.refused(_check_reply([{**self.GOOD["groups"][0], **edit},
+                                           self.GOOD["groups"][1]]), fragment)
+
+    def test_a_reply_whose_shape_is_not_the_schema_is_refused(self):
+        g1 = self.GOOD["groups"][0]
+        for name, reply in (
+            ("not an object", ["G1"]),
+            ("an unknown key", {**self.GOOD, "accepted": True}),
+            ("sites as a map", _check_reply([
+                {**g1, "sites": {"S1": {"verdict": "fits", "reason": "x"}}},
+                self.GOOD["groups"][1]])),
+            ("hidden claims as a map", _check_reply([
+                {**g1, "hidden_claims": {"S1": "x"}}, self.GOOD["groups"][1]])),
+        ):
+            with self.subTest(reply=name):
+                with self.assertRaises(review_panel.ResultError):
+                    self.parse(reply)
+
+
+class TheMergeCheckDecidesWhichGroupsBecomeOneDefect(unittest.TestCase):
+    """What the merge check does, as the engine applies it: all fit and the group is one
+    defect; a site that does not fit or hides a claim leaves, and the rest stand while two
+    or more remain; a check that is missing or unreadable upholds no group."""
+
+    SITES = ("S1", "S2", "S3", "S4")
+
+    def decided(self, states, units=None):
+        units = [{"id": CHECK_UNIT, "groups": [PROPOSED_TRIPLE]}] if units is None else units
+        record = review_panel.build_merge_check(units, states, [PROPOSED_TRIPLE])
+        return record, review_panel.accepted_grouping(self.SITES, record)
+
+    def checked(self, **edits):
+        return self.decided([_check_state(CHECK_UNIT, [
+            _check_group("G1", ["S1", "S2", "S3"], **edits)])])
+
+    def test_every_site_fits_and_the_group_is_one_defect(self):
+        record, grouping = self.checked()
+        self.assertEqual(grouping, [["S1", "S2", "S3"], ["S4"]])
+        [group] = record["groups"]
+        self.assertEqual(group["accepted"], ["S1", "S2", "S3"])
+        self.assertEqual(group["removed"], [])
+        self.assertEqual(group["mechanism"], MERGE_TRIPLE["mechanism"])
+
+    def test_a_site_that_does_not_fit_leaves_and_the_rest_stand(self):
+        record, grouping = self.checked(misfit=["S3"])
+        self.assertEqual(grouping, [["S1", "S2"], ["S3"], ["S4"]])
+        self.assertEqual(record["groups"][0]["removed"],
+                         [{"site": "S3", "why": review_panel.CHECK_DOES_NOT_FIT,
+                           "reason": "S3 is not this mistake."}])
+
+    def test_a_group_reduced_below_two_dissolves(self):
+        record, grouping = self.checked(misfit=["S2", "S3"])
+        self.assertEqual(grouping, [["S1"], ["S2"], ["S3"], ["S4"]])
+        group = record["groups"][0]
+        self.assertEqual(group["accepted"], [])
+        self.assertEqual([(r["site"], r["why"]) for r in group["removed"]],
+                         [("S1", review_panel.CHECK_TOO_FEW),
+                          ("S2", review_panel.CHECK_DOES_NOT_FIT),
+                          ("S3", review_panel.CHECK_DOES_NOT_FIT)])
+
+    def test_a_hidden_claim_removes_its_site_even_where_it_fits(self):
+        record, grouping = self.checked(hidden=["S2"])
+        self.assertEqual(grouping, [["S1", "S3"], ["S2"], ["S4"]])
+        self.assertEqual(record["groups"][0]["removed"],
+                         [{"site": "S2", "why": review_panel.CHECK_HIDDEN_CLAIM,
+                           "reason": "S2 also leaks a handle."}])
+
+    def test_a_fix_that_touches_a_refuted_site_is_recorded_and_removes_nothing(self):
+        record, grouping = self.checked(refuted=["S3"])
+        self.assertEqual(grouping, [["S1", "S2", "S3"], ["S4"]])
+        self.assertEqual(record["groups"][0]["fix_touches_refuted"],
+                         {"value": True, "sites": ["S3"]})
+
+    def test_a_missing_or_unreadable_result_accepts_no_group(self):
+        for state in ("missing", "failed"):
+            with self.subTest(state=state):
+                record, grouping = self.decided([_check_state(CHECK_UNIT, (), state)])
+                self.assertEqual(grouping, [["S1"], ["S2"], ["S3"], ["S4"]])
+                self.assertEqual(record["units"][0]["state"], state)
+                self.assertFalse(record["groups"][0]["checked"])
+                self.assertEqual(record["groups"][0]["accepted"], [])
+
+    def test_a_group_no_check_was_planned_for_is_not_accepted(self):
+        """A run reported at `merged`, before its check ran, has proposed groups and no
+        check: every site is its own defect."""
+        record, grouping = self.decided([], units=[])
+        self.assertEqual(grouping, [["S1"], ["S2"], ["S3"], ["S4"]])
+        self.assertFalse(record["groups"][0]["checked"])
+
+    def test_the_check_runs_on_the_lane_the_merge_did_not(self):
+        self.assertEqual(review_panel.MERGE_CHECK_UNIT_ID, CHECK_UNIT)
+        self.assertNotEqual(review_panel.MERGE_CHECK_LANE, review_panel.LANES[0])
+        self.assertIn(review_panel.MERGE_CHECK_LANE, review_panel.LANES)
+
+
+def _check_material(gid, sites):
+    """One group as the merge check payload states it, for planning without a run."""
+    return {"group": gid, "mechanism": f"{gid}'s one rule is broken at each site.",
+            "instances": [{"site": sid, "instance": f"{sid} breaks it."} for sid in sites],
+            "sites": [{"id": sid, "area": "area-01", "asks": "defect",
+                       "status": "established", "consequence": f"{sid} goes wrong.",
+                       "split_reason": None,
+                       "members": [{"file": "a.py", "line_start": 1, "line_end": 1,
+                                    "failure": f"{sid} fails.", "directions": ["Fix it."],
+                                    "rationale": None, "snippet": None}]}
+                      for sid in sites]}
+
+
+class OverTheMergeCheckCeilingGroupsBatchWhole(unittest.TestCase):
+    """Over either of the merge check's ceilings the groups are batched, and a group is
+    never split across batches — one over the ceiling on its own goes in a batch alone."""
+
+    GROUPS = (_check_material("G1", ["S1", "S2"]), _check_material("G2", ["S3", "S4"]),
+              _check_material("G3", ["S5", "S6"]))
+
+    def size(self, groups):
+        return review_panel.measure_payload(
+            review_panel.render_merge_checker_payload("B", "P", list(groups)))
+
+    def plan(self, groups, lines=10 ** 9, size=10 ** 9, reply=None):
+        return [(unit.id, unit.groups) for unit in review_panel.plan_merge_check(
+            "B", "P", list(groups), ceiling=review_panel.Ceiling(lines=lines, bytes=size),
+            reply_ceiling=reply)]
+
+    def test_everything_under_both_ceilings_is_one_unit_on_the_other_lane(self):
+        [unit] = review_panel.plan_merge_check("B", "P", list(self.GROUPS))
+        self.assertEqual((unit.id, unit.lane, unit.groups),
+                         (CHECK_UNIT, review_panel.MERGE_CHECK_LANE, ("G1", "G2", "G3")))
+
+    def test_no_group_to_check_is_no_unit(self):
+        self.assertEqual(self.plan(()), [])
+
+    def test_at_the_line_ceiling_one_unit_and_just_over_it_a_second(self):
+        lines = self.size(self.GROUPS)[0]
+        self.assertEqual(self.plan(self.GROUPS, lines=lines),
+                         [(CHECK_UNIT, ("G1", "G2", "G3"))])
+        self.assertEqual(self.plan(self.GROUPS, lines=lines - 1),
+                         [(f"{CHECK_UNIT}-1", ("G1", "G2")), (f"{CHECK_UNIT}-2", ("G3",))])
+
+    def test_at_the_byte_ceiling_one_unit_and_just_over_it_a_second(self):
+        size = self.size(self.GROUPS)[1]
+        self.assertEqual(self.plan(self.GROUPS, size=size),
+                         [(CHECK_UNIT, ("G1", "G2", "G3"))])
+        self.assertEqual(self.plan(self.GROUPS, size=size - 1),
+                         [(f"{CHECK_UNIT}-1", ("G1", "G2")), (f"{CHECK_UNIT}-2", ("G3",))])
+
+    def test_at_the_reply_ceiling_one_unit_and_just_over_it_a_second(self):
+        per = review_panel.MERGE_CHECK_REPLY_BYTES_PER_SITE
+        self.assertEqual(self.plan(self.GROUPS, reply=6 * per),
+                         [(CHECK_UNIT, ("G1", "G2", "G3"))])
+        self.assertEqual(self.plan(self.GROUPS, reply=6 * per - 1),
+                         [(f"{CHECK_UNIT}-1", ("G1", "G2")), (f"{CHECK_UNIT}-2", ("G3",))])
+
+    def test_a_group_over_the_ceiling_alone_goes_in_a_batch_of_its_own_whole(self):
+        big = _check_material("G2", [f"S{n}" for n in range(3, 9)])
+        groups = (self.GROUPS[0], big, _check_material("G3", ["S9", "S10"]))
+        lines = self.size([groups[0], groups[2]])[0]
+        self.assertGreater(self.size([big])[0], lines)
+        self.assertEqual(self.plan(groups, lines=lines),
+                         [(f"{CHECK_UNIT}-1", ("G1",)), (f"{CHECK_UNIT}-2", ("G2",)),
+                          (f"{CHECK_UNIT}-3", ("G3",))])
+
+    def test_the_ceilings_are_stated_beside_the_others(self):
+        self.assertIsInstance(review_panel.MERGE_CHECK_CEILING, review_panel.Ceiling)
+        self.assertGreater(review_panel.MERGE_CHECK_CEILING.bytes, 150 * 1024,
+                           "the ceiling is under the payload the trial already ran")
+        self.assertGreater(review_panel.MERGE_CHECK_REPLY_CEILING,
+                           77 * review_panel.MERGE_CHECK_REPLY_BYTES_PER_SITE)
+
+
+class NoDefectOfSeveralSitesWithoutAnAcceptedCheck(_SitesCase):
+    """No defect of several sites exists without an accepted merge check result
+    covering every one of its sites, and a stated mechanism with one instance per site."""
+
+    def test_a_grouping_nothing_upheld_is_refused(self):
+        for name, check in (("no check at all", None),
+                            ("a check upholding other sites", _accepting([["S1", "S2"]]))):
+            with self.subTest(check=name):
+                with self.assertRaises(review_panel.GroupingError):
+                    self.built([["S1", "S3"], ["S2"]], merge_check=check)
+
+    def test_an_upheld_group_is_one_defect_carrying_its_mechanism(self):
+        findings = self.built([["S1", "S3"], ["S2"]])
+        d1 = findings.defects[0]
+        self.assertEqual(d1["sites"], ["S1", "S3"])
+        self.assertEqual(d1["mechanism"], "One rule broken at each site.")
+        self.assertEqual(d1["instances"], [{"site": "S1", "instance": "S1 breaks it."},
+                                           {"site": "S3", "instance": "S3 breaks it."}])
+        self.assertIsNone(findings.defects[1]["mechanism"])
+
+
+class AMergeCheckedGroupIsOneDefect(_FindingsCase):
+    """The round end to end: the other lane's unit, handed each proposed group with each
+    site's full record, decides which groups the report shows as one defect."""
+
+    def merged_run(self, check=None, synthesis=None, dispatch=DISPATCH):
+        return self.run_all(reading=SITES_READING,
+                            merge={MERGE_UNIT: _merge_reply([MERGE_TRIPLE])}, check=check,
+                            synthesis=synthesis, dispatch=dispatch)
+
+    def section(self):
+        return " ".join(review_panel._unescape(_section(
+            self.text(), review_panel.SUBSECTION_MERGE)).split())
+
+    def test_one_read_only_unit_on_the_other_lane_records_its_payload_size(self):
+        self.merged_run()
+        [unit] = self.checkers()
+        self.assertEqual((unit["id"], unit["lane"]), (CHECK_UNIT, "B"))
+        self.assertEqual(unit["groups"], [PROPOSED_TRIPLE])
+        raw = (self.rundir / unit["payload"]).read_bytes()
+        self.assertEqual(unit["payload_bytes"], len(raw))
+        self.assertEqual(unit["payload_lines"], raw.count(b"\n"))
+        schema = json.loads((self.rundir / unit["schema"]).read_text(encoding="utf-8"))
+        self.assertEqual(schema,
+                         review_panel.load_schema(review_panel.MERGE_CHECKER_SCHEMA_NAME))
+
+    def test_the_payload_carries_the_claim_and_each_sites_record_with_its_source(self):
+        self.merged_run()
+        text = (self.rundir / self.checkers()[0]["payload"]).read_text(encoding="utf-8")
+        groups = text.split(review_panel.TO_CHECK_HEADING, 1)[1]
+        groups = groups.split(review_panel.RESULT_SCHEMA_HEADING, 1)[0]
+        self.assertIn("### G1\n", groups)
+        self.assertIn(MERGE_TRIPLE["mechanism"], groups)
+        for record in MERGE_TRIPLE["instances"]:
+            self.assertIn(record["instance"], groups)
+        for site, outcome in (("S1", "established"), ("S2", "established"),
+                              ("S3", "refuted")):
+            self.assertIn(f"#### {site} (outcome: {outcome})\n", groups)
+        self.assertIn(FINDING["failure"], groups)
+        self.assertIn("The run raised as claimed.", groups)
+        # The quoted source, from the pinned tree.
+        self.assertIn("return x + 1", groups)
+        # Nothing says which lane proposed the merge, or who raised or checked a site.
+        for absent in (MERGE_UNIT, "lane", "Lane", "cand-0", "verify-area",
+                       *FILE_JOB["lenses"]):
+            self.assertNotIn(absent, groups, absent)
+
+    def test_an_upheld_group_is_one_defect_holding_every_site(self):
+        self.merged_run()
+        doc = self.findings()
+        self.assertEqual([(d["id"], d["sites"]) for d in doc["defects"]],
+                         [("D1", ["S1", "S2", "S3"])])
+        self.assertEqual(doc["defects"][0]["mechanism"], MERGE_TRIPLE["mechanism"])
+        self.assertEqual({s["id"]: s["status"] for s in doc["sites"]},
+                         {"S1": "established", "S2": "established", "S3": "refuted"})
+        self.assertEqual(doc["merge_check"]["groups"][0]["accepted"], ["S1", "S2", "S3"])
+        entry = self.defect_block(self.text(), "D1")
+        self.assertIn("3 sites", " ".join(review_panel._unescape(entry).split()))
+        for site in ("S1", "S2", "S3"):
+            self.assertIn(f'- <a id="{site}-src"></a>**{site}** · ', entry)
+            self.assertIn(f"\n### {site} · ", self.text())
+        self.assertIn(f"{CHECK_UNIT} — complete", self.section())
+
+    def test_a_site_that_does_not_fit_is_its_own_defect_and_is_named(self):
+        self.merged_run(check={CHECK_UNIT: _check_reply([
+            _check_group("G1", ["S1", "S2", "S3"], misfit=["S3"])])})
+        doc = self.findings()
+        self.assertEqual([(d["id"], d["sites"]) for d in doc["defects"]],
+                         [("D1", ["S1", "S2"]), ("D2", ["S3"])])
+        section = self.section()
+        self.assertIn("S3", section)
+        self.assertIn("S3 is not this mistake.", section)
+
+    def test_a_missing_check_upholds_no_group_and_is_named(self):
+        self.merged_run(check={})
+        doc = self.findings()
+        self.assertEqual([d["sites"] for d in doc["defects"]], [["S1"], ["S2"], ["S3"]])
+        self.assertIn(f"{CHECK_UNIT} — missing", self.section())
+        self.assertIn(review_panel.MERGE_CHECK_DEGRADED, self.section())
+        self.assertNotIn(review_panel.EVERY_UNIT_RETURNED, self.text())
+
+    def test_defect_ids_are_the_same_across_two_renders(self):
+        self.merged_run()
+        first = self.findings()
+        proc = _run("report", str(self.rundir), "--rerender")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.findings(), first)
+
+    def test_a_changed_grouping_invalidates_the_check_and_the_synthesis(self):
+        synthesis = {"synth-A": {"tiers": ["A run stops"], "defects": [
+            {"defect": "D1", "heading": "It indexes first.", "tier": "A run stops",
+             "what_goes_wrong": "It indexes first.", "fix": "Check first.", "site_notes": [],
+             "cross_references": []}], "summary": "one"}}
+        self.merged_run(synthesis=synthesis)
+        self.assertEqual(self.units()["stage"], review_panel.REPORTED_STAGE)
+        # The merge's groups move under the check planned over them.
+        merge = self.rundir / "units" / MERGE_UNIT / "result.json"
+        merge.write_text(json.dumps(_merge_reply([
+            {**MERGE_TRIPLE, "sites": ["S1", "S2"], "instances": MERGE_TRIPLE["instances"][:2]},
+            _single("S3")])), encoding="utf-8")
+        proc = _run("report", str(self.rundir), "--rerender")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("merge check", proc.stderr)
+        self.assertIn("--redo", proc.stderr)
+        # The groups stand, and the check now takes a site out: the defects the synthesis
+        # was handed are no longer this run's.
+        merge.write_text(json.dumps(_merge_reply([MERGE_TRIPLE])), encoding="utf-8")
+        check = self.rundir / "units" / CHECK_UNIT / "result.json"
+        check.write_text(json.dumps(_check_reply([
+            _check_group("G1", ["S1", "S2", "S3"], misfit=["S3"])])), encoding="utf-8")
+        proc = _run("report", str(self.rundir), "--rerender")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("synthesis", proc.stderr)
+
+    def test_route_and_cluster_redo_from_merge_checked_take_the_check_back(self):
+        for command, stage in (("cluster", review_panel.CLUSTERED_STAGE),
+                               ("route", review_panel.VERIFICATION_STAGE)):
+            with self.subTest(command=command):
+                self.rundir = Path(tempfile.mkdtemp(dir=self.tmp)) / "run"
+                self.plan_into(self.rundir)
+                stub_dispatch(self.rundir, SITES_READING, DISPATCH)
+                self.assertEqual(_run("route", str(self.rundir)).returncode, 0)
+                stub_dispatch(self.rundir, VERIFY_TABLE)
+                self.clustered()
+                self.merged(table={MERGE_UNIT: _merge_reply([MERGE_TRIPLE])})
+                self.merge_checked()
+                self.assertEqual(self.units()["stage"], review_panel.MERGE_CHECKED_STAGE)
+                self.assertTrue((self.rundir / "units" / CHECK_UNIT / "result.json").is_file())
+                proc = _run(command, str(self.rundir), "--redo")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(self.checkers(), [])
+                self.assertEqual(self.mergers(), [])
+                self.assertFalse((self.rundir / "units" / CHECK_UNIT).exists())
+                self.assertEqual(self.units()["stage"], stage)
+
+    def test_at_the_one_runtime_rung_no_sentence_says_a_second_model_checked(self):
+        self.merged_run(dispatch={**DISPATCH, "rung": "one-runtime"})
+        section = self.section()
+        self.assertIn(review_panel.RUNG_BREADTH["one-runtime"][1], section)
+        text = self.reads_as()
+        for false in ("other model", "second model", "another model", "both models"):
+            self.assertNotIn(false, text)
+
+    def test_check_runs_the_merge_check_parse_before_a_reply_is_landed(self):
+        self.plan_into(self.rundir)
+        stub_dispatch(self.rundir, SITES_READING, DISPATCH)
+        self.assertEqual(_run("route", str(self.rundir)).returncode, 0)
+        stub_dispatch(self.rundir, VERIFY_TABLE)
+        self.clustered()
+        self.merged(table={MERGE_UNIT: _merge_reply([MERGE_TRIPLE])})
+        self.merge_check()
+        reply = self.rundir / "dispatch" / CHECK_UNIT / "reply.json"
+        reply.parent.mkdir(parents=True)
+        reply.write_text(json.dumps(_check_reply([_check_group("G1", ["S1", "S2", "S3"])])),
+                         encoding="utf-8")
+        proc = _run("check", str(self.rundir), CHECK_UNIT)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        reply.write_text(json.dumps(_check_reply([_check_group("G1", ["S1", "S2"])])),
+                         encoding="utf-8")
+        proc = _run("check", str(self.rundir), CHECK_UNIT)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("no verdict", proc.stderr)
+
+    def test_at_a_two_model_rung_the_same_sentence_says_models(self):
+        self.merged_run()
+        self.assertIn(review_panel.RUNG_BREADTH["two-runtimes"][1], self.section())
+
+
+class EverySiteOfAMergedGapRendersInTheCoverageSections(_CoverageCase):
+    """Two coverage sites the check upheld as one mistake are one coverage defect, and each
+    site is still a test to write (or a test that covers it): every site renders, with its
+    own input, location and test, in "Coverage gaps" and in the appendix's covered table.
+    Clustering is left unanswered, so every candidate is a site: S5 and S6 are the gaps."""
+
+    GAPS = {"sites": ["S5", "S6"], "mechanism": "No test sends an input outside the range.",
+            "instances": [{"site": "S5", "instance": "a"}, {"site": "S6", "instance": "b"}],
+            "reason_kept_apart": None}
+
+    def merged_gaps(self, coverage):
+        self.routed()
+        stub_dispatch(self.rundir, self.verify_table(coverage(self.gap_ids())))
+        self.cluster()
+        self.merged(table={MERGE_UNIT: _merge_reply(
+            [_single("S1"), _single("S2"), _single("S3"), _single("S4"), self.GAPS])})
+        self.merge_checked()
+        self.report()
+        doc = json.loads((self.rundir / "findings.json").read_text(encoding="utf-8"))
+        self.assertEqual([d["sites"] for d in doc["coverage_defects"]], [["S5", "S6"]])
+        return " ".join(review_panel._unescape(self.text()).split())
+
+    def test_every_site_of_a_standing_merged_gap_is_a_test_to_write(self):
+        def coverage(ids):
+            return {"verdicts": [
+                _gap_verdict(ids[0], test_first="tests/test_engine.py: send y = -1."),
+                _gap_verdict(ids[1], test_first="tests/test_core.py: send a string x.")],
+                "summary": "both stand"}
+        text = self.merged_gaps(coverage)
+        gaps = " ".join(review_panel._unescape(_section(
+            self.text(), review_panel.SECTION_COVERAGE_GAPS)).split())
+        for fact in (GAP["failure"], GAP_TWO["failure"], "send y = -1.",
+                     "send a string x.", "core.py:5-6", "core.py:1"):
+            self.assertIn(fact, gaps)
+        self.assertIn("test_engine", gaps)
+        self.assertIn("test_core", gaps)
+        self.assertTrue(text)
+
+    def test_every_site_of_a_covered_merged_gap_is_a_row_of_the_covered_table(self):
+        def coverage(ids):
+            return {"verdicts": [
+                _gap_verdict(ids[0], "gap_refuted", covered_by="tests/test_engine.py::neg"),
+                _gap_verdict(ids[1], "gap_refuted", covered_by="tests/test_core.py::text")],
+                "summary": "both covered"}
+        self.merged_gaps(coverage)
+        covered = " ".join(review_panel._unescape(_section(
+            self.text(), review_panel.SUBSECTION_COVERED)).split())
+        for fact in (_short_failure(GAP), _short_failure(GAP_TWO), "core.py:5-6",
+                     "core.py:1", "tests/test_engine.py::neg", "tests/test_core.py::text"):
+            self.assertIn(fact, covered)
+        self.assertEqual(sum(1 for line in _section(
+            self.text(), review_panel.SUBSECTION_COVERED).splitlines()
+            if re.match(r'^\| (?:<a id="[^"]+"></a>)?S\d', line)), 2)
+
+    def test_the_counts_at_the_top_agree_with_the_sections(self):
+        """One site stands and one is covered: the top counts the gap's two sites by their
+        own outcomes, as the two sections list them, and not the gap once by placement."""
+        def coverage(ids):
+            return {"verdicts": [
+                _gap_verdict(ids[0], test_first="tests/test_engine.py: send y = -1."),
+                _gap_verdict(ids[1], "gap_refuted", covered_by="tests/test_core.py::text")],
+                "summary": "one of each"}
+        self.merged_gaps(coverage)
+        text = self.text()
+        self.assertIn("- Coverage gaps: 1 at 2 sites, counted by site from 2 findings — "
+                      "1 standing, 1 covered by a test already, 0 unresolved.",
+                      _section(text, review_panel.SECTION_DESCRIPTION))
+        self.assertIn(f" {review_panel.SECTION_COVERAGE_GAPS} (1)", text)
+        self.assertEqual(sum(1 for line in _section(text, review_panel.SUBSECTION_COVERED)
+                             .splitlines() if re.match(r'^\| (?:<a id="[^"]+"></a>)?S\d', line)), 1)
+
+
+def _short_failure(gap):
+    return review_panel._short(gap["failure"])
 
 
 if __name__ == "__main__":

@@ -117,7 +117,7 @@ place — a green run over untouched tests reads exactly like a checked one.
 
 ## Constraints
 
-- Move logic as-is. Do not rewrite, optimise, or rename things while extracting — that is a separate task.
+- Move logic as-is. Do not rewrite, optimize, or rename things while extracting — that is a separate task.
 - Prefer placing hooks close to the component that uses them unless the logic is clearly shared across multiple components.
 - Follow the project's existing naming conventions, import style, and file structure throughout.
 - Follow the project's `CLAUDE.md` / `AGENTS.md` conventions (whichever exists).

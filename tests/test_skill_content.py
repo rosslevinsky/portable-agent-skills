@@ -81,10 +81,10 @@ PUSHING_EXECUTORS = ("plan-run", "plan-run-v1")
 # fallbacks for a repository the remote never answered for. All four push blocks ship the
 # same shape; naming it here is what makes "port it" checkable.
 #
-# The derivation must ASK THE REMOTE. Reading `refs/remotes/origin/HEAD` was the earlier
-# shape and it has a hole: the command that sets that ref refuses unless the matching
-# tracking ref already exists, so a clone that never fetched the default branch leaves the
-# variable empty — and a trunk named neither `main` nor `master` then clears the literal
+# The derivation must ASK THE REMOTE. Reading `refs/remotes/origin/HEAD` instead has a
+# hole: the command that sets that ref refuses unless the matching tracking ref already
+# exists, so a clone that never fetched the default branch leaves the variable empty —
+# and a trunk named neither `main` nor `master` then clears the literal
 # fallbacks too, and the push lands on it. `ls-remote --symref` needs no tracking ref.
 _DEFAULT_BRANCH_DERIVATION = "ls-remote --symref"
 
@@ -404,7 +404,7 @@ class PushGuards(unittest.TestCase):
         self.assertFalse(guards_default_branch(denied, own, code))
 
     def test_the_guard_shape_plan_run_v1_already_ships_is_recognised(self):
-        """The predicates must accept the fix, or phase 2 has nothing it can write."""
+        """The predicates must accept a correct guard, or no fix could ever pass them."""
         code = shell_code(
             'branch="$(git rev-parse --abbrev-ref HEAD)"\n'
             'default="$(git ls-remote --symref origin HEAD 2>/dev/null)"\n'
@@ -592,13 +592,13 @@ class CommitAndPushBlocksRun(unittest.TestCase):
                     f"the block pushed to the default branch:\n{proc.stdout}{proc.stderr}")
 
     def test_a_custom_default_is_still_guarded_when_the_remote_cannot_be_answered(self):
-        """Why the LOCAL ref is asked first.
+        """Why the LOCAL ref still answers when the remote cannot.
 
         `refs/remotes/origin/HEAD` needs no network and is right in any ordinary clone.
-        Asking the remote before it made an unreachable network the reason the guard stopped
-        working: the lookup came back empty, `main` and `master` both missed a trunk called
-        `trunk`, and the phase published straight to it — a far commoner way to lose than the
-        unfetched-clone case that ordering was meant to fix.
+        Asking only the remote makes an unreachable network the reason the guard stops
+        working: the lookup comes back empty, `main` and `master` both miss a trunk called
+        `trunk`, and the phase publishes straight to it — a far commoner way to lose than the
+        unfetched clone.
         """
         for i, (where, block) in enumerate(self.blocks):
             with self.subTest(block=where):
@@ -865,10 +865,10 @@ class WriteLocationIsDerived(unittest.TestCase):
 class OverwriteGuardsPrecedeTheirWrites(unittest.TestCase):
     """The guard has to run before the first write, not before the write it names.
 
-    `plan-phase-v1`'s existing `phases.md` check sat in Step 6 — after Step 5 had already
-    recreated every phase document. Protecting the tracker while overwriting the documents
-    whose progress it points at is not protection, and the half-executed plan is the common
-    case.
+    `plan-phase-v1` writes the phase documents in Step 5 and `phases.md` in Step 6, so its
+    check for an existing `phases.md` has to open Step 5, not Step 6. Protecting the tracker
+    while overwriting the documents whose progress it points at is not protection, and the
+    half-executed plan is the common case.
     """
 
     def test_the_v1_tracker_guard_runs_before_any_phase_document_is_written(self):
@@ -914,8 +914,8 @@ class UntrackedNoiseIsSubtractedButOnlyWhenGitCanSaySo(unittest.TestCase):
     """The sweep skips files git does not track, and fails CLOSED when git cannot answer.
 
     An untracked file is scratch work, build residue or a stale checkout, so scanning it for
-    things that must not be shared checks a route that does not exist — 645 violations on an
-    ordinary working copy, every one untracked, which is enough noise to make the guard
+    things that must not be shared checks a route that does not exist — an ordinary working
+    copy yields hundreds of untracked violations, which is enough noise to make the guard
     useless as a signal. The danger runs the other way, which is why three checks fail
     closed: a wrong "tracked" answer subtracts everything and a sweep that scanned nothing
     reports clean. Git is optional because the validator SHIPS, and is used only to SUBTRACT.
@@ -946,7 +946,7 @@ class UntrackedNoiseIsSubtractedButOnlyWhenGitCanSaySo(unittest.TestCase):
             worktree.mkdir(parents=True)
             (root / ".claude" / "settings.json").write_text("{}\n", encoding="utf-8")
             # Untracked, and carrying something the sweep would otherwise report: this is
-            # the 645-violation noise the subtraction exists to remove.
+            # the untracked noise the subtraction exists to remove.
             self._tree_with_a_planted_path(worktree)
             subprocess.run(
                 ["git", "-C", str(root), "add", "-f", ".claude/settings.json"],
@@ -981,8 +981,8 @@ class UntrackedNoiseIsSubtractedButOnlyWhenGitCanSaySo(unittest.TestCase):
             # Named in BYTES, and turned into a path with `os.fsdecode`, because the fixture
             # must not depend on the locale either. Writing `"café.md"` directly fails to
             # *create* the file under `LC_ALL=C`, where the filesystem encoding is ASCII —
-            # which is the CI job this test exists for, so it broke exactly where it was
-            # needed. `os.fsdecode` gives the string this process would use for those bytes,
+            # which is the CI job this test exists for, so it would break exactly where it
+            # is needed. `os.fsdecode` gives the string this process would use for those bytes,
             # and both spellings write the same bytes to disk.
             raw_name = "café.md".encode("utf-8")
             (root / os.fsdecode(raw_name)).write_text("x\n", encoding="utf-8")
@@ -1099,10 +1099,10 @@ class UntrackedNoiseIsSubtractedButOnlyWhenGitCanSaySo(unittest.TestCase):
 class PrivacyGuardCoversTheWholeRepository(unittest.TestCase):
     """The private-identifier sweep must not quietly shrink back to one directory.
 
-    It scanned `skills/` and `README.md` only, while the docs claimed it replaced a
-    `grep -r` over everything. A fake home path planted in six files passed clean — the
-    installers among them, which were 47 KB of path-handling shell and the likeliest place
-    for a real one to be pasted. These tests are that review's canary, kept.
+    The sweep reads the whole tree, not only `skills/` and `README.md`. These tests plant a
+    fake home path in files outside those two — the installer among them, which is
+    path-handling code and the likeliest place for a real one to be pasted — and require
+    the sweep to report each one.
     """
 
     CANARY = "/home/someone/secret"  # hygiene-exempt: the canary itself
@@ -1110,10 +1110,8 @@ class PrivacyGuardCoversTheWholeRepository(unittest.TestCase):
     # Files a sweep scoped to `skills/` does not reach. Each is a real shipped path, not a
     # fixture.
     BLIND_SPOTS = (
-        # `install.sh` and `install.ps1` were the original two entries and the reason this
-        # canary exists — 47 KB of path-handling shell where a real home path is likeliest
-        # to be pasted. They are gone; `install.py` takes their place here rather than the
-        # list simply getting shorter.
+        # The installer: path-handling code, where a real home path is likeliest to be
+        # pasted.
         "install.py",
         "CONTRIBUTING.md",
         "PORTABILITY.md",
@@ -1151,7 +1149,7 @@ class PrivacyGuardCoversTheWholeRepository(unittest.TestCase):
                         f"narrowed again. Findings: {found}")
 
     def test_a_home_path_is_caught_on_every_platform_not_just_linux(self):
-        """The macOS and Windows forms went uncaught until a review pasted one in.
+        """The macOS and Windows forms are home directories as much as the Linux one.
 
         macOS is in the CI matrix, so it is a real place for a real path to come from.
         """
@@ -1188,13 +1186,13 @@ class PrivacyGuardCoversTheWholeRepository(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "posix", "see the note on the test above")
     def test_a_symlink_is_judged_by_the_same_rule_wherever_it_sits(self):
-        """The link branch kept the rule the file branch had already been fixed away from.
+        """The link branch applies the same rule as the file branch.
 
         Which pattern set applies is decided by the file's NAME — the identity documents that
-        legitimately carry the owner's handle get the relaxed set, and nothing else does. The
-        symlink branch instead asked "is it under `skills/`?", so the identical
-        `../<sibling-repo>/x` target was caught under `skills/` and missed at the repository
-        root, which is where such a link would actually sit.
+        legitimately carry the owner's handle get the relaxed set, and nothing else does. A
+        symlink branch asking instead "is it under `skills/`?" catches the identical
+        `../<sibling-repo>/x` target under `skills/` and misses it at the repository root,
+        which is where such a link would actually sit.
         """
         import tempfile
         target = "../dotfiles/private/x"  # hygiene-exempt: test data
@@ -1335,10 +1333,10 @@ class ResumeReadsOnlyStateSomeStepWrites(unittest.TestCase):
     """A resume branch keyed on a box nobody ticks re-runs work that is already finished.
 
     `plan-run-v1`'s 3a decides where an interrupted run re-enters by reading the phase
-    document's Task and Test boxes. 3d ticked task boxes only, so the middle branch (work
-    done, gate not yet run) was unreachable and a resumed run redid the phase from the top.
+    document's Task and Test boxes. If 3d ticks task boxes only, the middle branch (work
+    done, gate not yet run) is unreachable and a resumed run redoes the phase from the top.
 
-    This pins that defect; it does not prove the general property, since a document could
+    This pins that case; it does not prove the general property, since a document could
     satisfy it by wording alone. The value is that deleting the instruction again fails.
     """
 
@@ -1408,10 +1406,10 @@ class EverySuiteRunsWholeWhenExecutedDirectly(unittest.TestCase):
 
 
 class TheTestsReadmeNamesEverySuite(unittest.TestCase):
-    """Documentation that ships has to be true, and this bit had drifted badly.
+    """Documentation that ships has to be true.
 
-    `tests/README.md` is the map of this directory; naming a fraction of what is here meant
-    the only reliable way to learn what the suites cover was to run them. No count in this
+    `tests/README.md` is the map of this directory; naming a fraction of what is here means
+    the only reliable way to learn what the suites cover is to run them. No count in this
     docstring and none in the README's prose either: a fixed number goes stale the first time
     a suite is added, and a count above a table is a second answer to a question the table
     already answers.
@@ -1488,12 +1486,12 @@ class EveryCodexExecReviewerIsPinnedReadOnly(unittest.TestCase):
 
     Two flags are needed and neither implies the other. `-s read-only` bounds the model's
     *shell*, not the runtime's built-in patch tool, which is gated by the approval policy
-    instead: a `-s read-only` spawn with approvals at their default still wrote a file, and
-    wrote nothing once `approval_policy=never` was pinned.
+    instead: a `-s read-only` spawn with approvals at their default can still write a file,
+    and pinning `approval_policy=never` closes that path.
 
-    Rung 1 spells both. Rung 2 named `codex exec` with no arguments, which the validator's
-    lint cannot see — it reads flags on a command it can find. So the rung reached on exactly
-    the hosts with least set up was the unpinned one.
+    Rung 1 spells both, and so must rung 2. A bare `codex exec` with no arguments is one the
+    validator's lint cannot see — it reads flags on a command it can find — and rung 2 is
+    the one reached on exactly the hosts with least set up.
     """
 
     def test_no_codex_exec_reviewer_is_spelled_without_both_flags(self):
@@ -1511,6 +1509,84 @@ class EveryCodexExecReviewerIsPinnedReadOnly(unittest.TestCase):
             "a `codex exec` reviewer is spawned without a hard read-only bound; "
             "both flags are required and neither implies the other:\n"
             + "\n".join(offenders))
+
+
+class EveryDispatchingSkillNamesItsMechanism(unittest.TestCase):
+    """A skill that starts a second agent says how, and a reader can tell which way ran.
+
+    There are two ways to start one. A program launches it through `diff-review`'s
+    supervisor, `review_runner.py`, where `--backend` chooses its model and credentials. Or a
+    host launches an in-process sub-agent, which runs the host's own model, so no backend
+    applies. plan-run and security-review-codebase need neither: without the supervisor they
+    do the work in their own context, and they say which path ran so a result is never
+    credited to a model that did not produce it.
+
+    A raw `codex exec` or `claude -p` line in their dispatch notes is a third way that
+    ignores the backend, so none may appear outside a supervisor call.
+    """
+
+    DOCS = {
+        "plan-duel": ("SKILL.md",),
+        "diff-review": ("SKILL.md",),
+        "review-panel": ("SKILL.md", "references/dispatch.md"),
+        "plan-run": ("SKILL.md",),
+        "security-review-codebase": ("references/hierarchical-mode.md",),
+    }
+    # The skills with a path that starts no program: an in-process sub-agent, or no agent.
+    FALL_BACK = ("plan-run", "security-review-codebase")
+
+    def _text(self, skill: str) -> str:
+        """Every document of the skill, `>` markers and emphasis stripped, whitespace
+        collapsed — so a reflowed paragraph cannot move an assertion."""
+        raw = "\n".join((SKILLS / skill / doc).read_text(encoding="utf-8")
+                        for doc in self.DOCS[skill])
+        raw = re.sub(r"(?m)^\s*>+\s?", "", raw).replace("**", "")
+        return " ".join(raw.split())
+
+    def test_each_names_the_supervisor_and_how_a_backend_reaches_it(self):
+        for skill in self.DOCS:
+            with self.subTest(skill=skill):
+                text = self._text(skill)
+                self.assertTrue("review_runner.py" in text,
+                              "the skill never names the supervisor that launches its agents")
+                self.assertTrue(re.search(r"`--backend|`backend`", text),
+                                 "the skill never says how a backend reaches its agent")
+
+    def test_an_in_process_sub_agent_takes_no_backend(self):
+        for skill in ("diff-review",) + self.FALL_BACK:
+            with self.subTest(skill=skill):
+                self.assertTrue("no backend applies" in self._text(skill),
+                              "the skill does not say that an in-process sub-agent runs the "
+                              "host's model, so a user expects a backend to reach it")
+
+    def test_the_two_that_fall_back_state_the_fallback_and_report_the_path(self):
+        fallback = {"plan-run": "in this context",
+                    "security-review-codebase": "sequentially in this context"}
+        for skill in self.FALL_BACK:
+            with self.subTest(skill=skill):
+                text = self._text(skill)
+                at = text.find("not installed")
+                self.assertNotEqual(at, -1,
+                                    "the skill never says what happens without diff-review")
+                self.assertTrue(fallback[skill] in text[at:at + 300],
+                              "the path without diff-review is not the skill's own context")
+                self.assertTrue("which path ran" in text,
+                                 "the skill does not say that it reports which path ran")
+
+    # An invocation, not a mention: the program followed by an argument.
+    LAUNCH = re.compile(r'codex exec [-"<]|claude -p [-"<]|"codex", "exec"')
+
+    def test_no_raw_launch_line_remains_outside_a_supervisor_call(self):
+        for skill in self.FALL_BACK:
+            text = self._text(skill)
+            for match in self.LAUNCH.finditer(text):
+                with self.subTest(skill=skill, at=text[match.start():match.start() + 60]):
+                    before = text[max(0, match.start() - 600):match.start()]
+                    call = before.rfind("review_runner.py")
+                    self.assertNotEqual(call, -1,
+                                        "a raw launch line, not a supervisor call")
+                    self.assertRegex(before[call:], r'(^|[\s"])--["\s,]',
+                                     "the launch is not the supervisor's argv after `--`")
 
 
 class TheSkillsDirectoryArgumentNamesTheTreeUnderTest(unittest.TestCase):
@@ -1682,8 +1758,7 @@ class TheShippedSkillsHaveNoDanglingReferences(unittest.TestCase):
 class TheContractAndTheCodeNameEachOther(unittest.TestCase):
     """`PORTABILITY.md` describes the rules; the validator implements them, separately.
 
-    Two statements of one intent with nothing tying them together, which is the drift shape
-    this repository keeps finding in itself. A mapping that pins only some sections leaves
+    Two statements of one intent with nothing tying them together drift apart. A mapping that pins only some sections leaves
     the rest deletable with nothing noticing.
     """
 
@@ -1701,8 +1776,8 @@ class TheContractAndTheCodeNameEachOther(unittest.TestCase):
         """The document may not grow a section the check does not know about.
 
         The reverse of the rule the validator already enforces. That one stops a section
-        being deleted; this one stops one being added and left unpinned, which is how the
-        eight-of-sixteen gap opened in the first place.
+        being deleted; this one stops one being added and left unpinned, which would let the
+        mapping cover only some sections with no test failing.
         """
         import re
         headings = re.findall(r"^## (.+)$",
@@ -1732,7 +1807,7 @@ class TheUnbornRepoUnstageActuallyUnstages(unittest.TestCase):
     """The one command this skill offers for a staged secret in a repository with no commits.
 
     `git rm --cached` refuses the moment the file was edited after being staged — which is
-    exactly the shape a secret caught mid-edit has — so the advice failed in the single case
+    exactly the shape a secret caught mid-edit has — so that advice fails in the single case
     it exists for, and the first commit is where a stray `.env` is likeliest to be sitting.
     """
 
@@ -1772,7 +1847,7 @@ class TheUnbornRepoUnstageActuallyUnstages(unittest.TestCase):
             self.assertTrue(secret.exists(), "the working-tree copy was removed with it")
 
     def test_the_two_failures_are_named_separately(self):
-        """One error was quoted for both commands, and they do not fail alike: `restore
+        """One error must not be quoted for both commands, as they do not fail alike: `restore
         --staged` cannot resolve HEAD, while `reset HEAD <path>` calls HEAD an ambiguous
         argument. A reader given the wrong message looks for the wrong problem."""
         text = (SKILLS / "commit" / "SKILL.md").read_text(encoding="utf-8")
@@ -1812,7 +1887,7 @@ PWSH = POWERSHELLS[0] if POWERSHELLS else None
 class TheRunDirectoryIsOutsideTheAuditedTree(unittest.TestCase):
     """This skill's central promise is that it never writes into the code it is reading.
 
-    Both safety checks compared how a path is SPELLED. A symlink, a bind mount or a `..`
+    Comparing how a path is SPELLED is not enough. A symlink, a bind mount or a `..`
     segment can spell a path outside the tree and resolve inside it, and the whole report
     then lands in the user's source.
     """
@@ -2050,7 +2125,7 @@ class ThePushAsksTheRemoteNotItsLocalCopy(unittest.TestCase):
 
     A branch deleted or rewound elsewhere leaves that ref still matching HEAD, so the guard
     decides the work is already published, skips the push, and the phase is ticked with
-    nothing on the remote. Every one of the four push sites asked the local copy.
+    nothing on the remote. So every one of the four push sites asks the remote.
     """
 
     def _guards(self):
@@ -2131,8 +2206,9 @@ class TheV1WindowsNoteAndResumeAreComplete(unittest.TestCase):
     """Two places in the superseded suite where a partial statement changes what happens.
 
     Its commit-and-push block carries four decisions. The adapter note for a native-Windows
-    shell — the one place a reader is told to reimplement the block — listed two, and the two
-    it left out are the guards that stop every phase being pushed to the default branch.
+    shell — the one place a reader is told to reimplement the block — must name all four,
+    and the two easiest to leave out are the guards that stop every phase being pushed to
+    the default branch.
 
     And its resume reads "Tasks and Tests ticked, Exit Criteria not" as ungated work. The
     bookkeeping step ticks those criteria ONE AT A TIME, so a crash inside it leaves some
@@ -2181,7 +2257,7 @@ class ShippedTextSaysWhatTheCodeDoes(unittest.TestCase):
     def _norm(self, *parts):
         # Blockquote markers are stripped first. Half of what these check lives inside `>`
         # quotes, and a sentence wrapped across two quoted lines keeps a `>` in the middle
-        # of it — which is how one of these passed while checking nothing.
+        # of it — which lets a check pass while checking nothing.
         text = (SKILLS.joinpath(*parts)).read_text(encoding="utf-8")
         return " ".join(re.sub(r"(?m)^\s*>\s?", "", text).split())
 
@@ -2237,7 +2313,7 @@ class ShippedTextSaysWhatTheCodeDoes(unittest.TestCase):
 
 
 class PlanRunsOwnDocumentsAgreeWithEachOther(unittest.TestCase):
-    """Six statements in `plan-run` that its own neighbours, adapters or code contradict."""
+    """Six statements in `plan-run` that its own neighbors, adapters or code contradict."""
 
     def _plan_run(self, *parts):
         text = (SKILLS / "plan-run").joinpath(*parts).read_text(encoding="utf-8")
@@ -2311,16 +2387,16 @@ class PlanRunsOwnDocumentsAgreeWithEachOther(unittest.TestCase):
 
 
 class PlanInitAndDemoVideoKeepTheirPromises(unittest.TestCase):
-    """Three promises whose mechanism was somewhere else, or nowhere."""
+    """Three promises, each checked against the text that has to keep it."""
 
     def _norm(self, *parts):
         text = SKILLS.joinpath(*parts).read_text(encoding="utf-8")
         return " ".join(re.sub(r"(?m)^\s*>\s?", "", text).split())
 
     def test_the_index_step_keys_on_the_path_not_the_slug(self):
-        """The Overview promises a row for any plan under `plans/`. Step 7 skipped unless
-        Steps 2 and 5 had generated a slug, so `plans/custom/plan.md` — under `plans/`, and
-        perfectly linkable — got none."""
+        """The Overview promises a row for any plan under `plans/`, so Step 7 keys on the
+        plan's path, not on whether Steps 2 and 5 generated a slug: `plans/custom/plan.md`
+        has no generated slug and still gets a row."""
         text = self._norm("plan-init", "SKILL.md")
         if "Step 2 and Step 5 generated a `<slug>`" in text:
             self.fail("Step 7 still decides on whether a slug was generated, so a plan the "
@@ -2336,8 +2412,8 @@ class PlanInitAndDemoVideoKeepTheirPromises(unittest.TestCase):
 
     def test_the_tour_spec_records_what_the_subtitles_need(self):
         """`subtitles.md` derives timing from each step's start and duration, citing the
-        tour spec. The spec's `step()` had a comment where the recording should be, and
-        cited `subtitles.md` back."""
+        tour spec. A spec whose `step()` holds a comment where the recording should be, and
+        cites `subtitles.md` back, gives the timing no source."""
         spec = self._norm("demo-video", "references", "guided-tour-spec.md")
         for token in ("duration", "push"):
             if token not in spec:
@@ -2424,7 +2500,8 @@ class TheSafetyChecksSurviveTheirOwnFixes(unittest.TestCase):
 
     def test_the_comment_claims_only_what_pwd_p_resolves(self):
         """`pwd -P` resolves pathname links. A bind mount is not a link, and claiming it is
-        covered is the same class of defect these commits were fixing."""
+        covered is the same class of defect as the others in this class: a containment check
+        that claims more than it checks."""
         text = " ".join(self.DOC.read_text(encoding="utf-8").split())
         window = text[text.index("Compared by WHERE IT LEADS"):][:500]
         if "bind mount" in window and "NOT covered" not in window:
@@ -2597,7 +2674,8 @@ class TheMaintainersGuideNamesNothingThatWasRenamed(unittest.TestCase):
     # not `routed` -- so it is a real run value, and belongs in the vocabulary the guide may
     # quote, but never in the table.
     UNITS_STAGE_CONSTANTS = ("READING_STAGE", "VERIFICATION_STAGE", "CLUSTERED_STAGE",
-                             "SYNTHESIZED_STAGE", "REPORTED_STAGE")
+                             "MERGED_STAGE", "MERGE_CHECKED_STAGE", "SYNTHESIZED_STAGE",
+                             "REPORTED_STAGE")
     STAGE_CONSTANTS = UNITS_STAGE_CONSTANTS + ("ROUTED_STAGE",)
 
     @classmethod
@@ -2643,6 +2721,9 @@ class TheMaintainersGuideNamesNothingThatWasRenamed(unittest.TestCase):
         """
         engine, driver = self.modules["engine"], self.modules["driver"]
         return (set(driver._SUBCOMMANDS) | set(driver.OUTCOMES) | set(driver.ROUNDS)
+                # The engine stage each round closes with, which is a subcommand the loop
+                # runs; `merge-check` is the one spelled with a hyphen.
+                | {stage for _kinds, stage in driver.ROUNDS.values()}
                 | {driver.ADJUDICATED, driver.RESOLVED, driver.DECIDED,
                    driver.ORPHAN_CLAIM, driver.RUNNING, driver.UNCERTAIN}
                 | {engine.UNIT_COMPLETE, engine.UNIT_FAILED, engine.UNIT_MISSING}
@@ -2652,7 +2733,7 @@ class TheMaintainersGuideNamesNothingThatWasRenamed(unittest.TestCase):
 
     # ---- the direction that catches a name the guide INVENTS --------------------
     # The checks above ask whether a value the code has appears in the guide, which cannot
-    # fail on a name the code never had: replacing every `plan` with `plna` left them all
+    # fail on a name the code never had: replacing every `plan` with `plna` leaves them all
     # green. These three ask the opposite question, of whatever the guide happens to quote,
     # so they hold without anyone extending a list.
 
@@ -2668,8 +2749,8 @@ class TheMaintainersGuideNamesNothingThatWasRenamed(unittest.TestCase):
     def test_every_constant_name_the_guide_quotes_resolves(self):
         """The same shape for the public constants — `ROUNDS`, `UNIT_MISSING`, the rest.
 
-        Two characters is enough to be one: at a three-character floor an invented `OK`
-        passed, and no real constant is helped by the extra letter.
+        Two characters is enough to be one: a three-character floor lets an invented `OK`
+        pass, and no real constant is helped by the extra letter.
         """
         unresolved = [token for token in sorted(self.quoted)
                       if re.fullmatch(r"[A-Z][A-Z0-9_]+", token)
@@ -2743,7 +2824,7 @@ class TheMaintainersGuideNamesNothingThatWasRenamed(unittest.TestCase):
     # ---- the enumerations, each bound to the namespace it claims --------------------
     # Asking whether a word occurs SOMEWHERE in the source is too weak for a list that
     # claims to BE a namespace: a stage called `routing`, a command called `preview` and a
-    # dialect key `ruby` all passed that way, because each word is in the source doing some
+    # dialect key `ruby` all pass that way, because each word is in the source doing some
     # other job. Each check below pins its list to the real namespace instead, and fails
     # first if its anchor sentence has gone — a span that matches nothing must not read as
     # a list with nothing wrong in it.

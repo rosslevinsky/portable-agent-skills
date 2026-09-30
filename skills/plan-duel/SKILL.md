@@ -21,13 +21,14 @@ description: >
 
 _Classification: Degraded — the duel runs from **either** runtime as controller with
 the other runtime as participant (both directions are implemented), but every LLM
-judgment point is now a subprocess, so two hard prerequisites apply. (1) **Both**
+judgment point is now a subprocess, so three hard prerequisites apply. (1) **Both**
 runtimes' CLIs must be present on `PATH` — the three roles span the controller's own
 CLI (Agent A and the judge) as well as the participant's; the engine resolves all
 three via `shutil.which` and halts naming any that are missing. (2) A **Python
 3.10+** interpreter must be available to run the engine (`plan_duel.py`); on absence
-or an older interpreter the skill reports `Python 3.10+ required` and stops. The
-controller and participant CLIs are supplied as argv **data** by the adapter blocks
+or an older interpreter the skill reports `Python 3.10+ required` and stops. (3) The
+**`diff-review` skill**, installed beside this one: its `review_runner.py` launches every
+role. The controller and participant CLIs are supplied as argv **data** by the adapter blocks
 below — no runtime name is hardcoded in the engine._
 
 _Progress: observable via a run-level `progress.log` in the workdir — a single,
@@ -88,6 +89,11 @@ does not directly compare two already-written `plan.md` files as separate inputs
   nothing rather than a wasted Plan A, and no manual pre-flight step is needed. On a
   resume the check runs before any cleanup, so a missing CLI never destroys existing
   artifacts; replaying a finished duel's `summary.md` needs no CLI at all.
+- **The `diff-review` skill, installed beside this one.** Its `review_runner.py` launches and
+  supervises every role. If that skill is unavailable the engine stops before it creates a
+  workdir or runs a role, and names it; there is no equivalent to substitute, since the
+  engine has no launcher of its own. Install it beside this one, or pass
+  `--supervisor <path to its review_runner.py>`.
 
 ---
 
@@ -168,7 +174,7 @@ the engine substitutes), a `stdout` capture mode (`file` = the CLI writes its
 artifact directly; `clean-last-message` = the engine captures only the CLI's final
 message), an optional `cwd` anchor, and the `placeholders` the command uses.
 
-**No role pins a model** — that choice is the runtime's, and a pinned label goes stale.
+**The adapters below pin no model** — a pinned label goes stale. See "Choosing a model".
 
 **Every role states its file permission explicitly — never inherit the runtime's default.**
 `agent_a` and `agent_b` are contractually required to write a plan file, so each command
@@ -192,12 +198,12 @@ against a scratch workdir, not a tree you are relying on.
 
 **A sandbox mode alone does not cover every write path.** The sandbox governs the
 model's *shell commands* — under `-s read-only` a shell redirect fails with
-`Read-only file system` (verified). But a runtime's built-in patch/edit tool is not a
-shell command, so it is gated by the **approval policy** instead: with approvals left at
-their default a `-s read-only` spawn still wrote a file, and the same spawn wrote nothing
-once `approval_policy=never` was pinned (both verified). So a sandboxed command states
-both — the sandbox bounds the shell, the approval policy bounds the edit tool. Together
-they are what confine that runtime's writing agent to the workdir.
+`Read-only file system`. But a runtime's built-in patch/edit tool is not a shell
+command, so it is gated by the **approval policy** instead: with approvals left at their
+default a `-s read-only` spawn can still write a file, and the same spawn writes nothing
+once `approval_policy=never` is pinned. So a sandboxed command states both — the sandbox
+bounds the shell, the approval policy bounds the edit tool. Together they are what confine
+that runtime's writing agent to the workdir.
 
 A default-inherited permission is what breaks first, which is why the writing roles never
 inherit one: the default depends on whether the user has marked that directory trusted,
@@ -282,17 +288,53 @@ companion is missing or malformed halts up front, before any plan is generated.
 > **Adapter note — why the judge stays read-only while still producing a file.** The
 > sandbox governs the *model's* shell commands; `--output-last-message` is written by the
 > CLI process itself, so the judge can be denied write access and still land
-> `judge-round-⟪round⟫.md` (verified end-to-end). That is the intended pairing, not an
-> oversight: it enforces the judge prompt's "do not create, write, or edit any file"
-> instruction at the process level.
+> `judge-round-⟪round⟫.md`. That is the intended pairing, not an oversight: it enforces the
+> judge prompt's "do not create, write, or edit any file" instruction at the process level.
 > The Claude-adapter judge reaches the same posture by a different flag: `--permission-mode
 > plan` is that CLI's read-only mode, refusing the edit tools outright rather than declining
-> to grant them. Both halves verified — a spawn under it told to create a file creates
+> to grant them. Both halves hold — a spawn under it told to create a file creates
 > nothing, and a judge spawn still returns its schema-conforming verdict, because that reply
 > is the CLI's own final message, not a tool call.
 > If a future CLI version ever routes its last-message write through the sandbox, the judge
 > would fail with no output — the fix is to widen that one role to `workspace-write`, since
 > the file it writes is inside the workdir.
+
+### Choosing a model
+
+A role may carry three more fields. `model` is the model it runs, and `⟪model⟫` in its
+command is where the engine puts it — the engine refuses either one without the other.
+`env` holds literal settings for the role's environment, such as a provider's address;
+`env_from_parent` forwards a credential by name, mapping the variable the CLI reads to the
+one your shell holds the key in — names on both sides, never a key. Each is an object of
+variable name to string. A role sent to another provider supplies that provider's
+credential and blanks any key the CLI would otherwise send there.
+
+When both sides run on one CLI, give `--controller-name` and `--participant-name` different
+values that name the models: the final plan files are named after them, and names that match
+are refused. `summary.md` reports each side's model from its `model` field. For
+example, `agent_b` of the Claude adapter moved to a provider, run with `--controller-name
+Claude` and `--participant-name Claude-<model-b>`:
+
+```json
+{
+  "command": ["claude", "-p", "⟪prompt⟫", "--model", "⟪model⟫", "--permission-mode", "acceptEdits", "--allowedTools", "Bash Write", "--add-dir", "⟪workdir⟫"],
+  "stdout": "file",
+  "placeholders": ["prompt", "workdir", "model"],
+  "model": "<model-b>",
+  "env": {"ANTHROPIC_BASE_URL": "<provider address>", "ANTHROPIC_API_KEY": ""},
+  "env_from_parent": {"ANTHROPIC_AUTH_TOKEN": "<variable holding your provider key>"}
+}
+```
+
+Or name a `backend` from your backends file (`~/.portable-agent-skills/backends.json`, or
+where `PORTABLE_AGENT_SKILLS_BACKENDS` points). The role then runs that backend's model; a
+`model` the role also states must match it. Put `⟪backend_args⟫` in the command, as an argument
+of its own, where the backend's `args` go. The backend's settings reach the CLI. Before the first launch the engine refuses
+a backend written for another CLI and a forwarded variable that is unset in your shell.
+
+A resume cannot change who plays a role whose output it keeps: a changed CLI, `model`,
+`backend` (or what its entry in the backends file says), `env` value or `env_from_parent`
+name is refused, naming the role. Any other change to a command, such as an added flag, resumes.
 
 ### Other runtimes
 

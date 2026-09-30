@@ -1,0 +1,1 @@
+{"build": {"answer": "yes", "argv": ["python3", "-m", "compileall", "-q", "."], "cwd": ".", "exit_status": 0, "output": "", "truncated": false}, "tests": {"answer": "yes", "argv": ["python3", "-m", "unittest", "discover"], "cwd": ".", "exit_status": 1, "output": "FAILED (errors=1)\n", "truncated": false}, "summary": "Compiles; the suite runs and its one test fails to import."}

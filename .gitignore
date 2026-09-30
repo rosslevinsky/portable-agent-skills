@@ -16,20 +16,20 @@ __pycache__/
 # the directory holds whole extra copies of this repository — transient tool state, exactly
 # like __pycache__, and never something to commit.
 #
-# It is ignored because whole-tree checks were reading it and could not be trusted while it
-# existed. `git ls-files --others --exclude-standard` reports each nested checkout as a
-# single directory entry, which a caller expecting file paths then tries to open and dies
-# on with IsADirectoryError. The privacy sweep walked into them and reported hundreds of
-# violations out of those checkouts' own fixtures — a guard nobody can read is off.
-# (The sweep also now skips untracked files outright; this rule is what keeps them out of
-# a listing in the first place, and the two are not substitutes.)
+# It is ignored because a whole-tree check cannot be trusted while it can see them.
+# `git ls-files --others --exclude-standard` reports each nested checkout as a single
+# directory entry, which a caller expecting file paths then tries to open and dies on with
+# IsADirectoryError. A privacy sweep that walks into them reports those checkouts' own
+# fixtures as violations by the hundred — a guard nobody can read is off. (The sweep also
+# skips untracked files outright; this rule is what keeps them out of a listing in the
+# first place, and the two are not substitutes.)
 .claude/worktrees/
 
-# Claude Code's per-user local settings, written automatically beside the tracked
-# settings.json and filled with absolute home-directory paths and per-machine permission
-# grants. Every contributor to this repository is an agent user, so this is the likeliest
-# accidental commit here — and its contents are precisely what the validator's privacy
-# sweep exists to keep out of a published tree. Only the local override is ignored.
+# Claude Code's per-user local settings, written automatically and filled with absolute
+# home-directory paths and per-machine permission grants. In a repository an agent works
+# in, this is the likeliest accidental commit — and its contents are precisely what the
+# validator's privacy sweep exists to keep out of a published tree. Only the local
+# override is ignored.
 .claude/settings.local.json
 
 # Playwright / web-verify + demo-video artifacts (heavy; reference by path/CI-URL,
@@ -66,13 +66,17 @@ plans/**/runs/
 # This rule protects a file you CREATE. It does not untrack one already committed: git
 # applies .gitignore to untracked paths only. That asymmetry is deliberate — a project that
 # already tracks such a file goes on tracking it, while the copy you write in your own clone
-# stays invisible to git. Verified in both directions before this line was written.
+# stays invisible to git.
 #
 # Start from scripts/private-identifiers.txt.example.
 scripts/private-identifiers.txt
 
 # A dated review note left at the root by a session, for a human to read later. Ignored
-# because `--manifest-closure` counts every path git reports as untracked-but-not-ignored,
-# so a note left here turns the gate red until somebody classifies a file nobody ships.
-# Anchored to the root, so it cannot swallow anything nested.
+# because it is a working note, not source, so nothing that lists untracked files has to
+# account for it. Anchored to the root, so it cannot swallow anything nested.
 /OPEN-PROBLEMS-*.md
+
+# Provider API keys. The pack reads keys only from the environment; a `keys.env` (or
+# `keys.ps1`) that a user sources from their shell must never be committed, wherever it lands.
+keys.env
+keys.ps1

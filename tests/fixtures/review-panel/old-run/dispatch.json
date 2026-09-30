@@ -1,0 +1,1 @@
+{"rung": "two-runtimes", "lanes": {"A": {"adapter": "runtime-one sub-agent", "permission": "read-only"}, "B": {"adapter": "runtime-two command line", "permission": "read-only sandbox"}}}

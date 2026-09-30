@@ -2,23 +2,30 @@
 
 `report` is the last stage and the only one that reads the dispatcher's record. **It** is
 what writes `findings.json`, from everything the stages before it left in the run directory
-— one record per candidate, one per cluster, one per area clustering touched, and the
-synthesis round's own record where that round ran — renders `report.md`
-from that structure, and converts that file into `report.html`. The page is the prose in
+— one record per candidate, one per site (a cluster: the reports of one mistake at one
+place), one per defect (one mistake, with the sites where it has to be fixed), one per area
+clustering touched, and the merge, merge check and synthesis rounds' own records where those
+rounds ran — renders `report.md` from that structure, and converts that file into `report.html`. The page is the prose in
 another format, not a second report written beside it: nothing decides what the page says
 except what the report already said, so the two cannot disagree about a **fact**. The page
 carries one thing the prose does not — a contents list — and that is navigation rather than
-a fact, added by the conversion the way ids and back-links already are. All three land in
-the run directory, from what is already there: `job.json`, `job-notes.json` where the
-interview left one, `report-notes.json` where the operator wrote one, `inventory.json`,
-`areas.json`, `units.json`, `candidates.json`, every verification, clustering and synthesis unit's
-`result.json` or `error.txt`, `dispatch.json`, and `snapshot/`, which is where the source
-quoted beside each established defect is read from. Nothing else: no clock, no absolute
+a fact, added by the conversion the way ids and back-links already are. Beside them it
+writes the **fix brief** — `fix-brief.md`, the same records as `fix-brief.json`, and one
+`fix-brief/D<n>.md` for each defect not refuted and each test to write — which keeps only
+what an agent needs to fix each one and leaves out every refuted site. It does not carry the
+operator's notes: a site the operator marked as mistaken is in the fix brief as the run left
+it. A run reported before the fix brief existed gets one from `--rerender`. All of it lands
+in the run directory, from what is
+already there: `job.json`, `job-notes.json` where the interview left one,
+`report-notes.json` where the operator wrote one, `inventory.json`, `areas.json`,
+`units.json`, `candidates.json`, every verification, clustering, merge, merge check and
+synthesis unit's `result.json` or `error.txt`, `dispatch.json`, and `snapshot/`, which is where the source
+quoted at each established site is read from. Nothing else: no clock, no absolute
 path, so two runs over one tree write byte-identical files whatever order their units landed
 in.
 
 The synthesis round is **optional**, and `report` is where that shows: the document is
-always grouped by status, and a round that came back with a usable answer adds its tiers as
+always grouped by where each defect is placed, and a round that came back with a usable answer adds its tiers as
 a level inside those sections. A round whose unit was written adds no tiers unless a
 usable result landed, and the appendix names that unit and says what the grouping is
 instead. A unit with neither a result nor an error beside it is recorded as
@@ -33,10 +40,11 @@ The round itself writes only its unit and the listing beside it; its answer reac
 document is a pure function of the run directory and not of anything the round did while it
 ran — one answer, one reader.
 
-It runs once. Any of the three already present is a refusal, because somebody may have
+It runs once. Any of its outputs already present is a refusal, because somebody may have
 annotated what the first run wrote; `--rerender` is how you say you meant it, and it
-replaces only those three and refuses anything else in their way. All three publish
-together — a failure puts back the state the call found. The exit code says whether
+replaces only its own outputs — every `D<n>.md` in `fix-brief/` included, so none is left
+from an earlier grouping — and refuses anything else in their way. They publish together —
+a failure puts back the state the call found. The exit code says whether
 execution completed — `0` for the documents written, `2` for a refusal — and never whether
 the tree is clean.
 
@@ -45,6 +53,38 @@ verdict becomes one, what each section holds and what the stage refuses are all 
 where they are enforced, in the engine and in the schemas the payloads carry. What is
 written down here is the one file the engine cannot produce and the one instruction it
 cannot carry out.
+
+## What the document holds
+
+It opens by saying what the two numbers are — a **defect** (`D1`, …) is one mistake, a
+**site** (`S1`, …) one place where it has to be fixed — and counts both: defects by
+placement, sites by outcome, and the candidates behind them. A defect is placed under
+Established when any of its sites is, under Refuted only when all are, and under Unresolved
+otherwise; every site keeps its own outcome. Coverage gaps are counted by site, as the
+coverage sections list them. Where the grouping or the narrative falls short of a finished
+run — no merge yet, a merge or check reply not used, a synthesis that failed or refused an
+entry, a run directory written before sites — a line at the top says which. The limits of
+the run follow, then the operator's notes, then the two indices: every defect not refuted,
+ranked by worst severity, then cheapest fix, then fewest sites, and every file with its sites
+and their defects. Refuted defects are under **Refuted**.
+
+Then the defects, under **Established defects**, **Unresolved** and **Refuted**, each by tier.
+A defect of one site is one compact entry: its heading, one line naming the site, its
+account, fix and related defects, its first test, what would settle it where it is
+unresolved, and its quoted source. A defect of several sites gives its account once, a
+table with one row per site (outcome, severity, what is particular to it, its test), and
+the quoted source at each site, or why none is quoted. Without a synthesis account, a
+defect of several sites shows the mechanism the merge check upheld.
+
+**Evidence** follows, one entry per site in site order, headed by its number, location,
+outcome and defect. It holds every line the site's readers and checkers recorded, as a
+defect of that one site rendered it before sites existed, less exactly these: the defect's
+account; the line giving the full path and the commit, stated once at the top; the quoted
+source, the first test and what is not settled, which the defect entry shows; a clustering
+note on a site the merge put in a defect of several, moved to the appendix; and a block
+another site already printed, replaced by a pointer to that site. The appendix lists each,
+with the mechanism every defect of several sites was merged on, the sites the check took
+out, the compound sites and their second claims, and the record of the run.
 
 ## `dispatch.json`
 
@@ -58,24 +98,32 @@ is refused by name, and nothing is defaulted:
 {
   "rung": "two-runtimes",
   "lanes": {
-    "A": {"adapter": "fresh sub-agents of the driving runtime", "permission": "read-only"},
+    "A": {"adapter": "fresh sub-agents of the driving runtime", "permission": "read-only",
+          "model": "model-a-v1"},
     "B": {"adapter": "the other runtime's command line under the read-only supervisor",
-          "permission": "read-only sandbox to read; verification in a disposable copy with write"}
+          "permission": "read-only sandbox to read; verification in a disposable copy with write",
+          "model": "model-b-v1"}
   }
 }
 ```
 
-- `rung` is `two-runtimes` or `one-runtime` — the two rungs the skill declares, and which
-  one a record names follows the configuration the run was planned against, which is pinned
-  and cannot change under it. There is no third: a run where one context was both finder
-  and verifier satisfies none of what a status on the page means, and the driver refuses
-  such a run rather than recording a weaker rung for it.
+- `rung` is `two-runtimes`, `one-runtime-two-models`, `two-runtimes-one-model` or
+  `one-runtime` — the four rungs the skill declares, and which one a record names follows
+  the configuration the run was planned against, which is pinned and cannot change under it. There is no fifth: a run where one
+  context was both finder and verifier satisfies none of what a status on the page means,
+  and the driver refuses such a run rather than recording a weaker rung for it.
 - `lanes` has exactly `A` and `B`; each records `adapter` (the runtime and the mechanism
   that ran the lane's units, in the dispatcher's words) and `permission` (the containment
   it actually applied). Both are free text on purpose: the engine cannot verify a sandbox,
-  so it renders the claim verbatim rather than a vocabulary it could not check.
-- One cross-check ties the rung to the lanes: `two-runtimes` claims two models, so both
-  lanes naming one adapter is refused. `one-runtime` is checked no further, and a record
+  so it renders the claim verbatim rather than a vocabulary it could not check. Each may
+  also record `model`, which `one-runtime-two-models` and `two-runtimes-one-model` require
+  and the other two do not, so a run directory written before the field existed still
+  re-renders.
+- Cross-checks tie the rung to the lanes, comparing models by name as written:
+  `two-runtimes` claims two runtimes and two models, so both lanes naming one adapter, or
+  one model, is refused; `one-runtime-two-models` is refused where both lanes record one
+  model; and `two-runtimes-one-model` is refused where the adapters match or the models
+  differ. `one-runtime` is checked no further, and a record
   naming it with two adapters is accepted: the engine renders what it is given and cannot
   know what ran. The report then claims only what that rung allows.
 
@@ -89,7 +137,7 @@ things the block says outright that it cannot supply, along with a fresh run dir
 sentence to keep honest is that one, not a claim of reproducibility from the page alone.
 
 Printing the JSON is the point: the report is what gets sent on, and an instruction naming
-`job.json` names a file that is not travelling with it. `root` is the one field substituted, by
+`job.json` names a file that is not traveling with it. `root` is the one field substituted, by
 the literal `/absolute/path/to/the/tree`, which keeps the page down to a single absolute path.
 Note that this is a well-formed absolute path: a job pasted back unedited is *accepted* and then
 fails on the missing tree, rather than being refused on the field — one clause of warning is
@@ -176,8 +224,8 @@ leave two runs' counts incomparable; the corrected ids are named beside them ins
 `findings.json` does not carry the notes, and no finding is edited.
 
 The engine only reads this file, and `--rerender` never replaces it. A correction names a
-defect by id, and ids come from clustering: after a re-clustered run, check each id still names
-the defect you meant before re-rendering.
+defect by id, and ids come from the grouping the merge check accepted: after a redo, check each
+id still names the defect you meant before re-rendering.
 
 ## Handing the report to the owner
 
@@ -189,6 +237,11 @@ Read `report.md` against the job. Then, before saying anything to the owner:
    reason, and a caveat for anything the owner should know about the run as a whole. All of it
    goes in `report-notes.json`, not in the conversation. With none of the three, write no file.
 2. Run `<python> <this skill's dir>/review_panel.py report <rundir> --rerender`.
-3. Point the owner at `report.md` by path, with a line or two: the rung, the counts by status,
-   and what the notes answer or correct. Never inline a snapshot file, an evidence block or a
-   payload: the report is the record, and what you say is the pointer to it.
+3. Point the owner at both outputs by path, with a line or two: `report.md`, for a person to
+   read and audit — the rung, the counts by status, and what the notes answer or correct —
+   and `fix-brief.md`, for an agent to fix from — the whole brief to one agent, or one
+   `fix-brief/D<n>.md` per agent, on the tree the review read: the commit the brief names,
+   plus any uncommitted changes the review saw. Say which
+   defects your notes correct, since the brief does not carry them. Never inline a snapshot
+   file, an evidence block or a payload: the report is the record, and what you say is the
+   pointer to it.

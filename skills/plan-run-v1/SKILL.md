@@ -114,21 +114,20 @@ decides where you re-enter:
 
   Not 3h whole. Its commit is **not** a no-op here: the only way to reach this branch is
   for 3i to have been interrupted after ticking an Exit Criterion, so `git add -A` stages
-  that tick and `git diff --staged --quiet` is false. Measured, the else arm then creates a
-  second commit carrying nothing but the tick, under the phase's own message ("Add schema
-  migration") — and anything else dirty in the tree with it, since the text had just said
-  the commit would do nothing. The paragraph below says as much: dirty bookkeeping is
-  *expected* at this point.
+  that tick and `git diff --staged --quiet` is false. The else arm then creates a second
+  commit carrying nothing but the tick, under the phase's own message ("Add schema
+  migration") — and anything else dirty in the tree with it. The paragraph below says as
+  much: dirty bookkeeping is *expected* at this point.
 
 Dirty *bookkeeping* proves nothing either way and is expected at this point: a phase-document
 status or an Exit Criteria tick written just before the crash is exactly what 3i writes.
 
 **The third branch names three sections rather than saying "everything".** Entry Criteria are
 a fourth section of boxes and nothing here ever ticks them — 3b *confirms* they are true,
-which is not the same edit. So "everything ticked" described a state a completed phase never
-reaches; and because the first branch asks only about Task and Test boxes, a finished phase
-matched no branch at all and the ladder ran out of instructions exactly where it was meant to
-resume.
+which is not the same edit. So "everything ticked" would describe a state a completed phase
+never reaches; and because the first branch asks only about Task and Test boxes, a finished
+phase would match no branch at all and the ladder would run out of instructions exactly where
+it is meant to resume.
 
 ### 3b — Check entry criteria
 
@@ -402,9 +401,8 @@ unclear, `git restore --staged` those paths so the index holds only plan bookkee
 not gate them and do not commit them. `git add -A` sweeps whatever else was dirty, and
 committing it publishes someone else's change under this plan's message.
 
-**What stops is that work, not this step.** Measured on the v2 counterpart, whose wording
-here was the same: a fresh reader given this arm and one ambiguously-owned file staged,
-unstaged, and stopped, leaving the bookkeeping commit unmade — the loss the paragraph above
+**What stops is that work, not this step.** A reader who unstages one ambiguously-owned
+file and then stops leaves the bookkeeping commit unmade — the loss the paragraph above
 exists to prevent, reached by obeying it. Withholding the tracker over some *other* file's
 ownership trades a question anyone can answer for the one thing a teammate pulling `origin`
 needs.

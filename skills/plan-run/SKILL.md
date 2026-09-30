@@ -85,24 +85,41 @@ run everything yourself, always. Whether workers then run *concurrently* is a **
 decision, settled by the isolation bound above and by nothing else — collapse the two and
 "parallelize when it's big" fans concurrent writers over shared state.
 
+**How a worker starts, and which way it ran.** An in-process sub-agent runs the host's own
+model, so no backend applies to it. A worker launched as a program goes through the supervisor
+the `diff-review` skill ships, `review_runner.py`, where `--backend <name>` picks its model and
+credentials from the user's backends file. If `diff-review` is not installed beside this skill
+and the host has no in-process sub-agent, both are unavailable: run the phase in this context.
+Do the same when the supervisor reports a status other than `ok`, and record its reason. The
+phase's evidence record says which path ran: the supervisor (with the backend's name and model,
+or the CLI's own sign-in), an in-process sub-agent, or this context.
+
 > **Claude adapter:** dispatch a phase with the Agent tool (subagent_type general-purpose),
 > passing the worker's brief — the three input paths, the progress file's path, this skill, **and the result contract from
 > `references/phase-worker-contract.md`**, which a general-purpose sub-agent does not load on
 > its own — and read the result from the sub-agent's final message; in-harness there is no
 > flag that can enforce its shape.
 > **Codex adapter:** in an interactive session spawn a per-phase worker agent
-> conversationally; autonomously (no user available), script it per phase with `codex exec -s workspace-write -c
+> conversationally; autonomously (no user available), launch it per phase through the
+> supervisor, where `<diff-review dir>` is that skill's installed directory:
+> `<python> <diff-review dir>/review_runner.py --cwd <dir> --deadline <s> --idle <s>
+> --result-mode external-file --findings <file> -- codex exec -s workspace-write -c
 > approval_policy=never -C <dir> --output-schema <this skill>/references/phase-worker-schema.json
 > --output-last-message <file> "<the worker's brief — the three input paths, the progress file's path, this skill, and the result
-> contract from references/phase-worker-contract.md>" < /dev/null`, which does enforce it.
+> contract from references/phase-worker-contract.md>"`, which does enforce it. `--findings`
+> and `--output-last-message` are one absolute path that does not exist yet. Size
+> `--deadline` to the phase and `--idle` no lower: the supervisor's defaults stop a worker after
+> fifteen minutes with no output, or thirty in all, and a worker may print nothing for as long
+> as it runs. For a backend, add
+> `--backend <name>` before the `--` and `-m ⟪model⟫ ⟪backend_args⟫` after `exec`.
 > **The brief is that trailing positional argument.** It is spelled out because the
 > paragraph below says the prompt is already in argv, and a template with nowhere to put it
 > reads as though the flags alone were the command — dispatching a worker with no brief at
 > all, which fails for reasons that point nowhere near the missing prompt. Those two permission
-> flags are **not** optional, and neither is the redirect: `codex exec` reads stdin even
-> when the prompt is already in argv, so a scripted call that leaves stdin open blocks
-> before it reaches the model — a hang with no output to diagnose it by. Close stdin
-> however the shell spells it (`< /dev/null`; `$null |` in PowerShell).
+> flags are **not** optional, and neither is a closed stdin: `codex exec` reads stdin even
+> when the prompt is already in argv, so a worker whose stdin is left open blocks before it
+> reaches the model — a hang with no output to diagnose it by. The supervisor launches it
+> with stdin closed.
 
 > **Live progress (non-blocking).** A worker's tool output is buffered and opaque until it
 > returns, so a long phase can look stalled. Create a per-phase append-only progress file —
@@ -162,8 +179,9 @@ If `execution.md` does not exist, stop and tell the user:
 **Then confirm the tracker is the checkbox shape** — it carries no format marker, so the
 shape is what you check. Two refusals, both loud:
 
-- A tracker written as `- phase:` entries is a **superseded shape**. Stop and report: "this
-  plan's tracker is a superseded `- phase:` record and cannot be run by this skill."
+- A tracker whose entries are `- phase:` lines rather than checkboxes is **not a shape this
+  skill reads**. Stop and report: "this plan's tracker is a `- phase:` record, not
+  checkboxes, and cannot be run by this skill."
 - A tracker with **no checkbox lines at all** is malformed, not finished. Stop and report
   it; never read zero boxes as *all phases complete*.
 
@@ -257,12 +275,11 @@ and branch 3 ends at a `git add -A` that commits it unverified.
      alone**, the way branch 1 scopes to what is dirty. When it lands, run **Publish's push
      block alone** — not the whole of Publish, whose finalization commit is already made and
      which would otherwise add a second one carrying nothing but a tick. (The v1 suite
-     states this outright, having measured that second commit; v2 ended the branch without
-     naming a continuation and inherited the default. Named rather than cited: an installed
-     skill is self-contained and cannot reach a sibling skill's file.) Never re-run
-     Work whose box is already ticked: an unscoped return either does nothing and lands you
-     back here, or repeats an action Satisfy's repeat guard does not cover, because that
-     guard is scoped to *unchecked* items. Do not read that as "everything is ticked" — the
+     states the same rule; it is named here rather than cited, because an installed skill
+     is self-contained and cannot reach a sibling skill's file.) Never re-run Work whose
+     box is already ticked: an unscoped return either does nothing and lands you back here,
+     or repeats an action Satisfy's repeat guard does not cover, because that guard is
+     scoped to *unchecked* items. Do not read that as "everything is ticked" — the
      box that put you here may not be, and the section above exempts post-publish boxes too.
      If the scoped push runs and still no round appears, **stop and report** rather than
      returning here a second time.
@@ -471,7 +488,8 @@ blocker/major.
 
 **Then fill the phase's evidence record** — the phase's **outcome** (shipped / partial /
 skipped and what it delivered, the line `as-built.md` reads), the changed surface, the
-verification commands and their outcomes, deviations (including the doc-vs-reality
+verification commands and their outcomes, how the phase ran (the supervisor with a backend
+or the CLI's own sign-in, an in-process sub-agent, or this context), deviations (including the doc-vs-reality
 corrections made in Satisfy), and any non-blocking follow-ups. Reference frames, screenshots and reports **by path or CI URL only**;
 never inline a heavy artifact and never commit one. This record is what a human reads and what
 `as-built.md` is assembled from — the independent review reads the diff, not this.
@@ -711,9 +729,9 @@ those paths to the user after it. Do not gate them and do not commit them. Only 
 affirmative "this plan owns it" licenses the gate; unclear is not a yes, here for the same
 reason it is not one in branch 1.
 
-**What stops is that work, not this step.** Measured: a fresh reader given this arm and one
-ambiguously-owned file staged, unstaged, and stopped, leaving `as-built.md` uncommitted —
-the loss the paragraph above exists to prevent, reached by obeying it. Withholding the drift
+**What stops is that work, not this step.** A reader who unstages one ambiguously-owned
+file and then stops leaves `as-built.md` uncommitted — the loss the paragraph above exists
+to prevent, reached by obeying it. Withholding the drift
 report over some *other* file's ownership trades a question anyone can answer for the one
 thing a teammate pulling `origin` needs. Then reuse Publish's empty-diff guard and its
 destination check.

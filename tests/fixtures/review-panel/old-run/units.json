@@ -1,0 +1,268 @@
+{
+  "lanes": [
+    "A",
+    "B"
+  ],
+  "stage": "reported",
+  "units": [
+    {
+      "area": "area-01",
+      "id": "area-01-A1",
+      "kind": "reader",
+      "lane": "A",
+      "lens": "bottom-up from the code",
+      "payload": "units/area-01-A1/payload.md",
+      "payload_bytes": 11798,
+      "payload_lines": 225,
+      "schema": "units/area-01-A1/schema.json"
+    },
+    {
+      "area": "area-01",
+      "id": "area-01-B1",
+      "kind": "reader",
+      "lane": "B",
+      "lens": "top-down from the contract",
+      "payload": "units/area-01-B1/payload.md",
+      "payload_bytes": 12034,
+      "payload_lines": 228,
+      "schema": "units/area-01-B1/schema.json"
+    },
+    {
+      "area": "area-02",
+      "id": "area-02-A1",
+      "kind": "reader",
+      "lane": "A",
+      "lens": "bottom-up from the code",
+      "payload": "units/area-02-A1/payload.md",
+      "payload_bytes": 11646,
+      "payload_lines": 217,
+      "schema": "units/area-02-A1/schema.json"
+    },
+    {
+      "area": "area-02",
+      "id": "area-02-B1",
+      "kind": "reader",
+      "lane": "B",
+      "lens": "top-down from the contract",
+      "payload": "units/area-02-B1/payload.md",
+      "payload_bytes": 11882,
+      "payload_lines": 220,
+      "schema": "units/area-02-B1/schema.json"
+    },
+    {
+      "area": "area-03",
+      "id": "area-03-A1",
+      "kind": "reader",
+      "lane": "A",
+      "lens": "bottom-up from the code",
+      "payload": "units/area-03-A1/payload.md",
+      "payload_bytes": 11641,
+      "payload_lines": 216,
+      "schema": "units/area-03-A1/schema.json"
+    },
+    {
+      "area": "area-03",
+      "id": "area-03-B1",
+      "kind": "reader",
+      "lane": "B",
+      "lens": "top-down from the contract",
+      "payload": "units/area-03-B1/payload.md",
+      "payload_bytes": 11877,
+      "payload_lines": 219,
+      "schema": "units/area-03-B1/schema.json"
+    },
+    {
+      "area": "area-03",
+      "id": "audit-area-03-A",
+      "kind": "auditor",
+      "lane": "A",
+      "lens": null,
+      "payload": "units/audit-area-03-A/payload.md",
+      "payload_bytes": 12046,
+      "payload_lines": 219,
+      "schema": "units/audit-area-03-A/schema.json"
+    },
+    {
+      "area": "area-03",
+      "id": "audit-area-03-B",
+      "kind": "auditor",
+      "lane": "B",
+      "lens": null,
+      "payload": "units/audit-area-03-B/payload.md",
+      "payload_bytes": 12046,
+      "payload_lines": 219,
+      "schema": "units/audit-area-03-B/schema.json"
+    },
+    {
+      "area": null,
+      "id": "probe-A",
+      "kind": "probe",
+      "lane": "A",
+      "lens": null,
+      "payload": "units/probe-A/payload.md",
+      "payload_bytes": 9871,
+      "payload_lines": 191,
+      "schema": "units/probe-A/schema.json"
+    },
+    {
+      "area": "area-01",
+      "asks": "defect",
+      "candidates": [
+        "cand-003",
+        "cand-007",
+        "cand-009"
+      ],
+      "finder": "A",
+      "id": "verify-area-01-A",
+      "kind": "verifier",
+      "lane": "B",
+      "lens": null,
+      "payload": "units/verify-area-01-A/payload.md",
+      "payload_bytes": 18888,
+      "payload_lines": 344,
+      "routing": "raised by lane A in area-01; addressed to the other lane, B, which raised none of these",
+      "schema": "units/verify-area-01-A/schema.json"
+    },
+    {
+      "area": "area-01",
+      "asks": "coverage",
+      "candidates": [
+        "cand-005"
+      ],
+      "finder": "A",
+      "id": "verify-area-01-A-coverage",
+      "kind": "verifier",
+      "lane": "B",
+      "lens": null,
+      "payload": "units/verify-area-01-A-coverage/payload.md",
+      "payload_bytes": 16047,
+      "payload_lines": 303,
+      "routing": "coverage gaps raised by lane A in area-01; addressed to the other lane, B, which raised none of these; asked whether any test in scope constructs the input, not whether the code is wrong",
+      "schema": "units/verify-area-01-A-coverage/schema.json"
+    },
+    {
+      "area": "area-01",
+      "asks": "defect",
+      "candidates": [
+        "cand-004",
+        "cand-006",
+        "cand-008"
+      ],
+      "finder": "B",
+      "id": "verify-area-01-B",
+      "kind": "verifier",
+      "lane": "A",
+      "lens": null,
+      "payload": "units/verify-area-01-B/payload.md",
+      "payload_bytes": 18712,
+      "payload_lines": 338,
+      "routing": "raised by lane B in area-01; addressed to the other lane, A, which raised none of these",
+      "schema": "units/verify-area-01-B/schema.json"
+    },
+    {
+      "area": "area-02",
+      "asks": "defect",
+      "candidates": [
+        "cand-002"
+      ],
+      "finder": "A",
+      "id": "verify-area-02-A",
+      "kind": "verifier",
+      "lane": "B",
+      "lens": null,
+      "payload": "units/verify-area-02-A/payload.md",
+      "payload_bytes": 18199,
+      "payload_lines": 320,
+      "routing": "raised by lane A in area-02; addressed to the other lane, B, which raised none of these",
+      "schema": "units/verify-area-02-A/schema.json"
+    },
+    {
+      "area": "area-02",
+      "asks": "defect",
+      "candidates": [
+        "cand-001"
+      ],
+      "finder": "B",
+      "id": "verify-area-02-B",
+      "kind": "verifier",
+      "lane": "A",
+      "lens": null,
+      "payload": "units/verify-area-02-B/payload.md",
+      "payload_bytes": 18184,
+      "payload_lines": 320,
+      "routing": "raised by lane B in area-02; addressed to the other lane, A, which raised none of these",
+      "schema": "units/verify-area-02-B/schema.json"
+    },
+    {
+      "area": "area-01",
+      "asks": "defect",
+      "candidates": [
+        "cand-003",
+        "cand-004",
+        "cand-006",
+        "cand-007",
+        "cand-008",
+        "cand-009"
+      ],
+      "id": "cluster-area-01",
+      "kind": "clusterer",
+      "lane": "A",
+      "lens": null,
+      "payload": "units/cluster-area-01/payload.md",
+      "payload_bytes": 10174,
+      "payload_lines": 194,
+      "schema": "units/cluster-area-01/schema.json"
+    },
+    {
+      "area": "area-01",
+      "asks": "coverage",
+      "candidates": [
+        "cand-005"
+      ],
+      "id": "cluster-area-01-coverage",
+      "kind": "clusterer",
+      "lane": "B",
+      "lens": null,
+      "payload": "units/cluster-area-01-coverage/payload.md",
+      "payload_bytes": 8658,
+      "payload_lines": 149,
+      "schema": "units/cluster-area-01-coverage/schema.json"
+    },
+    {
+      "area": "area-02",
+      "asks": "defect",
+      "candidates": [
+        "cand-001",
+        "cand-002"
+      ],
+      "id": "cluster-area-02",
+      "kind": "clusterer",
+      "lane": "A",
+      "lens": null,
+      "payload": "units/cluster-area-02/payload.md",
+      "payload_bytes": 8963,
+      "payload_lines": 158,
+      "schema": "units/cluster-area-02/schema.json"
+    },
+    {
+      "area": null,
+      "defects": [
+        "D1",
+        "D2",
+        "D3",
+        "D4",
+        "D5",
+        "D6",
+        "D7"
+      ],
+      "id": "synth-A",
+      "kind": "synthesizer",
+      "lane": "A",
+      "lens": null,
+      "payload": "units/synth-A/payload.md",
+      "payload_bytes": 13787,
+      "payload_lines": 274,
+      "schema": "units/synth-A/schema.json"
+    }
+  ]
+}

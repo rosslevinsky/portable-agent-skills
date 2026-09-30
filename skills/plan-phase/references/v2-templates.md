@@ -77,17 +77,17 @@ independent review reads the diff, not this._
 ~~~
 
 That is the whole document: **under 350 words of structure before any work goes into it.**
-Everything cut from earlier versions was cut for one of three reasons.
+Anything more is left out for one of three reasons.
 
-- **It restated a box above it.** "Every task above is checked off", "all tests pass", "all
-  verification commands pass" — a summary box is true exactly when the boxes it summarises
-  are, so it adds a second record to keep in step and nothing else.
-- **It was circular.** "This phase's box is ticked in `execution.md`" cannot be true when
-  `plan-run` reads the document to decide whether to tick that box.
-- **It was boilerplate the phase did not need.** A universal "prior phase completed" entry
-  box duplicates the tracker's ordering; a UI or CI criterion on a phase with neither is a
-  box nobody can tick; a suggested commit message is written better at commit time, from the
-  Goal and the evidence, than guessed at breakdown time.
+- **It would restate a box above it.** "Every task above is checked off", "all tests
+  pass", "all verification commands pass" — a summary box is true exactly when the boxes
+  it summarizes are, so it adds a second record to keep in step and nothing else.
+- **It would be circular.** "This phase's box is ticked in `execution.md`" cannot be true
+  when `plan-run` reads the document to decide whether to tick that box.
+- **It would be boilerplate the phase does not need.** A universal "prior phase completed"
+  entry box duplicates the tracker's ordering; a UI or CI criterion on a phase with neither
+  is a box nobody can tick; a suggested commit message is written better at commit time,
+  from the Goal and the evidence, than guessed at breakdown time.
 
 **No status line and no field block.** The checkboxes *are* the status, at finer grain than
 any word: a partly-ticked document is what "in progress" means, and it is what a resumed run
@@ -105,9 +105,9 @@ own Work pushes a different repository is not gated by this one's round. A crash
 waiting leaves that box unticked, so a resumed run re-checks the round instead of treating
 the phase as finished.
 
-**A ticked phase document in an older shape is a finished record.** Never re-emit or
-revalidate one to match this template: its boxes are ticked, its work is settled, and its
-filled "Review Packet" is the same evidence this template now calls **Evidence**.
+**A ticked phase document in another shape is a finished record.** Never re-emit or
+revalidate one to match this template: its boxes are ticked, its work is settled, and an
+evidence section headed "Review Packet" is read as this template's **Evidence**.
 `as-built.md` assembles from both without translation.
 
 ---

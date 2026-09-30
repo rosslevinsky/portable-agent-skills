@@ -97,16 +97,15 @@ reconstructing the bytes from the payload's declared inputs. The run directory s
 the same line: a worker reads its own payload, its own schema and the snapshot, and nothing a
 sibling unit produced. Dispatch should enforce that, rather than the report claiming it.
 
-**Declined — the boundary is not enforceable on any dispatch line here.** Measured, with a
-marker planted in one reader unit's landed result and each dispatch line pointed at it from
-the working directory it is given. The read-only sandbox returned the file in a handful of
-milliseconds with no approval: that mode bounds what a worker may **write**, and says nothing
-about what it may read. The command-line worker given an explicit list of directories
-returned it too, and said in its own reply that the file lay outside every directory it had
-been handed and that nothing had blocked the read — that flag widens a working set rather
-than denying what is outside it. A fresh sub-agent of the driving runtime returned it on its
-first tool call; a sub-agent inherits its parent's file access, and there is no boundary
-between them to begin with.
+**Declined — the boundary is not enforceable on any dispatch line here.** Each dispatch line
+can read another unit's landed result from the working directory it is given. The read-only
+sandbox allows it with no approval: that mode bounds what a worker may **write**, and says
+nothing about what it may read. The command-line worker given an explicit list of
+directories can read it too, although the file lies outside every directory it was handed —
+that flag widens a working set rather than denying what is outside it. A fresh sub-agent of
+the driving runtime can read it on its first tool call; a sub-agent inherits its parent's
+file access, and there is no boundary between them to begin with. Planting a marker file in
+one unit's result and asking each dispatch line for it shows all three.
 
 Moving the bytes does not help. Holding each result outside the run directory until the round
 closes relocates them, and a worker that can read the whole file system can read where they
@@ -122,8 +121,8 @@ it contains**, and nothing more: what lies in the worker's own working directory
 files, so the failure that destroys a run — unrelated material sitting where the report is
 written and read as though it were part of the job — cannot happen by accident.
 
-It is not a guarantee about what a worker can reach. The measurement above is unrestricted
-reads, and the run directory holds a copy of the job, which names the audited root: a worker
+It is not a guarantee about what a worker can reach. Reads are unrestricted, as above, and
+the run directory holds a copy of the job, which names the audited root: a worker
 that wanted the real repository's refs could open them directly, and the same is true of
 another run's artifacts anywhere on the host. Two things are open, then, and both are stated
 rather than papered over: within one run a worker is not separated from its siblings, and
@@ -146,7 +145,7 @@ which is shorter and easier to act on for it.
 one of them leaves nothing. Split what should have been merged and a reader sees one defect
 written up twice, notices the repetition and moves on. Merge what should have been split and
 one description stands where two were — worse, and the reason the brief spends most of its
-length on identity — but both candidates are still in the run, in one cluster, each with its
+length on identity — but both candidates are still in the run, in one site, each with its
 own verdict beside it. Judge wrongly here and a finding a reader raised and a stranger
 confirmed leaves the report with nothing to say that it was ever there — not a line, not a
 count that fails to add up. Its result would still be on disk in the run directory, which is
@@ -162,17 +161,82 @@ the findings are worth, which nothing so far does. Even then the answer is an or
 rather than a deletion: what the run thinks is noise sits at the end, where it is still
 there to be counted and argued with.
 
-## The engine starts no worker, and that survived a driver being built
+## A defect is one mistake, and the site is where the evidence lives
 
-**Proposed.** A Python program drives every round now, so the reason to keep workers out of
-the engine has gone with the hand loop that needed it. Fold the loop back in: one program,
-one place to look, and no boundary to explain.
+**Proposed.** One mistake copied into several places shows up as several defects, each with
+its own heading, account, fix and test, and a reader has to discover that they are one
+problem. Cluster the whole run at once instead of each area on its own, or join any two
+findings that look alike, and give the joined defect one status.
+
+**Declined, in favor of two levels.** A **site** is what clustering produces: the reports of
+one mistake at one place. It is still built per area, which is what bounds each clustering
+payload, and a file belongs to one area, so a site never spans areas. A **defect** is one
+mistake with one or more sites, and it may span areas. Everything a reader or a checker
+established stays on the site — location, quoted source, evidence, verdicts, status,
+corroboration, severity and the test that should fail first — computed from that site's own
+candidates and copied, never re-derived from what a later round said. A defect's status is
+a placement and nothing more: under Established if any site is, under Refuted only if all
+are, otherwise Unresolved, always shown with the count at each outcome. One status for the
+whole group would let an established site vouch for a refuted one.
+
+**The grouping is a claim, so the other lane checks it.** No verifier ever said that two
+sites are the same mistake: every verdict is about one site. One merge unit, on the first
+lane, reads a compact record of every site and proposes groups, stating the shared mechanism
+once and how each site instantiates it. A unit on the other lane then judges every site of
+every group of two or more against that stated mechanism, site by site. Only the sites it
+upholds stay; a group left with fewer than two dissolves; a site it says carries a second
+claim leaves. The engine proves an exact partition of the sites, refuses a group mixing a
+defect with a coverage gap, and refuses any defect of several sites that no accepted check
+covers. A reply that fails a check is discarded whole, as a clustering reply is, and a check
+that never lands accepts no group: either way every site that reply covered becomes its own
+defect and the report says so. Where a round was batched, that is one batch's sites; the
+other batches' groups stand. Sites are grouped only as the unit grouped them, never by a chain of
+pairwise likeness, because A resembling B and B resembling C is not one mistake.
+
+**A compound site stays apart.** A finding carries its reader's report whole, and one that
+asserts two mistakes makes a site asserting both. Folding it into the defect for one of
+them hides the other under an account and a fix that do not mention it. So the merge names
+such a site and keeps it in a group of its own, the engine refuses a reply that puts one in
+a group of several, and the check's question about a hidden claim catches one the merge
+missed.
+
+**The reader's one-mistake rule is not enforced, and that is enough.** The reader brief says
+each finding is one mistake and two problems at one place are two findings. Nothing checks
+it. A reader that ignores it produces a compound site, and the two nets above keep that site
+out of any group, so the cost is a mistake written up twice rather than a claim lost.
+Enforcing the rule would mean splitting findings into single claims before verification,
+which changes the reader's schema, routing and verification together.
+
+**The merge round and the merge-check round both have ceilings, checked when they are planned, and they decide batching.**
+The merge's input is batched to 4,000 lines and 400 KB (`MERGE_CEILING`), its reply to
+64 KB estimated at 256 bytes a site; the check's input to 6,000 lines and 400 KB
+(`MERGE_CHECK_CEILING`), its reply to 64 KB at 384 bytes a checked site. A single site or
+group larger than a ceiling on its own still goes, in a batch of its own, and the reply
+figure is an estimate the plan uses, not a size the engine measures. All of these are
+batching estimates with headroom, not measured model limits. Over the merge's ceiling the
+sites are split into batches by directory and merged within each,
+and the report says merges across batches were not attempted: a large run loses the
+cross-batch merges rather than all of them, which skipping the round would. The check
+batches by group and never splits one, because half a group checked is a different claim.
+
+A size cap on a defect is not among the guards. One mistake copied twelve times is one
+defect of twelve sites, and a small group can be wrong; the check is what decides.
+
+**What would change it.** Findings split into single claims before they are verified, which
+would make every site assert one thing and retire the compound-site rule. And a real run
+reaching either ceiling, which would give its value a measurement rather than a margin.
+
+## The engine starts no worker, even with a driver beside it
+
+**Proposed.** A Python program drives every round, so nothing is left that needs workers
+kept out of the engine. Fold the driver's loop into it: one program, one place to look, and
+no boundary to explain.
 
 **Declined, and the boundary is narrower than it looks.** Three reasons commonly given for
 it are not reasons, and saying so is most of what this entry is for.
 Runtime neutrality does not require it — the adapter file supplies that, and the driver
-names no product anywhere. Spawning nothing did not keep the engine small; it is the same
-order of magnitude as the sibling that spawns, and which is larger has already changed once.
+names no product anywhere. Spawning nothing does not keep the engine small; it is the same
+order of magnitude as the sibling that spawns, and today it is the larger of the two.
 And dispatch inside the engine would not cost the report its determinism, because the report
 is a pure function of run-directory data whatever started the workers.
 
@@ -203,9 +267,10 @@ stops spending a heading on something nobody will act on.
 
 **Declined.** The same rule as the clustering unit's, one stage later, and the argument is
 the same argument with more to lose. A defect reaching this round has been raised by a
-reader, PUT to a stranger that did not raise it, and merged into a cluster under a proof
-that no candidate was dropped. Three stages have been built to make sure a finding cannot
-quietly disappear. A fourth that could delete one would undo all of it at the last step, and
+reader, PUT to a stranger that did not raise it, grouped into a site under a proof that no
+candidate was dropped, and into a defect under a proof that no site was. Four stages have
+been built to make sure a finding cannot quietly disappear. A fifth that could delete one
+would undo all of it at the last step, and
 at the step where the least evidence remains: the round is handed no status and no severity,
 so the thing it would be deleting is a defect it cannot see the standing of. So the
 assignment is proved a partition of exactly the ids the round was handed before it is
@@ -236,10 +301,9 @@ index again.
 
 **Declined for now, and the shape of the growth is why.** The payload is the brief, the
 problem statement and the inline schema — a **fixed part that does not grow at all** — plus
-the defect index and the per-defect detail. Measured over the suite's standard fixture, the
-fixed part is the large majority of a small run's payload, and the index holds a **steady
-sixth** of the part that does vary, at every size from three defects to three hundred,
-because an index entry and a defect's own detail block both grow with the count.
+the defect index and the per-defect detail. The index holds a **roughly constant share**
+of the part that does vary, whatever the defect count, because an index entry and a
+defect's own detail block both grow with the count.
 
 **One unit therefore grows linearly, and the index can never crowd out the detail it sits
 beside.** Splitting the round into `k` units makes each carry the whole index again, so the
@@ -277,11 +341,12 @@ one whose two defects share no file. Having checked those, print the connection 
 document already says these two defects are related.
 
 **Declined — the check is narrower than the claim, and the report says so.** What the engine
-can see for itself is that the id resolves and that the two defects touch a file in common.
+can see for itself is that the id resolves and that the two defects touch a file in common or
+sit under one tier.
 What the prose asserts is that the two are related **in the way it says** — the same
 mechanism at two sites, one causing or masking the other, one fix that has to account for
 both. Nothing in this run establishes that. Confirming it would need a stage that read both
-defects and the code around them, which is a fifth round and does not exist. So a surviving
+defects and the code around them, which is a round of its own and does not exist. So a surviving
 reference is **checked, not verified**, and the sentence at the top of the body that marks
 the round's prose as one agent's reading covers the references too. A reference the check
 refuses is dropped and named, so a reader can see what was refused rather than only what was
@@ -327,10 +392,10 @@ brief, one schema, one ladder.
 failure real?* answers correctly about a missing test every time: it is not one. A gap
 asserts nothing about the code being wrong — a branch can be perfectly correct today and
 have nothing guarding it, which is usually why nobody noticed the test was absent. Run
-through the defect brief, every gap came back `refuted`, and `refuted` is rendered under a
-heading that tells the reader nothing beneath it is work. Real, named, missing tests were
-filed as dismissed claims, which is not a rendering problem: the pipeline asked the wrong
-question and then believed the answer.
+through the defect brief, a gap is liable to come back `refuted`, and `refuted` is rendered
+under a heading that tells the reader nothing beneath it is work, so real, named, missing
+tests would be filed as dismissed claims. That is not a rendering problem: the defect
+question is the wrong one to ask of a gap.
 
 So the statuses are the gap's own — the branch exists and no test in scope builds the input,
 or a named test does, or nothing could tell — and the engine refuses each set on the other's
@@ -350,19 +415,22 @@ including one whose only test arrives through `also_read`. It is the same agent 
 same question, and more areas asking it finds more gaps.
 
 **Declined.** A gap would then be raised twice, from two directions, by two units that
-cannot see each other — and the clustering round cannot merge them, because clusters never
-span areas. Two entries for one missing test, in two sections, with nothing in the report
-saying they are the same thing. Ownership is the rule that makes the round total without
+cannot see each other — and clustering cannot make them one site, because a site never spans
+areas. The merge round may put the two sites in one defect, since a defect can span areas,
+but that is a claim it is free not to make and the other lane is free to refuse; left
+apart, they are two entries for one missing test, in two sections, with nothing in the
+report saying they are the same thing. Ownership is the rule that makes the round total without
 making it overlap: the auditor sits where the tests are, and follows a test to a subject
 another area owns through the `also_read` list its readers already carry.
 
-**What would change it.** Clusters that may span areas, which is a change to the closure
-proof rather than to this round — every candidate belongs to exactly one area today, and
-that is what makes the batch key total.
+**What would change it.** Sites that may span areas, which is a change to the closure
+proof rather than to this round — every candidate belongs to exactly one area, and that is
+what makes the batch key total. Defects spanning areas do not reach it: a defect joins
+sites, it does not make two findings about one place into one.
 
 ## The file that would settle a claim is a field, not a sentence to be parsed
 
-**Considered:** leaving the unresolved reason as it was — the verifier names the file in its
+**Considered:** leaving the file inside the unresolved reason — the verifier names it in its
 rationale — and having the report read those rationales to build the table of what one more
 file would settle. No schema change, no new field, and the information is already written
 down.
@@ -381,13 +449,13 @@ shape of the field and not the decision to have one.
 
 ## An abbreviated quotation is a quotation, and the ends are what is checked
 
-**Considered:** requiring a reader to quote the whole of a cited range, which is what the
-comparison had always demanded, and dropping the schema's permission to abbreviate a long
+**Considered:** requiring a reader to quote the whole of a cited range, which is what an
+exact comparison demands, and dropping the schema's permission to abbreviate a long
 one to its first and last lines.
 
 **Declined.** A forty-line citation would then carry forty lines into a payload that is
 already the largest thing a reader is handed, and the permission exists because of that. The
-comparison was simply behind the schema, and a warning raised on every abbreviated
+comparison follows the schema instead, and a warning raised on every abbreviated
 quotation is a warning nobody acts on — which costs the ones that are real, since they sit
 among them.
 
@@ -491,7 +559,7 @@ that is the moment to do it.
 
 The weakness is sharpest where a file stem is an ordinary word — a `run.py` is linked by any
 test whose text contains `run`. It is bounded by "mentioned in a test in scope", which is far
-tighter than the rule this replaced, where every file in an area was the auditor's business.
+tighter than making every file in an area the auditor's business.
 
 **What would change it.** A job that states the links, which is what subject mode already is.
 
@@ -524,22 +592,24 @@ other, that no clustering round would know to merge.
 
 A misplaced finding costs itself and the unit lands with the rest, by the same rule as a
 location outside the snapshot. The auditor answered; one finding in the wrong file is not
-grounds for discarding the thirty beside it.
+grounds for discarding the others beside it.
 
-**What would change it.** Nothing about the auditor. A clustering round that could merge
-across areas would remove the duplication argument, and it would still leave the bounding
-argument standing.
+**What would change it.** Nothing about the auditor. Sites never span areas, so no
+clustering round merges the two; a defect can, but only as two sites of one mistake after
+the other lane has checked it, which softens the duplication argument without removing it.
+Sites that could span areas would remove it, and would still leave the bounding argument
+standing.
 
 ## An untested file is not shown to the auditor at all
 
 **Proposed.** List every file of the area, marking which have tests, so the auditor can see
 what it is not being asked about.
 
-**Declined.** That is what produced the noise. An auditor that can see an untested file
-beside a tested one writes "no test constructs this input" about it, which is true of every
-line of a file nothing tests and is true because the file has no test rather than because of
-anything the auditor read. One area returned 72 such findings about one file, and a verifier
-then confirmed all 72 with the same sentence each time.
+**Declined.** That produces noise. An auditor that can see an untested file beside a tested
+one writes "no test constructs this input" about it, which is true of every line of a file
+nothing tests and is true because the file has no test rather than because of anything the
+auditor read. One untested file can yield dozens of such findings, and a verifier then
+confirms each with the same sentence.
 
 What a run is missing tests for is a question the report already answers from the inventory,
 where it costs no agent anything.
@@ -558,7 +628,7 @@ else is relative to the reviewed root, and a second absolute path is what the ch
 invariant exists to catch: a report is read on somebody else's machine, where the operator's
 filesystem is not information but exposure.
 
-**The printed job is where this now bites, and it is the only field substituted there.** That
+**The printed job is where this bites, and it is the only field substituted there.** That
 block exists to be pasted back to a runtime, so every other field is verbatim; `root` renders as
 a placeholder. The cost is real and small: one edit before the paste. It is also the field a
 reader would most often have had to change anyway — the tree is on their disk, at their path,
@@ -581,8 +651,8 @@ nobody can miss it.
 **Declined.** The appendix is defined as the record of the run rather than the work it found,
 and nothing in the job is needed to fix a defect — a subject-mode job runs to a screen of area
 names, file counts and per-area lenses, which is a wall between the statement and the first
-thing a reader came for. The path legend was moved out of that position for the same reason and
-by the same rule.
+thing a reader came for. The path legend sits in the appendix for the same reason and by the
+same rule.
 
 What makes it a move and not a burial is the paragraph under the statement, and that paragraph
 is the part to protect: it says the statement is one field of a job, names the section, says who

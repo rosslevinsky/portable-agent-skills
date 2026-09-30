@@ -89,9 +89,9 @@ alongside — no phase is complete until its tests pass. This ordering flows int
 emitted phase doc's Tests section (the template's test-first note is load-bearing —
 keep it). Then decide which, if any, are genuinely **independent**.
 
-**Independent phases are rare, and that is correct.** Almost every phase executed so far
-has been a single sequential unit. Note independence when it is real; do not reach for it
-to signal that work is parallelisable in principle. The test:
+**Independent phases are rare, and that is correct.** Almost every phase is a single
+sequential unit. Note independence when it is real; do not reach for it to signal that
+work is parallelizable in principle. The test:
 
 - Phases are independent only if their affected-file sets are **disjoint** *and* none of
   them shares a surface with another. **Disjoint files is a filter, not proof of
@@ -139,8 +139,8 @@ overwrite anything. Three cases, all destructive to get wrong:
   boxes are exactly where the run resumes. Overwriting resets that progress. Ask the user
   whether to re-plan or resume; autonomously, stop and report rather than discarding
   execution state.
-- **It is a superseded `- phase:` tracker** — the directory is the finished record of a run
-  executed under an older shape. Writing fresh documents over it destroys that record.
+- **It is a `- phase:` tracker** — its entries are `- phase:` lines, not checkboxes, so the
+  directory is the finished record of a run this suite no longer drives. Writing fresh documents over it destroys that record.
   Leave it alone; start a new plan directory instead.
 - **`phase-*.md` documents with no tracker beside them at all** — an earlier run of this
   skill stopped between Step 5 and Step 6. This is the case a tracker-only guard waves

@@ -7,9 +7,9 @@ to run a review: read it to write the adapter config, and to answer a run that s
 
 The driver names no product anywhere. Each lane's command line arrives as **data** and the
 driver only renders and runs it, so the same run works under any runtime whose CLI can be
-spelled here. Permission is per unit rather than per lane — readers and clusterers read,
-while verifiers, the synthesis unit and the capability probe run builds and reproductions
-and write — so each lane declares two commands.
+spelled here. Permission is per unit rather than per lane — readers, clusterers and the
+merge and its check read, while verifiers, the synthesis unit and the capability probe run
+builds and reproductions and write — so each lane declares two commands.
 
 ```json
 {
@@ -52,9 +52,9 @@ and write — so each lane declares two commands.
 
 Lane B above takes every default.
 
-- `lanes` holds exactly `A` and `B`. `runtime`, `model`, `adapter` and both mode objects are
-  required; `slots` defaults to 2, `account` to `runtime`, and `provider_fault_patterns` to
-  none.
+- `lanes` holds exactly `A` and `B`. `runtime`, `adapter` and both mode objects are
+  required, and `model` unless a `backend` states it; `slots` defaults to 2, `account` to the
+  backend's name or else `runtime`, and `provider_fault_patterns` to none.
 - `slots` is how many of the lane's workers run at once, and it decides how long the run
   takes. The right number is the account's rate limit, so tell the owner the default and ask
   whether they want another; the preview marks a defaulted lane. A resume may change it.
@@ -65,7 +65,17 @@ Lane B above takes every default.
   months later needs: the mechanism, not just the product.
 - `account` is what an outage is counted against. Two lanes on one subscription share an
   account, and pausing one pauses both — which is correct, and the reason the key exists
-  separately from `runtime`.
+  separately from `runtime`. A lane on a backend is on that provider's account, so its
+  outage leaves a lane signed in to the same runtime running; state one `account` on both
+  where they really share a provider. A lane with `env` and no backend must state its
+  `account` where it would otherwise share one with a lane set up differently. The preview
+  names each lane's account.
+- `backend` names an entry in the user's backends file: the model, where it runs, with what
+  credentials. `env` sets variables for the lane's workers; `env_from_parent` maps one a
+  worker reads to the one here holding its value. The supervisor applies them to that lane
+  alone, and no value is written into the run. Before anything is planned, a backend must be
+  written for the program its commands launch and agree with any `model` the lane states,
+  and every forwarded variable must be set.
 - `provider_fault_patterns` are case-insensitive regular expressions matched against the
   terminal event's own error text. **The wording of a provider's refusal is the provider's
   to change**, so what counts as one lives here and never in the code. Declaring none is a
@@ -78,15 +88,22 @@ Lane B above takes every default.
   cannot verify a sandbox, so it renders the claim rather than a vocabulary it could not
   check — which means an inaccurate one is a false statement in the report.
 
-**Two lanes on one runtime naming different models is refused at startup, before anything
-is planned.** The report has one sentence for a one-runtime run and it says the candidates
-were checked by the same model, calling any disagreement a difference of context. That is
-false of two models, and it is not a two-runtime run either. Give the two lanes one model,
-or two runtimes.
+**Two lanes on one runtime naming different models run at their own rung,
+`one-runtime-two-models`, only when every command of both carries `⟪model⟫`** — the one
+proof the named model reached the worker. The report then says both models, and that the
+two shared one harness: its tools, system prompt and permission layer. Without the marker
+the configuration is refused at startup, before anything is planned.
+
+Two lanes on two runtimes naming the same model — two backends can point two runtimes at
+one — run at `two-runtimes-one-model`: the report says two sessions of one model in two
+tools, never both models.
 
 ### What the driver fills in
 
-`⟪prompt⟫`, `⟪payload⟫`, `⟪schema⟫`, `⟪input⟫`, `⟪cwd⟫`, `⟪transcript⟫`. A command using a
+`⟪prompt⟫`, `⟪payload⟫`, `⟪schema⟫`, `⟪input⟫`, `⟪cwd⟫`, `⟪transcript⟫`, and two that are
+optional: `⟪model⟫`, the lane's model, as an argument of its own or a setting's whole value
+(`model=⟪model⟫`); and `⟪backend_args⟫`, the backend's `args`, as an argument of its own on a
+lane that names a backend. A command using a
 marker the driver does not fill is refused when the config is parsed; so is one carrying
 neither `⟪prompt⟫` nor `⟪payload⟫`, which would launch a worker with nothing to do and fail
 for a reason pointing nowhere near the missing task.
@@ -101,8 +118,9 @@ which lane found what.
 
 Every attempt is launched through the supervisor the diff-review skill ships,
 found beside this one by default and overridable with `--supervisor`. The driver supplies
-`--idle`, `--deadline`, `--cwd`, `--display`, `--findings`, `--result-mode` and **both of
-the supervisor's opt-in flags**, and neither is optional here:
+`--idle`, `--deadline`, `--cwd`, `--display`, `--findings`, `--result-mode`, the lane's
+`--backend` and settings where it has them, and **both of the supervisor's opt-in flags**,
+and neither is optional here:
 
 - `--status-detail` puts the terminal event's own error text on the status line. Without it
   a quota refusal arrives as *the reviewer exited 1*, and every pending unit spends its
@@ -153,13 +171,13 @@ review_panel_run.py resolve-unit <rundir> <unit> --grant-launches <n>|--fail --r
   worker are gone. The driver cannot establish it: the supervisor detaches its worker and
   says so. Without the attestation either command refuses — `--retry` because a second
   worker would start beside a live one, `--fail` because the attempt's capacity
-  reservation would never be released, which at one slot per lane stops the lane for the
-  rest of the run. With it, `--fail` publishes the unit's error, releases the reservation,
+  reservation would stay held until a completion the worker may never write, which at one
+  slot per lane can stop the lane for the rest of the run. With it, `--fail` publishes the unit's error, releases the reservation,
   and that attempt's working copy becomes deletable.
 - `resolve-unit --fail` asks for the same attestation while the unit has an attempt nobody
   can account for, and with it fails that attempt too, each with its own record. The
-  reservation belongs to the attempt, not the unit, so a unit failed over one released
-  nothing and held its slot for the rest of the run. At the launch ceiling, where every
+  reservation belongs to the attempt, not the unit, so failing the unit alone would release
+  nothing and hold its slot until that attempt's worker completes, which may be never. At the launch ceiling, where every
   attempt is adjudicated, it asks for nothing.
 - `resolve-unit --grant-launches` is the way out of the launch-limit quarantine, which a
   unit reaches when repeated infrastructure faults — not its own answers — used up its

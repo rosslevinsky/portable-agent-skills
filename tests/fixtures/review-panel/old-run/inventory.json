@@ -1,0 +1,66 @@
+{
+  "commit": {
+    "commit": "",
+    "committed": "",
+    "dirty": null,
+    "state": "not-a-repository"
+  },
+  "context": [],
+  "coverage": {
+    "reviewed_not_tracked": [],
+    "root": "",
+    "state": "unavailable",
+    "tracked_not_reviewed": []
+  },
+  "excluded": [
+    "vendor/lib.py"
+  ],
+  "files": [
+    {
+      "bytes": 87,
+      "lines": 3,
+      "path": "README.md",
+      "sha256": "e99aff74639c41290949034facb890da9d00a47d207f5a2418b9fcf18b9c809c"
+    },
+    {
+      "bytes": 33,
+      "lines": 3,
+      "path": "docs/guide.md",
+      "sha256": "852d1a34a3336925c38b9e33a70b954d00c4888680b6ce6420328e94dbee2cde"
+    },
+    {
+      "bytes": 64,
+      "lines": 6,
+      "path": "engine/core.py",
+      "sha256": "fb960a82e2ecb475cae604ce131e9c1cb013d9e0409c4263f9593d52fd979800"
+    },
+    {
+      "bytes": 30,
+      "lines": 2,
+      "path": "engine/sub/deep.py",
+      "sha256": "d2fecc186e32b8bce535cb495939a86b518c73435d04c52fddd7092364f359c2"
+    },
+    {
+      "bytes": 30,
+      "lines": 2,
+      "path": "engine/util.py",
+      "sha256": "9809cc05d3ee2322949c691ff73d6fe9f26597a961b7322cb8854641017e3670"
+    },
+    {
+      "bytes": 25,
+      "lines": 2,
+      "path": "run.py",
+      "sha256": "1043ef52e8b2145382368acfe3244720f319f539a54f1542a9c3c857ed3d2111"
+    },
+    {
+      "bytes": 76,
+      "lines": 5,
+      "path": "tests/test_engine.py",
+      "sha256": "b97041a9c4c4bb7fe6a60241c916ded878c75d9b21010c113919820f8a9d256e"
+    }
+  ],
+  "skipped": [],
+  "source": "walk",
+  "taken": "2026-09-27 22:44:41 UTC",
+  "tree_sha256": "c46945e9d2fb9cd30c38348a247810f41edb639db0115b4367b75494900e245b"
+}

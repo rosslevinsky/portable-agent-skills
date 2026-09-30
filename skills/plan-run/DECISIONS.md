@@ -3,8 +3,7 @@
 Why parts of this skill are shaped the way they are. Nothing here is an instruction and
 nothing on the runtime path reads it: a run works from `SKILL.md` and the three references
 alone. This is for whoever proposes changing one of these rules — several of them look
-gratuitous until you know which simpler version was tried and how it failed, and each has
-been re-proposed by at least one review round since.
+gratuitous until you know which simpler version fails and how.
 
 ## Why the push check is what it is
 
@@ -67,8 +66,8 @@ no answer at all, and any other name by whichever source replied.
 
 `plan.md`'s `| Format | v2 |` row plus the tracker's filename — `execution.md`, never
 `phases.md` — is the whole v1↔v2 non-collision mechanism. A marker inside the tracker would
-decide scope from the file's *contents*, which is how a parsing bug once became a silently
-skipped check.
+decide scope from the file's *contents*, and then a bug in parsing those contents skips the
+check silently.
 
 ## Why a phase watches the round its box names
 
@@ -113,19 +112,13 @@ that never ran must not look the same on disk.
 
 ## Why the Codex worker dispatch keeps `--output-schema`
 
-It looks free to delete. Deleting it is wrong, for a reason that only shows up when measured.
+It looks free to delete. Deleting it is wrong, for a reason that does not show on the surface.
 
-Codex coerces **every** `agent_message` under that flag. A real phase worker, run twice,
-identical but for it:
+Codex coerces **every** `agent_message` under that flag, not only the last. A worker's
+narration — "the new unit test is correctly red" — comes out as complete `DONE` objects,
+including messages sent before the worker has decided what to do.
 
-```
-without   4 narration messages, then the result object
-          "The new unit test is correctly red: ModuleNotFoundError: No module named 'greet'"
-with      5 messages, all five complete DONE objects — the first claiming the phase
-          finished before the worker had decided what to do
-```
-
-So the flag destroys the work log and replaces it with four false claims of completion. That
+So the flag destroys the work log and replaces it with false claims of completion. That
 reads like a reason to drop it, and `diff-review` **does** drop it for exactly that cost: a
 reviewer's reasoning *is* its product, so coercing it destroys the deliverable.
 
@@ -136,7 +129,6 @@ in-harness. Nothing reads an intermediate one, so those false `DONE`s are unreac
 than dangerous. Nor is narration the debugging channel: that is the per-phase progress file,
 written by explicit tool actions, which coercion never touches.
 
-The asymmetry between the runtimes is measured rather than assumed, and it is why the two
-skills settle this differently. Claude keeps prose in its assistant messages and puts the
-object on a separate structured-output channel, so enforcement costs it nothing. Codex has one
-channel, and the schema takes it.
+The asymmetry between the runtimes is why the two skills settle this differently. Claude
+keeps prose in its assistant messages and puts the object on a separate structured-output
+channel, so enforcement costs it nothing. Codex has one channel, and the schema takes it.

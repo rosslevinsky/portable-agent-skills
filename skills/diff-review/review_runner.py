@@ -38,6 +38,13 @@ are opt-in rather than always-on because adding a field to the status line is a 
 every existing caller would have to absorb, and the reason for wanting them — telling a
 provider outage apart from a bad answer — belongs to one caller.
 
+**A backend chooses the agent's model.** ``--backend NAME`` reads a named entry from the
+user's backends file — which model, the harness it is written for, provider arguments and
+settings, and the names of the variables holding a key — checks it fits the program being
+launched, fills the ``⟪model⟫`` and ``⟪backend_args⟫`` markers, and gives the agent a copy of
+this process's environment with those settings merged on top. No forwarded value is written
+anywhere. With no backend and no environment flag the agent inherits the environment as is.
+
 Known limitation — native Windows batch shims: if ``shutil.which`` resolves the reviewer to
 a ``.cmd``/``.bat``, Windows runs it through the shell, which reinterprets ``%VAR%`` / ``&``
 outside Python's quoting. Prefer a non-shim executable, or run under WSL/Git-Bash.
@@ -45,10 +52,13 @@ outside Python's quoting. Prefer a non-shim executable, or run under WSL/Git-Bas
 import argparse
 import codecs
 import contextlib
+import hashlib
+import io
 import itertools
 import json
 import math
 import os
+import re
 import shutil
 import signal
 import stat
@@ -64,8 +74,8 @@ def _emit(status, **extra):
     payload = {"status": status}
     payload.update(extra)
     # FLUSHED, because stdout is block-buffered whenever it is a pipe — which is how every
-    # caller runs this — and any path that ends in `os._exit` skips the buffer entirely. The
-    # one line this program contracts to print was lost that way.
+    # caller runs this — and any path that ends in `os._exit` skips the buffer entirely,
+    # losing the one line this program contracts to print.
     print(json.dumps(payload), flush=True)
     return 0 if status == "ok" else 1
 
@@ -120,6 +130,340 @@ def _substitute_schema(cmd, schema):
     ], None
 
 
+# --- backends: which model, where, and with what credentials ------------------------------
+# A backend is a named entry in ONE user-level JSON file. It never says how an agent is
+# launched — the caller's command does that — only which model, the harness it is written
+# for, the arguments and settings that point that harness at a provider, and which variables
+# of this process carry the credential. This program is the only reader of the file: other
+# engines ask it through `--resolve-backend` rather than parsing the file a second way.
+#
+# A backend with no credential field at all is ordinary: it is the shape of the harness's own
+# sign-in and of a gateway whose helper the harness runs itself. Nothing here can tell those
+# apart from a backend that points a signed-in harness at a third party with no credential,
+# because that would mean knowing providers — so nothing here calls any backend safe.
+BACKENDS_ENV_VAR = "PORTABLE_AGENT_SKILLS_BACKENDS"
+MODEL_MARKER = f"{PLACEHOLDER_OPEN}model{PLACEHOLDER_CLOSE}"
+BACKEND_ARGS_MARKER = f"{PLACEHOLDER_OPEN}backend_args{PLACEHOLDER_CLOSE}"
+BACKEND_FIELDS = ("harness", "model", "args", "env", "env_from_parent")
+COMMENT_PREFIX = "//"
+# The suffixes a platform launcher adds to a program's name: `some-cli.cmd` is `some-cli`.
+_LAUNCHER_SUFFIXES = (".exe", ".cmd", ".bat", ".com")
+
+
+def backends_path():
+    """The user's backends file: the override variable when set, else under the home folder.
+
+    The same on every platform, beside the folders both harnesses keep their own settings in,
+    and built from `Path.home()` because nothing expands a literal `~` in a path handed to
+    Python.
+    """
+    override = os.environ.get(BACKENDS_ENV_VAR)
+    if override:
+        return Path(override)
+    return Path.home() / ".portable-agent-skills" / "backends.json"
+
+
+def harness_of(program):
+    """The harness a program name launches: its last path part, without a launcher suffix.
+
+    Case-folded, because Windows answers `Codex.EXE` for the program a POSIX box calls `codex`.
+    Both separators are split on, so a Windows path read anywhere names the same program.
+    """
+    base = program.replace("\\", "/").rsplit("/", 1)[-1]
+    stem, suffix = os.path.splitext(base)
+    if suffix.lower() in _LAUNCHER_SUFFIXES:
+        base = stem
+    return base.casefold()
+
+
+def _env_key(name):
+    """The key a variable is stored under. Windows names are case-insensitive, and
+    `os.environ` there holds them upper-cased, so `Path` and `PATH` must not become two."""
+    return name.upper() if os.name == "nt" else name
+
+
+# A variable name, and nothing else. Stricter than any platform requires, because the one
+# realistic thing typed where a name belongs is a key, and a key has a hyphen or a prefix
+# this refuses. A refused name is never quoted back: it may be that key.
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_NOT_A_NAME = ("is not a variable name (letters, digits and underscores, not starting with a "
+               "digit); it is not quoted here, in case a value was typed in its place")
+
+
+def _bad_env_name(name):
+    return not _ENV_NAME.match(name)
+
+
+def _unique_keys(pairs):
+    """`json.loads` keeps the LAST of two equal keys in silence; a backends file that names one
+    backend twice would run whichever came second. Refused instead."""
+    found = {}
+    for key, value in pairs:
+        if key in found:
+            # Unquoted: inside `env` the key may be something typed where a name belongs.
+            raise ValueError("a key is defined more than once in one object")
+        found[key] = value
+    return found
+
+
+def _validated_backend(name, entry, where):
+    """Check one backend strictly and return it with every field present.
+
+    Strings throughout and unknown keys refused, so a mistake fails here, naming the backend
+    and the field, rather than as a `TypeError` inside a spawn. Messages name fields and
+    variables and never quote a value.
+    """
+    def refuse(problem):
+        raise _Refused(f"backend {name!r} in {where}: {problem}")
+
+    if not name:
+        raise _Refused(f"{where}: a backend's name must not be empty")
+    if not isinstance(entry, dict):
+        refuse("must be a JSON object of " + ", ".join(BACKEND_FIELDS))
+    unknown = sorted(set(entry) - set(BACKEND_FIELDS))
+    if unknown:
+        refuse(f"unknown key(s) {', '.join(unknown)}; a backend has only "
+               f"{', '.join(BACKEND_FIELDS)}")
+    for field in ("harness", "model"):
+        value = entry.get(field)
+        if not isinstance(value, str) or not value.strip():
+            refuse(f"'{field}' is required and must be a non-empty string")
+    args = entry.get("args", [])
+    if not isinstance(args, list) or not all(isinstance(part, str) for part in args):
+        refuse("'args' must be a list of strings")
+    mappings = {}
+    for field in ("env", "env_from_parent"):
+        mapping = entry.get(field, {})
+        if not isinstance(mapping, dict):
+            refuse(f"'{field}' must be an object of variable name to string")
+        for child, value in mapping.items():
+            if _bad_env_name(child):
+                refuse(f"an entry in '{field}' {_NOT_A_NAME}")
+            if not isinstance(value, str):
+                refuse(f"'{field}' entry {child!r} must be a string")
+            if field == "env_from_parent" and _bad_env_name(value):
+                refuse(f"'{field}' entry {child!r}: the variable it reads {_NOT_A_NAME}")
+            if "\0" in value:
+                refuse(f"'{field}' entry {child!r} holds a NUL character")
+        mappings[field] = dict(mapping)
+    both = ({_env_key(n) for n in mappings["env"]}
+            & {_env_key(n) for n in mappings["env_from_parent"]})
+    if both:
+        refuse(f"{', '.join(sorted(both))} is set by both 'env' and 'env_from_parent'")
+    return {"harness": entry["harness"], "model": entry["model"], "args": list(args),
+            "env": mappings["env"], "env_from_parent": mappings["env_from_parent"]}
+
+
+def resolve_backend(name):
+    """Read the backends file and return the named backend, every field present.
+
+    The whole file is validated, not only the entry asked for, so a mistake in it is reported
+    the first time the file is read rather than the first time that entry is used.
+    """
+    path = backends_path()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise _Refused(
+            f"backend {name!r} was asked for, but there is no backends file at {path}. "
+            f"Create it, or set {BACKENDS_ENV_VAR} to the file you keep") from None
+    except (OSError, ValueError) as exc:
+        raise _Refused(f"the backends file {path} could not be read as UTF-8 text: "
+                       f"{type(exc).__name__}") from None
+    try:
+        document = json.loads(text, object_pairs_hook=_unique_keys)
+    except ValueError as exc:
+        raise _Refused(f"the backends file {path} is not valid JSON: {exc}") from None
+    if not isinstance(document, dict):
+        raise _Refused(f"the backends file {path} must be a JSON object mapping each "
+                       f"backend's name to its fields")
+    # JSON has no comments: a name starting `//` sets an entry aside, whatever it holds.
+    backends = {key: _validated_backend(key, entry, path) for key, entry in document.items()
+                if not key.startswith(COMMENT_PREFIX)}
+    if name not in backends:
+        defined = ", ".join(sorted(backends)) or "none"
+        raise _Refused(f"no backend named {name!r} in {path}; defined: {defined}")
+    return backends[name]
+
+
+def _contains_run(cmd, run):
+    return any(cmd[i:i + len(run)] == run for i in range(len(cmd) - len(run) + 1))
+
+
+def _setting_value(part):
+    """The value of a `key=value`, `key="value"` or `key='value'` argument, or None otherwise.
+
+    A key holds no whitespace, so a sentence in a prompt that happens to contain `=` is not
+    read as a setting.
+    """
+    key, sep, value = part.partition("=")
+    if not sep or not key or any(ch.isspace() for ch in key):
+        return None
+    # Both TOML string forms: Codex's `-c` accepts a literal string ('…') as well.
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+def _fills_model(part):
+    """Where the model marker is filled: the whole argument, or a setting's whole value.
+
+    Nowhere else, because a review prompt is an argument too and may mention the marker; the
+    reviewed text must reach the agent exactly as it was written.
+    """
+    return part == MODEL_MARKER or _setting_value(part) == MODEL_MARKER
+
+
+def _with_model(part, model):
+    if part == MODEL_MARKER:
+        return model
+    key, sep, value = part.partition("=")
+    return key + sep + value.replace(MODEL_MARKER, model)
+
+
+def backend_digest(backend):
+    """A short digest of a backend's fields, exactly as `--resolve-backend` prints them.
+
+    The engines take the same digest of the printed fields when a run begins and hand it back
+    with `--backend-digest` on every launch, so the formula here and theirs must stay the same:
+    sorted-key JSON, SHA-256, the first sixteen hex characters.
+    """
+    text = json.dumps(backend, sort_keys=True)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _apply_backend(cmd, backend, name):
+    """Fit a backend to the agent argv: check its harness, fill the two markers.
+
+    Whoever builds a command may fill the markers itself and pass `--backend` only for the
+    environment and the harness check; an argv with no markers left passes through unchanged.
+    `⟪backend_args⟫` is filled only where an argument is exactly the marker, and `⟪model⟫` only
+    where `_fills_model` says; any other mention of either is text and is left alone.
+    """
+    marked = any(_fills_model(part) or part == BACKEND_ARGS_MARKER for part in cmd)
+    if backend is None:
+        if marked:
+            raise _Refused(f"the agent argv uses {MODEL_MARKER} or {BACKEND_ARGS_MARKER} but "
+                           f"no --backend was given, so there is nothing to fill them with")
+        return cmd
+    # A backend's settings reach only the CLI it was written for. On another one they are
+    # ignored, and the agent silently runs that CLI's default provider while the run credits
+    # this backend's model.
+    launched, expected = harness_of(cmd[0]), harness_of(backend["harness"])
+    if launched != expected:
+        raise _Refused(f"backend {name!r} is written for harness {expected!r}, but the agent "
+                       f"argv launches {launched!r}. Use a backend written for {launched!r}")
+    model = backend["model"]
+    # The model marker is filled inside the backend's own args too, where a harness takes
+    # the model as one of its provider settings.
+    args = [_with_model(part, model) if _fills_model(part) else part
+            for part in backend["args"]]
+    # Args with nowhere to go would be dropped, and the agent would reach the harness's
+    # default provider. Present already as a run of the argv means the caller filled them.
+    if args and BACKEND_ARGS_MARKER not in cmd and not _contains_run(cmd, args):
+        raise _Refused(f"backend {name!r} has 'args', but the agent argv has no "
+                       f"{BACKEND_ARGS_MARKER} to put them in and does not already carry "
+                       f"them, so its provider settings would be dropped")
+    filled = []
+    for part in cmd:
+        if part == BACKEND_ARGS_MARKER:
+            filled.extend(args)
+        else:
+            filled.append(_with_model(part, model) if _fills_model(part) else part)
+    # A model that reaches no argument never ran, while the run credits it — the same silent
+    # mismatch as dropped args. It must stand as an argument or as a setting's value.
+    if not any(part == model or _setting_value(part) == model for part in filled):
+        raise _Refused(f"backend {name!r} names model {model!r}, but no argument of the agent "
+                       f"argv carries it: add {MODEL_MARKER} where the CLI takes its model")
+    return filled
+
+
+def _flag_pairs(values, flag, value_is_name):
+    pairs = []
+    for position, raw in enumerate(values or (), 1):
+        name, sep, value = raw.partition("=")
+        # Positions, never the text: a malformed pair may be a value typed in the wrong place.
+        if not sep or _bad_env_name(name) or (value_is_name and _bad_env_name(value)):
+            shape = "CHILD=PARENT" if value_is_name else "NAME=VALUE"
+            raise _Refused(f"{flag} number {position} is not {shape}")
+        if "\0" in value:
+            raise _Refused(f"{flag} number {position} holds a NUL character")
+        pairs.append((name, value))
+    return pairs
+
+
+def _launch_settings(args):
+    """Resolve `--backend` and build the agent's environment; return (backend, env).
+
+    `env` is None when there is nothing to set, so the child inherits this process's
+    environment exactly as it always has. Otherwise it is a COPY of that environment with the
+    settings merged on top: `Popen(env=...)` replaces rather than extends, and a replaced
+    environment loses PATH, and on Windows PATHEXT and SYSTEMROOT, so the CLI cannot start.
+
+    A forwarded value is read here and placed in the child's environment and nowhere else —
+    no message below quotes one.
+    """
+    name = getattr(args, "backend", None)
+    pinned = getattr(args, "backend_digest", None)
+    if pinned is not None and name is None:
+        raise _Refused("--backend-digest is given only with --backend")
+    backend = resolve_backend(name) if name is not None else None
+    # The file is read afresh on every launch, so an entry edited while a run is in progress
+    # would otherwise start this agent on another address or key under the same name. Named
+    # by the backend only: the entry's values are what a message must never quote.
+    if pinned is not None and backend_digest(backend) != pinned:
+        raise _Refused(f"the entry for backend {name!r} in the backends file changed since "
+                       f"the run pinned it, so nothing was launched. Put the entry back as "
+                       f"it was, or start a new run")
+    literal, forwarded = [], []
+    if backend is not None:
+        origin = f"backend {args.backend!r}"
+        literal += [(k, v, f"{origin} 'env'") for k, v in backend["env"].items()]
+        forwarded += [(k, v, f"{origin} 'env_from_parent'")
+                      for k, v in backend["env_from_parent"].items()]
+    literal += [(k, v, "--env")
+                for k, v in _flag_pairs(getattr(args, "env", None), "--env", False)]
+    forwarded += [(k, v, "--env-from-parent")
+                  for k, v in _flag_pairs(getattr(args, "env_from_parent", None),
+                                          "--env-from-parent", True)]
+    if not literal and not forwarded:
+        return backend, None
+    origins = {}
+    for child, _value, origin in literal + forwarded:
+        key = _env_key(child)
+        if key in origins:
+            raise _Refused(f"{child} is set by both {origins[key]} and {origin}; set it once")
+        origins[key] = origin
+    # The launching side only. The child's side is the harness's own name, normally unset in
+    # the user's shell by design; checking it would refuse every mapped backend. Empty counts
+    # as unset: an empty key fails at the provider minutes into a run instead of here.
+    # Named by the child's side and where it came from, NEVER by the launching side: a key
+    # pasted where that variable's name belongs can be shaped like a name (`fw_…`), passes the
+    # name rule, and would be printed here and copied into a review report.
+    unset = sorted({f"{child} (from {origin})" for child, parent, origin in forwarded
+                    if not os.environ.get(parent)})
+    if unset:
+        raise _Refused(f"these credentials read a variable that is not set, or is empty, in "
+                       f"this process's environment: {'; '.join(unset)}. Check the variable "
+                       f"each one names and export it before the run")
+    if os.name == "posix":
+        # A value this platform's encoding cannot carry would raise inside the spawn, quoting
+        # a character of it. Refused here by name instead.
+        for child, value, origin in literal + [(c, "", o) for c, _p, o in forwarded]:
+            try:
+                os.fsencode(child)
+                os.fsencode(value)
+            except UnicodeEncodeError:
+                raise _Refused(f"{child} from {origin} cannot be passed to the agent in this "
+                               f"platform's filesystem encoding") from None
+    env = os.environ.copy()
+    for child, value, _origin in literal:
+        env[_env_key(child)] = value
+    for child, parent, _origin in forwarded:
+        env[_env_key(child)] = os.environ[parent]
+    return backend, env
+
+
 def _is_verdict(obj):
     """True if ``obj`` is a dict carrying every required field in a usable shape.
 
@@ -166,8 +510,8 @@ def _scan_verdict(text):
     # the supervision loop has exited, so neither --idle nor --deadline bounds it.
     #
     # RecursionError is caught alongside ValueError because raw_decode recurses once per
-    # nesting level: deeply nested JSON raised straight past `except ValueError` and turned
-    # a COMPLETED review into status: error.
+    # nesting level, and deeply nested JSON raises RecursionError, which is not a
+    # ValueError. A candidate that raises it is skipped like any other that fails to decode.
     decoder = json.JSONDecoder()
     starts = [index for index, char in enumerate(text) if char == "{"]
     for index in reversed(starts[-_MAX_VERDICT_SCAN_STARTS:]):
@@ -242,8 +586,9 @@ def _reconcile_blocking_count(verdict):
 
     claimed = verdict.get("blocking_count")
     # A whole number the model spelled as 2.0 or "2" is a claim, not an absence. Read as an
-    # absence it fell past the positive-claim floor below, and a verdict saying two blockers
-    # over an empty findings list was published as 0 — what a gate reads as clean.
+    # absence it would fall past the positive-claim floor below, and a verdict saying two
+    # blockers over an empty findings list would be published as 0 — what a gate reads as
+    # clean.
     if isinstance(claimed, bool):
         claimed = None
     elif isinstance(claimed, float):
@@ -251,8 +596,9 @@ def _reconcile_blocking_count(verdict):
     elif isinstance(claimed, str):
         # `int()` decides, never `isdigit()`. "++2" survives an lstrip of the signs, "\u00b2"
         # IS a digit to Python, and a 5000-digit string is refused by the interpreter's own
-        # limit — each raised ValueError out of a review that had ALREADY SUCCEEDED, from
-        # outside every handler here, and the finished work was reported as a crash.
+        # limit. Passed by an `isdigit()` check, each would raise ValueError out of a review
+        # that has ALREADY SUCCEEDED, and the finished work would be reported as a crash;
+        # caught here, the claim is simply absent.
         try:
             claimed = int(claimed.strip())
         except ValueError:
@@ -262,8 +608,8 @@ def _reconcile_blocking_count(verdict):
 
     # Written back HERE, before any path can return. The published verdict promises an
     # integer and the equal-claim return below touches nothing — so a verdict claiming "1"
-    # beside one blocking finding agreed with itself and went out as a string, which a gate
-    # comparing numbers cannot read.
+    # beside one blocking finding would agree with itself and go out as a string, which a
+    # gate comparing numbers cannot read.
     if claimed is not None:
         verdict["blocking_count"] = claimed
 
@@ -286,8 +632,8 @@ def _reconcile_blocking_count(verdict):
         # blocking" is the rule the paragraph above records as tried and REJECTED — and it
         # contradicted its own number: two unrecognized findings, "each counted", published
         # as 1. Worse the other way, a verdict with two real blockers beside a `critical`
-        # went out as `blocking_count: 2` asserting the unknowns were included, so a human
-        # reconciling the tally fixed the two blockers and merged with the others open.
+        # would go out as `blocking_count: 2` asserting the unknowns were included, and a
+        # reader reconciling the tally would fix the two blockers and treat the rest as done.
         return (
             f"{len(unknown)} finding(s) carry an unrecognized severity ({listed}); "
             f"blocking_count could not be derived from them, so the count was floored at "
@@ -366,14 +712,14 @@ def _terminate(proc):
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
                            capture_output=True, timeout=5)
         except (OSError, subprocess.SubprocessError):
-            pass  # fall through to terminate/kill, which is what this always did
+            pass  # fall through to terminate/kill
     for hard in (False, True):
         try:
             if os.name == "posix":
                 # The GROUP id is the child's pid — start_new_session made it the leader —
                 # and never `os.getpgid`, which raises once `wait()` below has reaped that
-                # leader. It did, on the SIGTERM rung, and the SIGKILL rung then never ran
-                # while a descendant still held the inherited pipes.
+                # leader, so it could not name the group for the SIGKILL rung while a
+                # descendant still holds the inherited pipes.
                 os.killpg(proc.pid, signal.SIGKILL if hard else signal.SIGTERM)
             else:
                 if proc.poll() is not None:
@@ -402,7 +748,7 @@ def _reap_group(proc):
     the GROUP outlives the leader while it still has members. ``os.getpgid`` is unusable
     because ``poll()`` has already reaped the child.
 
-    POSIX only, and Windows is UNCHANGED by this — said plainly because the fix reads as
+    POSIX only; on Windows this does nothing — said plainly because the function reads as
     platform-neutral and is not.
     """
     if os.name != "posix":
@@ -711,10 +1057,10 @@ def _display_decoder():
 def _drain_stderr(stream, write_display, state, lock, done):
     """Tee the child's stderr to the display log; it never reaches the JSONL parser.
 
-    Its own pipe, because merging it into stdout let a warning land in the MIDDLE of a JSONL
+    Its own pipe, because merging it into stdout lets a warning land in the MIDDLE of a JSONL
     line: a pipe write above PIPE_BUF is not atomic, so the two descriptors interleave and
-    the line stops parsing. When that line was the terminal result event, a completed review
-    was reported as an error and thrown away.
+    the line stops parsing. When that line is the terminal result event, a completed review
+    is reported as an error and thrown away.
     """
     decoder = _display_decoder()
     fd = stream.fileno()
@@ -810,10 +1156,17 @@ def _open_display(path):
     kept only while `fstat` reports a regular file. O_BINARY keeps Windows from translating
     newlines underneath the text layer, which would translate them again. The caller treats
     every display step as best-effort, so failing here costs the log and nothing else.
+
+    A link at the path is never followed: a caller may name a display log inside a directory
+    the agent can write to, and a link planted there would carry the agent's output to a file
+    outside it. O_NOFOLLOW refuses one where it exists; elsewhere the name is inspected first.
     """
     flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
     flags |= getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
-    fd = os.open(path, flags, 0o600)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow and os.path.islink(path):
+        return None
+    fd = os.open(path, flags | nofollow, 0o600)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             os.close(fd)
@@ -846,7 +1199,7 @@ class _Refused(Exception):
     """A request this supervisor will not start, carrying the reason as its message."""
 
 
-def _preflight(args):
+def _preflight(args, backend=None):
     """Check the request, resolve the reviewer program, prepare the output directories.
 
     Every answer here is reached BEFORE anything is created and before any signal handler is
@@ -880,10 +1233,9 @@ def _preflight(args):
 
     # A RELATIVE output path is refused when `--cwd` is given, rather than guessed at. The
     # child is launched with `cwd=args.cwd` while the supervisor resolves these paths against
-    # its own working directory, so `--cwd /repo --findings findings.md` had the child create
-    # `/repo/findings.md` and the supervisor look in the launch directory: it reported that
-    # the reviewer wrote nothing, and a retry could then overwrite a pre-existing file
-    # without ever having checked it.
+    # its own working directory, so a relative path names two files: with `--cwd /repo
+    # --findings findings.md` the child writes `/repo/findings.md` while the supervisor reads,
+    # and checks for existence, `findings.md` in the launch directory.
     if args.cwd:
         for path, flag in ((args.findings, "--findings"),
                            (args.verdict_json, "--verdict-json"),
@@ -930,6 +1282,9 @@ def _preflight(args):
     if not cmd:
         raise _Refused("no reviewer command given")
 
+    # Before the program is resolved: the harness check reads the name the caller wrote.
+    cmd = _apply_backend(cmd, backend, getattr(args, "backend", None))
+
     cmd, schema_error = _substitute_schema(cmd, args.schema)
     if schema_error is not None:
         raise _Refused(schema_error)
@@ -937,7 +1292,7 @@ def _preflight(args):
     # PATH only — never the current directory. On Windows `shutil.which` searches CWD first,
     # mirroring cmd.exe, and this supervisor's whole job is to review a checkout it does not
     # trust: a repository carrying `codex.exe` at its root would be RUN by the tool sent to
-    # read it. An absolute or explicitly relative path stays honoured — that is the caller
+    # read it. An absolute or explicitly relative path stays honored — that is the caller
     # naming a binary, not a checkout supplying one.
     if os.path.dirname(cmd[0]):
         # ...unless `--cwd` is also given, because then "explicitly relative" names two
@@ -963,9 +1318,10 @@ def _preflight(args):
             if os.getcwd() not in search_path.split(os.pathsep):
                 # The checkout's own copy, found because Windows searches the current
                 # directory before PATH and not because anyone put it there. Search the REST
-                # of PATH rather than reporting the program missing: refusing here dropped
-                # the review to a same-model rung over a reviewer that was installed all
-                # along. The copy in the tree is still never run.
+                # of PATH rather than reporting the program missing: a missing reviewer is a
+                # launch error, which the skill falls open on to a same-model rung, and a
+                # reviewer installed on PATH should still be found. The copy in the tree is
+                # still never run.
                 exe = _which_outside_cwd(cmd[0], search_path)
     if exe is None:
         raise _Refused(f"reviewer CLI not found on PATH: {cmd[0]}")
@@ -1004,10 +1360,10 @@ class _Interrupts:
     """Cancellation: the handlers, the files this run created, and the one status line.
 
     Everything about being interrupted is here — what to terminate, what to remove, and the
-    rule that EXACTLY ONE JSON status line is printed however the run ends. That rule was
-    broken three times while it was spread across `run`: once printing nothing at all, once
-    able to print twice, and once marking itself reported before the line was out. It is one
-    object so that there is one place to get it right.
+    rule that EXACTLY ONE JSON status line is printed however the run ends. Spread across
+    `run`, that rule is easy to break three ways: printing nothing at all, printing twice, or
+    marking itself reported before the line is out. It is one object so that there is one
+    place to get it right.
     """
 
     def __init__(self):
@@ -1086,10 +1442,9 @@ class _Interrupts:
 
         EVERY exit after `arm` goes through here. Storing the payload first is what tells
         `_on_signal` the print is imminent, so it steps aside rather than exiting silently;
-        marking the run reported before the line was actually out told the handler the
-        opposite, and a signal in that window ended a finished review in silence. `finally`,
-        so a print that RAISES — a closed stdout — still leaves the caller's handlers as it
-        found them.
+        `_on_signal` reads `reported` as "the line is out" and exits without printing, so
+        `reported` is set only after the print returns. `finally`, so a print that RAISES —
+        a closed stdout — still leaves the caller's handlers as it found them.
         """
         self.payload = dict(status=status, **extra)
         try:
@@ -1184,7 +1539,7 @@ class _Stream:
                       "capture_cap": self.cap, "transcript_bytes": 0,
                       "capture_dropped": 0, "capture_truncated": False,
                       "capture_overflow": None, "display_bytes": 0,
-                      "read_error": None}
+                      "read_error": None, "raw": [], "raw_bytes": 0}
         self.lock = threading.Lock()
         self.done = threading.Event()
         self.err_done = threading.Event()
@@ -1257,7 +1612,7 @@ class _Stream:
         buf = b""
         # One decoder ACROSS chunks, because a read boundary falls wherever the bytes
         # happened to arrive — mid-character as readily as anywhere else. Decoding each
-        # chunk on its own turned one em dash into three replacement characters in the log a
+        # chunk on its own turns one em dash into three replacement characters in the log a
         # human reads. Reader-local: this thread is its only user, so it needs no lock.
         # Only the DISPLAY path needs this — the JSONL path accumulates raw bytes and
         # decodes whole lines, so a split inside a line never reaches it.
@@ -1288,6 +1643,10 @@ class _Stream:
                 with self.lock:
                     self.state["last_activity"] = time.monotonic()  # heartbeat per CHUNK, not per line
                 self.write_display(display_decoder.decode(data))
+                if self.mode == "raw-stdout":
+                    if not overflowed:
+                        overflowed = self._keep_raw(data)
+                    continue
                 if overflowed or self.mode not in ("stream-json-result-event",
                                                    "stream-transcript"):
                     continue
@@ -1328,6 +1687,24 @@ class _Stream:
             if tail:
                 self.write_display(tail)
             self.done.set()
+
+    def _keep_raw(self, data):
+        """Hold one chunk of a raw-stdout reply; return True once the reply is over the cap.
+
+        The reply is kept whole or refused: bytes dropped from either end leave a reply its
+        author did not write, with nothing in it to say so.
+        """
+        with self.lock:
+            total = self.state["raw_bytes"] + len(data)
+            if self.cap is not None and total > self.cap:
+                self.state["raw"] = []
+                self.state["capture_overflow"] = (
+                    f"the reply exceeded --max-capture-bytes ({self.cap}), and a reply is "
+                    f"never shortened")
+                return True
+            self.state["raw"].append(data)
+            self.state["raw_bytes"] = total
+        return False
 
     def watch(self, idle, deadline):
         """Poll until the reviewer exits or one of the two clocks runs out.
@@ -1521,12 +1898,43 @@ def _read_verdict_file(path, size, cap):
     return path.read_text(encoding="utf-8", errors="replace")
 
 
+def _write_reply(path, data):
+    """Write a raw-stdout reply, byte for byte, to the path this run claimed.
+
+    Bytes rather than text, so a reply that is not valid UTF-8 lands as the agent wrote it.
+    **Never through a link.** A write-capable agent can put one at the path after the claim,
+    and opening the path would follow it wherever O_NOFOLLOW does not exist (Windows),
+    truncating the file it names. So the reply goes into a new file beside the path, created
+    exclusively, and is moved over it: a move replaces a link, it never follows one.
+    """
+    folder = os.path.dirname(os.path.abspath(path))
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+    fd, temp = None, None
+    for n in range(100):
+        temp = os.path.join(folder, f".reply-{os.getpid()}-{n}.tmp")
+        try:
+            fd = os.open(temp, flags, 0o600)
+            break
+        except FileExistsError:
+            continue
+    if fd is None:
+        raise OSError(f"no free name to write the reply beside {path}")
+    try:
+        with open(fd, "wb") as fh:
+            fh.write(data)
+        os.replace(temp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temp)
+        raise
+
+
 def _route_outcome(args, status, reason, drained, exit_code, state, lock):
     """Decide the outcome from what actually arrived, and write it to ``--findings``.
 
-    The three result modes disagree about what counts as the review — a final result event,
-    the whole transcript, or a file the reviewer wrote itself — and this is the only step that
-    knows the difference. Returns the status, its reason, and the text that landed in
+    The four result modes disagree about what counts as the review — a final result event,
+    the whole transcript, a file the reviewer wrote itself, or its plain stdout — and this is
+    the only step that knows the difference. Returns the status, its reason, and the text that landed in
     ``--findings``, which is what a verdict is then extracted from.
 
     A status that arrived here already failed (an idle timeout, a deadline) is carried through
@@ -1537,10 +1945,10 @@ def _route_outcome(args, status, reason, drained, exit_code, state, lock):
     # Every write below is REVIEWER-DERIVED text, and every one takes `errors="replace"` for
     # the same reason the reads on this path do. JSON permits an unpaired `\ud800` escape and
     # Python's decoder produces the lone surrogate faithfully, so it reaches here intact. A
-    # plain `write_text` then raises `UnicodeEncodeError` — a `ValueError`, which the
-    # `except OSError` below did not catch — and a COMPLETED cross-model review was reported
-    # as an error, so the caller fell open to a same-model reviewer: the one trade the skill
-    # says must never be made. U+FFFD in one word does not compare to that.
+    # plain `write_text` then raises `UnicodeEncodeError`, which the handler below reports as
+    # `status: error` over a COMPLETED cross-model review — the outcome that sends a caller to
+    # a same-model reviewer, the one trade the skill says must never be made. With
+    # `errors="replace"` the surrogate is written as `?` instead, and the review stays ok.
     try:
         if status == "ok":
             with lock:
@@ -1610,6 +2018,14 @@ def _route_outcome(args, status, reason, drained, exit_code, state, lock):
                     Path(args.findings).write_text(
                         transcript + "\n", encoding="utf-8", errors="replace")
                     findings_text = transcript
+            elif args.result_mode == "raw-stdout":
+                with lock:
+                    data = b"".join(state["raw"])
+                if not data:
+                    status, reason = "error", "the agent printed no reply"
+                else:
+                    _write_reply(args.findings, data)
+                    findings_text = data.decode("utf-8", "replace")
             else:  # external-file: require a fresh, non-empty verdict file
                 fp = Path(args.findings)
                 try:
@@ -1629,8 +2045,9 @@ def _route_outcome(args, status, reason, drained, exit_code, state, lock):
     except (OSError, ValueError, RecursionError) as exc:
         # ValueError alongside OSError: `UnicodeEncodeError` and `UnicodeDecodeError` are
         # ValueErrors. The `errors="replace"` above should mean nothing here can raise one,
-        # but a decoding surprise landing in the module-level `except BaseException` is what
-        # turned a completed review into `status: error` once already. RecursionError for
+        # but if one does, it is caught here and reported as a named routing failure, with a
+        # transcript-mode partial kept below, rather than escaping to the module-level
+        # `except BaseException`, which reports only `unexpected: ...`. RecursionError for
         # the same reason: the verdict-only path serializes an object the decoder accepted,
         # and `json.dumps` recurses once per nesting level, so an object nested past the
         # encoder's limit is a routing failure with a name rather than an unexpected exit.
@@ -1672,7 +2089,7 @@ def _publish_verdict(args, status, verdict_unavailable, findings_text, state, lo
                 )
                 verdict_path = args.verdict_json
             # Same widening as the routing block above, and for the same reason. This one
-            # is belt to that fix's braces — `json.dumps` escapes a surrogate to ASCII, so
+            # is belt to that block's braces — `json.dumps` escapes a surrogate to ASCII, so
             # it cannot currently raise — but this write is REPORTED, never fatal, and it
             # must stay that way for every failure rather than for one kind of failure.
             # RecursionError beside the rest, for the same reason: `json.dumps` recurses
@@ -1686,7 +2103,8 @@ def _publish_verdict(args, status, verdict_unavailable, findings_text, state, lo
 
 def run(args):
     try:
-        cmd, verdict_unavailable = _preflight(args)
+        backend, child_env = _launch_settings(args)
+        cmd, verdict_unavailable = _preflight(args, backend)
     except _Refused as refusal:
         # Nothing has been created and no handler is armed yet, so a refusal is only ever
         # this one line.
@@ -1695,6 +2113,10 @@ def run(args):
     popen_kw = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     stdin=subprocess.DEVNULL,  # a reviewer that probes stdin gets EOF, never hangs
                     bufsize=0, cwd=args.cwd or None)
+    # Passed only when something is set, so a run with no backend and no environment flag
+    # launches exactly as before: the child inherits this process's environment.
+    if child_env is not None:
+        popen_kw["env"] = child_env
     if os.name == "posix":
         popen_kw["start_new_session"] = True  # own process group, for a clean group kill
     # Armed BEFORE anything is claimed, which is earlier than the child needs and exactly
@@ -1751,7 +2173,7 @@ def run(args):
         return guard.deferred(None)
 
     # The spawn window is closed by RECORDING a signal, never by blocking one. Blocking here
-    # looked right and was not: the child inherits the mask across fork and exec, so the
+    # looks right and is not: the child inherits the mask across fork and exec, so the
     # reviewer would start unable to handle the termination this supervisor later sends it,
     # and every cancellation would wait out the grace period and land as SIGKILL. Instead
     # the handler notes the signal while the child is invisible and returns, and the few
@@ -1791,7 +2213,7 @@ def run(args):
         args, status, verdict_unavailable, findings_text, stream.state, stream.lock)
 
     # The claim created this path empty to hold it. If no verdict was written into it, remove
-    # it — "no verdict" has always meant "no verdict file", and a caller that tests for the
+    # it — "no verdict" means "no verdict file", and a caller that tests for the
     # file would otherwise read an empty one as a verdict that exists. Only where this run
     # CLAIMED it, though: a verdict whose directory could not be prepared is never claimed, and
     # deleting that path anyway removes a file this program did not create, which is the one
@@ -1861,6 +2283,26 @@ def run(args):
                               if key != "status"})
 
 
+def _resolve_backend_command(head):
+    """`--resolve-backend NAME`: print one backend's fields and exit, launching nothing.
+
+    The one way another engine reads the backends file, so there is one parser of it. The
+    output keeps this program's contract of one JSON status line.
+    """
+    ap = argparse.ArgumentParser(prog="review_runner.py --resolve-backend", add_help=False)
+    ap.add_argument("--resolve-backend", required=True)
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            parsed = ap.parse_args(head)
+    except SystemExit:
+        return _emit("error", reason="--resolve-backend takes one name and no other option")
+    try:
+        backend = resolve_backend(parsed.resolve_backend)
+    except _Refused as refusal:
+        return _emit("error", reason=str(refusal))
+    return _emit("ok", backend=backend)
+
+
 def main(argv=None):
     # PIN THE ENCODING FIRST, before argparse can print anything. `--schema`'s help text
     # interpolates the ⟪…⟫ markers, so on a console that cannot represent them argparse's own
@@ -1877,7 +2319,15 @@ def main(argv=None):
             stream.reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, TypeError, ValueError, OSError):
             pass  # no reconfigure, a different signature, or a stream that refuses
-    ap = argparse.ArgumentParser(description="Supervise one cross-model review.")
+    argv = sys.argv[1:] if argv is None else list(argv)
+    # Only what precedes `--` is this program's: the agent's own argv may carry anything.
+    head = argv[:argv.index("--")] if "--" in argv else argv
+    if any(a == "--resolve-backend" or a.startswith("--resolve-backend=") for a in head):
+        return _resolve_backend_command(head)
+    ap = argparse.ArgumentParser(
+        description="Supervise one cross-model review.",
+        epilog="Alone, --resolve-backend NAME prints the named backend's fields as "
+               '{"status": "ok", "backend": {...}} and exits, launching nothing.')
     ap.add_argument("--idle", type=float, default=900.0,
                     help="idle/heartbeat timeout in seconds (kill on this much total silence)")
     ap.add_argument("--deadline", type=float, default=1800.0,
@@ -1902,10 +2352,12 @@ def main(argv=None):
                          "not already exist, like --findings, and may not name the same "
                          "path")
     ap.add_argument("--result-mode", required=True,
-                    choices=["external-file", "stream-json-result-event", "stream-transcript"],
+                    choices=["external-file", "stream-json-result-event", "stream-transcript",
+                             "raw-stdout"],
                     help="external-file: the child writes --findings itself; "
                          "stream-json-result-event: extract the final JSONL result event; "
-                         "stream-transcript: concatenate all of the reviewer's message text")
+                         "stream-transcript: concatenate all of the reviewer's message text; "
+                         "raw-stdout: the child's stdout, byte for byte, is the reply")
     ap.add_argument("--status-detail", action="store_true",
                     help="add terminal_detail to the status line: the terminal event's own "
                          "error text — its top-level message, then a nested error's "
@@ -1922,6 +2374,25 @@ def main(argv=None):
                          "than shortening the transcript in silence, whether or not it had "
                          "ended. Opt-in: without it nothing is bounded and nothing is "
                          "counted")
+    ap.add_argument("--backend",
+                    help="name of a backend in the user's backends file "
+                         f"({BACKENDS_ENV_VAR}, else ~/.portable-agent-skills/backends.json). "
+                         "Its harness must match the program the agent argv launches; its "
+                         f"model and args fill any {MODEL_MARKER} and {BACKEND_ARGS_MARKER} "
+                         "left in that argv; its env and env_from_parent reach the agent")
+    ap.add_argument("--backend-digest", metavar="HEX",
+                    help="only with --backend: the digest of that backend's fields as "
+                         "--resolve-backend printed them when the run began (sorted-key "
+                         "JSON, SHA-256, first 16 hex characters). Refused before launch "
+                         "when the entry no longer matches it")
+    ap.add_argument("--env", action="append", metavar="NAME=VALUE",
+                    help="repeatable: a literal setting for the agent's environment. Never "
+                         "a secret, since argv is readable by anyone who can list processes; "
+                         "a key goes through --env-from-parent")
+    ap.add_argument("--env-from-parent", action="append", metavar="CHILD=PARENT",
+                    help="repeatable: give the agent the value of this process's PARENT "
+                         "variable under the name CHILD. Refused before launch when PARENT "
+                         "is unset or empty")
     ap.add_argument("cmd", nargs=argparse.REMAINDER, help="-- <reviewer argv ...>")
     try:
         args = ap.parse_args(argv)
