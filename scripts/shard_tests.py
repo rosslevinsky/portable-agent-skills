@@ -56,14 +56,15 @@ def run_all(total: int, passthrough: list[str]) -> int:
     """Every shard at once, as child processes, returning non-zero if any of them failed.
 
     CI gets its speed from running the shards on N MACHINES. A developer has one, so this
-    is worth exactly what the machine's cores are worth and no more: measured on two cores,
-    four shards take half the wall clock of four in a row, not a quarter. Half is still half.
+    is worth what the machine's cores are worth: on two cores, CPU-bound shards take at best
+    about half the wall clock of four in a row, not a quarter. Time a shard spends waiting on
+    a subprocess or on disk overlaps beyond that. Half is still half.
 
     **Bytecode writing is off in the children**, and that is what makes running them at once
     safe rather than merely faster. Concurrent interpreters import the same modules and race
-    to write the same `__pycache__` directories; the projection tests then find bytecode
-    under `skills/` that the manifest does not classify, and a suite that passes alone fails
-    in company. With it off there is nothing to clean up between runs either.
+    to write the same `__pycache__` directories; a test that inventories the tree then finds
+    bytecode under `skills/` that nothing classifies, and a suite that passes alone fails in
+    company. With it off there is nothing to clean up between runs either.
 
     Output is captured per shard and printed whole, in shard order, once everything is done.
     Streamed, four suites interleave line by line into something no one can read.

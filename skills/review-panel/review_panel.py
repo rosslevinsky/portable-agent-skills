@@ -55,7 +55,7 @@ Design rules:
   * No branded CLI name anywhere in this file.
   * ``encoding="utf-8"`` pinned on every read and write; ``pathlib`` for paths.
 
-Built so far: ``plan`` and ``route`` are complete. ``plan`` loads the job strictly, checks
+The stages, in order. ``plan`` loads the job strictly, checks
 the run directory, enumerates and measures the tree, partitions it into areas under a
 closure proof, writes the snapshot (a file copy, never a worktree), ``inventory.json`` and
 ``areas.json``, then one unit directory per reader and per auditor under ``units/`` —
@@ -87,6 +87,7 @@ import tempfile
 from datetime import datetime, timezone
 import json
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -95,7 +96,7 @@ import subprocess
 import sys
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import Callable, Iterable, Mapping, Sequence
 
 _PROG = "review_panel.py"
 
@@ -169,9 +170,9 @@ _JOB_REQUIRED_KEYS = ("problem", "root", "exclude", "partition", "lenses")
 # reviews the whole tree under root, which is a different job from one that lists every
 # file in it, and the record has to be able to say which was asked for.
 # `coverage` is the one question a job can take off the table. A security review wants
-# defects and not 348 missing-test entries beside them, and no tuning of where an auditor
-# goes gets that to zero for a job that never wanted the question asked. Absent means the
-# engine decides, as it always has.
+# defects and not missing-test entries beside them, and no tuning of where an auditor goes
+# gets those to zero for a job that never wanted the question asked. Absent means the
+# engine decides.
 # `questions` is what the owner wants answered beyond the defects: free text, carried as
 # written, and never put in a payload. The readers answer the problem statement with
 # findings; the operator answers the questions afterwards, in `report-notes.json`.
@@ -598,11 +599,11 @@ BUILD_CHECK_TARGETS = ("build", "tests")
 def mint_rundir(job_path: str | Path) -> Path:
     """A run directory nobody has to invent a name for.
 
-    A caller choosing the name is a caller choosing another run's name: two runs on one box
-    picked the same one, and the second wrote its job file into the first's directory before
-    the emptiness check could refuse it -- the guard fired, but after a write. A name minted
-    from the clock and the job's own digest cannot collide, and the directory is created
-    here and empty by construction, so the check below has nothing to refuse.
+    A caller choosing the name can choose another run's name, and could write its job file
+    there before an emptiness check refuses it. Here the directory is claimed by creating it
+    -- an exclusive ``mkdir`` of a name built from the clock and the job's digest, with a
+    numbered suffix when that name is taken -- so it is empty by construction and no other
+    run can hold it.
     """
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     digest = hashlib.sha256(Path(job_path).read_bytes()).hexdigest()[:8]
@@ -1000,12 +1001,10 @@ def _git_entries(root: Path, *, tracked_only: bool = False) -> list[str] | None:
     return entries
 
 
-# Git tidies its own storage on its own schedule, and what prompts it is having just been
-# asked something. This engine asks several times over the audited root, so without these a
-# run can leave a `maintenance.lock` and a repacked object store in somebody's repository --
-# which is how one CI job went red on a test asserting the audited tree comes back
-# byte-identical. Nothing is damaged by it, and git does the same after `git status`; what
-# it costs is the promise. This engine copies the tree into `snapshot/` precisely so it
+# Git can tidy its own storage on its own schedule, and this engine asks it several
+# questions over the audited root, so these flags turn that housekeeping off as a
+# precaution: a run must not leave a `maintenance.lock` or a repacked object store in
+# somebody's repository. This engine copies the tree into `snapshot/` precisely so it
 # never touches the original, and an inspection that mutates what it inspects is not one.
 #
 # `-c` is git's OWN option and is ignored after the subcommand, so these lead the argv.
@@ -1321,7 +1320,7 @@ def _classify(root: Path, rel: str, ancestors: dict[str, bool]) -> Skipped | Non
     if Path(rel).name == ".git":
         # A linked worktree's ``.git`` is a FILE holding a gitdir pointer to the real
         # repository; copied into the snapshot it would let a reader's git reach refs the
-        # tree does not contain — the experiment's case-8 leak by another door.
+        # tree does not contain, handing a reader repository internals the job never listed.
         return Skipped(rel, _GIT_DIR_REASON)
     return None
 
@@ -2043,13 +2042,12 @@ def write_snapshot(job: Job, inventory: Inventory, rundir: str | Path, *,
     follow a write of its own.
 
     ``taken`` is when the snapshot was made, recorded so the report can say how old its
-    RAW DATA is. It is the one clock in a run directory, and it is here deliberately: a
-    report re-rendered weeks later says when it was rendered, and without this there was
-    nothing to tell a reader the reading underneath it was a month old. The cost is that
-    two runs over one tree no longer write byte-identical run directories — they differ on
-    this field and nothing else, which is what the suite asserts rather than the equality
-    it used to. Passed in rather than read here, so a caller that needs two runs to match
-    can hand over the same stamp.
+    RAW DATA is. The report prints this stamp beside its own generation stamp whenever the
+    two fall on different days, so a reader can tell the reading underneath is older than
+    the report. The cost is that two plans over one tree do not write byte-identical run
+    directories — they differ on this field and nothing else, which is what the suite
+    asserts. Passed in rather than read here, so a caller that
+    needs two runs to match can hand over the same stamp.
     """
     if claimed:
         rundir = Path(rundir)
@@ -2140,14 +2138,14 @@ class Ceiling:
     bytes: int
 
 
-# Starting values, tuned by the live smoke and changed together with the fixtures —
-# never to meet a cost target.
+# Starting values, changed together with the fixtures that exercise splitting — never to
+# meet a cost target.
 DEFAULT_CEILING = Ceiling(lines=2000, bytes=200 * 1024)
 # An auditor's ceiling is its own, and larger. What it reads is one subject and the tests
 # about it -- typically one big file and one small one -- where an area is many files
-# CHOSEN to fit. Measuring the first against the second flagged nearly every real job: a
-# 2,988-line service class is the ordinary case for the trees this is pointed at, and a
-# flag that always fires is one the eye learns to skip past.
+# CHOSEN to fit. One subject and its tests can exceed an area's ceiling on their own, since
+# a single source file can run to thousands of lines, and a flag that fires whenever that
+# happens is one the eye learns to skip past.
 #
 # Derived from whatever ceiling the job is running under rather than written as a second
 # literal, so narrowing one narrows both and the two cannot drift apart.
@@ -2158,6 +2156,16 @@ def audit_ceiling(ceiling: Ceiling) -> Ceiling:
     """What one coverage auditor may be asked to read, over the ceiling one area may hold."""
     return Ceiling(lines=ceiling.lines * AUDIT_CEILING_MULTIPLE,
                    bytes=ceiling.bytes * AUDIT_CEILING_MULTIPLE)
+
+
+# The merge round's two ceilings, checked when `merge` plans its units. Its payload is one
+# compact record per site and its reply one group entry per site, so both grow with the
+# number of sites; over either, the sites are batched by directory (see `plan_merge`).
+# These are batching estimates with headroom, not measured model limits.
+MERGE_CEILING = Ceiling(lines=4000, bytes=400 * 1024)
+# The reply is estimated before it exists, from the site count alone.
+MERGE_REPLY_BYTES_PER_SITE = 256
+MERGE_REPLY_CEILING = 64 * 1024
 # The two model lanes. Every area is read by both: its lens list is dealt to them in turn,
 # so a list of two gives each lane one lens and a list of four gives each two.
 LANES = ("A", "B")
@@ -2227,9 +2235,9 @@ class PlannedArea:
     # auditor's reading load is its share of this area plus files from elsewhere.
     #
     # Over the ceiling this is FLAGGED and never refused, the same answer the readers get
-    # for a single file over the ceiling. A run whose largest class is 2,988 lines against a
-    # 2,000-line ceiling is the ordinary case for the trees this is pointed at, and refusing
-    # it would mean the one file most worth auditing is the one file that cannot be.
+    # for a single file over the ceiling. A largest class over the 2,000-line ceiling is
+    # ordinary in a production tree, and refusing it would mean the one file most worth
+    # auditing is the one file that cannot be.
     audit_lines: int = 0
     audit_bytes: int = 0
     audit_oversize: bool = False
@@ -2402,9 +2410,10 @@ def settle_tests(tests: Sequence[str], sources: Sequence[str],
     ``is_test_path`` answers true when any parent directory is named `test`, `tests`,
     `spec`, `specs` or `__tests__`. That is right for most Python trees, where
     `tests/helpers.py` carries no marker in its name and is test support all the same —
-    and wrong wherever `tests` is an ordinary package name. A tree whose dev controllers
-    live in a `tests` package had 94 auditors planned over them, and every one of those
-    controllers was also missing from the source set the readers were partitioned over.
+    and wrong wherever `tests` is an ordinary package name. Taken at its word there, it
+    files every production module in that package as a test: each is left out of the
+    sources a test is resolved against, so no test can be found to cover it, and the files
+    it mentions are audited as though it tested them.
 
     So the directory signal stands unless BOTH of the things that could confirm it are
     absent: the file's own name says nothing (:func:`_named_as_test`), and it is about no
@@ -2697,8 +2706,8 @@ def preview(job: Job, inventory: Inventory, areas: Sequence[PlannedArea],
     running = len(audited) * AUDITORS
     out.append(f"reading units: {readers + running} = {readers} readers + {running} auditors")
     # The auditor count on its own line, with the rule that produced it. Buried in the sum
-    # above, 94 auditors nobody wanted read as a large run rather than as a round to turn
-    # off, and the owner found out after paying for them.
+    # above, dozens of unwanted auditors read as a large run rather than as a round to turn
+    # off, and the owner learns of them only after paying.
     out.append(f"coverage auditors: {running} — {len(audited)} of {len(areas)} areas, "
                f"{AUDITORS} per area"
                + ("; audited because a test in scope is about a file in it" if deriving
@@ -2895,8 +2904,8 @@ SUBJECT_HOW_SAID = {SUBJECT_BY_NAME: "named for it", SUBJECT_BY_MENTION: "mentio
 
 def _subject_stem(path: str) -> str:
     """A test file's stem with its test marker removed, or the stem unchanged when it
-    carries none. ``src/test/java/LeaseServiceMoveOutTest.java`` gives
-    ``LeaseServiceMoveOut``."""
+    carries none. ``src/test/java/OrderServiceCancelTest.java`` gives
+    ``OrderServiceCancel``."""
     stem = _stem_of(path)
     for marker in _SUBJECT_MARKERS_LEADING:
         if stem.startswith(marker):
@@ -2943,8 +2952,8 @@ def subjects_by_name(test: str, sources: Sequence[str]) -> tuple[str, ...]:
     Three keys, in order, and each is there because the one above it leaves a tie a real
     tree produces. **The same language first**: ``foo_test.go`` beside a ``web/foo.ts``
     and a ``go/foo.go`` matches both stems, and only one of them is in the language the
-    test is written in. **Then the longest stem**: a tree holding ``Lease.java`` and
-    ``LeaseService.java`` answers ``LeaseServiceMoveOutTest`` with both, and the shorter
+    test is written in. **Then the longest stem**: a tree holding ``Order.java`` and
+    ``OrderService.java`` answers ``OrderServiceCancelTest`` with both, and the shorter
     is a coincidence of spelling. **Then the nearest directory**, which settles a project
     that keeps one class name in two packages.
 
@@ -3115,7 +3124,7 @@ _JS_DIALECT = _MockDialect(
     # only when its initializer IS a `require` call: one that merely contains a require may
     # be passing it to a constructor, as `const real = new Thing(require("./config"))` does.
     # The tail stops at a comma as well, so the second declarator in
-    # `const cfg = require("./c"), real = new Thing()` survives its neighbour.
+    # `const cfg = require("./c"), real = new Thing()` survives its neighbor.
     drop_lines=(_STATEMENT_START + r"[ \t]*import[ \t]+[^;\n]*",
                 _STATEMENT_START + r"[ \t]*(?:const|let|var)\b[^;\n]*?(?<![=!<>])=[ \t]*"
                 r"require\s*\([^;,\n]*"),
@@ -3166,15 +3175,15 @@ def _for_stem(pattern: str, word: str) -> str:
 
     A plain replace rather than :meth:`str.format`, because these templates are REGEXES and
     regexes are full of braces: a repetition like ``{2,3}`` makes ``format`` raise, and so
-    does a character class holding one -- C++'s ``[({]`` did, on every C++ file, before a
-    test caught it. Whoever adds the next dialect should not have to know to escape them.
+    does a character class holding one, such as C++'s ``[({]``. Whoever adds the next
+    dialect should not have to know to escape them.
     """
     return pattern.replace("{stem}", word)
 
 
 def _alternation(patterns: tuple[str, ...]) -> str:
     """Several patterns as one, so a scan takes the EARLIEST match rather than the first
-    pattern's. Both callers depend on that and one of them silently did not have it."""
+    pattern's. Both callers depend on that, which is why both build it here."""
     return "|".join(f"(?:{pattern})" for pattern in patterns)
 
 
@@ -3270,7 +3279,7 @@ def _mock_only(text: str, stem: str, language: str) -> bool:
 
     A test that only mocks a class is evidence of nothing about it, and an auditor handed
     the link can only answer in the negative -- at length, and about code the test never
-    runs. One lane returned 30 such findings from a single link of this shape, each one
+    runs. A single link of this shape can yield dozens of such findings, each one
     resting on the observation that the test never instantiates the class.
 
     **The quantifier is `all`, and the direction is deliberate.** A test that mocks a class
@@ -3374,18 +3383,16 @@ def auditor_areas(areas: Sequence[PlannedArea]) -> tuple[PlannedArea, ...]:
     """The areas a coverage auditor is dispatched for, as :func:`partition` decided.
 
     The first rule of this panel is that a unit gets one bounded chunk it can read closely,
-    and the auditor was the single exception — it received every path in the tree. Two
-    auditors given that same list and that same question returned thirty-seven findings and
-    nine, with no code site in common: a question wide enough that two careful readers of it
-    agree on nothing is a question with no stopping rule in it, and each run answers a
-    slightly different one. Bounding it is what makes two auditors comparable, area by area.
+    and the auditor follows it: each is dispatched for one area, never handed every path in
+    the tree. A coverage question over the whole tree has no stopping rule in it, so each
+    run answers a slightly different one. Bounding it is what makes two auditors
+    comparable, area by area.
 
-    **What bounds it is the tested code, not the test file.** Dispatching to whichever area
-    happened to HOLD a test put the auditor in the wrong place nearly every time: over one
-    run, seven of ten tests sat in an area that did not contain the class they test, so five
-    areas were asked about code no test in scope targets — 206 of 315 findings amounting to
-    "this file has no tests" — while the area holding the class four of those tests are
-    about got no auditor, because no test file sat in it.
+    **What bounds it is the tested code, not the test file.** In file mode an area is
+    audited when it CONTAINS a source file some test in scope is about, wherever that test
+    sits. A test usually lives apart from the class it tests, so the area that holds it is
+    seldom the area its subject is in, and an auditor sent there would be asked about code
+    no test in scope targets.
 
     The rule is not re-derived here. It differs by partition mode, and the mode is known in
     exactly one place; asking the area is what keeps one answer from being computed twice.
@@ -3779,12 +3786,11 @@ COVERAGE_VERIFIER_SCHEMA_NAME = "coverage-verifier-schema.json"
 VERIFIER_KIND = "verifier"
 # The two questions a batch can put, and the two ladders a finding travels on. A reader
 # asks what is WRONG with this code; the coverage auditor asks what input NO TEST
-# constructs. Both answer in one finding shape, and for one generation of this engine both
-# were routed, verified and reported as the same thing — so every coverage finding went to
-# a verifier whose brief asks whether a claimed failure is real, and came back refuted for
-# the only reason it could: a missing test is not a failure. Both agents were right by
-# their briefs, and the run filed real, named, missing tests under the one heading that
-# tells a reader nothing there is work.
+# constructs. Both answer in one finding shape, and each travels its own ladder: its own
+# verifier schema, its own statuses and its own sections of the report. A verifier asked
+# whether a claimed failure is real can only refute a coverage finding, because a missing
+# test is not a failure, and a refuted finding lands under the one heading that tells a
+# reader nothing there is work.
 #
 # The question is not stored on a candidate. It is READ off the raiser's kind, which the
 # route record already carries — one fact in one place, which is why the two can never
@@ -3855,12 +3861,12 @@ VERDICT_KEYS = ("candidate", "status", "evidence", "rationale", "revision", "tes
 # code, which is not what was asked.
 COVERED_BY_KEY = "covered_by"
 # The files an unresolved verdict says would settle it, as PATHS rather than as a sentence.
-# `needs_a_file_outside_the_scope` is the commonest unresolved reason there is, and the
-# brief has always asked the verifier to name the file in its rationale — where nothing can
-# add it up. A third of one run's unresolved defects hung on the same three or four files,
-# and the report could not say so, because counting them meant reading free prose and
-# guessing which words were paths. An owner deciding whether to widen the next job's scope
-# needs the price of each file, and this is where that number comes from.
+# The brief also asks the verifier to name the file in its rationale for
+# `needs_a_file_outside_the_scope`, but free prose is where nothing can add it up: counting
+# files there means guessing which words are paths. Given as paths, they let the report
+# count how many open defects hang on each file outside the scope. An owner deciding
+# whether to widen the next job's scope needs the price of each file, and this is where
+# that number comes from.
 NEEDS_FILES_KEY = "needs_files"
 # The reason that field belongs to. Named once: the enum below and the rules that read it
 # must mean the same value.
@@ -4067,11 +4073,10 @@ class Verdict:
 
 def _utf8(text: str, field: str, error: type[ReviewPanelError] = ResultError) -> str:
     """A JSON escape can spell a lone surrogate (``\\ud800``) that the decoder accepts and
-    a UTF-8 write refuses. Every string a result carries is checked here, at parse, so
-    the unit fails by field name; unchecked, the payload write raised after the
-    verification directories existed and left a run directory that refused a retry.
-    ``dispatch.json`` is checked the same way, as a :class:`DispatchError`: unchecked,
-    the report write raised and left ``report.md.<pid>.tmp`` beside the run."""
+    a UTF-8 write refuses. Every string a result carries is checked here, at parse, and
+    refused by field name before anything is written from it: a finding carrying one is
+    rejected alone, beside its valid siblings, while one in a top-level field fails the
+    unit. ``dispatch.json`` is checked the same way, as a :class:`DispatchError`."""
     try:
         text.encode("utf-8")
     except UnicodeEncodeError as exc:
@@ -4288,10 +4293,10 @@ def parse_reader_result(obj: object, unit_id: str, files, cwd_files=None,
     none is relaxed; what changes is the blast radius, and it is the treatment a
     verification batch has already — see :func:`parse_verifier_result`. A reading unit is
     one dispatch of many independent observations, and one finding the engine cannot read
-    says nothing about the thirteen beside it. Failing the unit over it threw all of them
-    away and reported the area as unread, which is a far larger claim than the one the
-    error supports: on one run a single optional sub-field on a single finding cost 27
-    findings, about nine percent of that run's candidates.
+    says nothing about the others beside it. So each finding is parsed on its own: one that
+    breaks a rule is rejected and named, and the rest of the unit's findings are kept. An
+    unreadable finding is not evidence that the area went unread, and the unit is not
+    reported that way over one.
 
     A rejected finding raises no candidate — unlike a verdict, there is nothing for it to
     resolve to, because it is the thing that would have minted the id. It is named instead,
@@ -4314,7 +4319,8 @@ def parse_reader_result(obj: object, unit_id: str, files, cwd_files=None,
         # own claim about how many items it wrote, so it catches a reply that lost part of
         # its array -- a different failure from a finding the engine could not read, and one
         # that rejecting findings must not start reporting. Comparing it to the accepted
-        # count would fail the unit for exactly the reason this function no longer does.
+        # count would fail the unit over a finding the engine could not read, which this
+        # function deliberately does not do.
         _check_declared_count(obj, len(obj["findings"]))
         findings: list[Finding] = []
         rejected: list[str] = []
@@ -4680,7 +4686,7 @@ def compare_quote(snapshot: Path, file: str, line_start: int, line_end: int,
 def check_quotes(snapshot: Path, candidates: Sequence[Candidate]) -> tuple[Candidate, ...]:
     """Every candidate's quoted source against the pinned tree at the lines it cites.
 
-    Section 6 asks for this because a wrong line range is otherwise undetectable: the report
+    The check exists because a wrong line range is otherwise undetectable: the report
     extracts snippets mechanically, so a citation off by twenty lines prints twenty lines of
     innocent code under the heading of a real defect. The quotation is what makes the range
     checkable, and the engine records what it found rather than moving the range to fit —
@@ -4823,10 +4829,10 @@ def render_coverage_verifier_payload(brief: str, problem: str, candidates: Seque
 
     ``tests`` is the input a defect payload has no use for and this one cannot work without.
     The question is whether any test in scope constructs the named input, and a verifier
-    that has to guess which files are tests answers a different, vaguer question — the one
-    that made every coverage finding in a real run come back refuted for want of a brief
-    that asked this. It is a declared input with no default, like ``probe``, because an
-    input that may be omitted is one the byte reconstruction can silently miss.
+    that has to guess which files are tests answers a different, vaguer question, and can
+    refute every coverage finding for want of a brief that asks this. It is a declared
+    input with no default, like ``probe``, because an input that may be omitted is one the
+    byte reconstruction can silently miss.
     """
     out = [brief.rstrip("\n"), "\n", PROBLEM_HEADING, "\n", problem, "\n",
            *_probe_section(probe), TEST_INVENTORY_HEADING]
@@ -4861,10 +4867,10 @@ def _parse_evidence(raw: object, field: str) -> dict | None:
 
 # What a path may not contain if it is a path at all. A verifier asked for the file that
 # would settle a claim can answer with a description of one instead — "<caller of
-# handleDispute (webhook handler) - not present; locate with grep -rn ...>" arrived as a
-# single entry and was accepted, because normalizing separators is all it takes to turn a
-# sentence into something shaped like a path. It then stood in the report's table of files
-# to widen the scope to, beside real paths, where it can be neither opened nor counted.
+# cancelOrder (order handler) - not present; locate with grep -rn ...>" as a single entry —
+# and normalizing separators is all it takes to turn a sentence into something shaped like
+# a path. Refused here, it never stands in the report's table of files to widen the scope
+# to, beside real paths, where it could be neither opened nor counted.
 #
 # A space is the discriminator that matters; the brackets and quotes catch the same answer
 # wearing punctuation. A real path can hold a space, and one named here would be dropped —
@@ -4944,12 +4950,10 @@ def _parse_revision(raw: object, field: str) -> dict | None:
 #
 # This is not leniency about the contract — every rule below still applies, and a field
 # whose value is NOT determined (a `test_first` on an unresolved verdict, evidence on a
-# refuted one) is still required to be present. It is about what a missing key costs. One
-# verifier omitted `unresolved_reason` on 18 verdicts whose status was not `unresolved`,
-# which made `null` the only legal value; the unit was rejected whole, and 18 verdicts the
-# engine could read perfectly well resolved `unresolved` instead. Left alone that run would
-# have reported 87 established / 52 unresolved against a true 105 / 34 — a fifth of the
-# headline lost to a field that says nothing.
+# refuted one) is still required to be present. It is about what a missing key costs. A
+# verifier that omits `unresolved_reason` on verdicts whose status is not `unresolved`,
+# where `null` is the only legal value, would otherwise have each such verdict refused and
+# resolved `unresolved` instead — the headline counts moved by a field that says nothing.
 # A refuted gap is a refuted finding by another name, so it fixes the same three fields.
 _REFUSING = ("refuted", COVERAGE_GAP_REFUTED)
 _DETERMINED_NULL = {
@@ -5007,11 +5011,11 @@ def _parse_verdict(raw: object, field: str, batch: dict[str, bool],
     # symptom where this names the mistake: a verifier read the wrong brief, or the batch
     # was dispatched with it.
     # `isinstance` first, and not for tidiness: `in` against a set raises TypeError on an
-    # unhashable value, so a verifier answering `"status": []` or `{}` took the whole run down
-    # here -- before the validation below could refuse it by name -- and a resume re-read the
-    # same saved transcript and fell over again. A non-string status is a malformed verdict,
-    # not a cross-question one, so it belongs to `_one_of` below, which names the field and
-    # the values it accepts.
+    # unhashable value such as `"status": []` or `{}`, and TypeError is not the ResultError
+    # the callers turn into a named refusal -- it escapes before the validation below can
+    # refuse the verdict by name. A non-string status is a malformed verdict, not a
+    # cross-question one, so it belongs to `_one_of` below, which names the field and the
+    # values it accepts.
     if isinstance(raw.get("status"), str) and \
             raw["status"] in (set(VERDICT_STATUSES) | set(COVERAGE_STATUSES)) - set(allowed):
         other = COVERAGE_ASKS if asks == DEFECT_ASKS else DEFECT_ASKS
@@ -5060,10 +5064,9 @@ def _parse_verdict(raw: object, field: str, batch: dict[str, bool],
         # A DOCUMENTARY run is admitted here and an executed one is not, because they are
         # not the same act. Running the code and watching it fail is a reproduction, and
         # calling that a reading throws away the strongest thing the verifier has. Searching
-        # the tree to check that a reading holds is still the reading — and a verifier that
-        # does it, as they routinely do, had no status left to write: two verdicts were
-        # rejected for exactly this, and their candidates fell to unresolved with nothing
-        # wrong with the claims. `run_kind` must SAY documentary; unstated is refused with
+        # the tree to check that a reading holds is still the reading, and verifiers
+        # routinely do it, so a documentary run is admitted beside a reading verdict rather
+        # than leaving a sound claim no status to take. `run_kind` must SAY documentary; unstated is refused with
         # executed, since a rule that reads silence as the permissive answer is not a rule.
         if (status == "confirmed_by_reading" and evidence is not None
                 and evidence.get(RUN_KIND_KEY) != "documentary"):
@@ -5735,7 +5738,7 @@ def _claim_candidates(path: Path) -> None:
     route's writes; a route with no verification batch has nothing else to collide on. The
     route record replaces the empty file once the batches are written.
 
-    What it still refuses, now that an interrupted route's claim is reclaimed rather than
+    What it does refuse, since an interrupted route's claim is reclaimed rather than
     refused, is a route running **at the same time** as this one, and a link at that name,
     which exclusive creation refuses rather than following out of the run directory."""
     try:
@@ -5891,16 +5894,30 @@ def route_summary(states: Sequence[UnitState], candidates: Sequence[Candidate],
 # stronger. Parsed by name like the job: a record that says less than this, or whose rung
 # the lanes contradict, is a refusal — a report that guessed the rung would claim an
 # independence the run did not have.
-# Two rungs and no third. One context as both finder and verifier breaks rule 3 — a
-# finding goes to a unit that did not raise it — which every status on the page rests on,
-# so a run that ends that way has no rung here: the driver refuses it, and this refuses a
-# record naming one.
+# Four rungs: two runtimes running two models, two models inside one runtime, two runtimes
+# running one model, and one model in two contexts of one runtime.
+# One context as both finder and verifier breaks rule 3 — a finding goes to a unit that did
+# not raise it — which every status on the page rests on, so a run that ends that way has
+# no rung here: the driver refuses it, and this refuses a record naming one.
 DISPATCH_FILE_NAME = "dispatch.json"
 RUNG_TWO_RUNTIMES = "two-runtimes"
+# Two models sharing one harness — its tools, its system prompt, its permission layer. The
+# models differ, so the report may say "both models"; the harness does not, so it never
+# says two runtimes.
+RUNG_TWO_MODELS = "one-runtime-two-models"
 RUNG_ONE_RUNTIME = "one-runtime"
-RUNGS = (RUNG_TWO_RUNTIMES, RUNG_ONE_RUNTIME)
+# Two runtimes pointed at the same model: two separate sessions of one model, in two
+# different tools. The tools differ, so the report may say two runtimes; the model does
+# not, so it says two contexts and never "both models".
+RUNG_TWO_RUNTIMES_ONE_MODEL = "two-runtimes-one-model"
+RUNGS = (RUNG_TWO_RUNTIMES, RUNG_ONE_RUNTIME, RUNG_TWO_MODELS, RUNG_TWO_RUNTIMES_ONE_MODEL)
+# The rungs whose claim rests on what each lane's model is, so each lane must record one.
+RUNGS_NAMING_MODELS = (RUNG_TWO_MODELS, RUNG_TWO_RUNTIMES_ONE_MODEL)
 DISPATCH_KEYS = ("rung", "lanes")
-LANE_RECORD_KEYS = ("adapter", "permission")
+# `model` is required for the rungs that are told apart by model and optional for the
+# others, so a run directory written before lane records carried one still re-renders.
+LANE_RECORD_KEYS = ("adapter", "permission", "model")
+LANE_RECORD_REQUIRED = ("adapter", "permission")
 
 
 class DispatchError(ReviewPanelError):
@@ -5915,6 +5932,7 @@ class LaneRecord:
 
     adapter: str
     permission: str
+    model: str | None = None
 
 
 @dataclass(frozen=True)
@@ -5926,8 +5944,12 @@ class DispatchRecord:
 def parse_dispatch(obj: object) -> DispatchRecord:
     """Strictly parse the dispatcher's record; raise :class:`DispatchError` by name.
 
-    One cross-check ties the rung to the lanes: ``two-runtimes`` claims two models, so both
-    lanes recording one adapter contradicts it. ``one-runtime`` is checked no further, and a
+    Cross-checks tie the rung to the lanes: ``two-runtimes`` claims two runtimes and two
+    models, so both lanes recording one adapter, or one model, contradicts it;
+    ``one-runtime-two-models`` claims two models by name, so each lane must record its model
+    and the two must differ; and ``two-runtimes-one-model`` claims two runtimes and one model,
+    so the adapters must differ and each lane must record a model, the same one.
+    ``one-runtime`` is checked no further, and a
     record naming it with two adapters is accepted rather than refused — this engine spawns
     nothing, so what it is given is all it knows about what ran, and refusing a record it
     cannot check would refuse true ones with false.
@@ -5949,18 +5971,40 @@ def parse_dispatch(obj: object) -> DispatchRecord:
         raw, field = raw_lanes[lane], f"lanes.{lane}"
         if not isinstance(raw, dict):
             raise DispatchError(f"field '{field}' must be a JSON object (found {type(raw).__name__})")
-        _check_keys(raw, field, frozenset(LANE_RECORD_KEYS), LANE_RECORD_KEYS, DispatchError)
+        _check_keys(raw, field, frozenset(LANE_RECORD_KEYS), LANE_RECORD_REQUIRED,
+                    DispatchError)
+        if rung in RUNGS_NAMING_MODELS and "model" not in raw:
+            raise DispatchError(f"'{field}' is missing required field 'model': rung "
+                                f"{rung!r} is told apart from the others by its models")
         lanes[lane] = LaneRecord(
             adapter=_utf8(_parse_text(raw["adapter"], f"{field}.adapter", DispatchError),
                           f"{field}.adapter", DispatchError),
             permission=_utf8(_parse_text(raw["permission"], f"{field}.permission", DispatchError),
                              f"{field}.permission", DispatchError),
+            model=(_parse_text(raw["model"], f"{field}.model", DispatchError)
+                   if "model" in raw else None),
         )
     adapters = sorted({record.adapter for record in lanes.values()})
-    if rung == RUNG_TWO_RUNTIMES and len(adapters) == 1:
+    if rung in (RUNG_TWO_RUNTIMES, RUNG_TWO_RUNTIMES_ONE_MODEL) and len(adapters) == 1:
         raise DispatchError(
-            f"rung {RUNG_TWO_RUNTIMES!r} claims two models, but both lanes record the same "
+            f"rung {rung!r} claims two runtimes, but both lanes record the same "
             f"adapter ({adapters[0]!r}); record the rung that ran"
+        )
+    # Models are compared as written: one model reached under two names counts as two.
+    # A lane at `two-runtimes` or `one-runtime` may lack a model; the same-model refusal
+    # needs both lanes to record one.
+    recorded = [record.model for record in lanes.values()]
+    models = sorted({model for model in recorded if model is not None})
+    same = None not in recorded and len(models) == 1
+    if rung in (RUNG_TWO_RUNTIMES, RUNG_TWO_MODELS) and same:
+        raise DispatchError(
+            f"rung {rung!r} claims two models, but both lanes record the same "
+            f"model ({models[0]!r}); record the rung that ran"
+        )
+    if rung == RUNG_TWO_RUNTIMES_ONE_MODEL and not same:
+        raise DispatchError(
+            f"rung {rung!r} claims one model, but the lanes record different models "
+            f"({', '.join(repr(model) for model in models)}); record the rung that ran"
         )
     return DispatchRecord(rung=rung, lanes=lanes)
 
@@ -6004,7 +6048,12 @@ CLUSTER_UNIT_PREFIX = "cluster-"
 # spellings of one defect leave a reader unable to match the document against
 # ``findings.json``. The unit that produced the grouping is ``cluster-<area>``, which shares
 # no prefix with this, so neither can be read as the other.
-CLUSTER_ID_PREFIX = "D"
+DEFECT_ID_PREFIX = "D"
+# A SITE is what one cluster is: the reports of one mistake at one place. A defect is one
+# mistake with one or more sites, so the two need two spellings, and a site takes the number
+# a defect had when every defect was one site -- which is what lets a run rendered before
+# sites existed be read with its old numbers meaning the same places.
+SITE_ID_PREFIX = "S"
 CLUSTERER_RESULT_KEYS = ("clusters", "summary")
 CLUSTER_KEYS = ("members", "consequence", "split_reason")
 TO_GROUP_HEADING = "\n## Candidates to group\n"
@@ -6046,7 +6095,8 @@ class ClusterState:
 
 @dataclass(frozen=True)
 class Cluster:
-    """One defect, or one coverage gap. ``members`` are the candidates that describe it,
+    """One site of a defect, or of a coverage gap: the reports of one mistake at one place.
+    ``members`` are the candidates that describe it,
     ``grouped`` says whether a clustering unit put them together or the engine fell back to
     one candidate per cluster because that lane's unit could not be believed, and ``asks``
     says which of the two it is."""
@@ -6197,14 +6247,12 @@ def _parse_cluster(raw: object, field: str, handed: frozenset[str],
 
     The consequence's LENGTH is not among them, and that is deliberate. The schema bounds
     it at 120 characters and the brief asks for twelve words, because the consequence is
-    both the defect's heading and the widest column of the index — unbounded it ran to a
-    144-character median and a 245-character maximum, and the index stopped being
-    scannable. Refusing a reply here for a long one would cost the whole AREA its
-    clustering: every candidate in it would go unmerged and be reported on its own, which
-    is a far worse document than one heading that wraps. Both runtimes honour the bound as
-    an instruction — measured per dispatch lane on a 151-defect run, 88 characters at the
-    longest from one and 107 from the other, none over — so the schema is where it belongs
-    and this parser stays permissive on purpose.
+    both the defect's heading and the widest column of the index — unbounded it runs long
+    enough that the index stops being scannable. Refusing a reply here for a long one would
+    cost the whole AREA its clustering: every candidate in it would go unmerged and be
+    reported on its own, which is a far worse document than one heading that wraps. Both
+    runtimes honor the bound as an instruction, so the schema is where it belongs and this
+    parser stays permissive on purpose.
     """
     if not isinstance(raw, dict):
         raise ResultError(f"field '{field}' must be a JSON object (found {type(raw).__name__})")
@@ -6360,8 +6408,8 @@ def build_clusters(candidates: Sequence[dict], units: Sequence[dict],
     a defect twice costs a reader a minute, and merging two defects into one deletes the
     second with nothing left to show that it happened.
 
-    Clusters are ordered by area and then by their lowest member, and ids are assigned from
-    that order, so the run names a defect the same way however the clusterer listed them.
+    Clusters are ordered by area and then by their lowest member, and site ids are assigned
+    from that order, so the run names a site the same way however the clusterer listed them.
     That order is the FORMATION order and never the ranked one: a severity revision
     reorders the index, and an id assigned from the ranking would then name a different
     defect in the re-rendered document than it named in the one somebody cited.
@@ -6403,13 +6451,66 @@ def build_clusters(candidates: Sequence[dict], units: Sequence[dict],
     # gap in one area keep their own formation order, and neither renumbers the other.
     rows.sort(key=lambda row: (row[0], asked[row[5]], row[1]))
     clusters = tuple(
-        Cluster(id=f"{CLUSTER_ID_PREFIX}{n}", area=area, members=members,
+        Cluster(id=f"{SITE_ID_PREFIX}{n}", area=area, members=members,
                 consequence=consequence, split_reason=split_reason, grouped=grouped,
                 asks=question)
         for n, (area, members, consequence, split_reason, grouped, question)
         in enumerate(rows, 1)
     )
     return Clustering(clusters=clusters, ungrouped=tuple(ungrouped))
+
+
+class GroupingError(ReviewPanelError):
+    """A grouping of sites into defects that is not a partition of the run's sites."""
+
+
+@dataclass(frozen=True)
+class Defect:
+    """One mistake: the sites where it has to be fixed, in site order, all of one kind."""
+
+    id: str
+    asks: str
+    sites: tuple[str, ...]
+
+
+def group_sites(clustering: Clustering,
+                grouping: Sequence[Sequence[str]] | None = None) -> tuple[Defect, ...]:
+    """The run's defects: ``grouping`` as groups of site ids, or one defect per site where
+    it is ``None``.
+
+    **A partition or nothing.** Every site in exactly one group, no unknown id, no empty
+    group and no group mixing a defect's sites with a coverage gap's: a site left out is a
+    finding the report would drop, and a site in two groups is counted twice.
+
+    **D ids are assigned here, from the groups ordered by their lowest site** and never
+    from the order the groups arrived in or from any ranking, so a defect id is a pure
+    function of the run directory. With one defect per site, ``D<n>`` holds ``S<n>`` —
+    the number a defect had when every defect was one site.
+    """
+    kind_of = {cluster.id: cluster.asks for cluster in clustering.clusters}
+    groups = ([[cluster.id] for cluster in clustering.clusters] if grouping is None
+              else [list(group) for group in grouping])
+    seen: set[str] = set()
+    for group in groups:
+        if not group:
+            raise GroupingError("a defect has no site; every defect holds at least one")
+        for sid in group:
+            if sid not in kind_of:
+                raise GroupingError(f"{sid!r} is not a site of this run")
+            if sid in seen:
+                raise GroupingError(f"site {sid} is in two defects; a site is in exactly one")
+            seen.add(sid)
+        if len({kind_of[sid] for sid in group}) > 1:
+            raise GroupingError(f"sites {', '.join(group)} mix a defect with a coverage gap; "
+                                f"a defect holds sites of one kind")
+    missing = [sid for sid in kind_of if sid not in seen]
+    if missing:
+        raise GroupingError(f"site {missing[0]} is in no defect; every site is in exactly one")
+    ordered = sorted((sorted(group, key=_id_rank) for group in groups),
+                     key=lambda group: _id_rank(group[0]))
+    return tuple(Defect(id=f"{DEFECT_ID_PREFIX}{n}", asks=kind_of[group[0]],
+                        sites=tuple(group))
+                 for n, group in enumerate(ordered, 1))
 
 
 def write_clusters(rundir: Path, units_doc: dict, candidates: Sequence[dict],
@@ -6484,6 +6585,1008 @@ def cluster_summary(units: Sequence[ClusterUnit], states: Sequence[VerificationS
 
 
 # --------------------------------------------------------------------------- #
+# merge — which sites are one mistake, proposed by one unit over the whole run
+# --------------------------------------------------------------------------- #
+# Clustering stays per area, so the same mistake copied into files two areas own lands in
+# two sites that nothing has compared. This round reads one compact record per site across
+# the whole run and proposes which sites are one mistake. The unit groups and does nothing
+# else: it cannot judge a site, revise one or remove one. What it proposes is a claim no
+# verifier checked, so a group is not reported as one defect on this unit's say-so alone.
+MERGER_KIND = "merger"
+MERGER_SCHEMA_NAME = "merger-schema.json"
+MERGED_STAGE = "merged"
+MERGE_UNIT_PREFIX = "merge-"
+# On the first lane, as synthesis is: the check of a merge goes to the other one.
+MERGE_UNIT_ID = f"{MERGE_UNIT_PREFIX}{LANES[0]}"
+MERGER_RESULT_KEYS = ("groups", "compound", "summary")
+MERGE_GROUP_KEYS = ("sites", "mechanism", "instances", "reason_kept_apart")
+MERGE_INSTANCE_KEYS = ("site", "instance")
+MERGE_COMPOUND_KEYS = ("site", "second_claim")
+TO_MERGE_HEADING = "\n## Your sites\n"
+# How a site's kind reads in the payload. The two never share a group, and saying which is
+# which lets the unit keep them apart rather than learn the rule from a refusal.
+MERGE_KIND_WORDS = {DEFECT_ASKS: "a defect in what the files do",
+                    COVERAGE_ASKS: "a coverage gap: an input no test constructs"}
+
+
+@dataclass(frozen=True)
+class MergeUnit:
+    """One merge unit: the sites it is asked to group, addressed to one lane."""
+
+    id: str
+    lane: str
+    sites: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MergeState:
+    """What one merge unit came back as: exactly one of complete, failed or missing, with
+    the reason where it is not complete and the proved grouping where it is."""
+
+    id: str
+    state: str
+    reason: str | None
+    groups: tuple[dict, ...]
+    compound: tuple[dict, ...]
+    summary: str | None
+
+
+@dataclass(frozen=True)
+class MergeCompanions:
+    """What ``merge`` ships beside the engine and every merge payload is built from."""
+
+    merger_brief: str
+    merger_schema: dict
+
+
+def load_merge_companions() -> MergeCompanions:
+    return MergeCompanions(merger_brief=load_brief("merger"),
+                           merger_schema=load_schema(MERGER_SCHEMA_NAME))
+
+
+def merge_material(clustering: Clustering, candidates: Sequence[dict],
+                   rationales: dict[str, str | None]) -> tuple[dict, ...]:
+    """Every site as the merge payload states it, in site order: its id, area and kind, the
+    heading clustering wrote, why it was kept apart where it was, and for each candidate in
+    it the location, the failure as a reader stated it, the directions proposed and what the
+    agent that checked it said about the mechanism.
+
+    **No unit id, no lane, no lens and no verdict**, for the reason the clustering payload
+    carries none: the merge decides identity, and who raised a report or whether it stood
+    is not evidence that two sites are one mistake."""
+    by_id = {cand["id"]: cand for cand in candidates}
+    out: list[dict] = []
+    for site in clustering.clusters:
+        members = sorted((by_id[cid] for cid in site.members),
+                         key=lambda cand: (cand["file"], cand["line_start"], cand["line_end"],
+                                           cand["id"]))
+        out.append({
+            "id": site.id, "area": site.area, "asks": site.asks,
+            "consequence": site.consequence, "split_reason": site.split_reason,
+            "members": [{
+                "file": member["file"], "line_start": member["line_start"],
+                "line_end": member["line_end"], "failure": member["failure"],
+                "directions": _distinct(r["direction"] for r in member["raised_by"]),
+                "rationale": rationales[member["id"]],
+            } for member in members],
+        })
+    return tuple(out)
+
+
+def _merge_head(brief: str, problem: str) -> str:
+    return "".join([brief.rstrip("\n"), "\n", PROBLEM_HEADING, "\n", problem, "\n",
+                    TO_MERGE_HEADING])
+
+
+def _merge_record(site: dict) -> str:
+    """One site's block of the merge payload. Its own piece so a batch's size is the sum of
+    its sites' sizes and a plan can measure a batch without rendering it."""
+    out = [f"\n### {site['id']}\n", "\n", f"Area: {site['area']}\n",
+           f"Kind: {MERGE_KIND_WORDS[site['asks']]}\n",
+           *_payload_field("Consequence: ", site["consequence"])]
+    if site["split_reason"] is not None:
+        out += _payload_field("Kept apart from another report at this place because: ",
+                              site["split_reason"])
+    for member in site["members"]:
+        where = (f"line {member['line_start']}" if member["line_start"] == member["line_end"]
+                 else f"lines {member['line_start']}-{member['line_end']}")
+        out.append(f"\nAt {member['file']}, {where}:\n")
+        out += _payload_field("- Failure: ", member["failure"])
+        for direction in member["directions"]:
+            out += _payload_field("- Direction: ", direction)
+        out += ([f"- {NO_CHECK_LINE}\n"] if member["rationale"] is None
+                else _payload_field("- What the check found: ", member["rationale"]))
+    return "".join(out)
+
+
+def render_merger_payload(brief: str, problem: str, sites: Sequence[dict],
+                          schema: dict | None = None) -> str:
+    """The whole of a merge payload from exactly these inputs: the brief, the problem
+    statement verbatim, and the record of each site this unit groups."""
+    return (_merge_head(brief, problem) + "".join(_merge_record(site) for site in sites)
+            + "".join(_schema_section(schema)))
+
+
+def _site_directory(site: dict) -> str:
+    """The directory a site's file sits in, which is what batches are cut along: a mistake
+    copied between files of one directory is the copy most likely to be one mistake."""
+    return posixpath.dirname(site["members"][0]["file"])
+
+
+def plan_merge(brief: str, problem: str, material: Sequence[dict],
+               schema: dict | None = None, ceiling: Ceiling | None = None,
+               reply_ceiling: int | None = None) -> tuple[MergeUnit, ...]:
+    """One unit over every site, or no unit where the run has fewer than two sites — one
+    site is already one mistake, and a payload with nothing to compare asks nothing.
+
+    **Over either ceiling the sites are batched by directory**, and merges across batches
+    are not attempted; the report says so. Directories are taken in name order and whole
+    while they fit beside the batch being filled; one that does not starts the next batch,
+    and one over the ceiling on its own is split in site order. Every site lands in exactly
+    one batch; a single site over the ceiling goes in a batch of its own rather than being
+    dropped. The input ceiling bounds the rendered payload; the reply ceiling bounds the
+    reply, estimated from the site count because it does not exist yet.
+    """
+    ceiling = MERGE_CEILING if ceiling is None else ceiling
+    reply_ceiling = MERGE_REPLY_CEILING if reply_ceiling is None else reply_ceiling
+    if len(material) < 2:
+        return ()
+    fixed = measure_payload(_merge_head(brief, problem) + "".join(_schema_section(schema)))
+    sizes = {site["id"]: measure_payload(_merge_record(site)) for site in material}
+
+    def fits(sites: Sequence[dict]) -> bool:
+        lines = fixed[0] + sum(sizes[site["id"]][0] for site in sites)
+        size = fixed[1] + sum(sizes[site["id"]][1] for site in sites)
+        return (lines <= ceiling.lines and size <= ceiling.bytes
+                and len(sites) * MERGE_REPLY_BYTES_PER_SITE <= reply_ceiling)
+
+    if fits(material):
+        return (MergeUnit(id=MERGE_UNIT_ID, lane=LANES[0],
+                          sites=tuple(site["id"] for site in material)),)
+    by_directory: dict[str, list[dict]] = {}
+    for site in material:
+        by_directory.setdefault(_site_directory(site), []).append(site)
+    batches: list[list[dict]] = []
+    current: list[dict] = []
+    for directory in sorted(by_directory):
+        sites = by_directory[directory]
+        if fits(current + sites):
+            current += sites
+            continue
+        if current and fits(sites):
+            batches.append(current)
+            current = list(sites)
+            continue
+        # Over the ceiling on its own: filled site by site, and the last part stays open
+        # for the next directory.
+        for site in sites:
+            if current and not fits(current + [site]):
+                batches.append(current)
+                current = []
+            current.append(site)
+    if current:
+        batches.append(current)
+    return tuple(MergeUnit(id=f"{MERGE_UNIT_ID}-{n}", lane=LANES[0],
+                           sites=tuple(sorted((site["id"] for site in batch), key=_id_rank)))
+                 for n, batch in enumerate(batches, 1))
+
+
+def _parse_site_records(raw: object, field: str, allowed: Sequence[str],
+                        record_keys: Sequence[str], text_key: str, outside: str) -> list[dict]:
+    """A list of ``{site, <text_key>}`` records, each naming a site of ``allowed`` once.
+
+    Records rather than a map keyed by site id: a shipped schema closes every object and
+    requires every property, so it cannot describe keys it does not know. The engine builds
+    the map, and refuses the unknown or repeated id a map would have hidden."""
+    if not isinstance(raw, list):
+        raise ResultError(f"field '{field}' must be a list of records "
+                          f"(found {type(raw).__name__})")
+    out: list[dict] = []
+    for index, record in enumerate(raw):
+        where = f"{field}[{index}]"
+        if not isinstance(record, dict):
+            raise ResultError(f"field '{where}' must be a JSON object "
+                              f"(found {type(record).__name__})")
+        _check_keys(record, where, frozenset(record_keys), record_keys, ResultError)
+        site = _text(record["site"], f"{where}.site")
+        if site not in allowed:
+            raise ResultError(f"field '{where}.site' names {site!r}, {outside}")
+        if any(seen["site"] == site for seen in out):
+            raise ResultError(f"field '{where}.site' names {site!r} twice; each site has "
+                              f"one record")
+        out.append({"site": site, text_key: _text(record[text_key], f"{where}.{text_key}")})
+    return out
+
+
+def _parse_merge_group(raw: object, field: str, handed: Mapping[str, str],
+                       placed: dict[str, str]) -> dict:
+    """One group, with every rule that can be decided from it alone: an id this unit was
+    never handed, an id already in another group, an empty group, a group of several sites
+    with no mechanism or not one instance per site, and a group mixing kinds."""
+    if not isinstance(raw, dict):
+        raise ResultError(f"field '{field}' must be a JSON object (found {type(raw).__name__})")
+    _check_keys(raw, field, frozenset(MERGE_GROUP_KEYS), MERGE_GROUP_KEYS, ResultError)
+    if not isinstance(raw["sites"], list) or not raw["sites"]:
+        raise ResultError(f"field '{field}.sites' names no site; every group holds at "
+                          f"least one")
+    sites: list[str] = []
+    for index, raw_site in enumerate(raw["sites"]):
+        site = _text(raw_site, f"{field}.sites[{index}]")
+        if site not in handed:
+            raise ResultError(f"field '{field}.sites[{index}]' names {site!r}, which this "
+                              f"unit was not handed; a merge unit groups the sites in its "
+                              f"own payload and no others")
+        if site in placed:
+            raise ResultError(f"site {site} is in two groups, '{placed[site]}' and "
+                              f"'{field}'; every site belongs to exactly one")
+        placed[site] = field
+        sites.append(site)
+    kinds = {handed[site] for site in sites}
+    if len(kinds) > 1:
+        raise ResultError(f"field '{field}' would mix a defect with a coverage gap "
+                          f"({', '.join(sites)}); a group holds sites of one kind")
+    mechanism = _nullable_text(raw["mechanism"], f"{field}.mechanism")
+    instances = (None if raw["instances"] is None and len(sites) == 1
+                 else _parse_site_records(
+                     [] if raw["instances"] is None else raw["instances"],
+                     f"{field}.instances", sites, MERGE_INSTANCE_KEYS, "instance",
+                     "which is not in this group; an instance speaks for a site of its own "
+                     "group"))
+    if len(sites) > 1:
+        if mechanism is None or not mechanism.strip():
+            raise ResultError(f"field '{field}.mechanism' is empty; a group of several sites "
+                              f"is one mistake only where the one rule they break is stated")
+        if len(instances or ()) != len(sites):
+            raise ResultError(f"field '{field}.instances' does not give one instance per site "
+                              f"({len(instances or ())} for {len(sites)} sites); each site "
+                              f"says how it is that mistake")
+    return {"sites": sites, "mechanism": mechanism, "instances": instances,
+            "reason_kept_apart": _nullable_text(raw["reason_kept_apart"],
+                                                f"{field}.reason_kept_apart")}
+
+
+def parse_merger_result(obj: object, unit_id: str, handed: Mapping[str, str]) -> dict:
+    """Strictly parse a merge result and prove it is a partition of exactly the sites the
+    unit was handed, ``handed`` mapping each site id to its kind.
+
+    **All or nothing**, as a clustering reply is: a site dropped, repeated or never handed,
+    an empty group, a group of several sites without a mechanism or without one instance
+    per site, a group mixing kinds, and a compound site in a group of several each fail the
+    WHOLE unit. The degrade is every site its own defect, which keeps every finding visible;
+    a partly believed reply would report groups nobody proposed.
+    """
+    try:
+        if not isinstance(obj, dict):
+            raise ResultError(f"result must be a JSON object (found {type(obj).__name__})")
+        _check_keys(obj, "result", frozenset(MERGER_RESULT_KEYS), MERGER_RESULT_KEYS,
+                    ResultError)
+        if not isinstance(obj["groups"], list):
+            raise ResultError(f"field 'groups' must be a list (found {type(obj['groups']).__name__})")
+        placed: dict[str, str] = {}
+        groups = [_parse_merge_group(raw, f"groups[{index}]", handed, placed)
+                  for index, raw in enumerate(obj["groups"])]
+        missing = sorted((site for site in handed if site not in placed), key=_id_rank)
+        if missing:
+            raise ResultError(
+                f"every site this unit was handed belongs to exactly one group, and "
+                f"{len(missing)} of {len(handed)} are in no group: {', '.join(missing)}")
+        compound = _parse_site_records(
+            obj["compound"], "compound", tuple(handed), MERGE_COMPOUND_KEYS, "second_claim",
+            "which this unit was not handed; a merge unit speaks for the sites in its own "
+            "payload and no others")
+        size = {site: len(group["sites"]) for group in groups for site in group["sites"]}
+        for record in compound:
+            if size[record["site"]] > 1:
+                raise ResultError(
+                    f"site {record['site']} is compound — its report makes a second claim — "
+                    f"and is in a group of {size[record['site']]}; a compound site stays in "
+                    f"a group of its own, or the shared account would hide that claim")
+        return {"groups": groups, "compound": compound,
+                "summary": _text(obj["summary"], "summary", empty_ok=True)}
+    except ResultError as exc:
+        raise ResultError(f"{unit_id}: {exc}") from None
+
+
+def read_merge_results(rundir: Path, units: Sequence[dict],
+                       kinds: Mapping[str, str]) -> tuple[MergeState, ...]:
+    """Classify every merge unit as exactly one of complete, failed or missing, by the
+    landing rule every other kind is read by. ``kinds`` is each site's kind, from the
+    clustering this listing was proved against."""
+    states: list[MergeState] = []
+    for unit in units:
+        state, payload = _read_unit_file(rundir, unit["id"])
+        if state != UNIT_COMPLETE:
+            states.append(MergeState(unit["id"], state, _writable(str(payload)), (), (), None))
+            continue
+        try:
+            parsed = parse_merger_result(payload, unit["id"],
+                                         {site: kinds[site] for site in unit["sites"]})
+        except ResultError as exc:
+            states.append(MergeState(unit["id"], UNIT_FAILED, _writable(str(exc)), (), (),
+                                     None))
+            continue
+        states.append(MergeState(unit["id"], UNIT_COMPLETE, None, tuple(parsed["groups"]),
+                                 tuple(parsed["compound"]), parsed["summary"]))
+    return tuple(states)
+
+
+def check_merge(clustering: Clustering, units: Sequence[dict]) -> None:
+    """The merge listing against the run's own sites: every site in exactly one unit, and
+    no site the run does not have. Refused by name before any result is read, as
+    :func:`check_clustering` refuses the same shape one stage earlier: the partition check
+    proves a reply against the sites its own unit was HANDED, so a listing over a different
+    set of sites would pass it. No unit at all is not refused — that is a run with fewer
+    than two sites, or one made before this round existed."""
+    if not units:
+        return
+    sites = [cluster.id for cluster in clustering.clusters]
+    holder: dict[str, str] = {}
+    for unit in units:
+        if (not isinstance(unit.get("sites"), list)
+                or not all(isinstance(sid, str) for sid in unit["sites"])):
+            raise RunDirError(f"merge unit {unit.get('id', '(unnamed)')!s} has no list of "
+                              f"site ids; {UNITS_FILE_NAME} is not the engine's")
+        for sid in unit["sites"]:
+            if sid in holder:
+                raise RunDirError(f"site {sid} is in two merge units, {holder[sid]} and "
+                                  f"{unit.get('id')}; merge writes each site into one, so "
+                                  f"{UNITS_FILE_NAME} is not the engine's")
+            holder[sid] = str(unit.get("id"))
+    if sorted(holder, key=_id_rank) != sorted(sites, key=_id_rank):
+        raise RunDirError(f"the merge units are listed with sites that are not this run's "
+                          f"sites ({len(holder)} listed, {len(sites)} in the run); every site "
+                          f"is handed to exactly one merge unit, so {UNITS_FILE_NAME} is not "
+                          f"the engine's")
+
+
+def build_merge(units: Sequence[dict], states: Sequence[MergeState]) -> dict | None:
+    """The round as ``findings.json`` records it, or ``None`` where the run has no merge
+    unit. Each unit's groups are held exactly as proved; a unit that failed or never landed
+    holds none, which leaves every site it was handed its own defect."""
+    if not units:
+        return None
+    state_of = {state.id: state for state in states}
+    return {
+        "batched": len(units) > 1,
+        "units": [{
+            "unit": unit["id"],
+            "state": state_of[unit["id"]].state,
+            "reason": state_of[unit["id"]].reason,
+            "sites": list(unit["sites"]),
+            "groups": list(state_of[unit["id"]].groups),
+            "compound": list(state_of[unit["id"]].compound),
+            "summary": state_of[unit["id"]].summary,
+        } for unit in units],
+    }
+
+
+def write_merge(rundir: Path, units_doc: dict, units: Sequence[MergeUnit],
+                material: Sequence[dict], companions: MergeCompanions, problem: str) -> None:
+    """Write ``units/<id>/`` for every merge unit, then ``units.json`` at the merge stage.
+    The same landing, reclaim and take-back rules as :func:`write_clusters`."""
+    for unit in units:
+        target = rundir / UNITS_DIR / unit.id
+        if _not_a_unit_directory(target):
+            raise RunDirError(
+                f"{target} already exists and is a link or a file rather than a unit "
+                f"directory this stage wrote; move it aside and merge again"
+            )
+    _reclaim("merge", rundir, (),
+             tuple((rundir / UNITS_DIR / unit.id, UNIT_CONTENTS) for unit in units),
+             (rundir / UNITS_FILE_NAME,))
+    created: list[Path] = []
+    try:
+        by_id = {site["id"]: site for site in material}
+        listing = list(units_doc["units"])
+        for unit in units:
+            unit_dir = rundir / UNITS_DIR / unit.id
+            try:
+                unit_dir.mkdir(parents=True)
+            except OSError as exc:
+                raise InventoryError(f"cannot create {unit_dir}: {exc}") from exc
+            created.append(unit_dir)
+            text = render_merger_payload(companions.merger_brief, problem,
+                                         [by_id[sid] for sid in unit.sites],
+                                         schema=companions.merger_schema)
+            write_text(unit_dir / PAYLOAD_NAME, text)
+            write_json(unit_dir / SCHEMA_NAME, companions.merger_schema)
+            lines, size = measure_payload(text)
+            listing.append({
+                "id": unit.id, "kind": MERGER_KIND, "area": None, "lane": unit.lane,
+                "lens": None, "sites": list(unit.sites),
+                "payload": f"{UNITS_DIR}/{unit.id}/{PAYLOAD_NAME}",
+                "schema": f"{UNITS_DIR}/{unit.id}/{SCHEMA_NAME}",
+                "payload_lines": lines,
+                "payload_bytes": size,
+            })
+        write_json(rundir / UNITS_FILE_NAME, {
+            "stage": MERGED_STAGE, "lanes": units_doc.get("lanes", list(LANES)),
+            "units": listing,
+        })
+    except BaseException:
+        for unit_dir in created:
+            shutil.rmtree(unit_dir, ignore_errors=True)
+        raise
+
+
+def merge_summary(units: Sequence[MergeUnit], clustering: Clustering) -> str:
+    out = [f"{_plural(len(clustering.clusters), 'site')} to merge"]
+    for unit in units:
+        out.append(f"  {unit.id}  {_plural(len(unit.sites), 'site')}  lane {unit.lane}")
+    if not units:
+        out.append("  no merge unit: the run has fewer than two sites")
+    elif len(units) > 1:
+        out.append("  over the merge ceiling: batched by directory, and merges across "
+                   "batches are not attempted")
+    return "\n".join(out) + "\n"
+
+
+# --------------------------------------------------------------------------- #
+# merge check — every proposed group checked, site by site, by the other lane
+# --------------------------------------------------------------------------- #
+# A merge is a claim no verifier checked: every site's verdict says its failure is real, and
+# none says two sites are one mistake. So each group of several sites goes to a unit that
+# did not propose it, on the lane the merge did not run on, in a fresh context, and only
+# the sites it upholds become one defect. Groups of one are not checked: they claim nothing.
+MERGE_CHECKER_KIND = "merge-checker"
+MERGE_CHECKER_SCHEMA_NAME = "merge-checker-schema.json"
+MERGE_CHECKED_STAGE = "merge-checked"
+# Not `merge-` followed by anything: that prefix names the merge round's own units.
+MERGE_CHECK_UNIT_PREFIX = "mergecheck-"
+# The merge runs on the first lane, so its check runs on the other one.
+MERGE_CHECK_LANE = next(lane for lane in LANES if lane != LANES[0])
+MERGE_CHECK_UNIT_ID = f"{MERGE_CHECK_UNIT_PREFIX}{MERGE_CHECK_LANE}"
+GROUP_ID_PREFIX = "G"
+MERGE_CHECKER_RESULT_KEYS = ("groups", "summary")
+MERGE_CHECK_GROUP_KEYS = ("group", "sites", "hidden_claims", "fix_touches_refuted")
+MERGE_CHECK_VERDICT_KEYS = ("site", "verdict", "reason")
+MERGE_CHECK_HIDDEN_KEYS = ("site", "claim")
+MERGE_CHECK_REFUTED_KEYS = ("value", "sites")
+CHECK_FITS, CHECK_MISFITS = "fits", "does_not_fit"
+MERGE_CHECK_VERDICTS = (CHECK_FITS, CHECK_MISFITS)
+# Why a site left a proposed group: it does not fit the mechanism, its own material makes a
+# second claim the shared account would hide, or it fit and too few others did.
+CHECK_DOES_NOT_FIT, CHECK_HIDDEN_CLAIM, CHECK_TOO_FEW = "does_not_fit", "hidden_claim", "too_few"
+TO_CHECK_HEADING = "\n## The groups\n"
+# The merge check's two ceilings, checked when `merge-check` plans its units. Its payload
+# is each group's claim and each of its sites' full record, quoted source included, and its
+# reply one verdict per site, so both grow with the number of sites in groups of several.
+# Over either the groups are batched, and a group is never split across batches. These are
+# batching estimates with headroom, not measured model limits.
+MERGE_CHECK_CEILING = Ceiling(lines=6000, bytes=400 * 1024)
+# The reply is estimated before it exists, from the number of sites checked.
+MERGE_CHECK_REPLY_BYTES_PER_SITE = 384
+MERGE_CHECK_REPLY_CEILING = 64 * 1024
+
+
+@dataclass(frozen=True)
+class MergeCheckUnit:
+    """One merge check unit: the groups it checks, addressed to the lane the merge did not
+    run on."""
+
+    id: str
+    lane: str
+    groups: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MergeCheckState:
+    """What one merge check unit came back as: exactly one of complete, failed or missing,
+    with the reason where it is not complete and the proved answers where it is."""
+
+    id: str
+    state: str
+    reason: str | None
+    groups: tuple[dict, ...]
+    summary: str | None
+
+
+@dataclass(frozen=True)
+class MergeCheckCompanions:
+    """What ``merge-check`` ships beside the engine and every check payload is built
+    from."""
+
+    merge_checker_brief: str
+    merge_checker_schema: dict
+
+
+def load_merge_check_companions() -> MergeCheckCompanions:
+    return MergeCheckCompanions(merge_checker_brief=load_brief("merge-checker"),
+                                merge_checker_schema=load_schema(MERGE_CHECKER_SCHEMA_NAME))
+
+
+def number_groups(groups: Iterable[dict]) -> tuple[dict, ...]:
+    """Groups of several sites as the check sees them, numbered ``G1``, ``G2`` … in order of
+    each group's lowest site, so a group id is a pure function of the merge's results.
+    Each carries its sites and instances in site order and its mechanism as proposed."""
+    ordered = sorted(({"sites": sorted(group["sites"], key=_id_rank),
+                       "mechanism": group["mechanism"],
+                       "instances": sorted(group["instances"] or (),
+                                           key=lambda record: _id_rank(record["site"]))}
+                      for group in groups),
+                     key=lambda group: _id_rank(group["sites"][0]))
+    return tuple({"group": f"{GROUP_ID_PREFIX}{n}", **group}
+                 for n, group in enumerate(ordered, 1))
+
+
+def proposed_groups(merge: dict | None) -> tuple[dict, ...]:
+    """Every group of several sites a complete merge unit proposed. A unit whose reply was
+    discarded proposed nothing, and a group of one claims nothing to check."""
+    if merge is None:
+        return ()
+    return number_groups(group for unit in merge["units"] if unit["state"] == UNIT_COMPLETE
+                         for group in unit["groups"] if len(group["sites"]) > 1)
+
+
+def site_status(asks: str, statuses: Iterable[str]) -> str:
+    """A site's outcome from its own candidates' statuses and nothing else: established
+    where any is, refuted where all are, unresolved otherwise. In the lane's own vocabulary:
+    a gap "established" is a test to write and a gap "refuted" is one already written."""
+    held = set(statuses)
+    if held & set(ESTABLISHED_FOR[asks]):
+        return DEFECT_ESTABLISHED
+    if held == {"refuted" if asks == DEFECT_ASKS else COVERAGE_GAP_REFUTED}:
+        return DEFECT_REFUTED
+    return DEFECT_UNRESOLVED
+
+
+def merge_check_material(groups: Sequence[dict], clustering: Clustering,
+                         candidates: Sequence[dict], rationales: dict[str, str | None],
+                         statuses: dict[str, str],
+                         snippets: dict[str, dict | None]) -> tuple[dict, ...]:
+    """Every proposed group as the check payload states it: the stated mechanism, how each
+    site instantiates it, and each site's full record — its outcome, its consequence, and
+    for each candidate the location, the lines it cites from the pinned tree, the failure,
+    the directions proposed and what the agent that checked it found.
+
+    **Nothing says which lane proposed the merge, and no unit id, lane or lens appears**:
+    the check judges the claim, not its author. The outcome IS here, unlike in the merge's
+    payload, because the check is asked whether the shared fix would change a refuted site.
+    """
+    by_id = {cand["id"]: cand for cand in candidates}
+    site_of = {site.id: site for site in clustering.clusters}
+    out: list[dict] = []
+    for group in groups:
+        sites: list[dict] = []
+        for sid in group["sites"]:
+            site = site_of[sid]
+            members = sorted((by_id[cid] for cid in site.members),
+                             key=lambda cand: (cand["file"], cand["line_start"],
+                                               cand["line_end"], cand["id"]))
+            sites.append({
+                "id": sid, "area": site.area, "asks": site.asks, "status": statuses[sid],
+                "consequence": site.consequence, "split_reason": site.split_reason,
+                "members": [{
+                    "file": member["file"], "line_start": member["line_start"],
+                    "line_end": member["line_end"], "failure": member["failure"],
+                    "directions": _distinct(r["direction"] for r in member["raised_by"]),
+                    "rationale": rationales[member["id"]],
+                    "snippet": snippets.get(member["id"]),
+                } for member in members],
+            })
+        out.append({"group": group["group"], "mechanism": group["mechanism"],
+                    "instances": list(group["instances"]), "sites": sites})
+    return tuple(out)
+
+
+def _merge_check_head(brief: str, problem: str) -> str:
+    return "".join([brief.rstrip("\n"), "\n", PROBLEM_HEADING, "\n", problem, "\n",
+                    TO_CHECK_HEADING])
+
+
+def _merge_check_record(group: dict) -> str:
+    """One group's block of the check payload: its claim, then each site's record. Its own
+    piece so a batch's size is the sum of its groups' sizes."""
+    out = [f"\n### {group['group']}\n", "\n",
+           *_payload_field("Stated mechanism: ", group["mechanism"]),
+           "\nHow each site instantiates it:\n"]
+    for record in group["instances"]:
+        out += _payload_field(f"- {record['site']}: ", record["instance"])
+    for site in group["sites"]:
+        out += [f"\n#### {site['id']} (outcome: {site['status']})\n", "\n",
+                f"Area: {site['area']}\n", f"Kind: {MERGE_KIND_WORDS[site['asks']]}\n",
+                *_payload_field("Consequence: ", site["consequence"])]
+        if site["split_reason"] is not None:
+            out += _payload_field("Kept apart from another report at this place because: ",
+                                  site["split_reason"])
+        shown: set[tuple] = set()
+        for member in site["members"]:
+            where = (f"line {member['line_start']}" if member["line_start"] == member["line_end"]
+                     else f"lines {member['line_start']}-{member['line_end']}")
+            out.append(f"\nAt {member['file']}, {where}:\n")
+            snip = member["snippet"]
+            # The same cited range quoted once per site: two reports of one place routinely
+            # cite the same lines.
+            if snip is not None and (member["file"], snip["first_line"],
+                                     len(snip["lines"])) not in shown:
+                shown.add((member["file"], snip["first_line"], len(snip["lines"])))
+                width = len(str(snip["first_line"] + len(snip["lines"]) - 1))
+                body = [f"{snip['first_line'] + n:>{width}} | {line}"
+                        for n, line in enumerate(snip["lines"])]
+                if snip["truncated"]:
+                    body.append(SNIPPET_CUT_MARKER)
+                out += ["- Source:\n", *_fenced(body)]
+            out += _payload_field("- Failure: ", member["failure"])
+            for direction in member["directions"]:
+                out += _payload_field("- Direction: ", direction)
+            out += ([f"- {NO_CHECK_LINE}\n"] if member["rationale"] is None
+                    else _payload_field("- What the check found: ", member["rationale"]))
+    return "".join(out)
+
+
+def render_merge_checker_payload(brief: str, problem: str, groups: Sequence[dict],
+                                 schema: dict | None = None) -> str:
+    """The whole of a merge check payload from exactly these inputs: the brief, the problem
+    statement verbatim, and the record of each group this unit checks."""
+    return (_merge_check_head(brief, problem)
+            + "".join(_merge_check_record(group) for group in groups)
+            + "".join(_schema_section(schema)))
+
+
+def plan_merge_check(brief: str, problem: str, material: Sequence[dict],
+                     schema: dict | None = None, ceiling: Ceiling | None = None,
+                     reply_ceiling: int | None = None) -> tuple[MergeCheckUnit, ...]:
+    """One unit over every proposed group, or no unit where the merge proposed none.
+
+    **Over either ceiling the groups are batched, and a group is never split**: its sites
+    are judged against one mechanism, which a unit holding half of them cannot do. Groups
+    are taken in order and a batch closes when the next one would not fit beside it; a group
+    over the ceiling on its own goes in a batch alone rather than being split or dropped.
+    """
+    ceiling = MERGE_CHECK_CEILING if ceiling is None else ceiling
+    reply_ceiling = MERGE_CHECK_REPLY_CEILING if reply_ceiling is None else reply_ceiling
+    if not material:
+        return ()
+    fixed = measure_payload(_merge_check_head(brief, problem) + "".join(_schema_section(schema)))
+    sizes = {group["group"]: measure_payload(_merge_check_record(group)) for group in material}
+
+    def fits(groups: Sequence[dict]) -> bool:
+        lines = fixed[0] + sum(sizes[group["group"]][0] for group in groups)
+        size = fixed[1] + sum(sizes[group["group"]][1] for group in groups)
+        sites = sum(len(group["sites"]) for group in groups)
+        return (lines <= ceiling.lines and size <= ceiling.bytes
+                and sites * MERGE_CHECK_REPLY_BYTES_PER_SITE <= reply_ceiling)
+
+    if fits(material):
+        return (MergeCheckUnit(id=MERGE_CHECK_UNIT_ID, lane=MERGE_CHECK_LANE,
+                               groups=tuple(group["group"] for group in material)),)
+    batches: list[list[dict]] = []
+    for group in material:
+        if batches and fits(batches[-1] + [group]):
+            batches[-1].append(group)
+        else:
+            batches.append([group])
+    return tuple(MergeCheckUnit(id=f"{MERGE_CHECK_UNIT_ID}-{n}", lane=MERGE_CHECK_LANE,
+                                groups=tuple(group["group"] for group in batch))
+                 for n, batch in enumerate(batches, 1))
+
+
+def _parse_check_group(raw: object, field: str, sites: Sequence[str]) -> dict:
+    """One group's answer: one verdict for each of its sites and no other, and hidden
+    claims and refuted sites naming its own sites once each."""
+    if not isinstance(raw, dict):
+        raise ResultError(f"field '{field}' must be a JSON object (found {type(raw).__name__})")
+    _check_keys(raw, field, frozenset(MERGE_CHECK_GROUP_KEYS), MERGE_CHECK_GROUP_KEYS,
+                ResultError)
+    outside = ("which is not in this group; a group's answer speaks for its own sites and "
+               "no others")
+    if not isinstance(raw["sites"], list):
+        raise ResultError(f"field '{field}.sites' must be a list of records "
+                          f"(found {type(raw['sites']).__name__})")
+    verdicts: dict[str, dict] = {}
+    for index, record in enumerate(raw["sites"]):
+        where = f"{field}.sites[{index}]"
+        if not isinstance(record, dict):
+            raise ResultError(f"field '{where}' must be a JSON object "
+                              f"(found {type(record).__name__})")
+        _check_keys(record, where, frozenset(MERGE_CHECK_VERDICT_KEYS),
+                    MERGE_CHECK_VERDICT_KEYS, ResultError)
+        site = _text(record["site"], f"{where}.site")
+        if site not in sites:
+            raise ResultError(f"field '{where}.site' names {site!r}, {outside}")
+        if site in verdicts:
+            raise ResultError(f"field '{where}.site' names {site!r} twice; each site has "
+                              f"one verdict")
+        verdicts[site] = {"site": site,
+                          "verdict": _one_of(record["verdict"], f"{where}.verdict",
+                                             MERGE_CHECK_VERDICTS),
+                          "reason": _text(record["reason"], f"{where}.reason")}
+    missing = [site for site in sites if site not in verdicts]
+    if missing:
+        raise ResultError(f"field '{field}.sites' gives no verdict for {', '.join(missing)}; "
+                          f"every site of a group is judged against its mechanism")
+    hidden = _parse_site_records(raw["hidden_claims"], f"{field}.hidden_claims", sites,
+                                 MERGE_CHECK_HIDDEN_KEYS, "claim", outside)
+    touches = raw["fix_touches_refuted"]
+    where = f"{field}.fix_touches_refuted"
+    if not isinstance(touches, dict):
+        raise ResultError(f"field '{where}' must be a JSON object "
+                          f"(found {type(touches).__name__})")
+    _check_keys(touches, where, frozenset(MERGE_CHECK_REFUTED_KEYS), MERGE_CHECK_REFUTED_KEYS,
+                ResultError)
+    if not isinstance(touches["value"], bool):
+        raise ResultError(f"field '{where}.value' must be true or false "
+                          f"(found {type(touches['value']).__name__})")
+    if not isinstance(touches["sites"], list):
+        raise ResultError(f"field '{where}.sites' must be a list "
+                          f"(found {type(touches['sites']).__name__})")
+    refuted: list[str] = []
+    for index, raw_site in enumerate(touches["sites"]):
+        site = _text(raw_site, f"{where}.sites[{index}]")
+        if site not in sites:
+            raise ResultError(f"field '{where}.sites[{index}]' names {site!r}, {outside}")
+        if site in refuted:
+            raise ResultError(f"field '{where}.sites[{index}]' names {site!r} twice")
+        refuted.append(site)
+    return {"sites": [verdicts[site] for site in sites], "hidden_claims": hidden,
+            "fix_touches_refuted": {"value": touches["value"], "sites": refuted}}
+
+
+def parse_merge_checker_result(obj: object, unit_id: str,
+                               handed: Mapping[str, Sequence[str]]) -> dict:
+    """Strictly parse a merge check result against the groups the unit was handed,
+    ``handed`` mapping each group id to its site ids.
+
+    **All or nothing**: a group left out, answered twice or never handed, a site with no
+    verdict, two verdicts or one from another group, and a hidden claim or refuted site
+    naming a site outside its group each fail the WHOLE unit. The degrade is every group
+    it was handed unaccepted, which leaves each of their sites its own defect; a partly
+    believed reply would uphold groups nobody checked.
+    """
+    try:
+        if not isinstance(obj, dict):
+            raise ResultError(f"result must be a JSON object (found {type(obj).__name__})")
+        _check_keys(obj, "result", frozenset(MERGE_CHECKER_RESULT_KEYS),
+                    MERGE_CHECKER_RESULT_KEYS, ResultError)
+        if not isinstance(obj["groups"], list):
+            raise ResultError(f"field 'groups' must be a list "
+                              f"(found {type(obj['groups']).__name__})")
+        answered: dict[str, dict] = {}
+        for index, raw in enumerate(obj["groups"]):
+            field = f"groups[{index}]"
+            if not isinstance(raw, dict):
+                raise ResultError(f"field '{field}' must be a JSON object "
+                                  f"(found {type(raw).__name__})")
+            group = _text(raw.get("group"), f"{field}.group")
+            if group not in handed:
+                raise ResultError(f"field '{field}.group' names {group!r}, which this unit "
+                                  f"was not handed; a merge check unit answers for the "
+                                  f"groups in its own payload and no others")
+            if group in answered:
+                raise ResultError(f"field '{field}.group' names {group!r} twice; each group "
+                                  f"has one entry")
+            answered[group] = {"group": group,
+                               **_parse_check_group(raw, field, tuple(handed[group]))}
+        missing = sorted((group for group in handed if group not in answered), key=_id_rank)
+        if missing:
+            raise ResultError(f"{len(missing)} of {len(handed)} groups this unit was handed "
+                              f"have no entry: {', '.join(missing)}")
+        return {"groups": [answered[group] for group in sorted(answered, key=_id_rank)],
+                "summary": _text(obj["summary"], "summary", empty_ok=True)}
+    except ResultError as exc:
+        raise ResultError(f"{unit_id}: {exc}") from None
+
+
+def _handed_groups(unit: dict) -> dict[str, tuple[str, ...]]:
+    return {group["group"]: tuple(group["sites"]) for group in unit["groups"]}
+
+
+def read_merge_check_results(rundir: Path, units: Sequence[dict]) -> tuple[MergeCheckState, ...]:
+    """Classify every merge check unit as exactly one of complete, failed or missing, by
+    the landing rule every other kind is read by."""
+    states: list[MergeCheckState] = []
+    for unit in units:
+        state, payload = _read_unit_file(rundir, unit["id"])
+        if state != UNIT_COMPLETE:
+            states.append(MergeCheckState(unit["id"], state, _writable(str(payload)), (), None))
+            continue
+        try:
+            parsed = parse_merge_checker_result(payload, unit["id"], _handed_groups(unit))
+        except ResultError as exc:
+            states.append(MergeCheckState(unit["id"], UNIT_FAILED, _writable(str(exc)), (),
+                                          None))
+            continue
+        states.append(MergeCheckState(unit["id"], UNIT_COMPLETE, None,
+                                      tuple(parsed["groups"]), parsed["summary"]))
+    return tuple(states)
+
+
+def check_merge_check(proposed: Sequence[dict], units: Sequence[dict]) -> None:
+    """The check listing against the groups the merge round proposes NOW: every group in
+    exactly one unit, and each exactly as it was proposed when the check was planned.
+
+    **A change to a group's membership or mechanism invalidates its check and everything
+    after it**, so it is refused by name rather than read: a verdict that a site fits one
+    mechanism says nothing about another, and the defects synthesis was handed were built
+    from the groups the check upheld. No unit at all is not refused — that is a merge that
+    proposed no group, a run reported before its check ran, or one made before the round
+    existed; every proposed group is then simply unchecked."""
+    if not units:
+        return
+    listed: dict[str, dict] = {}
+    for unit in units:
+        if (not isinstance(unit.get("groups"), list)
+                or not all(isinstance(group, dict) and isinstance(group.get("group"), str)
+                           and isinstance(group.get("sites"), list)
+                           for group in unit["groups"])):
+            raise RunDirError(f"merge check unit {unit.get('id', '(unnamed)')!s} has no list "
+                              f"of groups; {UNITS_FILE_NAME} is not the engine's")
+        for group in unit["groups"]:
+            if group["group"] in listed:
+                raise RunDirError(f"group {group['group']} is in two merge check units; "
+                                  f"merge-check writes each group into one, so "
+                                  f"{UNITS_FILE_NAME} is not the engine's")
+            listed[group["group"]] = group
+    now = {group["group"]: group for group in proposed}
+    if listed != now:
+        raise RunDirError(
+            f"the merge check was planned over groups the merge round no longer proposes "
+            f"({len(listed)} checked, {len(now)} proposed now, or a group's sites or "
+            f"mechanism changed); a check of one grouping says nothing about another, so the "
+            f"check and every round after it no longer apply. Take them back with "
+            f"`cluster --redo` and run the rounds again")
+
+
+def _decide_group(group: dict, answer: dict | None) -> dict:
+    """What the check's answer does to one proposed group: a site that does not fit
+    leaves, a site hiding a second claim leaves, and the rest are one defect while
+    two or more remain. With no answer — the unit failed, never landed or was never
+    planned — the group is not accepted and every site in it stays its own defect."""
+    out = {"group": group["group"], "sites": list(group["sites"]),
+           "mechanism": group["mechanism"], "instances": list(group["instances"]),
+           "checked": answer is not None,
+           "verdicts": list(answer["sites"]) if answer else [],
+           "hidden_claims": list(answer["hidden_claims"]) if answer else [],
+           "fix_touches_refuted": answer["fix_touches_refuted"] if answer else None,
+           "accepted": [], "removed": []}
+    if answer is None:
+        return out
+    removed: dict[str, dict] = {}
+    for record in answer["sites"]:
+        if record["verdict"] == CHECK_MISFITS:
+            removed[record["site"]] = {"site": record["site"], "why": CHECK_DOES_NOT_FIT,
+                                       "reason": record["reason"]}
+    for record in answer["hidden_claims"]:
+        removed.setdefault(record["site"], {"site": record["site"], "why": CHECK_HIDDEN_CLAIM,
+                                            "reason": record["claim"]})
+    remaining = [site for site in group["sites"] if site not in removed]
+    if len(remaining) < 2:
+        for site in remaining:
+            removed[site] = {"site": site, "why": CHECK_TOO_FEW, "reason": None}
+        remaining = []
+    out["accepted"] = remaining
+    out["removed"] = [removed[site] for site in group["sites"] if site in removed]
+    return out
+
+
+def build_merge_check(units: Sequence[dict], states: Sequence[MergeCheckState],
+                      proposed: Sequence[dict]) -> dict | None:
+    """The round as ``findings.json`` records it, or ``None`` where the merge proposed no
+    group of several sites. Every proposed group is recorded with what the check decided,
+    including one no unit checked, which is accepted as nothing."""
+    if not proposed:
+        return None
+    state_of = {state.id: state for state in states}
+    answers: dict[str, dict] = {}
+    for unit in units:
+        state = state_of.get(unit["id"])
+        if state is not None and state.state == UNIT_COMPLETE:
+            answers.update({answer["group"]: answer for answer in state.groups})
+    return {
+        "batched": len(units) > 1,
+        "units": [{
+            "unit": unit["id"],
+            "state": state_of[unit["id"]].state if unit["id"] in state_of else UNIT_MISSING,
+            "reason": state_of[unit["id"]].reason if unit["id"] in state_of else None,
+            "groups": [group["group"] for group in unit["groups"]],
+            "summary": state_of[unit["id"]].summary if unit["id"] in state_of else None,
+        } for unit in units],
+        "groups": [_decide_group(group, answers.get(group["group"])) for group in proposed],
+    }
+
+
+def accepted_grouping(sites: Iterable[str], record: dict | None) -> list[list[str]]:
+    """The run's sites grouped into defects: each group the check upheld, and every other
+    site on its own. **The only grouping a report or synthesis is built from**, which is
+    what keeps a defect of several sites from existing without an accepted check covering
+    every one of its sites. Groups the merge proposed are taken whole as the check left
+    them and never joined: two groups sharing a resemblance are not one mistake."""
+    accepted = [list(group["accepted"]) for group in (record or {}).get("groups", ())
+                if len(group["accepted"]) > 1]
+    held = {site for group in accepted for site in group}
+    return accepted + [[site] for site in sites if site not in held]
+
+
+def _prove_grouping(defects: Sequence[Defect], record: dict | None) -> dict[str, dict]:
+    """Every defect of several sites against the check: an accepted group with exactly its
+    sites, a stated mechanism and one instance for each site. Refused otherwise, whoever
+    built the grouping. Returns each such defect's accepted group by defect id."""
+    upheld = {tuple(group["accepted"]): group for group in (record or {}).get("groups", ())
+              if len(group["accepted"]) > 1}
+    out: dict[str, dict] = {}
+    for defect in defects:
+        if len(defect.sites) < 2:
+            continue
+        group = upheld.get(tuple(defect.sites))
+        if group is None:
+            raise GroupingError(
+                f"sites {', '.join(defect.sites)} are grouped as one defect with no accepted "
+                f"merge check covering every one of them; a defect of several sites exists "
+                f"only where a unit that did not propose it upheld each site")
+        instances = {record["site"] for record in group["instances"]}
+        if not (group["mechanism"] or "").strip() or not set(defect.sites) <= instances:
+            raise GroupingError(
+                f"group {group['group']} was upheld without a stated mechanism and one "
+                f"instance for each of its sites")
+        out[defect.id] = group
+    return out
+
+
+def write_merge_check(rundir: Path, units_doc: dict, units: Sequence[MergeCheckUnit],
+                      material: Sequence[dict], proposed: Sequence[dict],
+                      companions: MergeCheckCompanions, problem: str) -> None:
+    """Write ``units/<id>/`` for every merge check unit, then ``units.json`` at the
+    merge-checked stage. The same landing, reclaim and take-back rules as
+    :func:`write_merge`. Each unit's row lists its groups exactly as proposed, which is
+    what :func:`check_merge_check` compares the merge's results against later."""
+    for unit in units:
+        target = rundir / UNITS_DIR / unit.id
+        if _not_a_unit_directory(target):
+            raise RunDirError(
+                f"{target} already exists and is a link or a file rather than a unit "
+                f"directory this stage wrote; move it aside and merge-check again"
+            )
+    _reclaim("merge-check", rundir, (),
+             tuple((rundir / UNITS_DIR / unit.id, UNIT_CONTENTS) for unit in units),
+             (rundir / UNITS_FILE_NAME,))
+    created: list[Path] = []
+    try:
+        by_id = {group["group"]: group for group in material}
+        claim = {group["group"]: group for group in proposed}
+        listing = list(units_doc["units"])
+        for unit in units:
+            unit_dir = rundir / UNITS_DIR / unit.id
+            try:
+                unit_dir.mkdir(parents=True)
+            except OSError as exc:
+                raise InventoryError(f"cannot create {unit_dir}: {exc}") from exc
+            created.append(unit_dir)
+            text = render_merge_checker_payload(companions.merge_checker_brief, problem,
+                                                [by_id[gid] for gid in unit.groups],
+                                                schema=companions.merge_checker_schema)
+            write_text(unit_dir / PAYLOAD_NAME, text)
+            write_json(unit_dir / SCHEMA_NAME, companions.merge_checker_schema)
+            lines, size = measure_payload(text)
+            listing.append({
+                "id": unit.id, "kind": MERGE_CHECKER_KIND, "area": None, "lane": unit.lane,
+                "lens": None, "groups": [claim[gid] for gid in unit.groups],
+                "payload": f"{UNITS_DIR}/{unit.id}/{PAYLOAD_NAME}",
+                "schema": f"{UNITS_DIR}/{unit.id}/{SCHEMA_NAME}",
+                "payload_lines": lines,
+                "payload_bytes": size,
+            })
+        write_json(rundir / UNITS_FILE_NAME, {
+            "stage": MERGE_CHECKED_STAGE, "lanes": units_doc.get("lanes", list(LANES)),
+            "units": listing,
+        })
+    except BaseException:
+        for unit_dir in created:
+            shutil.rmtree(unit_dir, ignore_errors=True)
+        raise
+
+
+def merge_check_summary(units: Sequence[MergeCheckUnit], proposed: Sequence[dict]) -> str:
+    out = [f"{_plural(len(proposed), 'group')} of several sites to check"]
+    for unit in units:
+        out.append(f"  {unit.id}  {_plural(len(unit.groups), 'group')}  lane {unit.lane}")
+    if not units:
+        out.append("  no merge check unit: the merge proposed no group of several sites")
+    elif len(units) > 1:
+        out.append("  over the merge check ceiling: batched by group, and no group is split")
+    return "\n".join(out) + "\n"
+
+
+# --------------------------------------------------------------------------- #
 # synthesize — one reading of the defect list nothing else can compute
 # --------------------------------------------------------------------------- #
 SYNTHESIZER_KIND = "synthesizer"
@@ -6501,7 +7604,27 @@ SYNTHESIS_UNIT_PREFIX = "synth-"
 # handed.
 SYNTHESIS_UNIT_ID = f"{SYNTHESIS_UNIT_PREFIX}{LANES[0]}"
 SYNTHESIZER_RESULT_KEYS = ("tiers", "defects", "summary")
-SYNTHESIS_KEYS = ("defect", "tier", "what_goes_wrong", "fix", "cross_references")
+SYNTHESIS_KEYS = ("defect", "heading", "tier", "what_goes_wrong", "fix", "site_notes",
+                  "cross_references")
+# The shape a listing written before a defect could have several sites asked for: no
+# heading and no site notes. Read from such a listing only, so an old run re-renders with
+# its narrative rather than losing every entry to the new key set.
+LEGACY_SYNTHESIS_KEYS = ("defect", "tier", "what_goes_wrong", "fix", "cross_references")
+SITE_NOTE_KEYS = ("site", "note")
+# How long a defect's words may run, held by the engine: it re-parses every reply by hand and
+# reads no schema keyword, so a limit the schema alone stated would reach the page whenever a
+# runtime did not enforce it. The reader sees each site's location, source, outcome and test
+# directly under the account, so the account need not walk the sites; without a limit a
+# defect's account grows with its sites, and merging saves no text. Words are the limit the
+# brief states; the characters are the schema's `maxLength`, held here as well so a runtime
+# that enforces the schema and one that does not reach one answer.
+SYNTHESIS_HEADING_CHARS = 120
+SYNTHESIS_ACCOUNT_WORDS = 60
+SYNTHESIS_ACCOUNT_CHARS = 600
+SYNTHESIS_FIX_WORDS = 60
+SYNTHESIS_FIX_CHARS = 600
+SYNTHESIS_NOTE_WORDS = 20
+SYNTHESIS_NOTE_CHARS = 200
 DEFECT_INDEX_HEADING = "\n## The defect index\n"
 TO_JUDGE_HEADING = "\n## Your defects\n"
 
@@ -6560,25 +7683,33 @@ def load_synthesis_companions() -> SynthesisCompanions:
     )
 
 
-def plan_synthesis(clusters: Sequence[Cluster]) -> tuple[SynthesisUnit, ...]:
+def plan_synthesis(defects: Sequence[Defect]) -> tuple[SynthesisUnit, ...]:
     """One unit holding every defect, or none at all where the run found nothing.
 
     A run with no defect gets no unit for the reason an area that raised nothing gets no
     clustering unit: a payload with an empty list asks a worker nothing, and the answer it
     would have to return is the empty one.
     """
-    if not clusters:
+    if not defects:
         return ()
     return (SynthesisUnit(id=SYNTHESIS_UNIT_ID, lane=LANES[0],
-                          defects=tuple(cluster.id for cluster in clusters)),)
+                          defects=tuple(defect.id for defect in defects)),)
 
 
 def synthesis_material(clustering: Clustering, candidates: Sequence[dict],
-                       rationales: dict[str, str | None]) -> tuple[dict, ...]:
-    """Every defect as the payload states it: its id, the heading the clustering round
-    wrote, why it was kept apart where it was, and for each site inside it the failure as a
-    reader stated it, the directions its raisers proposed, the fix sizes they estimated and
-    what the agent that checked it said about the mechanism.
+                       rationales: dict[str, str | None],
+                       defects: Sequence[Defect],
+                       upheld: dict[str, dict]) -> tuple[dict, ...]:
+    """Every defect as the payload states it: its id, its sites, the mechanism the merge
+    check upheld and each site's instance of it where it has several sites, and for each
+    site the heading the clustering round wrote, why it was kept apart where it was, and
+    for each report there the failure as a reader stated it, the directions its raisers
+    proposed, the fix sizes they estimated and what the agent that checked it said about
+    the mechanism.
+
+    ``upheld`` is each defect of several sites' accepted group by defect id, as
+    :func:`_prove_grouping` returns it. A defect of several sites with no group there is
+    refused, since its account would have no mechanism to be written from.
 
     **No status, no severity and no candidate id.** A tier is what these defects break, and
     a severity is how bad one is — shown the second, a synthesizer starts grouping by it
@@ -6587,26 +7718,49 @@ def synthesis_material(clustering: Clustering, candidates: Sequence[dict],
     readers and the checker said, and a judgment stage handed verdicts starts writing about
     the verdicts. It is also what keeps this round free of ``dispatch.json``, which the
     dispatcher writes once the LAST round has landed — and this is now that round.
+
+    One entry per DEFECT, under the defect's id, with one entry per SITE inside it. The
+    index line is the mechanism for a defect of several sites and the site's consequence for
+    a defect of one, so a defect can be cited by what it is.
     """
     by_id = {cand["id"]: cand for cand in candidates}
+    site_of = {cluster.id: cluster for cluster in clustering.clusters}
     out: list[dict] = []
-    for cluster in clustering.clusters:
-        members = sorted((by_id[cid] for cid in cluster.members),
-                         key=lambda cand: (cand["file"], cand["line_start"], cand["line_end"],
-                                           cand["id"]))
+    for defect in defects:
+        group = upheld.get(defect.id)
+        if len(defect.sites) > 1 and group is None:
+            raise GroupingError(
+                f"{defect.id} holds sites {', '.join(defect.sites)} and no upheld mechanism; "
+                f"a defect of several sites is narrated from the mechanism its check upheld")
+        instance_of = ({record["site"]: record["instance"] for record in group["instances"]}
+                       if group else {})
+        sites = []
+        for sid in defect.sites:
+            site = site_of[sid]
+            members = sorted((by_id[cid] for cid in site.members),
+                             key=lambda cand: (cand["file"], cand["line_start"],
+                                               cand["line_end"], cand["id"]))
+            sites.append({
+                "id": sid,
+                "consequence": site.consequence,
+                "instance": instance_of.get(sid),
+                "split_reason": site.split_reason,
+                "members": [{
+                    "file": member["file"],
+                    "line_start": member["line_start"],
+                    "line_end": member["line_end"],
+                    "failure": member["failure"],
+                    "directions": _distinct(r["direction"] for r in member["raised_by"]),
+                    "fix_sizes": _distinct(r["fix_size"] for r in member["raised_by"]),
+                    "rationale": rationales[member["id"]],
+                } for member in members],
+            })
         out.append({
-            "id": cluster.id,
-            "consequence": cluster.consequence,
-            "split_reason": cluster.split_reason,
-            "members": [{
-                "file": member["file"],
-                "line_start": member["line_start"],
-                "line_end": member["line_end"],
-                "failure": member["failure"],
-                "directions": _distinct(r["direction"] for r in member["raised_by"]),
-                "fix_sizes": _distinct(r["fix_size"] for r in member["raised_by"]),
-                "rationale": rationales[member["id"]],
-            } for member in members],
+            "id": defect.id,
+            "sites": list(defect.sites),
+            "consequence": group["mechanism"] if group else sites[0]["consequence"],
+            "mechanism": group["mechanism"] if group else None,
+            "site_material": sites,
         })
     return tuple(out)
 
@@ -6631,22 +7785,31 @@ def render_synthesizer_payload(brief: str, problem: str, index: Sequence[dict],
         out += _payload_field(f"- {entry['id']}: ", entry["consequence"])
     out.append(TO_JUDGE_HEADING)
     for defect in defects:
-        out += [f"\n### {defect['id']}\n", "\n",
-                *_payload_field("Consequence: ", defect["consequence"])]
-        if defect["split_reason"] is not None:
-            out += _payload_field("Kept apart from a defect at the same site because: ",
-                                  defect["split_reason"])
-        for member in defect["members"]:
-            where = (f"line {member['line_start']}"
-                     if member["line_start"] == member["line_end"]
-                     else f"lines {member['line_start']}-{member['line_end']}")
-            out.append(f"\nAt {member['file']}, {where}:\n")
-            out += _payload_field("- Failure: ", member["failure"])
-            for direction in member["directions"]:
-                out += _payload_field("- Direction: ", direction)
-            out.append(f"- Proposed fix size: {'; '.join(member['fix_sizes'])}\n")
-            out += ([f"- {NO_CHECK_LINE}\n"] if member["rationale"] is None
-                    else _payload_field("- What the check found: ", member["rationale"]))
+        out.append(f"\n### {defect['id']}\n")
+        if defect["mechanism"] is not None:
+            out += ["\n", f"Sites: {', '.join(defect['sites'])}\n",
+                    *_payload_field("The mechanism the merge check upheld: ",
+                                    defect["mechanism"])]
+        for site in defect["site_material"]:
+            out += [f"\n#### {site['id']}\n", "\n",
+                    *_payload_field("Consequence: ", site["consequence"])]
+            if site["instance"] is not None:
+                out += _payload_field("This site's instance of the mechanism: ",
+                                      site["instance"])
+            if site["split_reason"] is not None:
+                out += _payload_field("Kept apart from a defect at the same site because: ",
+                                      site["split_reason"])
+            for member in site["members"]:
+                where = (f"line {member['line_start']}"
+                         if member["line_start"] == member["line_end"]
+                         else f"lines {member['line_start']}-{member['line_end']}")
+                out.append(f"\nAt {member['file']}, {where}:\n")
+                out += _payload_field("- Failure: ", member["failure"])
+                for direction in member["directions"]:
+                    out += _payload_field("- Direction: ", direction)
+                out.append(f"- Proposed fix size: {'; '.join(member['fix_sizes'])}\n")
+                out += ([f"- {NO_CHECK_LINE}\n"] if member["rationale"] is None
+                        else _payload_field("- What the check found: ", member["rationale"]))
     out += _schema_section(schema)
     return "".join(out)
 
@@ -6675,8 +7838,52 @@ def _parse_tiers(raw: object) -> tuple[str, ...]:
     return tuple(tiers)
 
 
-def _parse_synthesis(raw: object, field: str, tiers: Sequence[str]) -> dict:
+def _limited(raw: object, field: str, chars: int, words: int | None = None) -> str:
+    """Non-empty text within its limits, refused by name and count where it runs over."""
+    text = _text(raw, field)
+    if len(text) > chars:
+        raise ResultError(f"field '{field}' runs to {len(text)} characters; the limit is "
+                          f"{chars} characters")
+    count = len(text.split())
+    if words is not None and count > words:
+        raise ResultError(f"field '{field}' runs to {count} words; the limit is {words} "
+                          f"words, because the reader sees each site's own evidence under it")
+    return text
+
+
+def _parse_site_notes(raw: object, field: str, sites: Sequence[str]) -> dict[str, str]:
+    """A defect's site notes as a map from site id to note, in the defect's site order. The
+    reply carries records rather than a map, since a closed schema cannot describe keys it
+    does not know; so the engine builds the map, and refuses a site that is not one of this
+    defect's or is named twice."""
+    if not isinstance(raw, list):
+        raise ResultError(f"field '{field}' must be a list (found {type(raw).__name__})")
+    notes: dict[str, str] = {}
+    for index, record in enumerate(raw):
+        where = f"{field}[{index}]"
+        if not isinstance(record, dict):
+            raise ResultError(f"field '{where}' must be a JSON object "
+                              f"(found {type(record).__name__})")
+        _check_keys(record, where, frozenset(SITE_NOTE_KEYS), SITE_NOTE_KEYS, ResultError)
+        site = _text(record["site"], f"{where}.site")
+        if site not in sites:
+            raise ResultError(f"field '{where}.site' names {site!r}, which is not a site of "
+                              f"this defect ({', '.join(sites)})")
+        if site in notes:
+            raise ResultError(f"field '{where}.site' names {site!r} twice")
+        notes[site] = _limited(record["note"], f"{where}.note", SYNTHESIS_NOTE_CHARS,
+                               SYNTHESIS_NOTE_WORDS)
+    return {site: notes[site] for site in sites if site in notes}
+
+
+def _parse_synthesis(raw: object, field: str, tiers: Sequence[str],
+                     sites: Sequence[str] | None) -> dict:
     """One defect's judgment, checked against the run's own vocabulary.
+
+    ``sites`` are the defect's sites as its listing recorded them, and ``None`` where the
+    listing predates sites: that reply was asked for no heading, no site notes and no
+    length, so it is read in the shape it was asked for, with ``heading`` ``None`` and the
+    renderer falling back to the site's consequence.
 
     A tier outside ``tiers`` is refused here rather than accepted and rendered: one
     vocabulary per run is the property, and a name the unit invented after declaring its
@@ -6687,7 +7894,8 @@ def _parse_synthesis(raw: object, field: str, tiers: Sequence[str]) -> dict:
     """
     if not isinstance(raw, dict):
         raise ResultError(f"field '{field}' must be a JSON object (found {type(raw).__name__})")
-    _check_keys(raw, field, frozenset(SYNTHESIS_KEYS), SYNTHESIS_KEYS, ResultError)
+    keys = LEGACY_SYNTHESIS_KEYS if sites is None else SYNTHESIS_KEYS
+    _check_keys(raw, field, frozenset(keys), keys, ResultError)
     defect = _text(raw["defect"], f"{field}.defect")
     tier = _text(raw["tier"], f"{field}.tier")
     if tier not in tiers:
@@ -6714,11 +7922,19 @@ def _parse_synthesis(raw: object, field: str, tiers: Sequence[str]) -> dict:
                 f"field '{field}.cross_references[{index}]' names {name!r} twice"
             )
         references.append(name)
+    if sites is None:
+        return {"defect": defect, "heading": None, "tier": tier,
+                "what_goes_wrong": _text(raw["what_goes_wrong"], f"{field}.what_goes_wrong"),
+                "fix": _text(raw["fix"], f"{field}.fix"), "site_notes": {},
+                "cross_references": references}
     return {
         "defect": defect,
+        "heading": _limited(raw["heading"], f"{field}.heading", SYNTHESIS_HEADING_CHARS),
         "tier": tier,
-        "what_goes_wrong": _text(raw["what_goes_wrong"], f"{field}.what_goes_wrong"),
-        "fix": _text(raw["fix"], f"{field}.fix"),
+        "what_goes_wrong": _limited(raw["what_goes_wrong"], f"{field}.what_goes_wrong",
+                                    SYNTHESIS_ACCOUNT_CHARS, SYNTHESIS_ACCOUNT_WORDS),
+        "fix": _limited(raw["fix"], f"{field}.fix", SYNTHESIS_FIX_CHARS, SYNTHESIS_FIX_WORDS),
+        "site_notes": _parse_site_notes(raw["site_notes"], f"{field}.site_notes", sites),
         "cross_references": references,
     }
 
@@ -6730,13 +7946,18 @@ def _defect_of(raw: object) -> str | None:
     return None
 
 
-def parse_synthesizer_result(obj: object, unit_id: str, handed: Sequence[str]) -> dict:
+def parse_synthesizer_result(obj: object, unit_id: str, handed: Sequence[str],
+                             sites: Sequence[Sequence[str]] | None) -> dict:
     """Strictly parse the synthesis result, and prove it answers for exactly the defects the
     unit was handed.
 
+    ``sites`` is the listing's ``defect_sites``, beside ``handed``: each defect's sites, which
+    its site notes may name and no others. ``None`` is a listing written before sites, whose
+    reply is read in the shape that listing asked for (see :func:`_parse_synthesis`).
+
     **The partition is proved before the judgment is believed**, exactly as the clustering
     round is: a dropped id, a repeated id or one the payload never listed fails the WHOLE
-    unit, and the run is then grouped by status as it was before this round existed. Part
+    unit, and the run is then grouped by status, as if this round had not run. Part
     of an assignment is not a smaller assignment — believing the entries that parsed would
     give the report a grouping nobody produced, over a defect list nobody agreed to.
 
@@ -6744,7 +7965,7 @@ def parse_synthesizer_result(obj: object, unit_id: str, handed: Sequence[str]) -
     unchanged and none is relaxed; what changes is the blast radius, for the reason
     :func:`parse_verifier_result` gives about one unreadable verdict. The round is one
     dispatch of many independent judgments, and an entry with an empty narrative or a tier
-    the reply never declared says nothing about the twenty beside it. That defect keeps no
+    the reply never declared says nothing about the others beside it. That defect keeps no
     tier and no prose, falls back to its status group, and the rejection is recorded by
     name so nothing is quietly thrown away.
 
@@ -6763,6 +7984,8 @@ def parse_synthesizer_result(obj: object, unit_id: str, handed: Sequence[str]) -
         if not isinstance(obj["defects"], list):
             raise ResultError(f"field 'defects' must be a list (found {type(obj['defects']).__name__})")
         wanted = frozenset(handed)
+        sites_of = (None if sites is None
+                    else {did: tuple(held) for did, held in zip(handed, sites)})
         assignments: dict[str, dict | None] = {}
         rejected: list[str] = []
         for index, raw in enumerate(obj["defects"]):
@@ -6779,7 +8002,7 @@ def parse_synthesizer_result(obj: object, unit_id: str, handed: Sequence[str]) -
                 # an object — rather than a sentence about attribution. Every one of those
                 # raises; the line after it is the guard against a shape that somehow did
                 # not, since an entry the engine cannot attribute must never pass silently.
-                _parse_synthesis(raw, field, tiers)
+                _parse_synthesis(raw, field, tiers, None if sites_of is None else ())
                 raise ResultError(f"field '{field}' does not say which defect it answers for")
             if named not in wanted:
                 raise ResultError(
@@ -6787,7 +8010,8 @@ def parse_synthesizer_result(obj: object, unit_id: str, handed: Sequence[str]) -
                     f"synthesis unit judges the defects in its own payload and no others"
                 )
             try:
-                assignments[named] = _parse_synthesis(raw, field, tiers)
+                assignments[named] = _parse_synthesis(
+                    raw, field, tiers, None if sites_of is None else sites_of.get(named, ()))
             except ResultError as exc:
                 rejected.append(_writable(f"{named}: {exc}"))
                 assignments[named] = None
@@ -6814,14 +8038,15 @@ def read_synthesis_result(rundir: Path, units: Sequence[dict]) -> SynthesisState
     if state != UNIT_COMPLETE:
         return SynthesisState(unit["id"], state, _writable(str(payload)), (), {}, (), None)
     try:
-        parsed = parse_synthesizer_result(payload, unit["id"], unit["defects"])
+        parsed = parse_synthesizer_result(payload, unit["id"], unit["defects"],
+                                          unit.get("defect_sites"))
     except ResultError as exc:
         return SynthesisState(unit["id"], UNIT_FAILED, _writable(str(exc)), (), {}, (), None)
     return SynthesisState(unit["id"], UNIT_COMPLETE, None, tuple(parsed["tiers"]),
                           parsed["assignments"], tuple(parsed["rejected"]), parsed["summary"])
 
 
-def check_synthesis(clusters: Sequence[Cluster], units: Sequence[dict]) -> None:
+def check_synthesis(defects: Sequence[Defect], units: Sequence[dict]) -> None:
     """The synthesis listing against the run's own defects: at most one unit, holding
     exactly the defect ids this run has. Refused by name before any result is read, as
     :func:`check_clustering` refuses the same shape one stage earlier.
@@ -6850,13 +8075,27 @@ def check_synthesis(clusters: Sequence[Cluster], units: Sequence[dict]) -> None:
             f"synthesis unit {unit.get('id', '(unnamed)')!s} has no list of defect ids; "
             f"{UNITS_FILE_NAME} is not the engine's"
         )
-    ids = [cluster.id for cluster in clusters]
+    ids = [defect.id for defect in defects]
     if sorted(unit["defects"]) != sorted(ids):
         raise RunDirError(
             f"synthesis unit {unit['id']} is listed with defects that are not this run's "
             f"defects ({len(unit['defects'])} listed, {len(ids)} in the run); the round is "
             f"handed every defect exactly once, so {UNITS_FILE_NAME} is not the engine's"
         )
+    # A listing written before defects could hold several sites has no record of them, and
+    # every defect in it is one site. Where the record is there, a regrouping since the
+    # round was planned changed what a defect id means, and the round no longer applies.
+    held = unit.get("defect_sites")
+    if held is not None:
+        now = {defect.id: list(defect.sites) for defect in defects}
+        if (not isinstance(held, list) or len(held) != len(unit["defects"])
+                or any(now[did] != sites for did, sites in zip(unit["defects"], held))):
+            raise RunDirError(
+                f"synthesis unit {unit['id']} was planned over defects holding other sites "
+                f"than this run's defects hold now; a regrouping since the round ran means "
+                f"its narrative describes other defects, so the synthesis and every round "
+                f"after it no longer apply. Take them back with `cluster --redo` and run the "
+                f"rounds again")
 
 
 def build_synthesis(units: Sequence[dict], state: SynthesisState | None) -> Synthesis | None:
@@ -6889,7 +8128,20 @@ def build_synthesis(units: Sequence[dict], state: SynthesisState | None) -> Synt
 
 
 CROSS_REF_ABSENT = "no defect in this run carries that id"
-CROSS_REF_APART = "the two defects touch no file in common"
+
+# The whole of the rule a cross-reference must pass once its id resolves: any one condition
+# keeps it. The resolver iterates this and nothing else, and the synthesizer brief, its
+# schema and the dropped reason are tested against these names, so a condition added here
+# and not to the prose fails a test instead of going untold to the writer. A tier is shared
+# only when both sides HAVE one: absent is not agreement.
+CROSS_REF_RULE: tuple[tuple[str, Callable[[frozenset[str], frozenset[str],
+                                           str | None, str | None], bool]], ...] = (
+    ("touch a file in common", lambda mine, theirs, _a, _b: bool(mine & theirs)),
+    ("sit under one tier", lambda _m, _t, tier, their_tier:
+        tier is not None and tier == their_tier),
+)
+CROSS_REF_APART = "the two defects neither " + " nor ".join(
+    name for name, _ in CROSS_REF_RULE)
 
 
 def resolve_cross_references(defect: str, references: Sequence[str],
@@ -6906,16 +8158,15 @@ def resolve_cross_references(defect: str, references: Sequence[str],
     reference sharing neither rests on nothing the engine can see, and the brief already
     tells the writer that sitting in one file is not by itself a connection.
 
-    The tier half is what the file half was standing in for. A same-file rule alone refused
-    22 links in one report -- among them a reverse endpoint with no idempotency key beside
-    a lost-response refund being retried, and a three-file refund chain, which are the
-    cross-file connections a reader most wants. The synthesis round assigns tiers to group
-    chains exactly like those, so two defects it put under one theme are connected by that
-    round's own judgment. An ABSENT tier is not a shared one: a run with no synthesis round
-    has none at all, and reading absence as agreement would turn this check into "keep
-    everything" on precisely the runs with the least to go on.
+    The tier half admits what the file half cannot: the cross-file connections a reader
+    most wants -- a reverse endpoint with no idempotency key beside a lost-response refund
+    being retried, say, or a refund chain across three files. The synthesis round assigns
+    tiers to group chains exactly like those, so two defects it put under one theme are
+    connected by that round's own judgment. An ABSENT tier is not a shared one: a run with
+    no synthesis round has none at all, and reading absence as agreement would turn this
+    check into "keep everything" on precisely the runs with the least to go on.
 
-    ``plan.md`` states the second as "the same file, or an overlapping line range". Those
+    The file half could be stated as "the same file, or an overlapping line range". Those
     are one test rather than two: two ranges in different files cannot overlap, so every
     pair an overlap would admit shares a file already, and testing the ranges as well would
     only ADD a way to accept a pair in two different files — which is the thing the check
@@ -6923,8 +8174,8 @@ def resolve_cross_references(defect: str, references: Sequence[str],
     two clauses would suggest a reference could pass on ranges alone.
 
     What this cannot check is whether the two defects are related **in the way the prose
-    says**. That would need a stage that read both, which is a fifth round and is not in
-    this plan. A surviving reference is therefore checked, not verified, and the reference
+    says**. That would need a stage that read both, which would be a fifth round, and none
+    exists. A surviving reference is therefore checked, not verified, and the reference
     the round is trusted for is the one it does not make.
     """
     mine = files_of.get(defect, frozenset())
@@ -6935,9 +8186,8 @@ def resolve_cross_references(defect: str, references: Sequence[str],
     for reference in references:
         if reference not in files_of:
             dropped.append({"defect": reference, "reason": CROSS_REF_ABSENT})
-        elif mine & files_of[reference]:
-            kept.append(reference)
-        elif my_tier is not None and tiers.get(reference) == my_tier:
+        elif any(holds(mine, files_of[reference], my_tier, tiers.get(reference))
+                 for _, holds in CROSS_REF_RULE):
             kept.append(reference)
         else:
             dropped.append({"defect": reference, "reason": CROSS_REF_APART})
@@ -6991,6 +8241,9 @@ def write_synthesis(rundir: Path, units_doc: dict, units: Sequence[SynthesisUnit
             listing.append({
                 "id": unit.id, "kind": SYNTHESIZER_KIND, "area": None, "lane": unit.lane,
                 "lens": None, "defects": list(unit.defects),
+                # Which sites each defect held when the round was planned, beside it: a D id
+                # alone survives a regrouping that changes what the defect is.
+                "defect_sites": [by_id[did]["sites"] for did in unit.defects],
                 "payload": f"{UNITS_DIR}/{unit.id}/{PAYLOAD_NAME}",
                 "schema": f"{UNITS_DIR}/{unit.id}/{SCHEMA_NAME}",
                 "payload_lines": lines,
@@ -7008,8 +8261,8 @@ def write_synthesis(rundir: Path, units_doc: dict, units: Sequence[SynthesisUnit
         raise
 
 
-def synthesis_summary(units: Sequence[SynthesisUnit], clusters: Sequence[Cluster]) -> str:
-    out = [f"{_plural(len(clusters), 'defect')} to judge"]
+def synthesis_summary(units: Sequence[SynthesisUnit], defects: Sequence[Defect]) -> str:
+    out = [f"{_plural(len(defects), 'defect')} to judge"]
     for unit in units:
         out.append(f"  {unit.id}  {_plural(len(unit.defects), 'defect')}  lane {unit.lane}")
     if not units:
@@ -7125,9 +8378,9 @@ def _previous_stamp(report: Path) -> str | None:
 
 # The stamp exactly as `render_report` writes it, so what is read back is a stamp and not
 # whatever else ended up in that file. Built from :data:`CLOCK_PATTERN` rather than spelled
-# again: hand-written, it went on matching the old shape after the format gained seconds, and
-# every stamp then read back as "not a stamp" — which is indistinguishable from no stamp at
-# all, so a finished report looked unpublished and the next run rewrote it.
+# again, so the shape read back changes with the shape written. A value this does not match
+# reads back as no stamp at all, and report outputs on disk with no stamp are refused as a
+# report published under rules that kept no record of it.
 _STAMP_FORM = re.compile(rf"\A{CLOCK_PATTERN}\Z", re.ASCII)
 
 
@@ -7190,7 +8443,8 @@ def _units_stage(rundir: Path) -> str | None:
     return doc.get("stage") if isinstance(doc, dict) else None
 
 
-REPORTABLE_STAGES = (CLUSTERED_STAGE, SYNTHESIZED_STAGE, REPORTED_STAGE)
+REPORTABLE_STAGES = (CLUSTERED_STAGE, MERGED_STAGE, MERGE_CHECKED_STAGE, SYNTHESIZED_STAGE,
+                     REPORTED_STAGE)
 
 
 def advance_to_reported(rundir: Path) -> None:
@@ -7266,6 +8520,13 @@ DEFECT_COLUMN = "Defect"
 PROMPT_LEAD_IN = "review-panel was given this prompt:"
 
 SECTION_DESCRIPTION = "Report description"
+# What the two kinds of number are, said before any of them is used.
+DEFECTS_AND_SITES = (
+    "A **defect** (`D1`, `D2`, …) is one mistake. A **site** (`S1`, `S2`, …) is one place — "
+    "a function, a document passage, a test — where that mistake has to be fixed. Every site "
+    "was read and checked on its own, and keeps its own outcome, severity, test and evidence. "
+    "Each site's quoted source is shown in its defect's entry; the rest of its evidence is "
+    "under **Evidence**, near the end, under the same number.")
 # The job the run answers: what was asked for, and what it takes to ask for it again. In the
 # APPENDIX, beside the record of what ran it, by the same rule as the path legend — nothing in
 # it is needed to fix a defect, and on a subject-mode job it runs to a screen. What a reader
@@ -7294,13 +8555,20 @@ CORRECTED_MARK = "Corrected by the operator"
 SECTION_INDEX = "Indices"
 SECTION_ESTABLISHED = "Established defects"
 SECTION_UNRESOLVED = "Unresolved"
+# Claims a check dismissed at every site. A section of defects like the two above it, since
+# each is still a mistake somebody claimed at a place, and last of the three, since none of
+# it is work.
+SECTION_REFUTED = "Refuted"
+# Everything the review recorded about each site that its defect's entry does not print,
+# one entry per site, under the site's number.
+SECTION_EVIDENCE = "Evidence"
 # The corroborated set's heading takes the rung's own word for breadth, so a run of one
 # runtime says contexts where a two-runtime run says models.
 SECTION_CORROBORATED = "Corroborated by "
 # Coverage gaps get a section of their own, and it is not in the appendix: a named missing
-# test is work. On the defect ladder they had nowhere to go but the refuted list, whose
-# heading tells a reader that nothing under it is work — and a run put eighteen real,
-# named, missing tests there.
+# test is work. Put to the defect question, a gap is liable to come back refuted, and the
+# refuted list's heading tells a reader that nothing under it is work, so a named missing
+# test filed there would read as dismissed.
 SECTION_COVERAGE_GAPS = "Tests to write"
 SECTION_APPENDIX = "Appendix"
 # The subsections, which are numbered by their parent where they are two ways into one
@@ -7308,11 +8576,11 @@ SECTION_APPENDIX = "Appendix"
 SUBSECTION_LEGEND = "Path legend"
 SUBSECTION_RANKED = "Every defect — most severe first"
 SUBSECTION_BY_FILE = "By file"
-SUBSECTION_REFUTED = "Refuted"
 SUBSECTION_COVERED = "Coverage gaps a test already covers"
 SUBSECTION_OUTSIDE = "What one more file would settle"
 SUBSECTION_VERIFIERS = "What each verification unit returned"
 SUBSECTION_NOTES = "Clustering notes"
+SUBSECTION_MERGE = "The merge round"
 SUBSECTION_SYNTHESIS = "The synthesis round"
 SUBSECTION_HOW_IT_RAN = "How this ran"
 SUBSECTION_COVERAGE = "Coverage"
@@ -7371,7 +8639,7 @@ DEFECT_META_SEP = " · "
 # what a person types and what separates any two commits in a tree this size; the whole
 # sha is stated once, under "How this ran".
 COMMIT_ABBREV = 10
-# The two axes spec section 3 asks for, kept apart so neither can imply the other.
+# The report's two axes, kept apart so neither can imply the other.
 # Axis A is DISCOVERY BREADTH, and the stored value is the lane fact the run actually
 # establishes: a candidate carries exactly one raiser, so ``both`` can only mean its
 # cluster holds candidates raised by both lanes. Which words a rung permits for that —
@@ -7406,6 +8674,8 @@ WHAT_GOES_WRONG_LABEL = "What goes wrong."
 FIX_LABEL = "Fix."
 TEST_FIRST_LABEL = "Test that should fail first."
 RELATED_LABEL = "Related."
+# What the synthesis round said is particular to one site of a defect of several.
+SITE_NOTE_LABEL = "At this site."
 # The fourth prose part, and the only one an UNRESOLVED defect has that an established one
 # does not. It carries the checker's own rationale, which on an unresolved verdict is
 # defined as "what was tried and what stopped it" — the one fact the reader of this section
@@ -7414,6 +8684,16 @@ RELATED_LABEL = "Related."
 # established defect the same rationale IS redundant with the narrative and stays in the
 # provenance record; that asymmetry is the whole reason this label exists.
 UNSETTLED_LABEL = "What is not settled."
+# Why a refuted defect was dismissed: every report's own rationale.
+REFUTED_LABEL = "Why it was dismissed."
+# What the Evidence section says it holds, and what it does not: the three things each
+# defect's entry shows instead, so no site needs a pointer line of its own.
+EVIDENCE_LEAD = ("Everything else the review recorded about each site, in site order: its "
+                 "severity, corroboration and verification, every report's check, and the runs "
+                 "and their output. Each heading gives the site's number, location, outcome "
+                 "and defect. Shown in the defect's entry instead of here: the site's quoted "
+                 "source, its first test that should fail first and, for an unresolved site, "
+                 "what is not settled.")
 # Where a defect the round could not place goes. It is still in the body — a judgment
 # stage may not delete a defect — and the heading says why it has no tier rather than
 # filing it under one the round never gave it. The entry's own refusal is named under
@@ -7425,11 +8705,11 @@ UNTIERED_GROUP = "The round returned no usable answer for these"
 # a run whose round was never dispatched from one whose round was thrown away.
 SYNTHESIS_DEGRADED = ("No tier was assigned, so the defects above are grouped by their "
                       "status, exactly as they are on a run with no synthesis round.")
-# The one sentence that marks the synthesised prose as a reading, printed where the body
+# The one sentence that marks the synthesized prose as a reading, printed where the body
 # begins. Every other claim in the document traces to a unit that checked it or to the
 # engine's own records; these trace to one agent's impression, and they are the most
 # confident-sounding sentences on the page. It is written ONCE and only where there is
-# something to disclaim — a disclaimer on a report carrying no synthesised prose is a
+# something to disclaim — a disclaimer on a report carrying no synthesized prose is a
 # sentence that says nothing, and a reader who meets one learns to skip the next.
 SYNTHESIS_DISCLAIMER = (
     f"The **tier** headings below, and each defect's **{WHAT_GOES_WRONG_LABEL[:-1]}**, "
@@ -7438,11 +8718,19 @@ SYNTHESIS_DISCLAIMER = (
     f"a unit that verified it or to the engine's own records, so read the grouping and "
     f"those three lines as a proposal and the rest as a finding."
 )
-# What a rung lets the report call Axis A: two models where two runtimes ran, two contexts
-# of one model where one did, and nothing stronger than the rung the record names.
+# Added where the round also wrote a defect's heading or a note on one of its sites, which
+# are its reading as much as the three lines are. A report whose headings are the clustering
+# round's consequences carries no such sentence, because none of its headings is a reading.
+SYNTHESIS_HEADED = (f" Each defect's heading, and any **{SITE_NOTE_LABEL[:-1]}** note under "
+                    f"one of its sites, is that agent's reading too.")
+# What a rung lets the report call Axis A: two models where two models ran, two contexts
+# of one model where one did — in one runtime or two — and nothing stronger than the rung
+# the record names.
 RUNG_BREADTH = {
     RUNG_TWO_RUNTIMES: ("one model", "both models"),
+    RUNG_TWO_MODELS: ("one model", "both models"),
     RUNG_ONE_RUNTIME: ("one context", "both contexts"),
+    RUNG_TWO_RUNTIMES_ONE_MODEL: ("one context", "both contexts"),
 }
 # What a record keeps of each raiser. Its consequence, direction and fix size are lifted to
 # the candidate, which carries exactly one raiser; what is left is the provenance and the
@@ -7455,7 +8743,9 @@ _FIX_RANK = {size: i for i, size in enumerate(FIX_SIZES)}
 # read by both lanes, and a candidate both lanes raised had no other model to go to.
 RUNG_NAMES = {
     RUNG_TWO_RUNTIMES: "two runtimes",
+    RUNG_TWO_MODELS: "one runtime running two models",
     RUNG_ONE_RUNTIME: "one runtime with sub-agents",
+    RUNG_TWO_RUNTIMES_ONE_MODEL: "two runtimes running one model",
 }
 # The engine cannot see a sandbox, so it repeats the dispatcher's record and says whose
 # words they are. The one containment fact it can state is its own: every payload it
@@ -7485,6 +8775,26 @@ QUOTE_FLAG = ("The source quoted with this report does not match what the pinned
               "the quotation.")
 QUOTE_UNCHECKED = ("The engine could not read those lines from the pinned tree, so the "
                    "quotation was not checked and no source is shown.")
+
+
+def _quote_flag_for(hit: int, total: int) -> str:
+    """QUOTE_FLAG for a defect several reports rest on, with the count inside the sentence:
+    a count in front of "this report" names one report while speaking for several."""
+    whose = f"all {total} reports" if hit == total else f"{hit} of these {total} reports"
+    gave = "that report" if hit == 1 else "the reports"
+    return (f"The source quoted with {whose} does not match what the pinned tree holds at "
+            f"those lines. The line range may be wrong. The engine left the range exactly as "
+            f"{gave} gave it, so read the location itself before acting on the quotation.")
+
+
+def _quote_unchecked_for(hit: int, total: int) -> str:
+    """QUOTE_UNCHECKED for several reports. Where only some could not be read, the others'
+    source may still be shown, so this says nothing about what is on the page."""
+    if hit == total:
+        return (f"The engine could not read those lines from the pinned tree for all {total} "
+                f"reports, so no quotation was checked and no source is shown.")
+    return (f"The engine could not read those lines from the pinned tree for {hit} of these "
+            f"{total} reports, so their quotations were not checked.")
 # A snippet's context and its ceiling. The pad is what makes a one-line citation readable —
 # a lone line tells nobody what it sits inside — and the ceiling is what stops a finding
 # that cites four hundred lines from putting four hundred lines in front of a reader.
@@ -7719,8 +9029,8 @@ def _where(cand: dict) -> str:
 
 @dataclass(frozen=True)
 class Findings:
-    """The run's findings as data: one record per candidate, one per cluster, and one per
-    lane clustering touched — with the defects and the coverage gaps kept apart.
+    """The run's findings as data: one record per candidate, one per site, one per defect,
+    and one per lane clustering touched — with the defects and the coverage gaps kept apart.
 
     Every rendering reads this, so a value the prose states and a value a consumer reads
     cannot drift apart — they are one field, computed once, in :func:`build_findings`.
@@ -7743,19 +9053,33 @@ class Findings:
     # being wrong, so "refuted" said of it means "a test covers this", which is the opposite
     # of the thing that word means two sections up. Every consumer that ranks, counts or
     # renders defects reads these two and is correct without knowing coverage exists.
+    #
+    # Two levels on each ladder: a SITE is one cluster, the reports of one mistake at one
+    # place, and every fact about its outcome is its own; a DEFECT is one mistake, with the
+    # sites where it has to be fixed, and is what the report is organized by.
     candidates: tuple[dict, ...]
-    clusters: tuple[dict, ...]
+    sites: tuple[dict, ...]
+    defects: tuple[dict, ...]
     clustering: tuple[dict, ...]
-    # The coverage ladder, same two shapes. Empty on a run with no auditor, which is why
+    # The coverage ladder, same three shapes. Empty on a run with no auditor, which is why
     # nothing here branches on whether the round ran.
     coverage: tuple[dict, ...] = ()
-    coverage_clusters: tuple[dict, ...] = ()
+    coverage_sites: tuple[dict, ...] = ()
+    coverage_defects: tuple[dict, ...] = ()
     # Two aggregates over BOTH ladders, each the same shape as ``clustering``: one record
     # per verification unit, and one per file outside the scope that open work hangs on.
     # Computed once here for the same reason every defect fact is — two renderings of one
     # number cannot disagree when there is only one number.
     verification: tuple[dict, ...] = ()
     outside_scope: tuple[dict, ...] = ()
+    # The merge round as it came back, or ``None`` where the run has no merge unit. Its
+    # groups do not decide the defects by themselves: a group is one defect only once a
+    # unit that did not propose it has checked it.
+    merge: dict | None = None
+    # The merge check as it came back and what it decided for each proposed group, or
+    # ``None`` where the merge proposed no group of several sites. The groups it accepted
+    # are the defects of several sites, and nothing else is.
+    merge_check: dict | None = None
 
 
 def _most_severe(levels: Sequence[str]) -> str:
@@ -7770,8 +9094,8 @@ def _strongest(axes: Sequence[str]) -> str:
 def _axis_b(status: str, evidence: dict | None) -> str:
     """Verification strength, which follows the evidence and not the status. A refuted
     verdict that ran the code was reached by running, and an established one that did not
-    is still only read — letting the status decide is exactly the conflation section 3
-    exists to end."""
+    is still only read. The status is what a check concluded and this is how it was
+    reached, so the status does not decide it."""
     if status == "unresolved":
         return AXIS_B_UNRESOLVED
     return AXIS_B_RUNNING if evidence is not None else AXIS_B_READING
@@ -7779,10 +9103,9 @@ def _axis_b(status: str, evidence: dict | None) -> str:
 
 # What the report CLAIMS about how a check was reached, which is not what the engine
 # stores. `axis_b` follows the presence of evidence, so a `grep` and a run of the code both
-# land on `by running` -- and in one real report every one of 89 runs was a search, while
-# every defect entry said the code had been run. The summary at the top of that report drew
-# the distinction and the entries did not, so the strongest-looking claim on the page was
-# the least honest one.
+# land on `by running`. So the report does not print `axis_b` as its claim: an entry says
+# `by running` only for an `executed` run and names a documentary one as reading with a
+# documentary run, and a strongest-looking claim on the page is never a search.
 #
 # A rename of the claim and not of the record: `axis_b` keeps its three values, so
 # `findings.json`, the ranking and the counts are untouched.
@@ -7810,9 +9133,9 @@ def _defect_verification_words(cluster: dict, members: Sequence[dict]) -> str:
     `axis_b` came from. Two places print this claim, and a fix to one of them alone is a
     disagreement between the header and the line below it."""
     # Both documentary and executed evidence carry `by running`, so the FIRST member
-    # matching the axis is not necessarily the one that earned the defect's claim: a
-    # documentary member ahead of an executed one made the header say a grep had settled a
-    # defect something was run for, and reversing the members changed the header.
+    # matching the axis is not necessarily the one that earned the defect's claim. An
+    # executed member is looked for first and the first matching member only after, so the
+    # header never says a grep settled a defect something was run for, whatever the order.
     candidates = [r for r in members if r["axis_b"] == cluster["axis_b"]]
     for record in candidates:
         if (record["evidence"] or {}).get(RUN_KIND_KEY) == "executed":
@@ -7860,11 +9183,11 @@ def _verification_records(records: Sequence[dict],
                           batches: Sequence[dict] = ()) -> tuple[dict, ...]:
     """One record per verification unit: what it was handed, and how its answers fell.
 
-    The established count over one set of files swung by a third between two runs of one
-    job, and the swing was entirely here — one unit answering `unresolved` to fifteen of
-    twenty-six while another answered it to none of twenty. Every verdict was already in
-    the report, one row per candidate, which is the form in which nobody can see that. A
-    per-unit count is the same data at the size the variance happens at.
+    The established count over one set of files can swing widely between two runs of one
+    job, and the swing can sit entirely here — one unit answering `unresolved` to most of
+    what it was handed while another answers it to none. Every verdict is already in
+    ``findings.json``, one entry per candidate, which is the form in which nobody can see
+    that. A per-unit count is the same data at the size the variance happens at.
 
     ``state`` rides along because a unit that failed or never landed also produces a column
     of unresolved, and that is not a verifier's judgment about anything. Reading the two
@@ -7932,11 +9255,11 @@ def _outside_scope_records(records: Sequence[dict]) -> tuple[dict, ...]:
 
     **Keyed by the class rather than by the path, because the path is the part the verifier
     could not check.** A file outside the reviewed set is one nothing in this run can open,
-    so every spelling here is a guess; one report priced a controller under
-    `api/server/...` at 12 defects and the same class under `api/lib/...` at 2, which is
-    one decision worth 14 split into two neither of which reads as the one to take. A
-    verdict that can name the class and not the path at all is the same answer with the
-    guess left out, and it lands in the same row.
+    so every spelling here is a guess. Keyed by the class, a controller guessed under
+    `api/server/...` by 12 defects and under `api/lib/...` by 2 is one row worth 14, rather
+    than two rows neither of which reads as the one to take. A verdict that can name the
+    class and not the path at all is the same answer with the guess left out, and it lands
+    in the same row.
 
     The trade is that two genuinely different files sharing a base name — two `index.ts` —
     merge into one row. Every path is kept in the row against exactly that: the merge
@@ -7952,7 +9275,7 @@ def _outside_scope_records(records: Sequence[dict]) -> tuple[dict, ...]:
     for record in records:
         for path in record.get("needs_files", ()):
             name = _class_named(path)
-            by_class.setdefault(name, set()).add(record["cluster_id"])
+            by_class.setdefault(name, set()).add(record["defect"])
             paths_of.setdefault(name, set()).add(path)
     return tuple(
         {"class": name, "paths": sorted(paths_of[name]),
@@ -7967,7 +9290,10 @@ def build_findings(dispatch: DispatchRecord, candidates: Sequence[dict],
                    snippets: dict[str, dict | None],
                    synthesis: Synthesis | None,
                    verification_states: Sequence[VerificationState] = (),
-                   batches: Sequence[dict] = ()) -> Findings:
+                   batches: Sequence[dict] = (),
+                   grouping: Sequence[Sequence[str]] | None = None,
+                   merge: dict | None = None,
+                   merge_check: dict | None = None) -> Findings:
     """Every qualifier a rendering can show, carried as its own field.
 
     The severity rule the report ranks by is applied once, here: the verifier's revision
@@ -7994,9 +9320,9 @@ def build_findings(dispatch: DispatchRecord, candidates: Sequence[dict],
 
     The synthesis round's answer is lifted onto the cluster it is about, so a rendering
     reads one record per defect rather than joining two lists at render time — the drift
-    ``findings.json`` exists to prevent. All five fields are written on every cluster
+    ``findings.json`` exists to prevent. All seven fields are written on every defect
     whatever the round did, because the shape of this file must not depend on what a run
-    found: a defect nothing judged says so with nulls and two empty lists.
+    found: a defect nothing judged says so with nulls, an empty map and two empty lists.
 
     A cross-reference is **checked here rather than where it is rendered**, for the same
     reason: checking it at render time would make two renderings decide separately which
@@ -8008,8 +9334,22 @@ def build_findings(dispatch: DispatchRecord, candidates: Sequence[dict],
     one reason that would settle it where its unresolved members agree on one, the largest
     fix any member needs, and the location of its lowest member, which is where a reader
     opens the file.
+
+    **Two levels.** Each cluster is a SITE, and every fact above is computed per site from
+    that site's own candidates, before and whatever the grouping: a site's facts cannot
+    move because it was grouped with another. ``grouping`` then puts sites into DEFECTS
+    (one per site where it is ``None``), and a defect's facts are rolled up from its sites
+    by :func:`defect_record`. The synthesis round's answer and the cross-references are
+    the defect's, since both are about the mistake and not about one place it was made.
+
+    **A defect of several sites exists only where ``merge_check`` upheld it**: a group with
+    exactly its sites, a stated mechanism and one instance per site. Whoever built
+    ``grouping``, one that puts sites together without that is refused here.
     """
     cluster_of = {cid: cluster for cluster in clustering.clusters for cid in cluster.members}
+    defects = group_sites(clustering, grouping)
+    upheld = _prove_grouping(defects, merge_check)
+    defect_of = {sid: defect.id for defect in defects for sid in defect.sites}
     lane_of = {cand["id"]: cand["raised_by"][0]["lane"] for cand in candidates}
     axis_a_of = {
         cluster.id: AXIS_A_BOTH if len({lane_of[cid] for cid in cluster.members}) > 1 else AXIS_A_ONE
@@ -8051,48 +9391,24 @@ def build_findings(dispatch: DispatchRecord, candidates: Sequence[dict],
             "covered_by": answer.covered_by,
             "needs_files": list(answer.needs_files),
             "unresolved_reason": answer.unresolved_reason,
-            "cluster_id": cluster_of[cand["id"]].id,
+            "site": cluster_of[cand["id"]].id,
+            "defect": defect_of[cluster_of[cand["id"]].id],
             "quote_check": cand["quote_check"],
             "snippet": snippets.get(cand["id"]),
             "answered": answer.answered,
-            # How many OTHER candidates share this defect. The renderer shows a member's own
+            # How many OTHER candidates share this site. The renderer shows a member's own
             # location only where there is another one to tell it apart from.
             "siblings": len(cluster_of[cand["id"]].members) - 1,
         })
     by_id = {record["id"]: record for record in records}
-    # Every file each defect touches, which is what a cross-reference is checked against.
-    # Built over the whole run before any record is written, because the check is between
-    # two defects and the second may be one this loop has not reached.
-    files_of = {cluster.id: frozenset(by_id[cid]["file"] for cid in cluster.members)
-                for cluster in clustering.clusters}
-    # And the tier each sits under, for the same reason and over the same whole run. Empty
-    # where the synthesis round did not run, which is not the same as every defect sharing
-    # one tier -- see :func:`resolve_cross_references`.
-    # `assignments` maps a defect to None where the round's entry for it could not be read
-    # -- an undeclared tier, an empty narrative -- which costs that defect its tier and no
-    # other. So the value is checked, not the key: a rejected entry has a key and no tier.
-    tier_of: dict[str, str | None] = {}
-    for cluster in clustering.clusters:
-        entry = synthesis.assignments.get(cluster.id) if synthesis is not None else None
-        tier_of[cluster.id] = entry["tier"] if entry else None
-    clusters = []
+    sites: list[dict] = []
     for cluster in clustering.clusters:
         members = [by_id[cid] for cid in cluster.members]
-        judged = synthesis.assignments.get(cluster.id) if synthesis is not None else None
-        kept_refs, dropped_refs = resolve_cross_references(
-            cluster.id, judged["cross_references"] if judged else (), files_of, tier_of)
         # The lane's own vocabulary. A gap "established" is a test to write and a gap
         # "refuted" is one already written; the words are the report's three, and reading
         # them off the defect statuses would file every gap as unresolved.
         established = [m for m in members if m["status"] in ESTABLISHED_FOR[cluster.asks]]
-        refusing = "refuted" if cluster.asks == DEFECT_ASKS else COVERAGE_GAP_REFUTED
-        held = {m["status"] for m in members}
-        if established:
-            status = DEFECT_ESTABLISHED
-        elif held == {refusing}:
-            status = DEFECT_REFUTED
-        else:
-            status = DEFECT_UNRESOLVED
+        status = site_status(cluster.asks, (m["status"] for m in members))
         # None sorts last and means a member a verifier never answered for. Kept in the
         # list because it is a THIRD case: a defect nothing settled because no verdict
         # arrived is not a defect whose reports disagree about what would settle it, and
@@ -8102,8 +9418,13 @@ def build_findings(dispatch: DispatchRecord, candidates: Sequence[dict],
                           if m["status"] == "unresolved"},
                          key=lambda reason: (reason is None, reason or ""))
         primary = min(members, key=lambda m: (m["file"], m["line_start"], m["line_end"], m["id"]))
-        clusters.append({
+        # The site's test is the one the renderer shows for it: an established member's
+        # before any other, and among those the first.
+        tests = [m["test_first"] for m in sorted(members, key=lambda m: m not in established)
+                 if m["test_first"] is not None]
+        sites.append({
             "id": cluster.id,
+            "defect": defect_of[cluster.id],
             "area": cluster.area,
             "asks": cluster.asks,
             "members": list(cluster.members),
@@ -8115,43 +9436,146 @@ def build_findings(dispatch: DispatchRecord, candidates: Sequence[dict],
             "axis_b": _strongest([m["axis_b"] for m in members]),
             "status": status,
             # One reason only where every unresolved member gives the same one. Where they
-            # differ the defect has no single settling question, and saying so beats picking
-            # one of them and filing the defect under a question it only half answers. The
-            # list beside it is the same computation, kept whole so the renderer can tell
-            # an empty answer from a disagreement.
+            # differ the site has no single settling question, and saying so beats picking
+            # one of them and filing it under a question it only half answers. The list
+            # beside it is the same computation, kept whole so the renderer can tell an
+            # empty answer from a disagreement.
             "unresolved_reasons": reasons,
             "unresolved_reason": reasons[0] if len(reasons) == 1 else None,
             "fix_size": max((m["fix_size"] for m in members), key=_FIX_RANK.__getitem__),
             "file": primary["file"],
             "line_start": primary["line_start"],
             "line_end": primary["line_end"],
+            "test_first": tests[0] if tests else None,
+        })
+    site_by_id = {site["id"]: site for site in sites}
+    # Every file each defect touches, which is what a cross-reference is checked against.
+    # Built over the whole run before any record is written, because the check is between
+    # two defects and the second may be one this loop has not reached.
+    files_of = {defect.id: frozenset(by_id[cid]["file"] for sid in defect.sites
+                                     for cid in site_by_id[sid]["members"])
+                for defect in defects}
+    # And the tier each sits under, for the same reason and over the same whole run. Empty
+    # where the synthesis round did not run, which is not the same as every defect sharing
+    # one tier -- see :func:`resolve_cross_references`.
+    # `assignments` maps a defect to None where the round's entry for it could not be read
+    # -- an undeclared tier, an empty narrative -- which costs that defect its tier and no
+    # other. So the value is checked, not the key: a rejected entry has a key and no tier.
+    tier_of: dict[str, str | None] = {}
+    for defect in defects:
+        entry = synthesis.assignments.get(defect.id) if synthesis is not None else None
+        tier_of[defect.id] = entry["tier"] if entry else None
+    rolled: list[dict] = []
+    for defect in defects:
+        judged = synthesis.assignments.get(defect.id) if synthesis is not None else None
+        kept_refs, dropped_refs = resolve_cross_references(
+            defect.id, judged["cross_references"] if judged else (), files_of, tier_of)
+        group = upheld.get(defect.id)
+        rolled.append({
+            **defect_record(defect.id, [site_by_id[sid] for sid in defect.sites]),
+            # The mechanism the check upheld, and the merge's one sentence per site that it
+            # checked. None on a defect of one site, which no merge claim is about.
+            "mechanism": group["mechanism"] if group else None,
+            "instances": ([record for record in group["instances"]
+                           if record["site"] in defect.sites] if group else None),
+            # The synthesis round's heading for the whole defect, or None where it wrote
+            # none: the renderer then heads the defect with its first site's consequence.
+            "heading": judged["heading"] if judged else None,
             "tier": judged["tier"] if judged else None,
             "what_goes_wrong": judged["what_goes_wrong"] if judged else None,
             "fix": judged["fix"] if judged else None,
+            # Site id to note, only for the sites the round said differ.
+            "site_notes": dict(judged["site_notes"]) if judged else {},
             # The references that survived checking, and the ones that did not with the
             # reason each was dropped. A dropped reference is recorded rather than silently
             # discarded: the round is asked for connections, and a reader who is never told
             # one was refused cannot tell a defect that stands alone from one whose only
-            # stated connection failed. Rendering the names is phase 6's, which is the
-            # stage that renders a cross-reference at all.
+            # stated connection failed.
             "cross_references": kept_refs,
             "dropped_cross_references": dropped_refs,
         })
     # Split last, on the one field that says which ladder each is on, so everything above
-    # is computed once for both. Every consumer of ``candidates`` and ``clusters`` ranks,
-    # counts and renders DEFECTS, and is right without knowing coverage exists.
-    coverage = tuple(r for r in records if r["asks"] == COVERAGE_ASKS)
-    defects = tuple(r for r in records if r["asks"] == DEFECT_ASKS)
-    gap_clusters = tuple(c for c in clusters if c["asks"] == COVERAGE_ASKS)
-    defect_clusters = tuple(c for c in clusters if c["asks"] == DEFECT_ASKS)
-    return Findings(dispatch.rung, synthesis.record if synthesis else None,
-                    commit, defects, defect_clusters,
+    # is computed once for both. Every consumer of ``candidates``, ``sites`` and ``defects``
+    # ranks, counts and renders DEFECTS, and is right without knowing coverage exists.
+    def ladder(rows: Sequence[dict], asks: str) -> tuple[dict, ...]:
+        return tuple(row for row in rows if row["asks"] == asks)
+
+    return Findings(dispatch.rung, synthesis.record if synthesis else None, commit,
+                    ladder(records, DEFECT_ASKS), ladder(sites, DEFECT_ASKS),
+                    ladder(rolled, DEFECT_ASKS),
                     _clustering_records(candidates, clustering, cluster_states),
-                    coverage, gap_clusters,
+                    ladder(records, COVERAGE_ASKS), ladder(sites, COVERAGE_ASKS),
+                    ladder(rolled, COVERAGE_ASKS),
                     # Over both ladders: a coverage batch is a verification unit like any
                     # other, and a gap can be open on a file outside the scope too.
                     _verification_records(records, verification_states, batches),
-                    _outside_scope_records(records))
+                    _outside_scope_records(records), merge, merge_check)
+
+
+def defect_record(defect_id: str, sites: Sequence[dict]) -> dict:
+    """One defect's facts, rolled up from its sites' records and from nothing else.
+
+    **Placement**: any site established places it under Established, every site refuted
+    under Refuted, anything else under Unresolved — and ``outcomes`` counts the sites each
+    way, because the placement alone hides a refuted or unresolved site inside an
+    established defect.
+
+    **Severity** is the worst of the established sites where there is one, else of every
+    site, and ``severity_site`` names the site that sets it: the rule a site applies to its
+    candidates, one level up, so a site nothing upheld lends the defect no severity.
+
+    **Fix size** is the largest a live site needs, where a refuted site needs none, beside
+    the count of sites — twelve one-line fixes are not one.
+
+    **Corroboration** is counted in sites: ``axis_a`` is ``both`` only where every site
+    was reported by both lanes, and ``corroborated_sites`` says how many were. Verification
+    strength is not rolled up at all: ``axis_b`` is the site's own where there is one site
+    and ``None`` where there are several, which each show their own.
+
+    With one site every field is that site's, which is what keeps a one-site defect the
+    defect it was before sites existed.
+    """
+    placed = {status: [site for site in sites if site["status"] == status]
+              for status in (DEFECT_ESTABLISHED, DEFECT_UNRESOLVED, DEFECT_REFUTED)}
+    if placed[DEFECT_ESTABLISHED]:
+        status = DEFECT_ESTABLISHED
+    elif len(placed[DEFECT_REFUTED]) == len(sites):
+        status = DEFECT_REFUTED
+    else:
+        status = DEFECT_UNRESOLVED
+    worst = min(placed[DEFECT_ESTABLISHED] or sites,
+                key=lambda site: (_SEVERITY_RANK[site["severity"]], _id_rank(site["id"])))
+    live = [site for site in sites if site["status"] != DEFECT_REFUTED] or list(sites)
+    reasons = sorted({reason for site in sites for reason in site["unresolved_reasons"]},
+                     key=lambda reason: (reason is None, reason or ""))
+    primary = min(sites, key=lambda site: (site["file"], site["line_start"],
+                                           site["line_end"], _id_rank(site["id"])))
+    corroborated = sum(1 for site in sites if site["axis_a"] == AXIS_A_BOTH)
+    first = sites[0]
+    return {
+        "id": defect_id,
+        "asks": first["asks"],
+        "sites": [site["id"] for site in sites],
+        "members": [cid for site in sites for cid in site["members"]],
+        "areas": sorted({site["area"] for site in sites}),
+        "consequence": first["consequence"],
+        "split_reason": first["split_reason"] if len(sites) == 1 else None,
+        "severity": worst["severity"],
+        "severity_site": worst["id"],
+        "axis_a": AXIS_A_BOTH if corroborated == len(sites) else AXIS_A_ONE,
+        "corroborated_sites": corroborated,
+        "axis_b": first["axis_b"] if len(sites) == 1 else None,
+        "status": status,
+        "outcomes": {key: len(value) for key, value in placed.items()},
+        "unresolved_reasons": reasons,
+        "unresolved_reason": reasons[0] if len(reasons) == 1 else None,
+        "fix_size": max((site["fix_size"] for site in live), key=_FIX_RANK.__getitem__),
+        "file": primary["file"],
+        "line_start": primary["line_start"],
+        "line_end": primary["line_end"],
+    }
+
+
 
 
 def findings_document(findings: Findings) -> dict:
@@ -8171,12 +9595,16 @@ def findings_document(findings: Findings) -> dict:
         "synthesis": findings.synthesis,
         "commit": findings.commit,
         "candidates": list(findings.candidates),
-        "clusters": list(findings.clusters),
+        "sites": list(findings.sites),
+        "defects": list(findings.defects),
         "clustering": list(findings.clustering),
         "coverage": list(findings.coverage),
-        "coverage_clusters": list(findings.coverage_clusters),
+        "coverage_sites": list(findings.coverage_sites),
+        "coverage_defects": list(findings.coverage_defects),
         "verification": list(findings.verification),
         "outside_scope": list(findings.outside_scope),
+        "merge": findings.merge,
+        "merge_check": findings.merge_check,
     }
 
 
@@ -8189,7 +9617,7 @@ def _unit_label(unit: dict) -> str:
 
 
 # The fence's language, by extension. NAMING a language costs nothing and lets every
-# renderer downstream of this file colour it properly; this file colours only the one it
+# renderer downstream of this file color it properly; this file colors only the one it
 # has a tokenizer for, which `_PAINTED_LANGUAGES` names.
 _FENCE_LANGUAGES = {
     ".java": "java", ".py": "python", ".ts": "typescript", ".tsx": "tsx",
@@ -8202,7 +9630,7 @@ _FENCE_LANGUAGES = {
 
 # Colour, baked in at render time. No runtime library: `report.html` is one file somebody
 # opens out of a run directory, so a CDN highlighter would render plain wherever there is no
-# network. Only a language with a tokenizer here is coloured; everything else falls through
+# network. Only a language with a tokenizer here is colored; everything else falls through
 # and renders exactly as it did before, which is the honest failure rather than a wrong one.
 _JAVA_KEYWORDS = frozenset("""abstract assert boolean break byte case catch char class const
 continue default do double else enum extends final finally float for goto if implements import
@@ -8222,13 +9650,13 @@ _CODE_GUTTER = re.compile(r"^(\s*\d+\s*\|)(.*)$")
 
 
 # The languages this file can actually tokenize. A fence may NAME any language -- that is
-# what lets a renderer downstream colour it -- but only a name in here is coloured HERE, and
+# what lets a renderer downstream color it -- but only a name in here is colored HERE, and
 # painting Java's keywords over Python or SQL would be worse than leaving them plain.
 _PAINTED_LANGUAGES = frozenset({"java"})
 
 
 def _painted(source: str, lang: str) -> str:
-    """One fenced block, HTML-escaped and coloured. Unknown language: escaped, uncoloured."""
+    """One fenced block, HTML-escaped and colored. Unknown language: escaped, uncolored."""
     if lang not in _PAINTED_LANGUAGES:
         return _html_entities(source)
     def paint(text: str) -> str:
@@ -8249,7 +9677,7 @@ def _painted(source: str, lang: str) -> str:
         The tokenizer matches `/* ... */` whole, and never sees one: the gutter is a
         per-line prefix, so the source reaches it one line at a time and a comment spanning
         two of them is two lines of ordinary code. Java code carries multi-line comments as
-        a matter of course, and every keyword inside one came out coloured as though it ran.
+        a matter of course, and every keyword inside one came out colored as though it ran.
         """
         if inside:
             closing = text.find("*/")
@@ -8327,7 +9755,7 @@ def _recorded(prefix: str, text: str) -> list[str]:
     :func:`_item` decides between inline and fenced from the text, which is right for
     worker prose — a one-line rationale reads better on the line it belongs to. It is wrong
     here, because these four lines sit together and are read as a set: whichever of them
-    happened to hold a ``<`` came out as a code block while its neighbour stayed inline,
+    happened to hold a ``<`` came out as a code block while its neighbor stayed inline,
     and one holding a backtick came out inline with the backtick escaped. Three renderings
     of one kind of line, chosen by what somebody typed.
 
@@ -8391,26 +9819,54 @@ def _as_code(text: str) -> str:
     return flat if "`" in flat else f"`{flat}`"
 
 
-def _render_evidence(evidence: dict, seen: set[str] | None = None) -> list[str]:
+# Which report a line of evidence speaks for, in words a reader says: a status name with its
+# underscores replaced reads "a unresolved report" and "a confirmed by reading report".
+_READING_WHOSE = {
+    "reproduced": "a reproduced report",
+    "confirmed_by_reading": "a report confirmed by reading",
+    "refuted": "a refuted report",
+    "unresolved": "an unresolved report",
+}
+
+
+def _status_words(status: str) -> str:
+    return f"a report marked {status.replace('_', ' ')}"
+
+
+def _render_evidence(evidence: dict, seen: set[str] | None = None,
+                     status: str | None = None) -> list[str]:
     """One run, under the defect it settles.
 
-    ``seen`` is the commands this DEFECT has already printed. Verifiers run one broad
-    search per batch and attach it to every verdict in it, so the same grep and the same
-    output appeared verbatim under five defects and three times under one -- which is what
-    made the collection read as a pile of unrelated greps rather than as evidence.
+    ``seen`` is the runs this DEFECT has already printed. Verifiers run one broad search per
+    batch and attach it to every verdict in it, so the same grep and the same output
+    would appear verbatim under several defects, and several times under one -- which makes
+    the collection read as a pile of unrelated greps rather than as evidence.
+
+    A run already printed renders NOTHING for a report that AGREES with one it was printed
+    for -- the same ``status`` and the same kind: the command, its output and a sentence
+    saying what it shows are on the page, and the report is still counted on its check line.
+    A report that reads the same run another way -- a refuted verdict resting on the run an
+    upheld one printed, or a documentary label on an executed run -- keeps one line with
+    its own sentence and label and not the output again, because that sentence is the only
+    place the report says why the run points its way.
     """
     command = _shell_line(evidence["argv"])
     kind = evidence.get(RUN_KIND_KEY)
-    # The WHOLE run, not its command. Keyed on the command alone, one command run twice --
-    # before a fix and after it, the ordinary way to show the fix works -- collapsed into
-    # one, and the second run's directory, exit status and output disappeared.
+    # The WHOLE run, not its command: argv, cwd, exit status, output and truncation. One
+    # command run twice -- before a fix and after it, the ordinary way to show the fix works
+    # -- prints twice whenever the two runs differ in any of those.
     identity = json.dumps([evidence["argv"], evidence["cwd"], evidence["exit_status"],
                            evidence["output"], evidence["truncated"]], sort_keys=True)
+    reading = json.dumps([identity, status, kind])
+    if seen is not None and reading in seen:
+        return []
     if seen is not None and identity in seen:
-        return [f"- Evidence{f' ({kind})' if kind else ''}: "
+        seen.add(reading)
+        whose = f", for {_READING_WHOSE.get(status, _status_words(status))}" if status else ""
+        return [f"- Evidence{f' ({kind})' if kind else ''}{whose}: "
                 f"{_one_line(evidence['shows'])} Same run as above.\n"]
     if seen is not None:
-        seen.add(identity)
+        seen.update((identity, reading))
     output, cut = _bounded_output(evidence["output"])
     note = "output truncated by the verifier" if evidence["truncated"] else "output complete"
     if cut:
@@ -8436,7 +9892,7 @@ def _render_evidence(evidence: dict, seen: set[str] | None = None) -> list[str]:
            f"{shown}{place} "
            f"(exit {evidence['exit_status']}, {note})\n"]
     if output:
-        # Labelled, so the page can fold it and the snippets stay open. It is a true label
+        # Labeled, so the page can fold it and the snippets stay open. It is a true label
         # rather than a presentation flag smuggled into the prose -- the block IS captured
         # console output -- and it is in both documents, so neither carries a fact the
         # other lacks.
@@ -8633,7 +10089,7 @@ def _short_names(paths: Sequence[str]) -> dict[str, str]:
     Each path gets the shortest suffix of directory components that no other path in the
     document shares, chosen for that path ALONE. `z/b/c.py` beside `x/a/c.py` and
     `y/a/c.py` prints as `b/c.py`: one directory already tells it apart, and lengthening it
-    to match what its neighbours needed is a directory a reader reads for nothing. A
+    to match what its neighbors needed is a directory a reader reads for nothing. A
     collision rendered as one name is two defects that look like one location.
 
     The comparison is over the RENDERED name, not the raw path, because that is what a
@@ -8655,7 +10111,7 @@ def _short_names(paths: Sequence[str]) -> dict[str, str]:
     """
     unique = sorted(set(paths))
     # How many paths each candidate name would stand for. Counted over the whole document
-    # at once, so a name is rejected by a path in another part of it just as by a neighbour.
+    # at once, so a name is rejected by a path in another part of it just as by a neighbor.
     bearers: dict[str, int] = {}
     for path in unique:
         for suffix in _path_suffixes(path):
@@ -8688,8 +10144,8 @@ class PathNames:
 
     Built once, from the paths the report is about to print, and consulted wherever one
     renders. That is what makes ONE spelling of a file possible: shortening at each call
-    site instead would let two of them disagree about the same file, which is the thing
-    section 9 forbids whichever spelling is chosen.
+    site instead would let two of them disagree about the same file, and one file under
+    two names is wrong whichever spelling is chosen.
     """
 
     def __init__(self, paths: Sequence[str]) -> None:
@@ -8761,8 +10217,13 @@ def _in_full(record: dict, commit: dict) -> str:
 
 def _breadth(cluster: dict, rung: str) -> str:
     """Corroboration in words, in the vocabulary the rung permits: two models where two
-    runtimes ran, two contexts of one model where one did."""
+    models ran, two contexts of one model where one did."""
     one, both = RUNG_BREADTH[rung]
+    # Counted in sites where there are several: "both models" said of a defect would claim
+    # both lanes reported every place it was made.
+    if len(cluster["sites"]) > 1:
+        return (f"{cluster['corroborated_sites']} of {len(cluster['sites'])} sites "
+                f"reported by {both}")
     if cluster["axis_a"] == AXIS_A_BOTH:
         return f"{both}, {_plural(len(cluster['members']), 'report')}"
     return one
@@ -8803,7 +10264,7 @@ def _settling(reason: str) -> str:
 
 
 def _id_rank(cluster_id: str) -> tuple[int, str]:
-    """A defect id ordered by its NUMBER rather than by its spelling.
+    """A defect or site id ordered by its NUMBER rather than by its spelling.
 
     ``D<n>`` carries no zero padding, so a plain string sort reads ``D10`` as sitting
     between ``D1`` and ``D2``. Two orderings break a tie on the id — the ranked index and
@@ -8811,14 +10272,14 @@ def _id_rank(cluster_id: str) -> tuple[int, str]:
     sequence. The fallback keeps the sort total for anything not of that shape, so a
     hand-built structure orders rather than raising.
     """
-    digits = cluster_id[len(CLUSTER_ID_PREFIX):]
+    digits = cluster_id[1:] if cluster_id[:1] in (DEFECT_ID_PREFIX, SITE_ID_PREFIX) else ""
     return (int(digits) if digits.isdigit() else -1, cluster_id)
 
 
 def _defect_order(cluster: dict) -> tuple:
-    """Severity first, then the cheapest fix within it, then file and line. Section 9's
-    ordering, computed and never triaged — an agent asked to rank these would make the
-    report a judgment the run cannot reproduce.
+    """Severity first, then the cheapest fix within it, then the fewest sites, then file and
+    line. The report's ordering, computed and never triaged — an agent asked to rank these
+    would make the report a judgment the run cannot reproduce.
 
     **Status is not a key here, because nothing ranked by this is refuted.** A list holding
     dismissed claims beside live ones needs status as its first key inside a severity, or a
@@ -8826,10 +10287,14 @@ def _defect_order(cluster: dict) -> tuple:
     work nobody will do sits at the top of the list of work to do. Keeping refuted defects
     out of the ranked views dissolves that conflict instead of tuning it, and leaves one rule
     a reader can hold: most severe first, cheapest first within that.
+
+    **The site count is part of the cost.** A defect's fix size is its largest site's, so a
+    one-line mistake made in twelve places ties with one made once; the count is what
+    ranks the twelve one-line fixes after the one.
     """
     return (_SEVERITY_RANK[cluster["severity"]],
-            _FIX_RANK[cluster["fix_size"]], cluster["file"], cluster["line_start"],
-            _id_rank(cluster["id"]))
+            _FIX_RANK[cluster["fix_size"]], len(cluster["sites"]), cluster["file"],
+            cluster["line_start"], _id_rank(cluster["id"]))
 
 
 def _is_work(cluster: dict) -> bool:
@@ -8919,15 +10384,16 @@ def _render_member(record: dict, commit: dict, names: PathNames,
                    moved: bool = False, verification: bool = True,
                    settled: str | None = None,
                    aggregate: str = DEFECT_ESTABLISHED,
-                   ran: set[str] | None = None) -> tuple[list[str], list[str]]:
+                   ran: set[str] | None = None,
+                   reports: int = 1) -> tuple[list[str], list[str]]:
     """One candidate inside its defect, carrying no run machinery at all.
 
     Returns its CHECK LINES and its body separately. The defect gathers every member's
-    check lines under one `Checks.` label, so each is a row in a labelled list rather than
-    an unlabelled bullet -- which is what the old shape produced, and what a reader could
-    not identify: a lone `by reading` under nothing, repeating the header field above it.
+    check lines under one `Checks.` label, so each is a row in a labeled list rather than
+    an unlabeled bullet, which a reader cannot identify: a lone `by reading` under nothing,
+    repeating the header field above it.
 
-    Section 10: candidate ids, lane letters, unit ids and lens names are audit data and
+    Candidate ids, lane letters, unit ids and lens names are audit data and
     belong in the provenance appendix, not in the text somebody reads while fixing this.
     What is left is what a fixer uses — what fails, what to do about it, what was concluded
     and what ran — and every string of it is a worker's, so it goes through :func:`_item`.
@@ -8942,15 +10408,19 @@ def _render_member(record: dict, commit: dict, names: PathNames,
     direction and the checker's rationale — are in the provenance appendix instead of
     here. Printing both would put one fact on the page twice in two voices, one of them
     checked and one of them not, and the narrative is the one a reader would believe.
-    Nothing else moves: the snippet, the evidence and the quote warning are what the claim
-    RESTS on rather than prose about it, and the warning in particular says the cited lines
-    may not be the lines the finding is about.
+    Nothing else leaves the entry: the snippet, the evidence and the quote warning are what
+    the claim RESTS on rather than prose about it, and the warning in particular says the
+    cited lines may not be the lines the finding is about. The warning does move UP, to the
+    defect, which prints it once with how many reports it covers.
 
     ``settled`` is the reason a heading above this member already gives — the unresolved
     section groups by it — so that member's own line for it is not written twice. A member
     whose reason DIFFERS from the heading's still writes one, which is the case the
     suppression must not swallow: a defect two checkers could not settle for two different
     reasons is grouped under neither.
+
+    ``reports`` is how many of the defect's reports return these exact check lines. The
+    defect prints them once for all of those reports, so the count rides on the verdict line.
     """
     # The location rides with the member only where the defect holds more than one. It is
     # what tells two reports of one site apart — without it, two members whose prose matches
@@ -8961,14 +10431,16 @@ def _render_member(record: dict, commit: dict, names: PathNames,
     # rides with THAT instead — as a lead rather than a trailing parenthesis, which would
     # sit beside the axis's own and read as part of it.
     # The location leads EVERY check line, whether the defect merges one report or five.
-    # Printed only for siblings before, which is backwards for a reader: one report is the
-    # common case, and the line then degenerated to a bare `by reading` -- a fragment
-    # under no label, saying what the header field above it had just said.
+    # Printed only for siblings, it would be missing in the common case of one report, and
+    # the line would shrink to a bare `by reading`, saying what the header field above it
+    # had just said.
     at = f"{_one_line(_at(record, names))} · "
     out: list[str] = [] if moved else _item(f"- Reported{where}: ", record["failure"])
-    if record["quote_check"] == QUOTE_DIFFERS:
+    # Where the defect is judged its body has no `Reported` line to hang a quote warning on,
+    # so the warning is the defect's to print, once, with how many reports it covers.
+    if not moved and record["quote_check"] == QUOTE_DIFFERS:
         out.append(f"- **{QUOTE_FLAG}**\n")
-    elif record["quote_check"] == QUOTE_UNREADABLE:
+    elif not moved and record["quote_check"] == QUOTE_UNREADABLE:
         out.append(f"- {QUOTE_UNCHECKED}\n")
     if not moved and record["direction"].strip():
         out += _item("- Direction: ", record["direction"])
@@ -8996,18 +10468,15 @@ def _render_member(record: dict, commit: dict, names: PathNames,
     # and the notes that belong under it. A defect gathers them under one `Checks.` label
     # so a line saying `unresolved` is a row in a table of checks rather than a fragment.
     checks: list[str] = []
+    counted = f" ({reports} reports)" if reports > 1 else ""
     if not record["answered"]:
-        # Section 10: the unit that failed, and why, is coverage's to name. Here it is one
-        # plain sentence, because a person reading this to fix something cannot act on a
-        # unit id and should not have to skip over one.
-        # `unresolved (unresolved)` said the engine's enum twice and then said the same
-        # fact a third time in the plain sentence that follows it — the same doubling the
-        # verdict line below dropped, in the branch nobody looked at. **This one has never
-        # been seen render**: it needs a verification unit that failed or never landed, and
-        # neither run available when it was changed had an unanswered candidate. It is
-        # fixed for consistency with the line below and not on evidence of harm, which is
-        # the honest thing to say about it.
-        checks.append(f"  - {at}no verdict came back; the unit that would have answered "
+        # The unit that failed, and why, is coverage's to name. Here it is one plain
+        # sentence, because a person reading this to fix something cannot act on a unit id
+        # and should not have to skip over one.
+        # It carries no status and no method: with no verdict both are `unresolved`, and
+        # printing them beside this sentence would say one fact three times — the doubling
+        # the verdict line below avoids.
+        checks.append(f"  - {at}no verdict came back{counted}; the unit that would have answered "
                       f"it is named under Coverage\n")
     else:
         # `confirmed_by_reading (by reading)` says one thing twice, once in the engine's own
@@ -9035,7 +10504,9 @@ def _render_member(record: dict, commit: dict, names: PathNames,
         # fallback names it instead of rendering nothing.
         if not told:
             told = [_verification_words(record["axis_b"], record["evidence"])]
-        outcome = _one_line(", ".join(told))
+        # The count rides on the outcome it counts, ahead of any file list, where it would
+        # read as one more entry in that list.
+        outcome = _one_line(", ".join(told)) + counted
         # The file an unresolved verdict named, on the line that says it is unresolved.
         # The verifier already named it -- it is where the "one more file would settle"
         # table comes from -- and this is where somebody deciding whether to chase it is
@@ -9047,13 +10518,6 @@ def _render_member(record: dict, commit: dict, names: PathNames,
             checks.append(f"  - {at}{outcome}\n")
         else:
             checks += _item(f"  - {at}{outcome} — ", record["rationale"])
-        # Where the member's own facts hang. They NEST under the verdict line while there is
-        # one; with it gone they move to the margin and take the location as a lead, because
-        # an indented bullet reads as belonging to the bullet above it and the bullet above
-        # it is then the defect's `Related.` or `Fix.` — which is how a severity revision
-        # came to render as a sub-point of a cross-reference list, and how two members'
-        # settling reasons came to stack under one another with nothing saying whose was
-        # whose. It is the same correction the proposed reproduction below already carries.
         # One fixed depth, under the check line this note belongs to. Every check line
         # renders, so there is always a line above for a note to hang from, which is what
         # makes a single indent correct. Choosing the depth from whether a verdict line
@@ -9076,7 +10540,7 @@ def _render_member(record: dict, commit: dict, names: PathNames,
         if not moved and record["test_first"] is not None:
             checks += _item(f"{indent}Test that should fail first: ", record["test_first"])
         if record["evidence"] is not None:
-            out += _render_evidence(record["evidence"], ran)
+            out += _render_evidence(record["evidence"], ran, record["status"])
     return checks, out
 
 
@@ -9084,18 +10548,18 @@ def _render_member(record: dict, commit: dict, names: PathNames,
 # read as a sentence in the body; in a table cell the same 250 characters wrap to four lines
 # and take the column beside them with them.
 #
-# Measured against 99 real headings rather than chosen: at 110 only 43% of labels came out
-# as a complete thought and the rest trailed off mid-clause; at 150, 93% do. A table where
-# almost every row ends in an ellipsis is one a reader stops trusting, and the width saved
-# by the tighter bound bought nothing but that.
+# Wide enough that a consequence of ordinary length fits whole, as a complete thought. A
+# label cut short ends in an ellipsis, a tighter bound cuts more of them, and a table where
+# most rows end in one is one a reader stops trusting; the width saved is not worth that.
 _LABEL_LIMIT = 150
 # A sentence end: a full stop, question mark or exclamation, then space, then a capital.
 # Bounded that way so `engine/core.py. ` ends a sentence and `cf. the loop` does not.
 _SENTENCE_END = re.compile(r"(?<=[.?!])\s+(?=[A-Z0-9\"'`(])")
 # Where a long sentence can be cut and still read as a finished one. A consequence names an
 # effect and then explains it — "…is later reversed, because the retry path…" — and the
-# effect alone is the label. Measured on the same 99: NONE of them had a second sentence, so
-# the sentence rule above never fired on real input and truncation was doing all the work.
+# effect alone is the label. A one-sentence consequence over the limit gets nothing from
+# the sentence rule above; this cuts it at a clause break between a third of the budget
+# and the budget, and a sentence with no break in that range is truncated.
 _CLAUSE_BREAK = re.compile(
     r",\s+(?:because|so|which|and|but|since|when|where|after|before|leaving|causing|"
     r"meaning|then|while|until)\b|;\s+|\s+—\s+")
@@ -9108,7 +10572,7 @@ def _short(text: str) -> str:
     experiences rather than what the code does — and it is kept, in the body heading,
     which is where somebody reads it. What a table cell and a list entry need is something
     that fits on the line: the first sentence, and a second only where the first is too
-    short to locate anything on its own. Section 9's preference is one.
+    short to locate anything on its own. One is the preference.
 
     Truncation is the last resort and is marked, because a label silently cut mid-clause
     reads as a complete thought that says the wrong thing.
@@ -9179,99 +10643,67 @@ def _unsettled(members: Sequence[dict], names: PathNames) -> list[str]:
     return out
 
 
-def _render_defect(cluster: dict, members: Sequence[dict], rung: str,
-                   commit: dict, names: PathNames, level: int = 3,
-                   verification: bool = True, unsettled: bool = False,
-                   corrected: bool = False) -> list[str]:
-    """One defect in full: its id and a one-line label as the heading, the whole
-    consequence under it, one line of metadata, and every member's own verdict — an
-    established defect never hides the refuted or unresolved sibling that describes the
-    same site.
+def _site_parts(site: dict, members: Sequence[dict], rung: str, commit: dict,
+                names: PathNames, judged: bool, verification: bool = True,
+                corrected: bool = False) -> dict[str, list]:
+    """Everything the report prints about one site, in parts, so the defect entry and the
+    site's evidence entry each take their own and no line is written twice.
 
-    **The heading is the label, not the sentence.** A consequence is written to be read as
-    a sentence and the good ones run past 200 characters; as a heading that is a line
-    nobody scans and an entry in a contents list nobody reads. The id leads it, so a
-    reader arriving from the index or from a cross-reference lands on the name they
-    followed. Where the label had to cut the sentence, the whole of it is the line under
-    the heading, which is where section 8 wanted it read — and where it did not, that line
-    would be the same sentence a second time and is not written.
+    The parts are the lines that make up a one-site defect's whole entry, less the
+    defect's own account, which the defect writes once:
 
-    **The metadata is one line.** Severity, corroboration and location were three bullets
-    saying in three lines what fits on one; fix size and the verification axis ride with
-    them because nothing else states the axis PER DEFECT. The field renders only where the
-    run settled its defects more than one way; where it settled them all the same way, the
-    summary's own breakdown at the top of the report is what states it, once, and a field
-    repeating that on every entry costs a reader attention to tell them nothing.
+    - ``meta``: severity, corroboration, location, fix size and verification on one line;
+    - ``in_full``: the full path and the commit, which the report also states once at the top;
+    - ``corrected``: the operator's mark, where the operator corrected this site's defect;
+    - ``source``: the cited lines, one block per range, each with its label where it needs one;
+    - ``split``: why a report at this location was kept apart from another;
+    - ``unsettled``: each checker's account of what stopped it, where the site is unresolved;
+    - ``tests``: one test that should fail first per location, each with its variants' line;
+    - ``quotes``: the quote warnings; ``checks``: every report's verdict; ``bodies``: the runs.
+
+    ``judged`` is whether the site's defect carries the synthesis round's account. Where it
+    does, the three fields that account was written FROM — the reader's failure text, the
+    reader's direction and the checker's rationale — are in ``findings.json`` rather than
+    here, the tests and the unsettled accounts are named parts, and the quote warnings are
+    the site's to print once; where it does not, every report's own lines render and its
+    test and its unsettled account sit under its check line, as they always have.
+
+    ``tests`` and ``unsettled`` are filled whether or not the site is judged: the defect entry
+    shows a site's first test and, for an unresolved site, what would settle it either way.
+    Only a judged site's evidence prints them as parts, since an unjudged site's check lines
+    already carry them.
     """
-    # One level below a section AND below a group heading. The unresolved section groups
-    # its defects by what would settle each, so a defect at the same level as its group
-    # would make the two indistinguishable to a reader and to anything parsing the
-    # document.
-    # The location is a NAME of code, so it is set as code: shaded, in the monospace face,
-    # and visually the same thing as the snippet it points into. Unless the name holds a
-    # BACKTICK, which a POSIX file name may: the escape that keeps it out of the prose is a
-    # backslash, and a code span closes on the backtick behind it -- `a\`b.py:1` came out
-    # as `a\` followed by loose text, which is a different file from the one cited. Left as
-    # prose there, where the escape does its job; the anchor pattern accepts either.
-    located = _one_line(_at(cluster, names))
-    fields = [cluster["severity"], _breadth(cluster, rung),
+    unsettled = site["status"] == DEFECT_UNRESOLVED
+    located = _one_line(_at(site, names))
+    # The location is a NAME of code, so it is set as code — unless the name holds a
+    # BACKTICK, which a POSIX file name may: a code span closes on the backtick behind the
+    # escape that keeps it out of the prose. Left as prose there, where the escape works.
+    fields = [site["severity"], _breadth(site, rung),
               located if "`" in located else f"`{located}`",
-              cluster["fix_size"]]
+              site["fix_size"]]
     labels = list(DEFECT_META_LABELS[:4])
-    # `Verification` is stated per defect only where the run has more than one answer for
-    # it. On a run where nothing could be executed it reads `by reading` on every defect
-    # alike, which is a property of the RUN and is already stated twice at the top -- and a
-    # field with one value costs a reader attention on every entry to tell them nothing.
+    # `Verification` is stated per site only where the run has more than one answer for it:
+    # a field with one value is a property of the run, stated at the top.
     if verification:
-        fields.append(_defect_verification_words(cluster, members))
+        fields.append(_defect_verification_words(site, members))
         labels.append(DEFECT_META_LABELS[4])
-    # `strict` because a field added without its label, or the other way round, would
-    # drop silently here — and the line would then stop matching `_MD_DEFECT_ENTRY`,
-    # leaving every defect on the page unanchored for a reason nothing points at.
+    # `strict`, so a field added without its label, or the other way round, fails here
+    # rather than silently shifting every field after it under the wrong label.
     meta = DEFECT_META_SEP.join(f"**{label}** {value}"
                                 for label, value in zip(labels, fields, strict=True))
-    label = _one_line(_short(cluster["consequence"]))
-    sentence = _one_line(cluster["consequence"])
-    out = [f"\n{'#' * level} {cluster['id']}. {label}\n\n"]
-    # The line below the heading exists to carry what the heading had to CUT, so it renders
-    # only where the heading cut something. Where the whole consequence fits a heading the
-    # two are the same sentence, and printing both put it on the page twice on every defect
-    # in the report. The condition is the truncation and not the round: a run whose
-    # synthesis degraded keeps the sentence on exactly these terms.
-    if sentence != label:
-        # The sentence lands on a line of its own with nothing of the engine's in front
-        # of it, so a leading `#` or `-` would be the worker writing this document's
-        # structure rather than its prose.
-        out.append(f"{_no_block_lead(sentence)}\n\n")
-    out += [f"- {meta}\n",
-            # The decode, in place: the short name above is only safe where a reader can
-            # get back to the path without leaving the entry.
-            f"  {_in_full(cluster, commit)}\n"]
-    # Under the metadata and above everything the panel said, so a reader meets it before
-    # acting on the entry. A pointer and not the reason: the reason is in one place.
-    if corrected:
-        out.append(f"- **{CORRECTED_MARK}.** See "
-                   f"[{SUBSECTION_CORRECTIONS}]({_anchor(SUBSECTION_CORRECTIONS)}).\n")
-    # The evidence, directly under the location that names it and ABOVE the prose about
-    # it. The heading already says in plain words what goes wrong, so a reader has decided
-    # whether this defect is theirs before reaching here; what they want next is the code,
-    # while the location is still on screen. Putting the narrative first makes them hold it
-    # in their head, scroll past it to the source, and scroll back to act on it.
-    # One block per SITE. Two reports of one defect routinely cite ranges that overlap
-    # without matching exactly -- 977-994 and 979-994 are the same piece of code read twice
-    # -- so comparing the rendered text keeps both and prints the middle of it twice. Ranges
-    # are collected per file, sorted, and one is dropped only where another CONTAINS it.
-    # Containment and not overlap: 10-15 beside 14-19 overlaps, and keeping the wider of
-    # the two throws away source the other cited -- silently, with no truncation marker,
-    # under a heading that says those lines are what the defect is about. Two ranges that
-    # merely touch are two pieces of code and both render.
-    # An ESTABLISHED member's snippet only, which is what leaves the unresolved section
-    # with no code in it at all. That was measured before it was decided: quoting the cited
-    # lines there took the section from 355 lines to 889 — 28 lines a defect — and the code
-    # it added is not the code that settles anything.
-    # A reader of that section is being sent to a DIFFERENT file, named in the settling
-    # account; the lines the claim was made about are described in words by the mechanism
-    # paragraph and linked, exact, by the location above it.
+    parts: dict[str, list] = {
+        "meta": [f"- {meta}\n"],
+        # The decode, in place: the full path and the commit, spelled as the legend spells it.
+        "in_full": [f"  {_in_full(site, commit)}\n"],
+        "corrected": ([f"- **{CORRECTED_MARK}.** See "
+                       f"[{SUBSECTION_CORRECTIONS}]({_anchor(SUBSECTION_CORRECTIONS)}).\n"]
+                      if corrected else []),
+    }
+    # One block per cited RANGE. Two reports of one site routinely cite ranges that overlap
+    # without matching exactly, so ranges are collected per file, sorted, and one is dropped
+    # only where another CONTAINS it: dropping one that merely overlaps would throw away
+    # source the other cited, silently. An ESTABLISHED member's snippet only; the code a
+    # claim nothing upheld was made about is not the code that settles anything.
     cited: list[tuple[str, int, int, dict, str | None]] = []
     for record in members:
         snip = record["snippet"]
@@ -9281,190 +10713,189 @@ def _render_defect(cluster: dict, members: Sequence[dict], rung: str,
         cited.append((record.get("file") or "", lo, lo + len(snip["lines"]) - 1,
                       snip, record.get("file")))
     kept: list[tuple[str, int, int, dict, str | None]] = []
-    # Sorted so a container always arrives before what it contains: same file, then the
-    # earliest start, then the widest of the ones that start together.
+    # Sorted so a container always arrives before what it contains.
     for entry in sorted(cited, key=lambda e: (e[0], e[1], -e[2])):
         if kept and kept[-1][0] == entry[0] and entry[2] <= kept[-1][2]:
             continue
         kept.append(entry)
-    # Each block says which lines it is, unless there is exactly one and the line above
-    # already named it. A defect can cite two files -- one member's report established and
-    # another's refuted -- and the snippet that survives need not be the one the defect's
-    # own location names, so an unlabelled block under that location shows a reader one
-    # file's source under another file's heading.
-    labelled = len(kept) > 1 or any(
-        _where(path, lo, hi, names) != _at(cluster, names) for path, lo, hi, _s, _p in kept)
-    for _path, lo, hi, snip, path in kept:
-        if labelled:
-            # The snippet reaches the LABEL and never the test above it: that test compares
-            # the block's location against the defect's to decide whether a label is needed,
-            # and a clause about the pad appended to one side would make them differ always.
-            out.append(f"  {_one_line(_where(_path, lo, hi, names, snip))}\n")
-        out += _render_snippet(snip, commit, path)
-    if cluster["split_reason"]:
-        out += _item("- Kept separate from another report at this location: ",
-                     cluster["split_reason"])
-    # The three named prose parts, where the synthesis round wrote them, in the order
-    # somebody works in: what happens, what to do about it, what should fail before the fix.
-    judged = cluster["tier"] is not None
-    if judged:
-        out += _item(f"- **{WHAT_GOES_WRONG_LABEL}** ", cluster["what_goes_wrong"])
-        # What stopped the check, for a defect nothing settled. It sits BETWEEN the
-        # mechanism and the fix because that is the order somebody works in here: what is
-        # claimed, what would decide whether it holds, and what to do if it does. One entry
-        # per checker, deduplicated the way the tests below are, since two lanes describing
-        # one site routinely give one account of what was missing.
-        if unsettled:
-            out += _unsettled(members, names)
-        out += _item(f"- **{FIX_LABEL}** ", cluster["fix"])
-        # The test is the verifier's, so it is one per member; deduplicated for the reason
-        # the member blocks below are, since two lanes describing one site name one test.
-        tests: list[str] = []
-        for record in members:
-            named = record["test_first"]
-            if named is None:
-                continue
-            where = f"({_one_line(_at(record, names))}) " if record["siblings"] else ""
-            rendered = "".join(_item(f"- **{TEST_FIRST_LABEL}** {where}", named))
-            if rendered not in tests:
-                tests.append(rendered)
-        out += tests
-        # Only the references that survived checking. The ones that did not are named,
-        # with the reason each was dropped, under "The synthesis round" in the appendix —
-        # a reader who is never told one was refused cannot tell a defect that stands
-        # alone from one whose only stated connection failed.
-        if cluster["cross_references"]:
-            named_refs = ", ".join(f"[{did}](#{did})" for did in cluster["cross_references"])
-            out.append(f"- **{RELATED_LABEL}** {named_refs}\n")
-    # Two lanes that described one defect in the same words render one entry, not two
-    # identical ones. Nothing is hidden by that: how many reports there were is the
-    # corroboration line above, and which units made them is the provenance appendix.
-    # Where two members differ at all — a different failure, a different verdict, a
-    # different rationale — both render, which is what keeps every member's own verdict
-    # visible.
-    seen: list[str] = []
-    # The reason the GROUP HEADING above already states, where there is exactly one. A
-    # member line repeating it under a heading that just said it costs a reader a line per
-    # report and tells them nothing; a member whose reason differs from the group's — a
-    # defect two checkers could not settle for two different reasons — still renders it.
-    settled = cluster["unresolved_reason"] if unsettled else None
-    # A member states its own outcome where the members of THIS defect do not all share
-    # one. The suppression above is about the defect's `Verification` field, which says
-    # nothing when every established defect in the run was settled the same way; a member
-    # line is a different fact at a different scope, and one defect routinely holds a
-    # report that was reproduced, one a check refuted and one nothing settled. Deciding
-    # the member line by the defect field's variance hid all three behind bare sentences,
-    # so a reader could not tell which of a defect's three reports had been upheld.
+    # Each block says which lines it is, unless there is exactly one and the site's own
+    # location already names it: a site can cite two files, and an unlabeled block under
+    # the location would show one file's source under another file's name.
+    labeled = len(kept) > 1 or any(
+        _where(path, lo, hi, names) != _at(site, names) for path, lo, hi, _s, _p in kept)
+    parts["source"] = [
+        ([f"  {_one_line(_where(_path, lo, hi, names, snip))}\n"] if labeled else [])
+        + _render_snippet(snip, commit, path)
+        for _path, lo, hi, snip, path in kept]
+    parts["split"] = (_item("- Kept separate from another report at this location: ",
+                            site["split_reason"]) if site["split_reason"] else [])
+    parts["unsettled"] = _unsettled(members, names) if unsettled else []
+    # One test per LOCATION: an established member's test at that location stands for it,
+    # and the members there that worded theirs differently are counted and pointed at
+    # rather than reprinted. That is a move and not a loss only because `findings.json`
+    # holds every candidate's test under its candidate id, which the provenance appendix
+    # traces to this site's defect.
+    tests: dict[str, list] = {}
+    for record in sorted(members, key=lambda r: r["status"] not in ESTABLISHED_STATUSES):
+        named = record["test_first"]
+        if named is None:
+            continue
+        where = f"({_one_line(_at(record, names))}) " if record["siblings"] else ""
+        rendered = "".join(_item(f"- **{TEST_FIRST_LABEL}** {where}", named))
+        if where not in tests:
+            tests[where] = [rendered, 0]
+        elif rendered != tests[where][0]:
+            tests[where][1] += 1
+    traced = (f"[{SUBSECTION_PROVENANCE}]({_anchor(SUBSECTION_PROVENANCE)}), in the "
+              f"appendix, lists this defect's candidate ids.\n")
+    parts["tests"] = []
+    for rendered, variants in tests.values():
+        block = [rendered]
+        if variants == 1:
+            block.append("  - One other report names a variant of this test; it is in "
+                         "`findings.json` beside this report, under that report's "
+                         f"candidate id. {traced}")
+        elif variants:
+            block.append(f"  - {variants} other reports name a variant of this test; each "
+                         f"is in `findings.json` beside this report, under its candidate "
+                         f"id. {traced}")
+        parts["tests"].append(block)
+    parts["quotes"] = _quote_warnings(members) if judged else []
+    # Where the members do not all share one verification method, each states its own.
     outcomes = {record["axis_b"] for record in members}
-    # The checks of every report, under one label, then the bodies. Deduplicated on the
-    # PAIR: two reports of one site whose prose matches are one body, and dropping a check
-    # line with it would lose a verdict the run actually returned.
-    # TWO passes, and the order is the point. The first renders every member with no
-    # evidence suppression at all and drops the duplicates; the second renders only the
-    # survivors, sharing one record of what has been printed.
+    shared = verification or len(outcomes) > 1
+    # Check lines are GROUPED: each distinct set prints once, with how many reports returned
+    # it. Every member is counted, including one whose body is dropped below as a duplicate,
+    # because dropping a check line would lose a verdict the run actually returned.
     #
-    # Suppressing first defeats the dedupe: two members identical in every way then differ
-    # only in that the second says "Same run as above", so both survive and the same check,
-    # failure and direction print twice. The suppression is about one defect's repetition,
-    # which is a question that can only be asked once the repetitions are gone.
-    kept: list[dict] = []
+    # The settling reason is not suppressed here, as it was under a heading that stated it:
+    # a site's evidence sits away from the group heading its defect is filed under.
+    groups: dict[str, list] = {}
     for record in members:
-        lines, body = _render_member(record, commit, names, judged,
-                                     verification or len(outcomes) > 1, settled,
-                                     cluster["status"])
-        rendered = ("".join(lines), "".join(body))
+        lines, _body = _render_member(record, commit, names, judged, shared, None,
+                                      site["status"])
+        groups.setdefault("".join(lines), [record, 0])[1] += 1
+    checked = ["".join(_render_member(first, commit, names, judged, shared, None,
+                                      site["status"], reports=count)[0])
+               for first, count in groups.values()]
+    # Bodies take TWO passes, and the order is the point: the first drops duplicate bodies
+    # with no evidence suppressed, the second renders the survivors sharing one record of the
+    # runs printed, so a run the site has already printed adds nothing under a later member.
+    # Suppressing first would defeat the dedupe: two identical members would then differ
+    # only in the second lacking its evidence, and both would survive.
+    seen: list[str] = []
+    survivors: list[dict] = []
+    for record in members:
+        _lines, body = _render_member(record, commit, names, judged, shared, None,
+                                      site["status"])
+        rendered = "".join(body)
         if rendered not in seen:
             seen.append(rendered)
-            kept.append(record)
-    # The runs THIS defect has printed. Scoped to the defect because that is the unit a
-    # reader takes in at once: the same broad search under two different defects is a fact
-    # each of them needs, and under one defect three times it is noise.
+            survivors.append(record)
     ran: set[str] = set()
-    checked: list[str] = []
     bodies: list[str] = []
-    for record in kept:
-        lines, body = _render_member(record, commit, names, judged,
-                                     verification or len(outcomes) > 1, settled,
-                                     cluster["status"], ran)
-        checked.append("".join(lines))
-        bodies.append("".join(body))
-    block = ["- **Checks.**\n", *checked] if any(checked) else []
-    return out + block + bodies
+    for record in survivors:
+        _lines, body = _render_member(record, commit, names, judged, shared, None,
+                                      site["status"], ran)
+        if "".join(body) not in bodies:
+            bodies.append("".join(body))
+    parts["checks"] = ["- **Checks.**\n", *checked] if any(checked) else []
+    parts["bodies"] = bodies
+    return parts
 
 
-def _render_index(clusters: Sequence[dict], rung: str, refuted: int,
-                  names: PathNames, sections: _Sections,
+def _quote_warnings(members: Sequence[dict]) -> list[str]:
+    """A judged defect's quote warnings, each printed once, above its checks.
+
+    A judged defect's bodies carry no `Reported` line saying which report each one is, so a
+    warning left in a body sits in the evidence list directly above whichever run follows
+    it -- which, once a repeated run is suppressed, is another report's -- and reads as
+    being about that run. Here it is one line for the defect saying how many of its reports
+    it covers, which is the fact a reader can act on: all of them means the cited range is
+    suspect, one of eight means one report's quotation is.
+    """
+    total = len(members)
+    out: list[str] = []
+    for state, one, several, bold in (
+            (QUOTE_DIFFERS, QUOTE_FLAG, _quote_flag_for, "**"),
+            (QUOTE_UNREADABLE, QUOTE_UNCHECKED, _quote_unchecked_for, "")):
+        hit = sum(1 for record in members if record["quote_check"] == state)
+        if not hit:
+            continue
+        sentence = one if total == 1 else several(hit, total)
+        out.append(f"- {bold}{sentence}{bold}\n")
+    return out
+
+
+def _render_index(clusters: Sequence[dict], refuted: int, sections: _Sections,
                   corrected: frozenset[str] = frozenset()) -> list[str]:
-    """The first of the three views of the defect list: one table, every defect that is
-    work, most severe first and cheapest first within that. Section 9 forbids a second
-    table that differs only by a filter, so this is the only place the list is ranked.
+    """The first way into the defect list: one row per defect that is work, most severe
+    first, then cheapest fix first, then fewest sites, so twelve one-line fixes of one
+    mistake do not rank as one. This is the only place the list is ranked.
 
     **It states its own ordering.** A ranked table whose rule a reader has to infer is a
-    table they re-sort by hand, and the rule here is not the obvious one — cost breaks ties
-    inside a severity, which is what makes the first rows the ones to start on.
+    table they re-sort by hand, and the rule here is not the obvious one.
 
-    It is a SUBSECTION of the index section rather than a section of its own. It and the
-    by-file table are two ways into one list, and as sibling headings they read as two
-    separate things a reader has to decide between.
+    A defect's row carries its worst site's severity, its sites counted by outcome and its
+    largest fix; where each site is, is the by-file view's to say and each entry's.
     """
     out = [sections.sub(SUBSECTION_RANKED),
            "Every defect that needs work, most severe first and, within a severity, "
-           "cheapest fix first. So the first rows are the blockers, in the order to take "
-           "them on.\n"]
+           "cheapest fix first, then fewest sites. So the first rows are the blockers, in the "
+           "order to take them on.\n"]
     if refuted:
         out.append(f"\n{_plural(refuted, 'refuted defect')} "
                    f"{'is' if refuted == 1 else 'are'} not here. Nothing needs doing about "
                    f"{'it' if refuted == 1 else 'them'}, so "
-                   f"{'it is' if refuted == 1 else 'they are'} listed under Refuted, in the "
-                   f"appendix, with the reason {'it' if refuted == 1 else 'each'} was "
-                   f"dismissed.\n")
-    out += [f"\n| {DEFECT_COLUMN} | Consequence | Severity | Status | Location | Fix size "
-            f"| Corroboration |\n", "|---|---|---|---|---|---|---|\n"]
+                   f"{'it is' if refuted == 1 else 'they are'} listed under "
+                   f"**{SECTION_REFUTED}**, with the reason {'it' if refuted == 1 else 'each'} "
+                   f"was dismissed.\n")
+    out += [f"\n| {DEFECT_COLUMN} | Heading | Severity | Sites | Fix size |\n",
+            "|---|---|---|---|---|\n"]
     for cluster in clusters:
         # Marked here as well as on the entry: this is the list a reader works down, and
         # one who acts from the row never opens the entry that carries the mark.
         mark = (f", [corrected by the operator]({_anchor(SUBSECTION_CORRECTIONS)})"
                 if cluster["id"] in corrected else "")
         out.append(f"| [{cluster['id']}](#{cluster['id']}) | "
-                   f"{_cell(_short(cluster['consequence']))} | "
-                   f"{_term_cell(cluster['severity'])} | {_term_cell(cluster['status'])}{mark} | "
-                   f"{_cell(_at(cluster, names))} | "
-                   f"{_term_cell(cluster['fix_size'])} | {_term_cell(_breadth(cluster, rung))} |\n")
+                   f"{_cell(_short(_title(cluster)))} | "
+                   f"{_term_cell(cluster['severity'])} | "
+                   f"{len(cluster['sites'])} ({_outcome_counts(cluster)}){mark} | "
+                   f"{_term_cell(cluster['fix_size'])} |\n")
     return out
 
 
-def _render_by_file(clusters: Sequence[dict], by_id: dict, names: PathNames,
+def _render_by_file(clusters: Sequence[dict], site_of: dict, by_id: dict, names: PathNames,
                     sections: _Sections) -> list[str]:
-    """The second view, and the reason it exists rather than being a sort of the first: one
-    person claims a file and closes what is in it in one change."""
-    # Every MEMBER's file, not just the defect's primary one. A cluster can hold reports
-    # in two files, and listing it under one of them hides the other from the person
-    # allocating the work — which is the only thing this table is for. A defect counts once
-    # per file it touches.
+    """The second way in, and the reason it exists rather than being a sort of the first:
+    one person claims a file and closes what is in it in one change. One row per file, with
+    every live site in it and the defect each belongs to — fixing a file fixes those sites,
+    and a defect is closed only when every one of its sites is."""
+    # Every file a site's REPORTS name, not just the site's own: a site can hold reports in
+    # two files, and listing it under one hides the other from the person allocating the
+    # work, which is the only thing this table is for.
     by_file: dict[str, list[dict]] = {}
-    ranges: dict[str, list[str]] = {}
     for cluster in clusters:
-        for record in [by_id[cid] for cid in cluster["members"]]:
-            held = by_file.setdefault(record["file"], [])
-            if cluster not in held:
-                held.append(cluster)
-            where = (str(record["line_start"]) if record["line_start"] == record["line_end"]
-                     else f"{record['line_start']}-{record['line_end']}")
-            seen = ranges.setdefault(record["file"], [])
-            if where not in seen:
-                seen.append(where)
+        for sid in cluster["sites"]:
+            site = site_of[sid]
+            if site["status"] == DEFECT_REFUTED:
+                continue
+            for path in dict.fromkeys(by_id[cid]["file"] for cid in site["members"]):
+                by_file.setdefault(path, []).append(site)
     out = [sections.sub(SUBSECTION_BY_FILE),
-           "The same defects, grouped by file, so one person can take a file and close "
-           "every defect listed under it in one change. A defect reported in two files is "
-           "listed under both.\n\n",
-           "| File | Defects | Most severe | Lines |\n", "|---|---|---|---|\n"]
-    # Ordered by the name the column actually shows. Sorting by the full path would leave
-    # a reader a column that is not in any order they can see.
+           "The same defects by file, so one person can take a file and close every site "
+           "listed under it in one change. Fixing a file fixes those sites; a defect is "
+           "closed only when all of its sites are.\n\n",
+           f"| File | Most severe | Sites ({DEFECT_COLUMN.lower()}) |\n", "|---|---|---|\n"]
+    # Ordered by the name the column actually shows, so the column is in an order a reader
+    # can see.
     for path in sorted(by_file, key=lambda p: (names.short(p), p)):
-        held = by_file[path]
-        out.append(f"| {_cell(names.short(path))} | {len(held)} | "
-                   f"{_term_cell(_most_severe([c['severity'] for c in held]))} | "
-                   f"{_cell(', '.join(ranges[path]))} |\n")
+        held = sorted(by_file[path], key=lambda s: (s["line_start"], _id_rank(s["id"])))
+        listed = ", ".join(f"{_site_link(site['id'], SOURCE_ANCHOR)} "
+                           f"([{site['defect']}](#{site['defect']}))" for site in held)
+        out.append(f"| {_cell(names.short(path))} | "
+                   f"{_term_cell(_most_severe([site['severity'] for site in held]))} | "
+                   f"{listed} |\n")
     return out
 
 
@@ -9494,61 +10925,341 @@ def _by_tier(clusters: Sequence[dict], tiers: Sequence[str]) -> list[tuple[str |
     return out
 
 
-def _render_body(clusters: Sequence[dict], by_id: dict, rung: str,
-                 commit: dict, names: PathNames, sections: _Sections,
-                 tiers: Sequence[str] = (), disclaim: bool = False,
-                 corrected: frozenset[str] = frozenset()) -> list[str]:
-    """The third view: the defects themselves, grouped by status and then by tier, with
-    severity order inside. Section 9 refuses a body that claims an ordering it does not
-    have, so neither grouping is an ordering: the status is a fact the engine computed, the
-    tier is the name one agent gave what these defects break, and the ORDER inside a tier is
-    the same computed priority the index uses.
+def _outcome_counts(defect: dict) -> str:
+    """A defect's sites counted by outcome, in the words the sections use."""
+    return ", ".join(f"{count} {status}" for status, count in defect["outcomes"].items()
+                     if count)
 
-    The tier is added inside the status sections rather than replacing them. It says what a
-    defect breaks; established, unresolved and refuted say whether anybody checked it, and a
-    reader who loses the second cannot tell a confirmed blocker from a claim nothing
-    settled. This is what overturns criterion 32 of the previous plan, which forbade
-    thematic grouping outright; the as-built there records the decision.
+
+def _refuted_reason(members: Sequence[dict]) -> str:
+    """Why a site was dismissed: every report's own rationale, collapsed to one line."""
+    return " ".join(_collapse(record["rationale"] or "") for record in members)
+
+
+def _site_link(sid: str, anchor: str | None = None) -> str:
+    """A link to a site: to its evidence, or to ``anchor`` under it."""
+    return f"[{sid}](#{sid}{anchor or ''})"
+
+
+class _Printed:
+    """What the document has printed so far that a later site may print again: each quoted
+    source and each captured output, keyed by its text, with the site that printed it.
+
+    An identical block is replaced by a pointer to the site that prints it, and only where
+    the pointer is shorter than the block. Every replacement is recorded, because the
+    appendix lists every place the evidence leaves something out.
     """
-    def members(cluster):
-        return [by_id[cid] for cid in cluster["members"]]
 
-    # Whether `Verification` varies across the defects that carry an entry. One value means
-    # it is a fact about the run, not about any defect, and the run states it twice already.
-    entried = [c for c in clusters if c["status"] == DEFECT_ESTABLISHED]
-    verification = len({c["axis_b"] for c in entried}) > 1
+    def __init__(self) -> None:
+        self.source: dict[str, str] = {}
+        self.output: dict[str, str] = {}
+        self.pointed: list[tuple[str, str, str]] = []
+        self.moved: list[tuple[str, list[str]]] = []
+
+    @staticmethod
+    def key(lines: Sequence[str]) -> str:
+        """A block's text as it compares: exact, less only the indentation its first line
+        is nested under. Indentation inside a block is part of what it says — two outputs
+        that differ only there are two outputs."""
+        held = "".join(lines).splitlines()
+        nest = len(held[0]) - len(held[0].lstrip(" ")) if held else 0
+        return "\n".join(line[nest:] if not line[:nest].strip() else line for line in held)
+
+    def source_block(self, sid: str, block: list[str]) -> list[str]:
+        key = self.key(block)
+        first = self.source.setdefault(key, sid)
+        if first == sid:
+            return block
+        pointer = f"  {SOURCE_POINTER.format(site=_site_link(first, SOURCE_ANCHOR))}\n"
+        if len(pointer) >= len("".join(block)):
+            return block
+        self.pointed.append((sid, first, "source"))
+        return [pointer]
+
+    def output_blocks(self, sid: str, text: str) -> str:
+        """``text`` with every fenced block another site already printed replaced."""
+        lines = text.splitlines(keepends=True)
+        out: list[str] = []
+        n = 0
+        while n < len(lines):
+            opening = _MD_FENCE.match(lines[n].rstrip("\n"))
+            if not opening:
+                out.append(lines[n])
+                n += 1
+                continue
+            end = n + 1
+            while end < len(lines):
+                closing = _MD_FENCE.match(lines[end].rstrip("\n"))
+                if closing and not closing.group(3) and len(closing.group(2)) >= len(
+                        opening.group(2)):
+                    break
+                end += 1
+            block = lines[n:end + 1]
+            key = self.key(block)
+            first = self.output.setdefault(key, sid)
+            pointer = (f"{opening.group(1)}"
+                       f"{OUTPUT_POINTER.format(site=_site_link(first))}\n")
+            if first != sid and len(pointer) < len("".join(block)):
+                self.pointed.append((sid, first, "output"))
+                out.append(pointer)
+            else:
+                out += block
+            n = end + 1
+        return "".join(out)
+
+
+# Where a site's quoted source sits in its defect's entry, and what points at it.
+SOURCE_ANCHOR = "-src"
+SOURCE_POINTER = "The same source as quoted for {site}."
+OUTPUT_POINTER = "The same output as printed under {site}."
+NO_SOURCE_QUOTED = ("No source is quoted for this site: the review quotes the cited lines "
+                    "only where a check upheld the claim, and this site is {status}.")
+SITES_LABEL = "Source at each site."
+SITE_NOTE_COLUMN = "Particular to this site"
+MECHANISM_UPHELD = "as the merge check upheld it"
+
+
+def _anchor_tag(ident: str) -> str:
+    """An anchor carried in the Markdown itself, so a link to a defect or a site resolves in
+    a plain Markdown viewer and not only on the page this engine converts it to. A worker's
+    `<` reaches the prose escaped, so only the engine can write one."""
+    return f'<a id="{ident}"></a>'
+
+
+def _site_line(site: dict, names: PathNames) -> str:
+    """A one-site defect's one line about its site: number, location, outcome, severity
+    and fix size. It is also where the site's quoted source is anchored."""
+    located = _one_line(_at(site, names))
+    return (f"- {_anchor_tag(site['id'] + SOURCE_ANCHOR)}**Site** "
+            f"{_site_link(site['id'])}{DEFECT_META_SEP}"
+            f"{located if '`' in located else f'`{located}`'}{DEFECT_META_SEP}"
+            f"**Outcome** {site['status']}{DEFECT_META_SEP}**Severity** {site['severity']}"
+            f"{DEFECT_META_SEP}**Fix size** {site['fix_size']}\n")
+
+
+def _first_test(parts: dict, judged: bool, site: dict) -> list[str]:
+    """The site's first test that should fail first, as its defect entry prints it: the
+    judged site's own first test part, or the site's test otherwise."""
+    if judged:
+        return parts["tests"][0] if parts["tests"] else []
+    if site["test_first"] is None:
+        return []
+    return _item(f"- **{TEST_FIRST_LABEL}** ", site["test_first"])
+
+
+def _render_entry(defect: dict, site_of: dict, by_id: dict, parts_of: dict, names: PathNames,
+                  level: int, printed: _Printed) -> list[str]:
+    """One defect, as a person fixing it reads it: one account of the mistake, then every
+    site where it has to be fixed with the lines to change there.
+
+    **A defect of one site** is one compact entry: its heading, one line naming the site,
+    the account, the fix, its related defects, the test that should fail first and, for an
+    unresolved site, what would settle it; then the site's quoted source. There is no inner
+    site wrapper: a defect of one site is not a defect around a site.
+
+    **A defect of several sites** carries its account once, then one table row per site with
+    that site's own outcome, severity, what is particular to it and its test, then the quoted
+    source at each site. Everything else a site's readers and checkers recorded is under
+    **Evidence**, by the site's number.
+    """
+    sites = [site_of[sid] for sid in defect["sites"]]
+    judged = defect["tier"] is not None and _is_work(defect)
+    label = _one_line(_short(_title(defect)))
+    # The anchor on a line of its own above the heading, where a Markdown viewer reads it
+    # as an element of its own and the heading keeps its text.
+    out = [f"\n{_anchor_tag(defect['id'])}\n\n{'#' * level} {defect['id']}. {label}\n\n"]
+    several = len(sites) > 1
+    sentence = _one_line(defect["consequence"])
+    # The line below the heading carries what the heading had to cut, or the site's own
+    # consequence under a heading the round wrote; under a heading that is the whole
+    # consequence it would be the same sentence twice. A defect of several sites states each
+    # site's consequence beside its source instead.
+    if not several and sentence != label:
+        out.append(f"{_no_block_lead(sentence)}\n\n")
+    if several:
+        worst = defect["severity_site"]
+        out.append(f"- **{_plural(len(sites), 'site')}**: {_outcome_counts(defect)}"
+                   f"{DEFECT_META_SEP}**Worst severity** {defect['severity']}, at "
+                   f"{_site_link(worst, SOURCE_ANCHOR)}{DEFECT_META_SEP}**Largest fix** "
+                   f"{defect['fix_size']}{DEFECT_META_SEP}**Areas** "
+                   f"{_one_line(', '.join(defect['areas']))}\n")
+    else:
+        out.append(_site_line(sites[0], names))
+    out += parts_of[sites[0]["id"]]["corrected"]
+    if not _is_work(defect):
+        # A dismissed claim: the reason, and nothing to do. Its evidence is under its site.
+        if not several:
+            members = [by_id[cid] for cid in sites[0]["members"]]
+            reason = _refuted_reason(members)
+            flag = (f" {QUOTE_FLAG}" if any(r["quote_check"] == QUOTE_DIFFERS for r in members)
+                    else "")
+            out += _item(f"- **{REFUTED_LABEL}** ", reason + flag)
+    elif judged:
+        out += _item(f"- **{WHAT_GOES_WRONG_LABEL}** ", defect["what_goes_wrong"])
+        # What stopped the check sits between the claim and the fix: the order somebody
+        # works in is what is claimed, what would decide whether it holds, and what to do.
+        if not several:
+            out += parts_of[sites[0]["id"]]["unsettled"][:1]
+        out += _item(f"- **{FIX_LABEL}** ", defect["fix"])
+    elif several:
+        # No account from the round: the mechanism the check upheld is the one account the
+        # run has of the whole defect, and it says whose it is.
+        out += _item(f"- **{WHAT_GOES_WRONG_LABEL[:-1]}**, {MECHANISM_UPHELD}: ",
+                     defect["mechanism"] or "")
+    if defect["cross_references"]:
+        out.append(f"- **{RELATED_LABEL}** "
+                   + ", ".join(f"[{did}](#{did})" for did in defect["cross_references"])
+                   + "\n")
+    if not several:
+        site = sites[0]
+        parts = parts_of[site["id"]]
+        note = defect["site_notes"].get(site["id"])
+        if note is not None:
+            out += _item(f"- **{SITE_NOTE_LABEL}** ", note)
+        if _is_work(defect):
+            out += _first_test(parts, judged, site)
+            if not judged:
+                out += parts["unsettled"][:1]
+        if parts["source"]:
+            out.append("- **Source.**\n")
+            for block in parts["source"]:
+                out += printed.source_block(site["id"], block)
+        return out
+    out += ["\n", f"| Site | Location | Outcome | Severity | {SITE_NOTE_COLUMN} | "
+                  f"{TEST_FIRST_LABEL[:-1]} |\n", "|---|---|---|---|---|---|\n"]
+    for site in sites:
+        members = [by_id[cid] for cid in site["members"]]
+        parts = parts_of[site["id"]]
+        particular = []
+        note = defect["site_notes"].get(site["id"])
+        if note is not None:
+            particular.append(_collapse(note))
+        if site["status"] == DEFECT_UNRESOLVED:
+            account = next((record["rationale"] for record in members
+                            if record["answered"] and record["status"] == "unresolved"
+                            and (record["rationale"] or "").strip()), None)
+            if account is not None:
+                particular.append(f"Not settled: {_collapse(account)}")
+        if site["status"] == DEFECT_REFUTED:
+            particular.append(f"Refuted: {_refuted_reason(members)}")
+        test = _collapse(site["test_first"] or "") if site["status"] != DEFECT_REFUTED else ""
+        # The first test's variant note rides with it whole — the count, where each variant
+        # is and the link to the ids — as it does under a defect of one site: the evidence
+        # prints neither.
+        note = (parts["tests"][0][1].strip()[2:]
+                if judged and parts["tests"] and len(parts["tests"][0]) > 1 else "")
+        cell = _cell(test) + (f" ({note})" if note and test else "")
+        located = _at(site, names)
+        out.append(f"| {_site_link(site['id'], SOURCE_ANCHOR)} | {_cell(located)} | "
+                   f"{_term_cell(site['status'])} | {_term_cell(site['severity'])} | "
+                   f"{_cell(' '.join(particular))} | {cell} |\n")
+    out.append(f"\n**{SITES_LABEL}**\n\n")
+    for site in sites:
+        parts = parts_of[site["id"]]
+        located = _one_line(_at(site, names))
+        out.append(f"- {_anchor_tag(site['id'] + SOURCE_ANCHOR)}**{site['id']}**{DEFECT_META_SEP}"
+                   f"{located if '`' in located else f'`{located}`'} — "
+                   f"{_one_line(site['consequence'])}{DEFECT_META_SEP}"
+                   f"[evidence](#{site['id']})\n")
+        if not parts["source"]:
+            out.append(f"  {NO_SOURCE_QUOTED.format(status=site['status'])}\n")
+        for block in parts["source"]:
+            out += printed.source_block(site["id"], block)
+    return out
+
+
+def _evidence_lines(site: dict, defect: dict, parts: dict, printed: _Printed) -> list[str]:
+    """Every line of a site's evidence the defect entry does not print.
+
+    Exactly these leave it, and the appendix lists each: the defect's own account, which is
+    not a site's; the line giving the full path and the commit, stated once at the top;
+    the quoted source, the first test and, for an unresolved site, what is not settled,
+    which its defect entry prints; a clustering note on a site the merge put in a defect of
+    several, moved to the appendix; and a block another site already printed, replaced by a
+    pointer to it. Everything else is as a one-site defect's entry renders it, in that
+    order.
+    """
+    judged = defect["tier"] is not None and _is_work(defect)
+    several = len(defect["sites"]) > 1
+    out = [*parts["meta"], *parts["corrected"]]
+    if parts["split"] and several:
+        printed.moved.append((site["id"], parts["split"]))
+    else:
+        out += parts["split"]
+    if judged:
+        out += parts["unsettled"][1:]
+        out += [line for block in parts["tests"][1:] for line in block]
+        out += parts["quotes"]
+    out += parts["checks"]
+    out += parts["bodies"]
+    return [printed.output_blocks(site["id"], "".join(out))]
+
+
+def _render_evidence_part(findings: Findings, parts_of: dict, names: PathNames,
+                          sections: _Sections, printed: _Printed) -> list[str]:
+    """The Evidence section: one entry per site, in site order, each headed by the whole of
+    its signpost — number, location, outcome and the defect it belongs to."""
+    defect_of = {defect["id"]: defect for defect in findings.defects}
+    sites = sorted(findings.sites, key=lambda site: _id_rank(site["id"]))
+    out = [sections.top(SECTION_EVIDENCE, len(sites))]
+    if not sites:
+        out.append("No site was raised.\n")
+        return out
+    out.append(EVIDENCE_LEAD + "\n")
+    for site in sites:
+        defect = defect_of[site["defect"]]
+        located = _one_line(_at(site, names))
+        out.append(f"\n{_anchor_tag(site['id'])}\n\n### {site['id']}{DEFECT_META_SEP}"
+                   f"{located if '`' in located else f'`{located}`'}{DEFECT_META_SEP}"
+                   f"{site['status']}{DEFECT_META_SEP}[{defect['id']}](#{defect['id']})\n\n")
+        out += _evidence_lines(site, defect, parts_of[site["id"]], printed)
+    return out
+
+
+def _render_body(clusters: Sequence[dict], by_id: dict, site_of: dict, parts_of: dict,
+                 names: PathNames, sections: _Sections, printed: _Printed,
+                 tiers: Sequence[str] = (), disclaim: bool = False,
+                 headed: bool = False) -> list[str]:
+    """The defects themselves, grouped by where they are placed and then by tier, with
+    severity order inside: Established, Unresolved and Refuted. Neither grouping is an
+    ordering: the placement is a fact the engine computed, the tier is the name one agent
+    gave what these defects break, and the ORDER inside a tier is the same computed
+    priority the index uses.
+
+    The tier is added inside the placement sections rather than replacing them. It says what
+    a defect breaks; established, unresolved and refuted say whether anybody checked it, and
+    a reader who loses the second cannot tell a confirmed blocker from a claim nothing
+    settled.
+    """
+    def entry(cluster: dict, level: int) -> list[str]:
+        return _render_entry(cluster, site_of, by_id, parts_of, names, level, printed)
 
     def grouped(held: Sequence[dict], level: int) -> list[str]:
-        """One status section's defects, under a tier heading each where the round named
-        any. With no tiers the defects sit at the section's own level, exactly as they did
-        before the round existed."""
+        """One section's defects, under a tier heading each where the round named any.
+        With no tiers the defects sit at the section's own level."""
         out: list[str] = []
         for name, group in _by_tier(held, tiers):
             if name is None:
                 for cluster in group:
-                    out += _render_defect(cluster, members(cluster), rung, commit, names,
-                                          level, verification,
-                                          corrected=cluster["id"] in corrected)
+                    out += entry(cluster, level)
                 continue
             out.append(f"\n{'#' * level} {_counted(_one_line(name), len(group))}\n")
             for cluster in group:
-                out += _render_defect(cluster, members(cluster), rung, commit, names,
-                                      level + 1, verification,
-                                      corrected=cluster["id"] in corrected)
+                out += entry(cluster, level + 1)
         return out
 
     out: list[str] = []
     established = [c for c in clusters if c["status"] == DEFECT_ESTABLISHED]
     out.append(sections.top(SECTION_ESTABLISHED, len(established)))
-    # Where the body begins, and said once for the whole document: the register is the
-    # clustering notes', which mark a judgment as a judgment in the same plain way.
+    # Where the body begins, and said once for the whole document.
     if disclaim:
-        out.append(f"{SYNTHESIS_DISCLAIMER}\n\n")
+        out.append(f"{SYNTHESIS_DISCLAIMER}{SYNTHESIS_HEADED if headed else ''}\n\n")
     if not established:
         out.append("Nothing was established.\n")
     else:
-        out.append("Each was confirmed by a checker that had not raised it. A defect keeps "
-                   "every report of it, including a report that a check refuted.\n")
+        out.append("Each has at least one site a checker that had not raised it confirmed. "
+                   "Every site keeps its own outcome, so a site nothing settled, or one a "
+                   "check refuted, is shown as that beside the others.\n")
     out += grouped(established, 3)
 
     unresolved = [c for c in clusters if c["status"] == DEFECT_UNRESOLVED]
@@ -9556,30 +11267,19 @@ def _render_body(clusters: Sequence[dict], by_id: dict, rung: str,
     if not unresolved:
         out.append("Nothing was left unresolved.\n")
     else:
-        # It names the part that is a VERDICT. The disclaimer above marks the round's
-        # narrative, fix and links as one agent's unchecked reading and is printed once for
-        # the whole document, at the top of the established section; a reader who arrives
-        # here from the index has not passed it, and the one part of this section they are
-        # meant to act on is the one part of it that is not the round's.
-        #
-        # It is scoped to "where a checker answered", because that is the only place the
-        # settling account can come from. A defect under `No verdict was received` has no
-        # answered member and so carries none, and a sentence promising one on every entry
-        # would leave a reader unable to tell an engine that dropped the part from a unit
-        # that never returned -- which is the distinction that group heading exists to draw.
+        # It names the part that is a VERDICT: the checker's own account of what stopped
+        # it, which is the one part of this section that is not the round's reading.
         out.append(f"Nothing here is established: each is a claim a check could not "
                    f"settle. Where a checker answered, the entry carries "
                    f"**{UNSETTLED_LABEL}** This is that checker's own account of what "
                    f"stopped it; for most of these it names the one file or contract that "
                    f"would decide the claim. Where no checker answered, the group says so, the "
-                   f"entry says a verdict never came back, and Coverage names the unit "
-                   f"that owes one. The defects are grouped by what would settle each, and "
-                   f"then by what each breaks. Every defect here sits under exactly one "
+                   f"site's evidence says a verdict never came back, and Coverage names the "
+                   f"unit that owes one. The defects are grouped by what would settle each, "
+                   f"and then by what each breaks. Every defect here sits under exactly one "
                    f"group, so a group's size counts pieces of work, not mentions.\n")
     # The settling reason stays the PRIMARY grouping: it is a fact the verifiers returned
-    # and it is what a person does next. The tier names the substance inside it, which is
-    # what turns one group of thirty-nine into groups somebody can take one of — and where
-    # the round named nothing the four fixed terms stand alone, as they always have.
+    # and it is what a person does next. The tier names the substance inside it.
     groups: dict[tuple[str, str | None], list[dict]] = {}
     for cluster in unresolved:
         groups.setdefault((_settles(cluster), cluster["tier"] if tiers else None), []).append(cluster)
@@ -9589,26 +11289,32 @@ def _render_body(clusters: Sequence[dict], by_id: dict, rung: str,
         held = groups[key]
         title = key[0] if key[1] is None else f"{key[0]} — {_one_line(key[1])}"
         out.append(f"\n### {_counted(title, len(held))}\n")
-        # The defect body, with the settling account added to it. This section is NOT a
-        # table and must not become one, which was tried: the four columns worth putting in
-        # one -- the id, the consequence, the severity and the location -- are all columns
-        # section 2a already ranks, for every defect on the page including these. A table
-        # here is a third copy of facts the reader has twice, re-sorted, and it is the one
-        # treatment in the report that would show LESS than the record holds: every
-        # unresolved cluster carries a populated mechanism, fix and settling account, and
-        # each of its candidates a rationale naming the file that would decide it. Nobody
-        # can pick one of these up from four columns, because the three things they need
-        # are exactly the fields a table leaves out.
-        #
-        # And the length a table would save is not there to save. Carrying the settling
-        # account, this section is SHORTER than the body treatment alone was -- the settling
-        # reason renders once per group rather than once per member, and the evidence
-        # de-duplication and the constant-field suppression above apply here unchanged.
         for cluster in held:
-            out += _render_defect(cluster, members(cluster), rung, commit, names, 4,
-                                  verification, unsettled=True,
-                                  corrected=cluster["id"] in corrected)
+            out += entry(cluster, 4)
+
+    refuted = sorted((c for c in clusters if c["status"] == DEFECT_REFUTED),
+                     key=lambda c: _id_rank(c["id"]))
+    out.append(sections.top(SECTION_REFUTED, len(refuted)))
+    if not refuted:
+        out.append("Nothing was refuted.\n")
+    else:
+        # Listed in the order they were raised: nothing ranks what needs no work.
+        out.append("Claims that were checked and dismissed at every site, each with the "
+                   "reason, so nobody goes over them again. Nothing here needs work.\n")
+    for cluster in refuted:
+        out += entry(cluster, 3)
     return out
+
+
+def _title(cluster: dict) -> str:
+    """What a defect is headed by: the heading the synthesis round wrote for it, or its
+    first site's consequence where the round wrote none."""
+    return cluster.get("heading") or cluster["consequence"]
+
+
+def _headed(clusters: Sequence[dict]) -> bool:
+    """Whether any of these defects carries a heading or a site note the round wrote."""
+    return any(cluster.get("heading") or cluster.get("site_notes") for cluster in clusters)
 
 
 def _carries_a_reading(cluster: dict) -> bool:
@@ -9620,10 +11326,10 @@ def _carries_a_reading(cluster: dict) -> bool:
     a surviving cross-reference, which renders beneath it, and which is the round's judgment
     as much as any other part of it.
 
-    Reading only the work defects left a run where the round's one usable answer was a
-    refuted defect's reference: the link rendered, and the sentence saying nobody checked it
-    did not. A reader then has an unchecked claim in the voice of a checked one, which is the
-    thing the disclaimer exists to prevent.
+    So a refuted defect counts when a cross-reference survives beneath it: that link
+    renders, and the sentence saying nobody checked it renders with it. Otherwise a reader
+    has an unchecked claim in the voice of a checked one, which is the thing the disclaimer
+    exists to prevent.
     """
     if _is_work(cluster):
         return cluster["tier"] is not None
@@ -9634,13 +11340,13 @@ def _render_corroborated(clusters: Sequence[dict], rung: str,
                          sections: _Sections) -> list[str]:
     """The defects two independent readers each found, named together.
 
-    **This is not a fourth view of the defect list**, and the difference is what keeps
-    section 9's bound intact rather than bending it. The three views each carry facts a
-    reader works from — the index ranks, the by-file table allocates, the body is the
-    defects themselves — and what makes a second filtered table of those facts harmful is
-    that it gives the same list a second ordering: a reader who works this one first works
-    by confidence where the index ranks by severity and cost. So this section carries no
-    severity, no location, no fix size, no status and no ordering of its own. It names a
+    **This is not a fourth view of the defect list**, and the difference is what keeps the
+    report's bound of three views intact rather than bending it. The three views each carry
+    facts a reader works from — the index ranks, the by-file table allocates, the body is
+    the defects themselves — and what makes a second filtered table of those facts harmful
+    is that it gives the same list a second ordering: a reader who works this one first
+    works by confidence where the index ranks by severity and cost. So this section carries
+    no severity, no location, no fix size, no status and no ordering of its own. It names a
     set, in the order the defects were raised, and says where the facts are. There is
     nothing in it to work from, and nothing to reconcile against the index.
 
@@ -9671,74 +11377,10 @@ def _render_corroborated(clusters: Sequence[dict], rung: str,
     # Two columns, and the id is a link into the defect's own entry. A severity or a
     # location column here would be the duplication this section is written to avoid: every
     # defect in it is in the ranked index, which already carries both. The test a table has
-    # to pass is whether it carries something the index does not -- which is why the refuted
-    # table below has four columns and this one has two. Refuted defects are in no ranked
-    # view at all, so their row is the only place those facts appear.
+    # to pass is whether it carries something the index does not.
     out += [f"| {DEFECT_COLUMN} | Consequence |\n", "|---|---|\n"]
     out += [f"| [{cluster['id']}](#{cluster['id']}) | "
-            f"{_cell(_short(cluster['consequence']))} |\n" for cluster in named]
-    return out
-
-
-def _render_refuted(clusters: Sequence[dict], by_id: dict, names: PathNames,
-                    corrected: frozenset[str] = frozenset()) -> list[str]:
-    """The claims a check dismissed, each with the reason that dismissed it.
-
-    A TABLE, one row per defect: which defect, what it said, where, and why it was
-    dismissed. It earns its four columns where the corroborated table two sections up earns
-    only two — a refuted defect is not work, so it is in no ranked view, and this row is the
-    only place any of those facts appear. What is bounded here is the MATERIAL, not the row:
-    a refuted claim gets its reason and the connections it named, and none of the apparatus
-    a defect in the body carries.
-
-    The row is also where its ANCHOR lives. A refuted defect has no heading of its own, so
-    a bare id in the first cell is what a link from anywhere else in the document lands on.
-
-    In the appendix rather than among the defects, because this section is the only one in
-    the report that is not work. Ranked beside live defects it distorted the ranking — the
-    order had to put status above cost to keep dismissed claims off the top — and read
-    beside them it costs a person time on every pass down the list. Here it is what it is:
-    the record of what was raised and settled, kept so nobody re-treads it and so the
-    judgment can be argued with.
-    """
-    refuted = [c for c in clusters if c["status"] == DEFECT_REFUTED]
-    out = [f"\n### {_counted(SUBSECTION_REFUTED, len(refuted))}\n\n"]
-    if not refuted:
-        out.append("Nothing was refuted.\n")
-        return out
-    out.append("Claims that were checked and dismissed, each with the reason, so nobody "
-               "goes over them again. Nothing here needs work.\n\n")
-    out.append(f"\n| {DEFECT_COLUMN} | Consequence | Location | Why it was dismissed |\n")
-    out.append("|---|---|---|---|\n")
-    for cluster in refuted:
-        # Collapsed, not escaped: _item escapes what it inlines, and doing both shows the
-        # reader the entities instead of the text.
-        reason = " ".join(_collapse(by_id[cid]["rationale"] or "")
-                          for cid in cluster["members"])
-        # The warning survives the compact form. A refutation is exactly where a wrong
-        # location does the most damage: the claim is dismissed, and the lines the verifier
-        # read were not the lines the reader meant.
-        misquoted = any(by_id[cid]["quote_check"] == QUOTE_DIFFERS
-                        for cid in cluster["members"])
-        # A connection the check KEPT, in the cell with the reason and behind the same
-        # label the body uses. Without the label it is a link glued to the end of a
-        # sentence with nothing saying what it is; without the link at all, the only
-        # cross-references a refuted defect could produce were the REFUSED ones, named in
-        # the appendix -- so the report stated what it had thrown away and not what it had
-        # allowed. A refuted claim is where a connection earns its keep: it says the
-        # dismissal covers this site and not the live defect beside it.
-        refs = ""
-        if cluster["cross_references"]:
-            refs = (f" **{RELATED_LABEL}** "
-                    + ", ".join(f"[{did}](#{did})" for did in cluster["cross_references"]))
-        flag = f" {QUOTE_FLAG}" if misquoted else ""
-        # In the last cell and never beside the id: the id alone in the first cell is what
-        # gives this row its anchor on the page.
-        mark = (f" **{CORRECTED_MARK}**; see "
-                f"[{SUBSECTION_CORRECTIONS}]({_anchor(SUBSECTION_CORRECTIONS)})."
-                if cluster["id"] in corrected else "")
-        out.append(f"| {cluster['id']} | {_cell(_short(cluster['consequence']))} | "
-                   f"{_cell(_at(cluster, names))} | {_cell(reason)}{flag}{refs}{mark} |\n")
+            f"{_cell(_short(_title(cluster)))} |\n" for cluster in named]
     return out
 
 
@@ -9828,7 +11470,40 @@ def _gap_primary(cluster: dict, by_id: dict) -> dict:
     return min(members, key=lambda m: _GAP_PRIMARY_RANK.get(m["status"], len(_GAP_PRIMARY_RANK)))
 
 
-def _gap_entry(cluster: dict, by_id: dict, names: PathNames) -> list[str]:
+def _gap_sites(findings: Findings) -> list[dict]:
+    """The coverage ladder as the two coverage sections list it: a gap of one site as its
+    defect, and every site of a gap of several as an entry of its own, placed by its own
+    outcome and naming the defect it belongs to. A merged gap is one mistake, but each of
+    its sites is its own test to write or its own test that covers it, and an entry read
+    off one site would drop the others' inputs, locations and tests."""
+    site_of = {site["id"]: site for site in findings.coverage_sites}
+    out: list[dict] = []
+    for defect in findings.coverage_defects:
+        if len(defect["sites"]) < 2:
+            out.append(defect)
+            continue
+        out += [{**site_of[sid], "part_of": defect["id"]} for sid in defect["sites"]]
+    return out
+
+
+def _gap_label(cluster: dict) -> str:
+    """How an entry names itself: its defect, or a site and the defect it is part of."""
+    return (f"{cluster['id']} (part of {cluster['part_of']})" if cluster.get("part_of")
+            else cluster["id"])
+
+
+def _gap_anchor(cluster: dict, anchored: set[str]) -> str:
+    """The anchor a coverage gap's defect is linked by, on the first entry of it the page
+    prints and on no other."""
+    did = cluster.get("part_of") or cluster["id"]
+    if did in anchored:
+        return ""
+    anchored.add(did)
+    return _anchor_tag(did)
+
+
+def _gap_entry(cluster: dict, by_id: dict, names: PathNames,
+               anchored: set[str] | None = None) -> list[str]:
     """One gap: where it is, the input no test constructs, the test the auditor proposed,
     and what the check found. Four facts and no apparatus — a gap carries no severity
     ranking, no corroboration axis and no snippet, because the thing to do with it is
@@ -9841,10 +11516,15 @@ def _gap_entry(cluster: dict, by_id: dict, names: PathNames) -> list[str]:
     primary = _gap_primary(cluster, by_id)
     # `_one_line`, like every other caller of `_at`: the string it returns is RAW by
     # contract, and a path is a REVIEWED repository's bytes. `<img src=x onerror=...>.py` is
-    # a legal POSIX name, and bare it reached `report.html` as a live tag -- the reviewed
-    # tree scripting the page its reviewer opens. This was the one call site that took it
-    # bare; the escape is the same one the tables and the defect entries already use.
-    out = [f"- **{_one_line(_at(cluster, names))}** — {_one_line(_short(cluster['consequence']))}\n"]
+    # a legal POSIX name, and `_one_line` escapes it so it reaches `report.html` as text
+    # rather than as a live tag -- the reviewed tree scripting the page its reviewer opens.
+    # The escape is the same one the tables and the defect entries use.
+    lead = _gap_anchor(cluster, anchored) if anchored is not None else ""
+    out = [f"- {lead}**{_one_line(_at(cluster, names))}** — "
+           f"{_one_line(_short(cluster['consequence']))}\n"]
+    if cluster.get("part_of"):
+        out.append(f"  - Site {_gap_label(cluster)}, one gap with several sites: each is "
+                   f"its own test to write.\n")
     out += _item("  - No test constructs: ", primary["failure"])
     out += _item("  - The auditor proposed: ", primary["direction"])
     if primary["test_first"]:
@@ -9884,7 +11564,7 @@ def _batch_notes(clusters: Sequence[dict], by_id: dict,
 
 
 def _render_coverage_gaps(findings: Findings, names: PathNames,
-                          sections: _Sections) -> list[str]:
+                          sections: _Sections, anchored: set[str]) -> list[str]:
     """The coverage ladder: gaps that stood, and gaps nothing settled.
 
     Its own section, and not a corner of the defect body, because a gap makes no claim that
@@ -9905,7 +11585,7 @@ def _render_coverage_gaps(findings: Findings, names: PathNames,
     proposes, so :func:`_test_named` reads it off rather than asking for it twice. Each
     entry still carries its own location, so nothing is lost by dropping the file heading.
     """
-    gaps = sorted(findings.coverage_clusters, key=_gap_order)
+    gaps = sorted(_gap_sites(findings), key=_gap_order)
     by_id = {record["id"]: record for record in findings.coverage}
     standing = [c for c in gaps if c["status"] == DEFECT_ESTABLISHED]
     unresolved = [c for c in gaps if c["status"] == DEFECT_UNRESOLVED]
@@ -9936,32 +11616,33 @@ def _render_coverage_gaps(findings: Findings, names: PathNames,
         out.append(f"\n#### {_one_line(spelling.get(key, GAPS_NO_TEST_NAMED))}\n\n")
         out += _batch_notes(held, by_id, said)
         for cluster in held:
-            out += _gap_entry(cluster, by_id, names)
+            out += _gap_entry(cluster, by_id, names, anchored)
     if unresolved:
         out.append(f"\n#### {_counted('Gaps nothing settled', len(unresolved))}\n\n")
         out.append("A check could not tell whether a test constructs the input. Grouped by "
                    "what would settle each, as the unresolved defects are.\n")
         groups: dict[str, list[dict]] = {}
         # `_settles`, as the defect section: two checkers naming different settling
-        # questions is a disagreement, and a gap filed under "no verdict was received" for
-        # it sent the reader to re-run units that had answered.
+        # questions is a disagreement and goes under the group that says so. Only a gap no
+        # checker answered goes under "no verdict was received", the one a reader acts on
+        # by re-running the unit.
         for cluster in unresolved:
             groups.setdefault(_settles(cluster), []).append(cluster)
         for heading in sorted(groups):
             out.append(f"\n##### {_counted(heading, len(groups[heading]))}\n\n")
             for cluster in groups[heading]:
-                out += _gap_entry(cluster, by_id, names)
+                out += _gap_entry(cluster, by_id, names, anchored)
     return out
 
 
-def _render_covered(findings: Findings, names: PathNames) -> list[str]:
+def _render_covered(findings: Findings, names: PathNames, anchored: set[str]) -> list[str]:
     """The gaps a check answered by naming the test that covers them.
 
     A table, one row per gap, and the test is the column that matters: a refutation of a
     coverage gap that names no test is refused by the engine, so every row here has one.
     In the appendix beside Refuted, because it is settled and is not work.
     """
-    covered = [c for c in sorted(findings.coverage_clusters, key=_gap_order)
+    covered = [c for c in sorted(_gap_sites(findings), key=_gap_order)
                if c["status"] == DEFECT_REFUTED]
     by_id = {record["id"]: record for record in findings.coverage}
     out = [f"\n### {_counted(SUBSECTION_COVERED, len(covered))}\n\n"]
@@ -9976,7 +11657,8 @@ def _render_covered(findings: Findings, names: PathNames) -> list[str]:
         member = by_id[cluster["members"][0]]
         tests = " ".join(_collapse(by_id[cid]["covered_by"] or "")
                          for cid in cluster["members"])
-        out.append(f"| {cluster['id']} | {_cell(_short(member['failure']))} | "
+        out.append(f"| {_gap_anchor(cluster, anchored)}{_gap_label(cluster)} | "
+                   f"{_cell(_short(member['failure']))} | "
                    f"{_cell(_at(cluster, names))} | {_cell(tests)} |\n")
     return out
 
@@ -10037,11 +11719,11 @@ VERIFIER_NOTES_NONE = "No verification unit returned a summary."
 def _render_verifier_variance(findings: Findings) -> list[str]:
     """One row per verification unit: what it was handed and how its answers fell.
 
-    The established count over one set of files swung by a third between two runs of one
-    job, and every bit of the swing was here — one unit answering `unresolved` to fifteen
-    of twenty-six while another answered it to none of twenty. Both runs' verdicts were in
-    the report already, one row per candidate in the provenance table, which is the form in
-    which nobody can see it. This is the same data at the size the variance happens at.
+    The established count over one set of files can swing widely between two runs of one
+    job, and the swing can sit entirely here — one unit answering `unresolved` to most of
+    what it was handed while another answers it to none. Every verdict is in
+    ``findings.json`` already, one entry per candidate, which is the form in which nobody
+    can see it. This is the same data at the size the variance happens at.
 
     Ordered by the share that came back unresolved, so the unit that answered fewest
     questions is the first row. No threshold decides what counts as a wide spread — a
@@ -10053,7 +11735,7 @@ def _render_verifier_variance(findings: Findings) -> list[str]:
     two together is what separates a spread of opinion from a unit that did not answer.
 
     **The finder's lane is the second column.** Routing hands a unit the findings of one
-    lane, so an unresolved share that runs from 0% to 62% across a run's units is as much a
+    lane, so an unresolved share that runs from none to most across a run's units is as much a
     question about whose findings those were as about who checked them, and the column is
     what lets a reader ask it. Each unit's own paragraph follows the table, for the reason
     the coverage section states its verifiers': a field the engine reads and nothing prints
@@ -10101,10 +11783,12 @@ def _render_verifier_variance(findings: Findings) -> list[str]:
 
 
 def _render_clustering_notes(findings: Findings, names: PathNames) -> list[str]:
-    """Section 2's audit of the merge. The one place candidate ids belong in prose: what is
+    """The report's audit of the merge. The one place candidate ids belong in prose: what is
     being explained here is a judgment — why two reports of one site were merged or kept
-    apart — and the ids are what make that judgment checkable."""
-    clusters = findings.clusters
+    apart — and the ids are what make that judgment checkable.
+
+    Read off the SITES, since a cluster is a site, and each is named by its own number."""
+    clusters = list(findings.sites)
     out = [f"\n### {SUBSECTION_NOTES}\n\n",
            f"Every candidate is in exactly one cluster: {_plural(len(findings.candidates), 'candidate')} "
            f"in {_plural(len(clusters), 'cluster')}, none dropped and none counted twice.\n"]
@@ -10135,18 +11819,17 @@ def _render_clustering_notes(findings: Findings, names: PathNames) -> list[str]:
 
 def _render_provenance(findings: Findings, tags: dict[str, str]) -> list[str]:
     """Every candidate id, lane letter, unit id and lens name in the document, in one place
-    nobody has to read to fix anything. Section 10: this is audit data, and keeping it here
-    is what lets the body above be written for the person doing the work.
+    nobody has to read to fix anything. This is audit data, and keeping it here is what
+    lets the body above be written for the person doing the work.
 
-    What this section does NOT carry is the three raw fields — what the reader said
-    failed, the direction it proposed, what the checker concluded. Reprinting all three
-    against every candidate costs 40,368 of the appendix's 59,771 words on a 216-candidate
-    run: an unsearchable second copy of fields ``findings.json`` already holds against the
-    same candidate id, in the same directory, in a form a program can read. Leaving them
-    there holds this section to 3,571 words instead of 53,921, with every candidate still
-    listed. The intro sentence below is what keeps that a move rather than a loss — it
-    names the file the full text is in, so a reader who wants a worker's own words knows
-    where they are.
+    What this section does NOT carry is the three raw fields — what the reader said failed,
+    the direction it proposed, what the checker concluded. Reprinting all three against
+    every candidate would be an unsearchable second copy of fields ``findings.json``
+    already holds against the same candidate id, in the same directory, in a form a program
+    can read. Leaving them there keeps this section to one short table row per raiser, with
+    every candidate still listed. The intro sentence below is what keeps that a move rather
+    than a loss — it names the file the full text is in, so a reader who wants a worker's
+    own words knows where they are.
 
     That sentence says EVERYTHING each unit wrote rather than listing the three fields,
     because a sentence that enumerates goes quietly false the moment a fourth thing stops
@@ -10159,11 +11842,11 @@ def _render_provenance(findings: Findings, tags: dict[str, str]) -> list[str]:
     the whole reason this section exists.
 
     The lens is referenced by a short tag and spelled out under **The job**, two subsections
-    up. A lens sentence runs to about 95 characters and a run has two of them; spelling one out
-    on every raiser line said the same two things 216 times. It is spelled out THERE rather
-    than in a legend here, because a lens is a field of the job and one legend per place that
-    cites a lens is the same text twice — the tag and its meaning now sit in one appendix, a
-    screen apart.
+    up. Every raiser line cites a lens, and many lines share one, so spelling it out on
+    each line would repeat the same sentence once per raiser. It is spelled out THERE
+    rather than in a legend here, because a lens is a field of the job and one legend per
+    place that cites a lens is the same text twice — the tag and its meaning sit in one
+    appendix, a screen apart.
     """
     # BOTH ladders. The section is the audit trail — which unit raised what and which
     # answered it — and a coverage gap raised by an auditor and answered by a coverage
@@ -10182,7 +11865,7 @@ def _render_provenance(findings: Findings, tags: dict[str, str]) -> list[str]:
     # repeated here: the id is what a reader follows back.
     out.append("\n| Defect | Candidate | Raised by | Proposed | Answered by |\n")
     out.append("|---|---|---|---|---|\n")
-    for cluster in (*findings.clusters, *findings.coverage_clusters):
+    for cluster in (*findings.defects, *findings.coverage_defects):
         for cid in cluster["members"]:
             record = by_id[cid]
             for raiser in record["raised_by"]:
@@ -10220,8 +11903,10 @@ def _render_synthesis_notes(findings: Findings) -> list[str]:
     record = findings.synthesis
     if record is None:
         return []
+    headed = (f"each defect heading it wrote, the **{SITE_NOTE_LABEL[:-1]}** notes, "
+              if _headed((*findings.defects, *findings.coverage_defects)) else "")
     out = [f"\n### {SUBSECTION_SYNTHESIS}\n\n",
-           f"What the judgment round returned. The tier headings, "
+           f"What the judgment round returned. The tier headings, {headed}"
            f"**{WHAT_GOES_WRONG_LABEL[:-1]}**, **{FIX_LABEL[:-1]}** and "
            f"**{RELATED_LABEL[:-1]}** came from this round, and nothing else in this report "
            f"did.\n\n"]
@@ -10230,15 +11915,243 @@ def _render_synthesis_notes(findings: Findings) -> list[str]:
                      record["reason"] or "no reason was recorded", SYNTHESIS_DEGRADED)
         return out
     out.append(f"- {record['unit']} — complete: {_plural(len(record['tiers']), 'tier')} "
-               f"named for {_plural(len(findings.clusters), 'defect')}.\n")
+               f"named for {_plural(len(findings.defects), 'defect')}.\n")
     for message in record["rejected"]:
         out += _item("- an entry could not be read, and only its own defect is affected: ",
                      message, "That defect carries no tier and no account of itself, and "
-                     "is grouped by its status instead.")
-    for cluster in findings.clusters:
+                     "is grouped by its status instead; a defect of several sites keeps "
+                     "the mechanism its sites were merged on.")
+    for cluster in findings.defects:
         for dropped in cluster["dropped_cross_references"]:
             out.append(f"- {cluster['id']} cited {_one_line(dropped['defect'])}, which was "
                        f"dropped: {dropped['reason']}.\n")
+    return out
+
+
+# What the report says of a merge unit whose reply was discarded or never came back. The
+# grouping is named as well as the unit, as for synthesis: a reader who knows the round
+# exists cannot otherwise tell a run whose merge was thrown away from one that found no
+# mistake made twice.
+MERGE_DEGRADED = ("Its reply was not used, so every site it was handed is reported as its "
+                  "own defect, as on a run with no merge round.")
+# The rule the merge check applies, in the words the rung permits: at the one-runtime rung
+# both lanes are one model in two contexts, and a sentence naming a second model would
+# tell a reader that a model checked a merge it never saw.
+MERGE_CHECK_RULE = ("A proposed group is reported as one defect only once a unit that did "
+                    "not propose it, on the other lane and in a fresh context, has checked it "
+                    "site by site, so {both} took part; only the sites it upheld are that "
+                    "defect, and every other site is its own.")
+# Why a group the round proposed is still not shown as one defect.
+MERGE_HELD = ("Nothing in this run has checked the groups proposed, so every site is "
+              "reported as its own defect.")
+# What the report says of a merge check unit whose reply was discarded or never came back.
+MERGE_CHECK_DEGRADED = ("Its reply was not used, so no group it was handed is reported as "
+                        "one defect: each of their sites is its own.")
+# Why a site left a proposed group, keyed by the engine's reason.
+CHECK_REMOVAL_WORDS = {
+    CHECK_DOES_NOT_FIT: "does not fit the mechanism",
+    CHECK_HIDDEN_CLAIM: "makes a second claim the shared account would hide",
+    CHECK_TOO_FEW: "fewer than two sites of the group were upheld",
+}
+MERGE_BATCHED = ("There were too many sites for one merge unit, so they were split into "
+                 "{batches} batches by directory and merged within each. Merges across "
+                 "batches were not attempted: sites of one mistake that fall in different "
+                 "batches are never reported as one defect.")
+
+
+def _render_merge_notes(findings: Findings) -> list[str]:
+    """What the merge round returned, and every place it fell short: a unit whose reply was
+    discarded or never came back, and the batches a run over the ceiling was split into.
+    A run with no merge unit writes none of it."""
+    record = findings.merge
+    if record is None:
+        return []
+    check = findings.merge_check
+    rule = MERGE_CHECK_RULE.format(both=RUNG_BREADTH[findings.rung][1])
+    unchecked = check is not None and not check["units"]
+    out = [f"\n### {SUBSECTION_MERGE}\n\n",
+           f"Which sites the merge round proposed as one mistake. {rule}"
+           + (f" {MERGE_HELD}" if unchecked else "") + "\n\n"]
+    if record["batched"]:
+        out.append(f"{MERGE_BATCHED.format(batches=len(record['units']))}\n\n")
+    for unit in record["units"]:
+        if unit["state"] != UNIT_COMPLETE:
+            out += _item(f"- {unit['unit']} — {unit['state']}: ",
+                         unit["reason"] or "no reason was recorded", MERGE_DEGRADED)
+            continue
+        several = [group for group in unit["groups"] if len(group["sites"]) > 1]
+        out.append(f"- {unit['unit']} — complete: "
+                   f"{_plural(len(several), 'group')} of several sites proposed over "
+                   f"{_plural(len(unit['sites']), 'site')}, and "
+                   f"{_plural(len(unit['compound']), 'site')} kept apart for a second "
+                   f"claim.\n")
+        if unit["summary"]:
+            out += _item(f"- {unit['unit']} reported: ", unit["summary"])
+        # A site whose report also asserts a second, independent mistake is kept apart, so
+        # merging it cannot hide the second claim; what that claim is, is said here.
+        for record in unit["compound"]:
+            out += _item(f"  - {record['site']} kept apart; its report also "
+                         f"claims: ", record["second_claim"])
+    return out + _render_merge_check_notes(findings)
+
+
+def _render_merge_check_notes(findings: Findings) -> list[str]:
+    """What the merge check returned and what it decided for every proposed group: the
+    defect an upheld group became and the mechanism it was merged on, every site the check
+    took out and why, and every unit whose reply was discarded or never came back."""
+    check = findings.merge_check
+    if check is None:
+        return []
+    out: list[str] = []
+    if check["batched"]:
+        out.append(f"The groups were checked in {len(check['units'])} batches; no group was "
+                   f"split between two.\n\n")
+    for unit in check["units"]:
+        if unit["state"] != UNIT_COMPLETE:
+            out += _item(f"- {unit['unit']} — {unit['state']}: ",
+                         unit["reason"] or "no reason was recorded", MERGE_CHECK_DEGRADED)
+            continue
+        out.append(f"- {unit['unit']} — complete: "
+                   f"{_plural(len(unit['groups']), 'group')} checked.\n")
+        if unit["summary"]:
+            out += _item(f"- {unit['unit']} reported: ", unit["summary"])
+    defect_of = {tuple(defect["sites"]): defect["id"]
+                 for defect in (*findings.defects, *findings.coverage_defects)}
+    for group in check["groups"]:
+        listed = ", ".join(group["sites"])
+        if not group["checked"]:
+            out.append(f"- {group['group']} ({listed}) was not checked, so each of its sites "
+                       f"is its own defect.\n")
+            continue
+        if group["accepted"]:
+            did = defect_of.get(tuple(group["accepted"]))
+            out += _item(f"- {group['group']} ({listed}) is [{did}](#{did}), merged on: ",
+                         group["mechanism"])
+        else:
+            out.append(f"- {group['group']} ({listed}) was not upheld, so each of its sites "
+                       f"is its own defect.\n")
+        for removed in group["removed"]:
+            why = CHECK_REMOVAL_WORDS[removed["why"]]
+            if removed["reason"] is None:
+                out.append(f"  - {removed['site']} taken out: {why}.\n")
+            else:
+                out += _item(f"  - {removed['site']} taken out, it {why}: ", removed["reason"])
+        touched = group["fix_touches_refuted"]
+        if touched and touched["value"]:
+            out.append(f"  - The checker said the shared fix would change code at a refuted "
+                       f"site: {', '.join(touched['sites']) or 'it named none'}.\n")
+    return out
+
+
+# What the top of the report says of how its sites were grouped, where the grouping is not
+# the one a finished merge and merge check decided. Each names itself, so a reader holding
+# a report of one defect per site can tell a run with no mistake made twice from one whose
+# grouping never happened or was thrown away.
+GROUPING_BEFORE_SITES = ("This run directory was written before a defect could have several "
+                         "sites, so every site is its own defect and keeps the number the "
+                         "report rendered then gave it: `D<n>` holds `S<n>`.")
+GROUPING_NO_MERGE = "No merge round has run, so every site is its own defect."
+GROUPING_MERGE_DEGRADED = (f"The merge round's reply was not used, so every site it was "
+                           f"handed is its own defect; **{SUBSECTION_MERGE}**, in the "
+                           f"appendix, says why.")
+GROUPING_HELD = ("The groups the merge round proposed have not been checked, so every site "
+                 "is its own defect.")
+GROUPING_CHECK_DEGRADED = (f"The merge check's reply was not used, so no group it was handed "
+                           f"is one defect: each of their sites is its own; "
+                           f"**{SUBSECTION_MERGE}**, in the appendix, says why.")
+GROUPING_NO_SYNTHESIS = (f"The synthesis round returned nothing usable, so no defect has a "
+                         f"heading, account or fix of its own: each is headed by its first "
+                         f"site's consequence, and a defect of several sites gives the "
+                         f"mechanism the merge check upheld as its account; "
+                         f"**{SUBSECTION_SYNTHESIS}**, in the appendix, says why.")
+
+
+def synthesis_refused_note(lost: Sequence[dict]) -> str:
+    """The top-of-report line for the defects whose synthesis entries were refused, built
+    from those defects: one entry is not "each", and only a defect of several sites has a
+    checked mechanism to give as its account."""
+    def named(defects: Sequence[dict]) -> str:
+        return ", ".join(f"[{d['id']}](#{d['id']})" for d in defects)
+    several = [d for d in lost if len(d["sites"]) > 1]
+    if len(lost) == 1:
+        text = (f"The synthesis round's entry for {named(lost)} could not be used, so it is "
+                f"headed by its {'first ' if several else ''}site's consequence")
+        if several:
+            text += ", and gives the mechanism the merge check upheld as its account"
+    else:
+        text = (f"The synthesis round's entries for {named(lost)} could not be used, so each "
+                f"is headed by its first site's consequence")
+        if several:
+            text += (f", and {named(several)} "
+                     f"{'gives' if len(several) == 1 else 'give'} the mechanism the merge "
+                     f"check upheld as {'its' if len(several) == 1 else 'their'} account")
+    return f"{text}; **{SUBSECTION_SYNTHESIS}**, in the appendix, says why."
+
+
+def _grouping_notes(findings: Findings, before_sites: bool) -> list[str]:
+    """One line for each way this report's grouping or narrative falls short of a finished
+    run's, or nothing where it does not."""
+    out: list[str] = []
+    if before_sites:
+        out.append(f"- {GROUPING_BEFORE_SITES}\n")
+    elif findings.merge is None:
+        if len(findings.sites) + len(findings.coverage_sites) > 1:
+            out.append(f"- {GROUPING_NO_MERGE}\n")
+    else:
+        if any(unit["state"] != UNIT_COMPLETE for unit in findings.merge["units"]):
+            out.append(f"- {GROUPING_MERGE_DEGRADED}\n")
+        check = findings.merge_check
+        if check is not None and not check["units"]:
+            out.append(f"- {GROUPING_HELD}\n")
+        elif check is not None and any(unit["state"] != UNIT_COMPLETE
+                                       for unit in check["units"]):
+            out.append(f"- {GROUPING_CHECK_DEGRADED}\n")
+    synthesis = findings.synthesis
+    if synthesis is not None and synthesis["state"] != UNIT_COMPLETE:
+        out.append(f"- {GROUPING_NO_SYNTHESIS}\n")
+    elif synthesis is not None and synthesis["rejected"]:
+        lost = [d for d in findings.defects if d["tier"] is None]
+        if lost:
+            out.append(f"- {synthesis_refused_note(lost)}\n")
+    return out
+
+
+SUBSECTION_LEFT_OUT = "What the evidence leaves out"
+
+
+def _render_left_out(printed: _Printed) -> list[str]:
+    """Every kind of line a site's evidence entry leaves out, and where each went.
+
+    This list is the whole of what leaves: every other line a site's readers and checkers
+    recorded is in its evidence entry as a one-site defect's entry renders it, in the same
+    order. A clustering note on a site the merge put in a defect of
+    several is printed here in full, and each block replaced by a pointer is named.
+    """
+    out = [f"\n### {SUBSECTION_LEFT_OUT}\n\n",
+           "Each site's evidence entry is every line its readers and checkers recorded, "
+           "less exactly these:\n\n",
+           f"- The site's **{WHAT_GOES_WRONG_LABEL[:-1]}**, **{FIX_LABEL[:-1]}** and "
+           f"**{RELATED_LABEL[:-1]}**: its defect's own account replaces them.\n",
+           "- The line giving the site's full path and the commit: every site is at the one "
+           f"commit stated at the top, and the **{SUBSECTION_LEGEND}** gives each path.\n",
+           "- The quoted source: moved to the site's place in its defect's entry.\n",
+           f"- The site's first **{TEST_FIRST_LABEL[:-1]}** and, for an unresolved site, "
+           f"**{UNSETTLED_LABEL[:-1]}**: shown in its defect's entry.\n"]
+    sources = [entry for entry in printed.pointed if entry[2] == "source"]
+    outputs = [entry for entry in printed.pointed if entry[2] == "output"]
+    out.append(f"- {_plural(len(printed.moved), 'clustering note')} on why a report was kept "
+               f"apart from another at one location, where the merge then put the site in a "
+               f"defect of several: moved here, below.\n")
+    out.append(f"- {_plural(len(sources), 'quoted source')} identical to one quoted for "
+               f"another site, and {_plural(len(outputs), 'block')} of output identical to "
+               f"one printed under another site: each replaced by a pointer to the site that "
+               f"prints it.\n")
+    for sid, first, kind in printed.pointed:
+        what = "quoted source" if kind == "source" else "output"
+        out.append(f"  - {_site_link(sid)}'s {what} points to {_site_link(first)}.\n")
+    for sid, lines in printed.moved:
+        out.append(f"\n{_site_link(sid)}:\n\n")
+        out += lines
     return out
 
 
@@ -10250,7 +12163,7 @@ OVERVIEW_LEAD = ("One paragraph the judgment round wrote about the run as a whol
 def _render_judgment_overview(findings: Findings) -> list[str]:
     """The synthesis round's own paragraph, under the counts it is about.
 
-    Written for a person reading the report and, until this was rendered, printed nowhere.
+    Written for a person reading the report, and printed nowhere else.
     It is labeled as a reading because it is one: the round saw the verified defects and
     wrote about them, and nothing checked what it wrote.
 
@@ -10307,7 +12220,7 @@ def _render_operator_notes(notes: ReportNotes, job: dict, findings: Findings, pr
         out.append("Each is the operator's reason for disagreeing with what the panel "
                    "concluded. The entry it names carries a mark pointing here, and is "
                    "otherwise as the panel left it.\n\n")
-        status = {c["id"]: c["status"] for c in findings.clusters}
+        status = {c["id"]: c["status"] for c in findings.defects}
         for entry in notes.corrections:
             target = entry["target"]
             if target in _BUILD_CHECK_WORDS:
@@ -10336,7 +12249,7 @@ def _run_kinds(runs: Sequence[dict]) -> str:
 
     A verdict written before the field existed states no kind. It is counted in its own
     part rather than assumed to be either, so the parts always sum to the number beside
-    them and no run is labelled by a guess.
+    them and no run is labeled by a guess.
     """
     if not runs:
         return ""
@@ -10350,7 +12263,7 @@ def _run_kinds(runs: Sequence[dict]) -> str:
 
 def _executability(probe: dict, findings: Findings,
                    corrected: frozenset[str] = frozenset()) -> list[str]:
-    """Section 7, as three facts that are never inferred from one another.
+    """Executability, as three facts that are never inferred from one another.
 
     CAPABILITY is the probe's: whether this tree builds and whether its tests run. ATTEMPTS
     is how many candidates proposed a reproduction — how much there was to execute. RAN is
@@ -10362,12 +12275,12 @@ def _executability(probe: dict, findings: Findings,
     **Where the capability was found is part of the fact.** The probe and the verifiers are
     both told to work in a disposable copy of the snapshot, so the probe's answer is about
     the environment the reproductions run in — and when the two disagree, the report is the
-    only place a reader can see that they do. A real run said *this tree builds — yes* and
-    then ran none of 207 proposed reproductions, because the snapshot held no build system
-    and the probe had answered for something else. Two true-looking sentences, four
-    thousand lines apart, and nothing to reconcile them. Where the probe reports a
-    capability and not one reproduction could use it, that is now said where the capability
-    is claimed, because a reader who believes the first sentence stops asking.
+    only place a reader can see that they do. A run can find *this tree builds — yes* and
+    then run none of its proposed reproductions, because the snapshot holds no build system
+    and the probe answered for something else: two true-looking sentences, thousands of
+    lines apart, and nothing on their own to reconcile them. So where the probe reports a
+    capability and not one proposed reproduction ran, that is said where the capability is
+    claimed, because a reader who believes the first sentence stops asking.
     """
     proposed = sum(1 for r in findings.candidates
                    if any(x["reproduction"] is not None for x in r["raised_by"]))
@@ -10421,8 +12334,8 @@ def _executability(probe: dict, findings: Findings,
                    "not a run of the code, which is why the two are counted separately.\n")
     # `0 proposed, 1 run` reads as impossible and is not. A reader proposes a reproduction
     # for the claims it can think of one for; a verifier is free to devise its own, and
-    # counting only what was proposed makes its work look like an arithmetic error. Seen in
-    # a live report, where those two numbers sat side by side with nothing reconciling them.
+    # counting only what was proposed makes its work look like an arithmetic error: two
+    # numbers side by side with nothing reconciling them.
     if ran > proposed:
         out.append(f"  - {_plural(ran - proposed, 'of those runs was', 'of those runs were')} "
                    f"devised by a verifier for a claim whose reader proposed none, which is "
@@ -10494,21 +12407,21 @@ def _reachability_dirs(inventory: dict) -> list[tuple[str, int]]:
 
 
 def _reachability(inventory: dict, names: PathNames) -> list[str]:
-    """Section 12's warning. It fires on ``tracked − reviewed`` being non-empty, not on the
-    reviewed set being a strict subset of what is tracked: the listing includes non-ignored
-    untracked files, so a run that reviews an untracked file while excluding a tracked
-    caller is not a subset and a subset test would drop the warning exactly where it is
-    needed. What the scope cannot answer is reachability — whether those files reach the
-    defects below.
+    """The reachability warning. It fires on ``tracked − reviewed`` being non-empty, not on
+    the reviewed set being a strict subset of what is tracked: the listing includes
+    non-ignored untracked files, so a run that reviews an untracked file while excluding a
+    tracked caller is not a subset and a subset test would drop the warning exactly where
+    it is needed. What the scope cannot answer is reachability — whether those files reach
+    the defects below.
 
     **A count and a direction, never the enumeration.** A subset review of a large
-    repository leaves nearly all of it unreviewed, and listing every such file put 10,695
-    bullets into one section of a real report: it ran from line 7 to line 10,715, pushed
-    every finding below line 10,700, and took the file to 1.5 MB. The fact is worth stating
-    and the list is worth nothing — a reader who wants the enumeration can take the
-    difference themselves, and every one of them already knows their own repository is
-    bigger than the part they asked for. What a reader cannot work out is where the
-    unreviewed files sit RELATIVE to what was read, so that is what is named.
+    repository leaves nearly all of it unreviewed, and listing every such file can put tens
+    of thousands of bullets into one section, pushing every finding below them and the file
+    to megabytes. The fact is worth stating and the list is worth nothing — a reader who
+    wants the enumeration can take the difference themselves, and every one of them already
+    knows their own repository is bigger than the part they asked for. What a reader cannot
+    work out is where the unreviewed files sit RELATIVE to what was read, so that is what
+    is named.
 
     The directory list is the ONE place the document spells a path against a different
     base. It has to: the comparison names files ABOVE the reviewed root, which have no
@@ -10557,7 +12470,7 @@ PATH_LEGEND_HEADING = f"\n### {SUBSECTION_LEGEND}\n\n"
 
 
 def _printed_paths(inventory: dict, files_of: dict, reading: Sequence[dict],
-                   findings: Findings, work: Sequence[dict], by_id: dict) -> list[str]:
+                   findings: Findings, by_id: dict) -> list[str]:
     """Every path this report is about to print, and nothing else.
 
     The legend is rendered from these, so a path gathered here that never reaches the
@@ -10567,18 +12480,17 @@ def _printed_paths(inventory: dict, files_of: dict, reading: Sequence[dict],
     body is what decides which paths appear. A test over a rendered report holds the two
     together in both directions, which is the only thing that keeps the mirror honest.
 
-    Every cluster's own location renders somewhere — the index and the body for work, the
-    refuted list for the rest — and a MEMBER's file renders in the by-file table and beside
-    a member inside a defect that holds more than one, both of which are the work clusters
-    and neither of which renders at all when there is no work to show.
+    Every site's location renders in its defect's entry and its evidence entry, and every
+    MEMBER's file renders on its check line in its site's evidence — refuted sites included,
+    since every site has an evidence entry.
     """
-    paths = [cluster["file"] for cluster in findings.clusters]
-    if findings.candidates and work:
-        paths += [by_id[cid]["file"] for cluster in work for cid in cluster["members"]]
+    paths = [cluster["file"] for cluster in findings.defects]
+    paths += [site["file"] for site in findings.sites]
+    paths += [by_id[cid]["file"] for site in findings.sites for cid in site["members"]]
     # Every coverage gap renders its own location too — the standing ones under their file
     # heading, the covered ones in the appendix table — and a path the document prints and
     # the legend does not decode is a short name a reader cannot place.
-    paths += [cluster["file"] for cluster in findings.coverage_clusters]
+    paths += [cluster["file"] for cluster in findings.coverage_defects]
     paths += list(inventory["excluded"])
     paths += [entry["path"] for entry in inventory["skipped"]]
     for unit in reading:
@@ -10588,45 +12500,70 @@ def _printed_paths(inventory: dict, files_of: dict, reading: Sequence[dict],
     return paths
 
 
-def _render_limits() -> list[str]:
-    """What a panel cannot establish, said on the page a person reads.
+def _limit_facts(inventory: dict, reading: Sequence[dict], files_of: dict,
+                 findings: Findings) -> dict:
+    """The counts behind this run's own limits: what it read, what it left, what it could
+    not settle. Every one is already listed somewhere in the report; these are the totals."""
+    # An area is read when ANY of its readers finished: an area has one reader per lens, and
+    # an auditor failing is a lost check, not an unread file. Unread means no reader came back.
+    readers = [unit for unit in reading
+               if unit["area"] is not None and unit.get("kind", READER_KIND) == READER_KIND]
+    read_areas = {unit["area"] for unit in readers if unit["state"] == UNIT_COMPLETE}
+    unread = {path for unit in readers if unit["area"] not in read_areas
+              for path in files_of[unit["area"]]}
+    # Counted in SITES, and pointed at every section they render in: a defect is placed
+    # under Established when any of its sites is, so an unresolved site can sit there, and a
+    # pointer to Unresolved alone would send a reader to a section that does not hold it.
+    placed = {defect["id"]: defect["status"] for defect in findings.defects}
+    open_sites = [site for site in findings.sites if site["status"] == DEFECT_UNRESOLVED]
+    held = {placed[site["defect"]] for site in open_sites}
+    return {"files": len(inventory["files"]),
+            "unread": len(unread),
+            "left_out": len(inventory["excluded"]) + len(inventory["skipped"]),
+            "unresolved": len(open_sites),
+            "unresolved_in": tuple(title for status, title in (
+                (DEFECT_ESTABLISHED, SECTION_ESTABLISHED),
+                (DEFECT_UNRESOLVED, SECTION_UNRESOLVED)) if status in held)}
 
-    Yield is not recall, and this method improves the first. A reader holding a long,
-    well-organized report reads thoroughness into it, and the two numbers move
-    independently: the count of defects goes up with more areas, more lenses and more
-    agents willing to raise a doubt, while whether the one bug that matters is among them
-    does not follow it.
 
-    **Unconditional, and unconditionally the same words.** It is true at every rung and of
-    every tree, so nothing about a run varies it; a caveat that appeared only on thin runs
-    would read as an apology for that run rather than as a property of the method.
+def _render_limits(facts: dict) -> list[str]:
+    """What this run did not examine, then what no run of this method can tell.
+
+    The first paragraph is this run's own: a reader holding a tidy report reads thoroughness
+    into it, and the numbers that bound it are the ones worth having beside the counts.
+    The second is the same words at every rung and on every tree, because it is a property
+    of the method and not of a run -- a caveat that appeared only on thin runs would read as
+    an apology for that run. It ends in the one thing a reader can do about it.
     """
+    read, files = facts["files"] - facts["unread"], facts["files"]
+    if not facts["unread"]:
+        parts = ["Readers covered the one file in scope." if files == 1 else
+                 f"Readers covered all {files} files in scope."]
+    else:
+        parts = [f"Readers covered {read} of the {_plural(files, 'file')} in scope.",
+                 f"No reader finished the area holding the other {facts['unread']}, so nobody "
+                 f"read {'it' if facts['unread'] == 1 else 'them'}."
+                 if facts["unread"] < files else
+                 "No reader finished, so nobody read any of them."]
+    if facts["left_out"]:
+        parts.append(f"{_plural(facts['left_out'], 'more file')} "
+                     f"{'was' if facts['left_out'] == 1 else 'were'} excluded by the job or "
+                     f"skipped.")
+    if facts["unread"] or facts["left_out"]:
+        parts.append(f"**{SUBSECTION_COVERAGE}**, in the appendix, names them.")
+    if facts["unresolved"]:
+        where = " and ".join(f"**{title}**" for title in facts["unresolved_in"])
+        parts.append(f"{_plural(facts['unresolved'], 'site')} "
+                     f"{'was' if facts['unresolved'] == 1 else 'were'} checked and not "
+                     f"settled either way; see {where}.")
     return [
         f"\n### {SUBSECTION_LIMITS}\n\n",
-        "**Reporting more defects is not the same as catching more of the bugs that are "
-        "there, and a panel improves the first.** Measured over one tree "
-        "against five production bugs its owner already knew about: three runs found 3, "
-        "then 2, then 1 of the five, while the count of defects they reported went 29, "
-        "then 100, then 147. The reports got steadily better and the chance of one naming "
-        "a particular bug you already have got worse.\n\n",
-        # This paragraph sits BEFORE the bullets, not after them. The page conversion is
-        # not a Markdown parser: a paragraph following a list continues inside the last
-        # `<li>`, so a closing caveat placed at the end would render as part of the final
-        # bullet and read as scoped to it.
-        "This page is organized, honest about its coverage and plainly written. That "
-        "makes it more convincing than a rough one, and leaves it just as incomplete. "
-        "Read it as a set of claims that were raised and checked, never as a verdict on "
-        "the tree.\n\n",
-        "Two things follow, and making a report nicer fixes neither.\n\n",
-        "- **A clean sweep is not evidence this tree is sound.** It is evidence only of what "
-        "a set of agents raised while reading a set of areas. Nothing here looks "
-        "specifically for the defects that matter most to you. The only way to find out "
-        "whether a run would have caught one is to test the run against a bug you "
-        "already know about.\n",
-        "- **A long report is not a thorough one.** Volume comes from more areas, more "
-        "lenses and more agents willing to raise a doubt. Whether the hard defect is in "
-        "here is a different question from how many entries there are, and it is the "
-        "number of entries that goes up.\n\n",
+        "**What this run covered.** " + " ".join(parts) + "\n\n",
+        "**What no run can tell you: what it missed.** A panel reports what its readers "
+        "happened to raise; it does not look for any particular bug, so one in a file it "
+        "read can still be absent here, and a longer report is not a more complete one. "
+        "To learn whether a run would catch a bug that matters to you, give it one you "
+        "already know about and see whether it appears.\n",
         # No single-asterisk emphasis anywhere in here: the page conversion recognizes
         # `**` alone, so one pair of stars reaches a reader as two literal characters.
     ]
@@ -10652,7 +12589,7 @@ def _render_by_tier(findings: Findings) -> list[str]:
     tiers = (findings.synthesis or {}).get("tiers") or ()
     if not tiers:
         return []
-    grouped = _by_tier(findings.clusters, tiers)
+    grouped = _by_tier(findings.defects, tiers)
     out = [f"\n### {SUBSECTION_BY_TIER}\n\n",
            "What the run found, grouped by the themes the judgment round named. The table "
            "holds counts only; the three views below are the lists to work from.\n\n",
@@ -10680,8 +12617,8 @@ def _render_legend(names: PathNames) -> list[str]:
         out.append("No file or directory is named in this report.\n")
         return out
     out.append("Every file and directory this report names, under the short name the "
-               "report uses for it. A path is spelled in full only here and under the defect "
-               "it locates, so a name that appears twice below is the same file both times. "
+               "report uses for it. A path is spelled in full only here, so a name that "
+               "appears twice below is the same file both times. "
                "Two things are copied as they were rather than written by the report, and "
                "keep their own spelling: a sentence quoted from a worker, and the job printed "
                "under **The job**. Shortening a path in either would be editing a record, and "
@@ -10698,9 +12635,9 @@ def _lens_tags(job: dict, areas: Sequence[dict]) -> dict[str, str]:
     names it by.
 
     Ordered by where the job DECLARES a lens — the job's own list first, then each area's
-    list in area order — and never by where a raiser first mentions one. The job block in
-    section 1 and the provenance table in the appendix both render from this one map, so a
-    tag means the same lens in both. Numbered from the raisers instead, the appendix could
+    list in area order — and never by where a raiser first mentions one. The job block and
+    the provenance table, both in the appendix, render from this one map, so a tag means
+    the same lens in both. Numbered from the raisers instead, the provenance table could
     hand ``L1`` to the lens the block above it called ``L2``, and a reader following a tag
     from one to the other would be reading the wrong instruction.
 
@@ -10815,7 +12752,7 @@ def _printed_job(job: dict) -> list[str]:
 
     **A reader will not have `job.json`.** The report is what gets sent on — pasted into a
     message, attached to a ticket, read on another machine weeks later — and every instruction
-    for running the audit again named a file that is not travelling with it. Printed here, the
+    for running the audit again named a file that is not traveling with it. Printed here, the
     job can be copied out of the page and handed straight back to a runtime, and the audit is
     reproducible from the document alone.
 
@@ -10883,10 +12820,10 @@ def _render_the_job(job: dict, notes: dict[str, str] | None, inventory: dict,
     Rendered from ``job.json``, ``job-notes.json``, ``areas.json`` and ``inventory.json`` and
     from nothing a worker wrote, so it cannot disagree with what ran — every count of areas or
     of files is read off the record of the partition rather than described. The problem
-    statement under the title is one of these fields, and a report that carried it alone said
-    nowhere that the rest existed: a reader who had not written the job could not tell how the
-    tree was divided, what each reader was told to read for, which files were in scope, or where
-    the file is that would let them run the same audit again.
+    statement under the title is one of these fields, and a report that carried it alone would
+    say nowhere that the rest existed: a reader who had not written the job could not tell how
+    the tree was divided, what each reader was told to read for, which files were in scope, or
+    where the file is that would let them run the same audit again.
 
     In the APPENDIX, and reachable from a pointer under the statement, by the same rule as the
     path legend: nothing here is needed to fix a defect, and this is where a reader auditing the
@@ -11012,6 +12949,23 @@ def _rung_line(dispatch: DispatchRecord, reading: Sequence[dict], areas: Sequenc
                 f"Candidates: {len(findings.candidates)} — {other} checked by the other model, "
                 f"{unresolved} left unresolved. Where the lanes disagree, the disagreement "
                 f"is between two different models.")
+    if dispatch.rung == RUNG_TWO_MODELS:
+        # Every rung has its own branch: a rung falling into the one-runtime sentence would
+        # say "the same model" about two.
+        return (f"{name}. Reading units: {units}; {coverage} read by both models. "
+                f"Candidates: {len(findings.candidates)} — {other} checked by the other model, "
+                f"{unresolved} left unresolved. Where the lanes disagree, the disagreement "
+                f"is between two different models, which shared one harness: its tools, its "
+                f"system prompt and its permission layer.")
+    if dispatch.rung == RUNG_TWO_RUNTIMES_ONE_MODEL:
+        return (f"{name}. Reading units: {units}; {coverage} read by both contexts. "
+                f"Candidates: {len(findings.candidates)} — {other} checked by a separate "
+                f"session of the same model in the other runtime, not the one that raised "
+                f"them, {unresolved} left unresolved. Where the lanes disagree, the "
+                f"disagreement is between two sessions of one model run in two different "
+                f"tools, and the report claims no more than that.")
+    if dispatch.rung != RUNG_ONE_RUNTIME:
+        raise DispatchError(f"no sentence states rung {dispatch.rung!r}")
     return (f"{name}. Reading units: {units}; {coverage} read by both contexts. "
             f"Candidates: {len(findings.candidates)} — {other} checked by a fresh context of "
             f"the same model, not the one that raised them, {unresolved} left unresolved. "
@@ -11019,12 +12973,22 @@ def _rung_line(dispatch: DispatchRecord, reading: Sequence[dict], areas: Sequenc
             f"model, and the report claims no more than that.")
 
 
+def made_before_sites(units_doc: dict) -> bool:
+    """Whether a run directory was written before a defect could have several sites: its
+    synthesis unit lists defects and not their sites. Every synthesis unit this engine
+    writes lists both; a run of either kind with no synthesis unit is told apart by nothing
+    and needs nothing more, since the report then says no merge round has run."""
+    return any(unit.get("kind") == SYNTHESIZER_KIND and "defect_sites" not in unit
+               for unit in units_doc["units"])
+
+
 def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: Sequence[dict],
                   findings: Findings, reading: Sequence[dict], batches: Sequence[dict],
                   states: Sequence[VerificationState], probe: dict,
                   *, rundir: Path | None = None, generated: str | None = None,
                   job_notes: dict[str, str] | None = None,
-                  report_notes: ReportNotes | None = None) -> str:
+                  report_notes: ReportNotes | None = None,
+                  before_sites: bool = False) -> str:
     """The whole report from the run directory's data and nothing else — no clock, and no
     path but the run directory it names — so two runs over one tree into one run directory
     render byte-identical reports, and two into different ones differ on that line alone.
@@ -11082,7 +13046,7 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
     tags = _lens_tags(job, areas)
     files_of = {area["id"]: area["files"] for area in areas}
     by_id = {record["id"]: record for record in findings.candidates}
-    ordered = sorted(findings.clusters, key=_defect_order)
+    ordered = sorted(findings.defects, key=_defect_order)
     # `ordered` ranks the work. Refuted defects are ranked by nothing: they are listed in
     # the appendix in id order, which is the order they were raised in.
     work = [c for c in ordered if _is_work(c)]
@@ -11094,7 +13058,25 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
     ungrouped = [entry for entry in findings.clustering if entry["state"] != UNIT_COMPLETE]
     # Gathered before a line is written, because the legend is printed above the body that
     # decides which paths appear in it.
-    names = PathNames(_printed_paths(inventory, files_of, reading, findings, work, by_id))
+    names = PathNames(_printed_paths(inventory, files_of, reading, findings, by_id))
+    # Every site's parts, computed once, because two sections print them: its defect's entry
+    # takes the source, the first test and what is not settled, and its evidence entry the
+    # rest.
+    site_of = {site["id"]: site for site in findings.sites}
+    placed = {defect["id"]: defect for defect in findings.defects}
+    corrected = report_notes.corrected() if report_notes is not None else frozenset()
+    # Whether `Verification` varies across the established sites. One value means it is a
+    # fact about the run, not about any site, and the top of the report states it.
+    verification = len({site["axis_b"] for site in findings.sites
+                        if placed[site["defect"]]["status"] == DEFECT_ESTABLISHED}) > 1
+    parts_of = {}
+    for site in findings.sites:
+        defect = placed[site["defect"]]
+        parts_of[site["id"]] = _site_parts(
+            {**site, "sites": [site["id"]]}, [by_id[cid] for cid in site["members"]],
+            dispatch.rung, findings.commit, names,
+            judged=defect["tier"] is not None and _is_work(defect),
+            verification=verification, corrected=defect["id"] in corrected)
     # The subtitle: what this report is OF, on one line under the title. A report outlives
     # the session that made it, and a reader holding one has to know which tree it was read
     # from before a single defect in it means anything. The source facts are deterministic
@@ -11143,50 +13125,65 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
     # the claim once.
     out.append("A panel of agents read this tree in bounded pieces. Whatever one agent "
                "raised was sent to another agent that had not raised it, to be checked.\n")
-    out.append("A **defect** here is one thing to fix. Reports that describe the same "
-               "problem are merged into one defect, and the appendix sets out how they "
-               "were merged, so the count can be challenged.\n")
+    out.append(DEFECTS_AND_SITES + "\n")
     out.append("**Established** means a checker that had not raised the claim upheld it. "
                "**Unresolved** means nothing settled it, and the group it sits under "
                "says what would. **Refuted** means a check dismissed it, so there is "
-               "nothing to do about it; it is listed in the appendix with the reason.\n")
+               f"nothing to do about it; it is listed under **{SECTION_REFUTED}** with the "
+               "reason. A defect is placed under Established when any of its sites is, and "
+               "under Refuted only when all of them are.\n")
     # What the appendix holds is set out at the top of the appendix itself; what a reader
     # needs here is only that there is one and that skipping it costs them nothing.
     out.append("The **appendix** at the end is the record of the run rather than the work "
                "it found. Nothing in it is needed to fix anything.\n\n")
-    counts = {status: sum(1 for c in findings.clusters if c["status"] == status)
+    out += _grouping_notes(findings, before_sites)
+    counts = {status: sum(1 for c in findings.defects if c["status"] == status)
               for status in (DEFECT_ESTABLISHED, DEFECT_REFUTED, DEFECT_UNRESOLVED)}
-    out.append(f"- By status: {counts[DEFECT_ESTABLISHED]} established, "
+    out.append(f"- Defects by placement: {counts[DEFECT_ESTABLISHED]} established, "
                f"{counts[DEFECT_REFUTED]} refuted, "
                f"{counts[DEFECT_UNRESOLVED]} unresolved.\n")
-    corrected = report_notes.corrected() if report_notes is not None else frozenset()
-    disputed = [c["id"] for c in sorted(findings.clusters, key=lambda c: _id_rank(c["id"]))
+    disputed = [c["id"] for c in sorted(findings.defects, key=lambda c: _id_rank(c["id"]))
                 if c["id"] in corrected]
     if disputed:
         out.append(f"  - The operator corrected {len(disputed)} of these: "
                    f"{', '.join(f'[{did}](#{did})' for did in disputed)}. The counts are "
                    f"the panel's own and stay as they are; the corrections are under "
                    f"**{SECTION_OPERATOR}**.\n")
+    outcomes = {status: sum(1 for s in findings.sites if s["status"] == status)
+                for status in (DEFECT_ESTABLISHED, DEFECT_REFUTED, DEFECT_UNRESOLVED)}
+    out.append(f"- Sites by outcome: {outcomes[DEFECT_ESTABLISHED]} established, "
+               f"{outcomes[DEFECT_REFUTED]} refuted, "
+               f"{outcomes[DEFECT_UNRESOLVED]} unresolved.\n")
     verdicts = {status: sum(1 for r in findings.candidates if r["status"] == status)
                 for status in VERDICT_STATUSES}
     out.append(f"- Candidates behind them: {len(findings.candidates)} — "
                f"{verdicts['reproduced']} reproduced, "
                f"{verdicts['confirmed_by_reading']} confirmed by reading, "
                f"{verdicts['refuted']} refuted, {verdicts['unresolved']} unresolved.\n")
-    # Section 2 asks for the merge's arithmetic in the report rather than only in the code:
-    # a reader counting defects can check the two numbers against each other.
-    out.append(f"- Defects: {len(findings.clusters)} from "
-               f"{_plural(len(findings.candidates), 'candidate')}; "
-               f"every candidate is in exactly one cluster.\n")
+    # The merge's arithmetic in the report rather than only in the code: a reader counting
+    # defects can check the three numbers against each other.
+    several = [d for d in findings.defects if len(d["sites"]) > 1]
+    out.append(f"- Defects: {len(findings.defects)} at "
+               f"{_plural(len(findings.sites), 'site')} from "
+               f"{_plural(len(findings.candidates), 'candidate')}; every candidate is at "
+               f"exactly one site and every site in exactly one defect"
+               + (f"; {_plural(len(several), 'defect')} "
+                  f"{'has' if len(several) == 1 else 'have'} more than one site" if several
+                  else "") + ".\n")
     # Counted apart, and never folded into the line above. A coverage gap is not a defect
-    # and adding the two would give a reader one number that means two things.
-    if findings.coverage_clusters:
-        gaps = {status: sum(1 for c in findings.coverage_clusters if c["status"] == status)
+    # and adding the two would give a reader one number that means two things. Counted by
+    # SITE, as the coverage sections list them: each site of a gap of several is its own
+    # test to write, placed by its own outcome.
+    if findings.coverage_defects:
+        listed_gaps = _gap_sites(findings)
+        gaps = {status: sum(1 for c in listed_gaps if c["status"] == status)
                 for status in (DEFECT_ESTABLISHED, DEFECT_REFUTED, DEFECT_UNRESOLVED)}
         parts = [f"{gaps[DEFECT_ESTABLISHED]} standing",
                  f"{gaps[DEFECT_REFUTED]} covered by a test already",
                  f"{gaps[DEFECT_UNRESOLVED]} unresolved"]
-        out.append(f"- Coverage gaps: {len(findings.coverage_clusters)} from "
+        at = ("" if len(listed_gaps) == len(findings.coverage_defects)
+              else f" at {_plural(len(listed_gaps), 'site')}, counted by site")
+        out.append(f"- Coverage gaps: {len(findings.coverage_defects)}{at} from "
                    f"{_plural(len(findings.coverage), 'finding')} — {', '.join(parts)}. "
                    f"They are tests to write, not defects, and are counted apart from the "
                    f"line above.\n")
@@ -11194,6 +13191,16 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
         out.append(f"- {_plural(len(ungrouped), 'area')} left unclustered, so a defect "
                    f"raised twice there is counted twice: "
                    f"{', '.join(entry['area'] for entry in ungrouped)}.\n")
+    # The commit once, for every site: no line number in this report means anything without
+    # it, and it is stated here rather than beside each site.
+    out.append(f"- Every line number in this report refers to "
+               f"{_commit_words(findings.commit, True)}; **{SUBSECTION_HOW_IT_RAN}**, in the "
+               f"appendix, names it in full.\n")
+    out.append(f"- Where things are: the defects, each with its account, its sites and the "
+               f"source at each site, are under **{SECTION_ESTABLISHED}**, "
+               f"**{SECTION_UNRESOLVED}** and **{SECTION_REFUTED}**; everything else the "
+               f"review recorded about each site is under **{SECTION_EVIDENCE}**, by the "
+               f"site's number.\n")
     out.append(f"- Reading units: {_plural_states([u['state'] for u in reading])}.\n")
     out.append(f"- Verification units: {_plural_states([s.state for s in states])}.\n")
     if listed:
@@ -11218,7 +13225,7 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
     # Last under the description, and after the counts rather than before them: it is a
     # caveat about the numbers a reader has just taken in, and the sentence about volume
     # lands on the total they are holding.
-    out += _render_limits()
+    out += _render_limits(_limit_facts(inventory, reading, files_of, findings))
     if report_notes is not None:
         out += _render_operator_notes(report_notes, job, findings, probe, sections)
 
@@ -11229,21 +13236,20 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
         lead, empty = "No candidate was raised.", ("Nothing to rank.", "Nothing to gather.")
     elif not work:
         lead = (f"Nothing to do: the {_plural(refuted_count, 'defect')} raised was checked "
-                f"and dismissed. It is "
-                f"under Refuted, in the appendix, with the reason."
+                f"and dismissed. It is under **{SECTION_REFUTED}**, with the reason."
                 if refuted_count == 1 else
                 f"Nothing to do: every one of the {_plural(refuted_count, 'defect')} "
-                f"raised was checked and dismissed. They are under Refuted, in the "
-                f"appendix, with the reason for each.")
-        empty = ("Nothing to do; see Refuted, in the appendix.",) * 2
+                f"raised was checked and dismissed. They are under **{SECTION_REFUTED}**, "
+                f"with the reason for each.")
+        empty = (f"Nothing to do; see **{SECTION_REFUTED}**.",) * 2
     else:
         # Short, because each way in states its own rule under its own heading; saying it
         # here as well puts one sentence in two places where an edit touches half of them.
         lead, empty = "One list of defects, with two ways in: by rank or by file.", None
     out.append(f"{lead}\n")
     if empty is None:
-        out += _render_index(work, dispatch.rung, refuted_count, names, sections, corrected)
-        out += _render_by_file(work, by_id, names, sections)
+        out += _render_index(work, refuted_count, sections, corrected)
+        out += _render_by_file(work, site_of, by_id, names, sections)
     else:
         # Both ways in are WRITTEN even with nothing to put in them. A subsection that
         # vanishes gives the page's contents list a different skeleton on every run, and
@@ -11252,36 +13258,46 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
         out.append(sections.sub(SUBSECTION_BY_FILE) + f"{empty[1]}\n")
     # The round's vocabulary, in the order it declared it, or nothing where the round was
     # not run or could not be believed. The disclaimer is scoped to what actually renders:
-    # a report carrying no synthesised prose has nothing to disclaim, and a sentence that
+    # a report carrying no synthesized prose has nothing to disclaim, and a sentence that
     # is always there says nothing.
     tiers = tuple(findings.synthesis["tiers"]) if findings.synthesis else ()
-    disclaim = any(_carries_a_reading(cluster) for cluster in ordered)
-    out += _render_body(ordered, by_id, dispatch.rung, findings.commit, names,
-                        sections, tiers, disclaim, corrected)
+    headed = _headed(ordered)
+    disclaim = headed or any(_carries_a_reading(cluster) for cluster in ordered)
+    printed = _Printed()
+    # A coverage gap's defect is anchored on the first entry of it printed, which may be
+    # under Tests to write or in the appendix's covered table.
+    gap_anchors: set[str] = set()
+    out += _render_body(ordered, by_id, site_of, parts_of, names, sections, printed, tiers,
+                        disclaim, headed)
     out += _render_corroborated(ordered, dispatch.rung, sections)
-    # Above the appendix, because a named missing test is work. Written only where the
+    # Above the evidence, because a named missing test is work. Written only where the
     # coverage round produced something: a section that is always there and usually empty
     # teaches a reader to skip it.
-    if findings.coverage_clusters:
-        out += _render_coverage_gaps(findings, names, sections)
+    if findings.coverage_defects:
+        out += _render_coverage_gaps(findings, names, sections, gap_anchors)
+    # Last before the appendix: what a person auditing a site reads, one link from the
+    # defect a person fixing it reads.
+    out += _render_evidence_part(findings, parts_of, names, sections, printed)
 
-    # Everything below is the record of the run rather than the work it found. Section 9's
-    # three views and the defects themselves are above; a person fixing something never has
+    # Everything below is the record of the run rather than the work it found. The three
+    # views and the defects themselves are above; a person fixing something never has
     # to come down here, and a person auditing the run never has to read past it. Its parts
     # are SUBSECTIONS of it: as siblings they would be the appendix only by where they sat,
     # and a reader scanning the section list could not tell which headings were work and
     # which were the record of the run.
     out.append(sections.top(SECTION_APPENDIX))
-    out.append("The record of the run rather than the work: what was dismissed, how the "
-               "duplicates were merged, what was asked for and what ran where, what was not "
-               "read, and which unit raised what. Nothing below is needed to fix a defect.\n")
-    out += _render_refuted(ordered, by_id, names, corrected)
-    if findings.coverage_clusters:
-        out += _render_covered(findings, names)
+    out.append("The record of the run rather than the work: how the duplicates were "
+               "merged, what the evidence leaves out, what was asked for and what ran where, "
+               "what was not read, and which unit raised what. Nothing below is needed to fix "
+               "a defect.\n")
+    if findings.coverage_defects:
+        out += _render_covered(findings, names, gap_anchors)
     out += _render_verifier_variance(findings)
     out += _render_outside_scope(findings, names)
     out += _render_clustering_notes(findings, names)
+    out += _render_merge_notes(findings)
     out += _render_synthesis_notes(findings)
+    out += _render_left_out(printed)
     out += _render_legend(names)
 
     # The rung is stated ONCE, in the summary, because every claim in the report is bounded
@@ -11356,8 +13372,14 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
     synthesis = findings.synthesis
     synthesis_clean = synthesis is None or (
         synthesis["state"] == UNIT_COMPLETE and not synthesis["rejected"])
+    # The merge round likewise: a merge unit whose reply was not used is a unit that did not
+    # return a valid result.
+    merge_clean = all(
+        unit["state"] == UNIT_COMPLETE
+        for record in (findings.merge, findings.merge_check) if record is not None
+        for unit in record["units"])
     if (not gaps and not failed_batches and probe_state == UNIT_COMPLETE
-            and not ungrouped and not rejected_any and synthesis_clean):
+            and not ungrouped and not rejected_any and synthesis_clean and merge_clean):
         out.append(f"{EVERY_UNIT_RETURNED}\n")
     if probe_state != UNIT_COMPLETE:
         out += _item(f"- {probe.get('unit', PROBE_UNIT_ID)} (capability probe) — "
@@ -11507,7 +13529,7 @@ BACK_TO_INDEX = "\u2191 Index"
 # id on a heading and the link back to the index already are — and `report.md` lacking one
 # does not put the two documents out of step. It lists the SECTIONS and never the defects:
 # repeating those would give the page a second ordering of the one list the index ranks,
-# which is what section 9's bound refuses.
+# which is what the report's bound of three views refuses.
 CONTENTS_TITLE = "Contents"
 _CONTENTS_LEVELS = (2, 3)
 # A heading's section number, which is the document's own count and moves whenever a
@@ -11547,7 +13569,7 @@ th, td { border: 1px solid #8884; padding: 0.35rem 0.5rem; text-align: left; ver
 td code, th code { white-space: nowrap; }
 pre { background: #7f7f7f1a; border: 1px solid #8883; border-radius: 4px; padding: 0.75rem;
       overflow-x: auto; white-space: pre-wrap; }
-/* Seven colours, defined for both schemes. The gutter takes tango's decimal-literal green,
+/* Seven colors, defined for both schemes. The gutter takes tango's decimal-literal green,
    which is what a pandoc-rendered report gives a line number and reads well against code
    without competing with it. Unselectable, so copying a snippet does not drag the numbers
    along with it. */
@@ -11570,20 +13592,20 @@ code { background: #7f7f7f24; border-radius: 3px; padding: 0.08em 0.32em; }
 pre code, pre code span { background: none; padding: 0; }
 blockquote { border-left: 3px solid #8884; margin: 0; padding-left: 1rem; }
 /* The two ways back read as one thing, so they are set as one thing: the link at the end of
-   a defect heading and the one a section heading carries. They sat at 0.75em and 0.6em, one
-   of them faded and the other not, which made the same gesture look like two. */
+   a defect heading and the one a section heading carries. Set at different sizes, or one
+   faded and the other not, the same gesture would look like two. */
 .back, .toc-jump::after { font-size: 0.7em; font-weight: normal; opacity: 0.6; }
 .back { margin-left: 0.5rem; }
 /* A section heading is a way back to the contents, and it SAYS SO WHETHER OR NOT the pointer
-   is over it — `::after` and not `:hover::after`. Shown only on hover it was a different
-   thing from the arrow on a defect heading, which is a real element and always there: one
-   gesture that the page advertised in one place and hid in the other, so a reader who never
-   happened to hover learned that a heading was clickable only by accident. It is also
+   is over it — `::after` and not `:hover::after`. Shown only on hover it would be a
+   different thing from the arrow on a defect heading, which is a real element and always
+   there: one gesture that the page advertised in one place and hid in the other, so a reader
+   who never happened to hover would learn that a heading was clickable only by accident. It is also
    invisible to anyone reading without a pointer at all.
 
    The arrow is CSS's own escape for U+2191 and the backslash is DOUBLED to reach the
-   stylesheet: in a Python string `\2191` is an octal escape, and it read as U+0011
-   followed by "91" — so the affordance said "\x11 91 contents". */
+   stylesheet: in a Python string `\2191` is an octal escape, which reads as U+0011
+   followed by "91" — so the affordance would say "\x11 91 contents". */
 .toc-jump { cursor: pointer; }
 .toc-jump::after { content: " \\2191 Contents"; }
 nav.contents { border: 1px solid #8884; padding: 0.5rem 1rem; margin: 1.5rem 0; scroll-margin-top: 1rem; }
@@ -11591,7 +13613,7 @@ h2, h3 { scroll-margin-top: 1rem; }
 nav.contents ul { margin: 0.25rem 0; padding-left: 1.25rem; }
 h2 { border-bottom: 1px solid #8884; padding-bottom: 0.2rem; margin-top: 2.5rem; }
 h4 { margin-top: 2rem; }
-/* The title block: the title and the one paragraph directly under it. Centred together,
+/* The title block: the title and the one paragraph directly under it. Centered together,
    because they are what the page IS rather than the first thing it says — and the subtitle
    is set smaller for the same reason: when it was made, how many files, at which commit.
    Selected structurally rather than by a class, so the prose stays prose in report.md and
@@ -11616,49 +13638,34 @@ _MD_BULLET = re.compile(r"^( *)- +(.*)$")
 # A defect names itself in its own heading, and in the first cell of its index row. That
 # id is the engine's own — never derived from heading text, which is a worker's prose and
 # which two defects may legitimately share.
-# Built from :data:`CLUSTER_ID_PREFIX` rather than spelled again, so the id has exactly one
+# Built from :data:`DEFECT_ID_PREFIX` rather than spelled again, so the id has exactly one
 # definition in this file. The patterns that READ an id and the writer that mints it must
 # agree, and a pattern spelled separately drifts from it silently: every defect on the page
 # loses its id and every index link points at nothing, while a test whose fixture spells the
 # id the way the writer does still passes.
-_DEFECT_ID = re.escape(CLUSTER_ID_PREFIX) + r"\d+"
+_DEFECT_ID = re.escape(DEFECT_ID_PREFIX) + r"\d+"
 _MD_DEFECT = re.compile(rf"^({_DEFECT_ID}) — ")
 # A defect's heading: the id, then the label. The id leads it because the engine writes
 # that prefix and a worker cannot — under the old shape the heading was the consequence
 # alone, so the id had to be read off the line below and a bullet elsewhere that merely
 # looked like that line could claim it.
 _MD_DEFECT_HEADING = re.compile(rf"^({_DEFECT_ID})\. ")
-# A defect's own entry line — the metadata the writer puts under the heading, matched
-# whole and built from the engine's own vocabularies, so a heading is confirmed as a
-# defect's rather than assumed to be one.
-#
-# Read off the LABELS, which is what makes the line unforgeable: `*` reaches the prose
-# escaped, so a consequence or a file name holding the separator cannot open a field of its
-# own. The location is bounded by its SHAPE — anything, ending in the line or line range
-# `_at` writes — and not by holding no whitespace. A file system admits a space in a name,
-# and `engine/my core.py` matched nothing here, so that defect's heading carried no id at
-# all and the index link jumped past it.
-def _md_label(n: int) -> str:
-    """One field's bold label, as the pattern below matches it. Escaped, because the label
-    is a name and not a pattern: a label that gained a character with a meaning in a regex
-    would silently change what this matches, and what it stops matching is every defect's
-    anchor."""
-    return re.escape(f"**{DEFECT_META_LABELS[n]}** ")
-
-
+# A defect's own entry line — the first line the writer puts under the heading, naming its
+# one site or counting its several — matched from its start and built from the engine's own
+# labels, so a heading is confirmed as a defect's rather than assumed to be one. Read off the
+# LABELS, which is what makes the line unforgeable: `*` and `[` reach the prose escaped, so a
+# consequence or a file name cannot open a field of its own.
+_SITE_ID = re.escape(SITE_ID_PREFIX) + r"\d+"
+# An anchor the writer put in the Markdown: a whole line above a heading, or the lead of a
+# bullet. Only the engine can write one; a worker's `<` reaches the prose escaped.
+_MD_ANCHOR = re.compile(r'^<a id="([A-Za-z0-9-]+)"></a>')
 _MD_DEFECT_ENTRY = re.compile(
-    r"^" + _md_label(0) + r"(?:" + "|".join(SEVERITIES) + r")"
-    + re.escape(DEFECT_META_SEP) + _md_label(1) + r".+"
-    # The location renders as code, so a backtick may sit either side of it. Without this
-    # the line stops matching, every defect on the page loses its id, and every link into
-    # one breaks -- silently, because nothing checks that an anchor exists.
-    + re.escape(DEFECT_META_SEP) + _md_label(2) + r"`?.+:\d+(?:-\d+)?`?"
-    + re.escape(DEFECT_META_SEP) + _md_label(3) + r"(?:"
-    + "|".join(re.escape(size) for size in FIX_SIZES) + r")"
-    # The last field is dropped where it does not vary, so the line has to match with and
-    # without it -- an anchor that depends on a field being present is an anchor that
-    # disappears the moment the field stops earning its place.
-    + r"(?:" + re.escape(DEFECT_META_SEP) + _md_label(4) + r".+)?$")
+    rf"^(?:<a id=\"{_SITE_ID}{re.escape(SOURCE_ANCHOR)}\"></a>)?"
+    rf"(?:\*\*Site\*\* \[({_SITE_ID})\]\(#\1\){re.escape(DEFECT_META_SEP)}"
+    rf"|\*\*\d+ sites\*\*: )")
+# A site's evidence entry, headed by its number and the rest of its signpost; the heading
+# carries the site's id.
+_MD_SITE_HEADING = re.compile(rf"^({_SITE_ID}){re.escape(DEFECT_META_SEP)}")
 # A backtick a worker wrote arrives escaped, and the lookbehind is what stops a span
 # opening on it — without it, `\`x\`` matches from the escaped backtick and swallows the
 # text as code. Emphasis needs no such guard and is not given one: escaping puts a backslash
@@ -11671,6 +13678,10 @@ _MD_EMPHASIS = re.compile(r"\*\*")
 # `[` is one of the characters every worker string arrives behind a backslash, so nothing
 # in this document but the writer above can produce this shape.
 _MD_DEFECT_LINK = re.compile(rf"(?<!\\)\[({_DEFECT_ID})\]\(#({_DEFECT_ID})\)")
+# A link to a site: to its evidence entry, or to its quoted source in its defect's entry.
+# The link text is free — a site's id, or a word — and only the TARGET is checked.
+_MD_SITE_LINK = re.compile(
+    rf"(?<!\\)\[([^\]\n]+)\]\(#({_SITE_ID}(?:{re.escape(SOURCE_ANCHOR)})?)\)")
 # A link to a SECTION, whose target is a slug rather than a defect id. Lower-case by
 # construction — see :func:`_slug` — which is what keeps it from matching a defect link, and
 # the link text is free: a pointer reading "this link" says less than the sentence around it
@@ -11745,6 +13756,10 @@ def _inline(text: str, defined: frozenset[str] | set[str] = frozenset(),
         lambda m: (f'<a href="#{m.group(2)}">{m.group(1)}</a>'
                    if m.group(1) == m.group(2) and m.group(2) in defined else m.group(1)),
         text)
+    text = _MD_SITE_LINK.sub(
+        lambda m: (f'<a href="#{m.group(2)}">{m.group(1)}</a>' if m.group(2) in defined
+                   else m.group(1)),
+        text)
     # A section link, after the defect one and distinguishable from it: a defect id is an
     # upper-case prefix and digits, and a section id is what `_slug` makes, which lower-cases.
     # The text is whatever the sentence needs; only the TARGET is checked.
@@ -11797,6 +13812,34 @@ def _defect_anchors(lines: Sequence[str]) -> dict[int, str]:
                 out[n] = named.group(1)
                 break
     return out
+
+
+def _site_anchors(lines: Sequence[str]) -> tuple[dict[int, str], dict[int, str]]:
+    """Which lines anchor a site: each evidence heading, by line, and each bullet the writer
+    led with an anchor — a site's line in its defect's entry, which anchors its source. Fenced text anchors
+    nothing, for the reason it defines no defect."""
+    headings: dict[int, str] = {}
+    sources: dict[int, str] = {}
+    fence: str | None = None
+    for n, line in enumerate(lines):
+        opening = _MD_FENCE.match(line.rstrip())
+        if fence is not None:
+            if opening and len(opening.group(2)) >= len(fence):
+                fence = None
+            continue
+        if opening:
+            fence = opening.group(2)
+            continue
+        heading = _MD_HEADING.match(line)
+        named = _MD_SITE_HEADING.match(heading.group(2)) if heading else None
+        if named:
+            headings[n] = named.group(1)
+            continue
+        bullet = _MD_BULLET.match(line.rstrip())
+        named = _MD_ANCHOR.match(bullet.group(2)) if bullet and not bullet.group(1) else None
+        if named:
+            sources[n] = named.group(1)
+    return headings, sources
 
 
 _MD_BARE_DEFECT_ID = re.compile(r"D\d+")
@@ -11867,7 +13910,7 @@ def _slug(title: str, taken: set[str]) -> str:
     title whose id is already taken gets a numbered spelling rather than a second
     definition of one id: two headings sharing an id makes every link to it ambiguous.
 
-    It cannot collide with a defect's id, which is :data:`CLUSTER_ID_PREFIX` and digits:
+    It cannot collide with a defect's id, which is :data:`DEFECT_ID_PREFIX` and digits:
     this lower-cases, so an upper-case prefix can never come out of it.
     """
     base = _SLUG_SEPARATORS.sub("-", _plain_title(title).lower()).strip("-")
@@ -11939,7 +13982,7 @@ def _contents_html(entries: Sequence[tuple[int, int, str, str]]) -> str:
 
 
 # The way back to the contents, from any section heading. Presentation only: it adds
-# behaviour and drops nothing, which is the rule render_html works under.
+# behavior and drops nothing, which is the rule render_html works under.
 HTML_BACK_TO_CONTENTS = """<script>
 (function () {
   var toc = document.querySelector("nav.contents");
@@ -11982,6 +14025,14 @@ def render_html(markdown: str) -> str:
     heading_ids = set(anchors.values())
     claimed: set[str] = set()
     defined = _defect_ids_defined(lines, anchors)
+    # A site's evidence heading anchors it like a defect's heading anchors the defect, and
+    # is left out of the contents list for the same reason.
+    site_headings, site_sources = _site_anchors(lines)
+    anchors = {**anchors, **site_headings}
+    defined |= set(site_headings.values()) | set(site_sources.values())
+    # An anchor the writer put in a table cell is an element of the page as written.
+    defined |= {m.group(1) for line in lines if line.startswith("|")
+                for m in re.finditer(r'<a id="([A-Za-z0-9-]+)"></a>', line)}
     contents = _contents(lines, anchors)
     section_ids = {n: ident for n, _, _, ident in contents}
     # Every section title to the id it carries, so a bold cross-reference in the prose becomes
@@ -11991,8 +14042,8 @@ def render_html(markdown: str) -> str:
     titles = {_plain_title(text): ident for _n, _level, text, ident in contents}
     listed = False
     # A defect written up in full names itself in its heading, and that is where the id
-    # lands. A REFUTED defect has no heading — it is one line in the appendix — so its line
-    # is the only claimant and keeps it. Whichever reaches an id first keeps it, or the
+    # lands; a line or row naming it elsewhere claims it only where no heading does.
+    # Whichever reaches an id first keeps it, or the
     # document defines one id twice and a link resolves to whichever a viewer picks.
     # Every id the document has defined so far. A cluster is named in the index, in its own
     # entry, in the clustering notes and in the appendix; exactly one of those may carry the
@@ -12043,11 +14094,10 @@ def render_html(markdown: str) -> str:
                 # The defining row does not link to itself.
                 cells.append(f'<a href="#{text}">{text}</a>'
                              if n == column and text in defined and not defines
-                             else _inline(cell, defined))
-            # A row naming a defect with a bare id, where no heading claims that id, is
-            # where the defect is set out -- a REFUTED one is a row of the appendix's
-            # refuted table and has no heading anywhere -- so the row carries the anchor and
-            # every link into it lands here.
+                             else _inline(cell, defined, titles))
+            # A row naming a defect with a bare id, where no heading claims that id, is the
+            # only place the page sets it out, so the row carries the anchor and every link
+            # into it lands here.
             anchor = f' id="{raw_first}"' if defines else ""
             out.append(f"<tr{anchor}>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>")
         out.append("</tbody></table></div>")
@@ -12090,7 +14140,8 @@ def render_html(markdown: str) -> str:
             fence, fence_indent, held = opening.group(2), opening.group(1), []
             fence_lang = opening.group(3) or ""
             continue
-        if not line.strip():
+        # A line that is only the writer's anchor: the heading below it carries the same id.
+        if not line.strip() or (_MD_ANCHOR.match(line) and not _MD_ANCHOR.sub("", line)):
             flush_table()
             if stack and stack[-1] == "p":
                 close_to(len(stack) - 1)
@@ -12114,6 +14165,10 @@ def render_html(markdown: str) -> str:
             out.append(f"<h{level}{attr}>{_inline(text, defined)}{back}</h{level}>")
             continue
         if line.startswith("|"):
+            # A table at the margin after a blank line stands on its own: left inside the
+            # list above it, a defect's site table renders as part of its last bullet.
+            if not rows and n and not lines[n - 1].strip():
+                close_to(0)
             if stack and stack[-1] == "p":
                 close_to(len(stack) - 1)
             rows.append(_split_cells(line.strip())[1:-1])
@@ -12155,16 +14210,26 @@ def render_html(markdown: str) -> str:
             elif stack and stack[-1] == "li":
                 close_to(len(stack) - 1)
             text = bullet.group(2)
+            if n in site_sources:
+                text = _MD_ANCHOR.sub("", text, count=1)
             named = _MD_DEFECT.match(text)
             owns = bool(named) and depth == 0 and named.group(1) not in claimed
             if owns:
                 claimed.add(named.group(1))
             attr = f' id="{named.group(1)}"' if owns else ""
+            if n in site_sources and site_sources[n] not in claimed:
+                claimed.add(site_sources[n])
+                attr = f' id="{site_sources[n]}"'
             back = (f' <a class="back" href="#{CONTENTS_ID}">{BACK_TO_INDEX}</a>'
                     if owns else "")
             out.append(f"<li{attr}>{_inline(text, defined, titles)}{back}")
             stack.append("li")
             continue
+        # A line at the margin after a blank line is a paragraph of its own, not the
+        # continuation of the bullet above the blank.
+        if stack and stack[-1] == "li" and not raw.startswith(" ") and n and \
+                not lines[n - 1].strip():
+            close_to(0)
         if stack and stack[-1] == "li":
             # An indented line under a bullet continues it; nothing is dropped.
             out.append(f"<br>{_inline(line.strip(), defined, titles)}")
@@ -12257,25 +14322,475 @@ def report_summary(states: Sequence[VerificationState], findings: Findings,
     out.append(f"{total}: " + ", ".join(
         f"{counts[status]} {status}" for status in VERDICT_STATUSES))
     ungrouped = [e for e in findings.clustering if e["state"] != UNIT_COMPLETE]
-    out.append(f"{_plural(len(findings.clusters), 'defect')} after clustering"
+    out.append(f"{_plural(len(findings.defects), 'defect')} after clustering"
                + (f"; {_plural(len(ungrouped), 'area')} not clustered" if ungrouped else ""))
     out.append("wrote " + ", ".join(str(target) for target in targets))
     return "\n".join(out) + "\n"
 
 
 # --------------------------------------------------------------------------- #
+# fix brief — the same defects, for an agent that will fix them
+# --------------------------------------------------------------------------- #
+# The second output, rendered from the same records as the report and kept to what fixing
+# needs: an agent reads the code itself, at the commit, so quoted source, check rows,
+# corroboration, lanes, clustering notes and provenance are left out, and so is every site
+# and defect with nothing to fix. It says nothing the run did not record.
+FIX_BRIEF_NAME = "fix-brief.md"
+FIX_BRIEF_DATA_NAME = "fix-brief.json"
+# One file per defect, the setup and that defect alone, so one defect can be handed to one
+# agent. **A directory the engine owns**: every name in it is one this stage writes, so a
+# re-render, a redo and a recovery each remove all of them before anything new lands — a
+# file left from a grouping that has since shrunk is a defect an agent would go and fix —
+# and anything else in it is refused rather than deleted.
+FIX_BRIEF_DIR = "fix-brief"
+_FIX_BRIEF_ENTRY = re.compile(rf"{DEFECT_ID_PREFIX}[1-9][0-9]*\.md\Z", re.ASCII)
+# How much of a run's output a site carries: the end, where a failure and its message are.
+FIX_BRIEF_OUTPUT_CHARS = 400
+FIX_BRIEF_TITLE = "Fix brief"
+# Where the report is, from the file that says so: the per-defect files sit one level down.
+FIX_BRIEF_LEAD = (
+    "For an agent fixing the defects this review established or left open. `{report}` has "
+    "the same defects with all their evidence; this keeps what is needed to fix them.")
+# What the numbers and the two outcomes mean to somebody about to change the code.
+FIX_BRIEF_GUIDE = (
+    "A defect (`D1`, `D2`, …) is one mistake. Its sites (`S1`, `S2`, …) are the places it "
+    "has to be fixed: code, documents, tests. A defect is fixed when every one of its sites "
+    "is.",
+    "`established`: the review's check upheld the site, by running code or by reading it.",
+    "`unresolved`: nothing settled the site. Confirm it before changing anything; the site "
+    "says what stopped the review.",
+    "Write the test that should fail first before the fix, and see it fail.",
+    "A heading, *What goes wrong*, *Fix* and a site's note are one agent's reading of the "
+    "run, and nothing checked them. Where a fix names an order, follow it.",
+    "Established defects come first, then unresolved; within each, most severe first, then "
+    "fewest sites. Refuted sites and defects are left out: there is nothing to fix at them.",
+)
+# What to do first at an unresolved site, by what stopped the review there.
+FIX_BRIEF_WHAT_TO_DO = {
+    "blocked_by_the_environment": (
+        "The review's environment stopped its run, so no output is shown. Run the "
+        "reproduction yourself and confirm the failure before changing anything."),
+    "needs_a_run": "Run the reproduction, or write the test, and confirm the failure before "
+                   "changing anything.",
+    "needs_a_file_outside_the_scope": "Read the files it needs and confirm the claim before "
+                                      "changing anything.",
+    "needs_a_product_decision": "Ask the owner what the code should do before changing "
+                                "anything.",
+}
+FIX_BRIEF_CONFIRM_FIRST = "Confirm the claim before changing anything."
+# Where a defect's account came from, which decides how the page labels it.
+FIX_ACCOUNT_SYNTHESIS, FIX_ACCOUNT_MECHANISM, FIX_ACCOUNT_SITE = (
+    "synthesis", "merge check", "site")
+# A reproduction as the brief carries it: a run's, an attempt the environment blocked, or
+# one a reader proposed that nothing ran.
+FIX_REPRO_RUN, FIX_REPRO_BLOCKED, FIX_REPRO_PROPOSED = "run", "blocked", "proposed"
+
+
+def _executed(record: dict) -> bool:
+    evidence = record["evidence"]
+    return evidence is not None and evidence.get(RUN_KIND_KEY) != "documentary"
+
+
+def _blocked(record: dict) -> bool:
+    return (record["status"] == DEFECT_UNRESOLVED
+            and record["unresolved_reason"] == "blocked_by_the_environment")
+
+
+def _fix_reproduction(members: Sequence[dict]) -> dict | None:
+    """One reproduction for a site, from the report that best evidences it: a reproduced one
+    whose run executed first, then any executed run, then a proposal nothing ran.
+
+    A refuted report's run shows the claim failing, so it is never the site's reproduction.
+    **An attempt the environment blocked keeps its command and loses its output**: the
+    failure it printed shows nothing about the code.
+    """
+    live = [m for m in members if m["status"] != DEFECT_REFUTED]
+    ran = sorted((m for m in live if _executed(m)),
+                 key=lambda m: (m["status"] != "reproduced", _blocked(m),
+                                m["status"] not in ESTABLISHED_STATUSES, m["id"]))
+    if ran:
+        record = ran[0]
+        evidence = record["evidence"]
+        if _blocked(record):
+            return {"kind": FIX_REPRO_BLOCKED, "argv": list(evidence["argv"]),
+                    "cwd": evidence["cwd"], "expect": None, "exit_status": None,
+                    "shows": None, "output": None, "output_cut": False}
+        output = (evidence.get("output") or "").strip()
+        cut = len(output) > FIX_BRIEF_OUTPUT_CHARS
+        return {"kind": FIX_REPRO_RUN, "argv": list(evidence["argv"]), "cwd": evidence["cwd"],
+                "expect": None, "exit_status": evidence["exit_status"],
+                "shows": evidence.get("shows"),
+                "output": ("…" + output[-FIX_BRIEF_OUTPUT_CHARS:] if cut else output) or None,
+                "output_cut": cut or bool(evidence.get("truncated"))}
+    for record in sorted(live, key=lambda m: (m["status"] not in ESTABLISHED_STATUSES, m["id"])):
+        for raiser in record["raised_by"]:
+            repro = raiser["reproduction"]
+            if repro is not None:
+                return {"kind": FIX_REPRO_PROPOSED, "argv": list(repro["argv"]),
+                        "cwd": repro["cwd"], "expect": repro["expect"], "exit_status": None,
+                        "shows": None, "output": None, "output_cut": False}
+    return None
+
+
+def _fix_unsettled(site: dict, members: Sequence[dict]) -> dict | None:
+    """What stopped the review at an unresolved site, and what to do about it first."""
+    if site["status"] != DEFECT_UNRESOLVED:
+        return None
+    open_ = [m for m in members if m["status"] == DEFECT_UNRESOLVED]
+    accounts: list[str] = []
+    for record in open_:
+        text = record["rationale"]
+        if text and text.strip() and text not in accounts:
+            accounts.append(text)
+    reason = site["unresolved_reason"]
+    if reason is not None:
+        label = UNRESOLVED_GROUPS[reason]
+    else:
+        label = UNKNOWN_SETTLING if site["unresolved_reasons"] == [None] else MIXED_SETTLING
+    return {"reason": reason, "label": label,
+            "what_to_do": FIX_BRIEF_WHAT_TO_DO.get(reason, FIX_BRIEF_CONFIRM_FIRST),
+            "accounts": accounts,
+            "needs_files": sorted({path for m in open_ for path in m["needs_files"]})}
+
+
+def _fix_heading(defect: dict, live: Sequence[dict]) -> str:
+    """The synthesis round's heading, else the first site with something to fix: a refuted
+    site's consequence describes code the review cleared."""
+    return defect["heading"] or live[0]["consequence"]
+
+
+def _fix_tests_to_write(findings: Findings, members: dict[str, list[dict]]) -> list[dict]:
+    """The coverage ladder's gaps that stood or that nothing settled, one record per site,
+    read as the report's *Tests to write* reads them. A gap a test already covers is left
+    out."""
+    sites = {site["id"]: site for site in findings.coverage_sites}
+    by_id = {record["id"]: record for record in findings.coverage}
+    out: list[dict] = []
+    for defect in findings.coverage_defects:
+        live = [sites[sid] for sid in defect["sites"] if sites[sid]["status"] != DEFECT_REFUTED]
+        if not live:
+            continue
+        records = []
+        for site in live:
+            primary = _gap_primary(site, by_id)
+            records.append({
+                "id": site["id"],
+                "file": site["file"],
+                "line_start": site["line_start"],
+                "line_end": site["line_end"],
+                "outcome": site["status"],
+                "test_class": _test_named(primary["test_first"] or "")[1],
+                "uncovered": site["consequence"],
+                "no_test_constructs": primary["failure"],
+                "proposed": primary["direction"],
+                "test_first": primary["test_first"],
+                # A checker's words only: an unanswered record carries the engine's own
+                # diagnostic in this field.
+                "check_found": (primary["rationale"]
+                                if site["status"] == DEFECT_ESTABLISHED
+                                and primary.get("answered", True) else None),
+                "unsettled": _fix_unsettled(site, members.get(site["id"], ())),
+            })
+        out.append({"id": defect["id"], "heading": _fix_heading(defect, live),
+                    "status": (DEFECT_ESTABLISHED if any(s["outcome"] == DEFECT_ESTABLISHED
+                                                        for s in records)
+                               else DEFECT_UNRESOLVED),
+                    "sites": records})
+    out.sort(key=lambda d: (d["status"] != DEFECT_ESTABLISHED, d["sites"][0]["file"],
+                            d["sites"][0]["line_start"], _id_rank(d["id"])))
+    return out
+
+
+def fix_brief_document(findings: Findings, probe: dict) -> dict:
+    """``fix-brief.json``: the records the fix brief renders, built from the run's findings
+    and the capability probe and from nothing else.
+
+    Defects first, then the tests to write. A site whose every report was refuted is left
+    out, and so is a defect or a gap with no other site.
+    """
+    sites = {site["id"]: site for site in findings.sites}
+    members: dict[str, list[dict]] = {}
+    for record in (*findings.candidates, *findings.coverage):
+        members.setdefault(record["site"], []).append(record)
+    live_ids = {defect["id"] for defect in findings.defects
+                if defect["status"] != DEFECT_REFUTED}
+    defects: list[dict] = []
+    for defect in findings.defects:
+        if defect["id"] not in live_ids:
+            continue
+        live = [sites[sid] for sid in defect["sites"] if sites[sid]["status"] != DEFECT_REFUTED]
+        established = [s for s in live if s["status"] == DEFECT_ESTABLISHED]
+        if defect["what_goes_wrong"]:
+            account, said = FIX_ACCOUNT_SYNTHESIS, defect["what_goes_wrong"]
+        elif defect["mechanism"]:
+            account, said = FIX_ACCOUNT_MECHANISM, defect["mechanism"]
+        else:
+            account, said = FIX_ACCOUNT_SITE, live[0]["consequence"]
+        several = len(defect["sites"]) > 1
+        defects.append({
+            "id": defect["id"],
+            "heading": _fix_heading(defect, live),
+            "status": DEFECT_ESTABLISHED if established else DEFECT_UNRESOLVED,
+            "severity": _most_severe([s["severity"] for s in (established or live)]),
+            "related": [ref for ref in defect["cross_references"] if ref in live_ids],
+            "account": account,
+            "what_goes_wrong": said,
+            "fix": defect["fix"],
+            "sites": [{
+                "id": site["id"],
+                "file": site["file"],
+                "line_start": site["line_start"],
+                "line_end": site["line_end"],
+                "outcome": site["status"],
+                "severity": site["severity"],
+                "fix_size": site["fix_size"],
+                # A defect of one site is headed by what is wrong there already.
+                "what_is_wrong_here": site["consequence"] if several else None,
+                "note": defect["site_notes"].get(site["id"]),
+                "test_first": site["test_first"],
+                "unsettled": _fix_unsettled(site, members.get(site["id"], ())),
+                "reproduction": _fix_reproduction(members.get(site["id"], ())),
+            } for site in live],
+        })
+    defects.sort(key=lambda d: (d["status"] != DEFECT_ESTABLISHED, _SEVERITY_RANK[d["severity"]],
+                                len(d["sites"]), _id_rank(d["id"])))
+
+    def step(attempt: dict | None) -> dict | None:
+        if attempt is None:
+            return None
+        return {key: attempt[key] for key in ("answer", "argv", "cwd", "exit_status")}
+
+    return {
+        "setup": {
+            "commit": findings.commit,
+            "probe": {"state": probe.get("state"), "reason": probe.get("reason"),
+                      "build": step(probe.get("build")), "tests": step(probe.get("tests")),
+                      "summary": probe.get("summary")},
+        },
+        "guide": list(FIX_BRIEF_GUIDE),
+        "defects": defects,
+        "tests_to_write": _fix_tests_to_write(findings, members),
+    }
+
+
+def _command_lines(argv: Sequence[str], cwd: str) -> list[str]:
+    """A command as a block somebody can paste, and the directory it runs in where that is
+    not the root."""
+    out = _fenced(shlex.join(argv).splitlines() or [""])
+    if cwd not in ("", "."):
+        out += _item("  - In: ", cwd)
+    return out
+
+
+def _fix_brief_setup(doc: dict) -> list[str]:
+    setup = doc["setup"]
+    probe = setup["probe"]
+    out = ["## Setup\n\n",
+           f"- The review read {_commit_words(setup['commit'])}. Line numbers below refer to "
+           f"that tree; read each file there yourself.\n"]
+    if probe["state"] != UNIT_COMPLETE:
+        out += _item(f"- The capability probe is recorded as {_one_line(str(probe['state']))}, "
+                     f"so nobody found out how to build this tree or run its tests: ",
+                     probe["reason"] or "no reason recorded")
+    else:
+        for label, attempt in (("Build", probe["build"]), ("Tests", probe["tests"])):
+            if not attempt["argv"]:
+                out.append(f"- {label}: {attempt['answer']}; the probe ran nothing.\n")
+                continue
+            status = attempt["exit_status"]
+            out.append(f"- {label}, as the capability probe ran it: {attempt['answer']}"
+                       f"{'' if status is None else f', exit {status}'}.\n")
+            out += _command_lines(attempt["argv"], attempt["cwd"])
+        if probe["summary"]:
+            out += _item("- What the probe reported: ", probe["summary"])
+    out.append("\n## How to use this\n\n")
+    out += [f"- {line}\n" for line in doc["guide"]]
+    return out
+
+
+def _fix_brief_entry(defect: dict) -> list[str]:
+    out = [f"\n## {defect['id']}. {_one_line(defect['heading'])}\n\n"]
+    meta = f"- Severity: {defect['severity']} · Sites: {len(defect['sites'])}"
+    if defect["related"]:
+        meta += f" · Related: {', '.join(defect['related'])}"
+    out.append(meta + "\n")
+    label = ("What goes wrong, as the merge check upheld it."
+             if defect["account"] == FIX_ACCOUNT_MECHANISM else WHAT_GOES_WRONG_LABEL)
+    out += _item(f"- **{label}** ", defect["what_goes_wrong"])
+    if defect["fix"]:
+        out += _item(f"- **{FIX_LABEL}** ", defect["fix"])
+    for site in defect["sites"]:
+        location = f"{site['file']}:{_lines(site)}"
+        shown = (f"`{location}`" if "`" not in location and _collapse(location) == location
+                 else _one_line(location))
+        out.append(f"\n### {site['id']} · {shown} · {site['outcome']} · {site['severity']} · "
+                   f"fix {site['fix_size']}\n\n")
+        if site["what_is_wrong_here"]:
+            out += _item("- Wrong here: ", site["what_is_wrong_here"])
+        if site["note"]:
+            out += _item("- Note: ", site["note"])
+        if site["test_first"]:
+            out += _item("- Test that should fail first: ", site["test_first"])
+        unsettled = site["unsettled"]
+        if unsettled:
+            out.append(f"- Not settled ({unsettled['label']}): {unsettled['what_to_do']}\n")
+            for account in unsettled["accounts"]:
+                out += _item("  - What stopped the check: ", account)
+            if unsettled["needs_files"]:
+                out += _item("  - Files it needs: ", ", ".join(unsettled["needs_files"]))
+        repro = site["reproduction"]
+        if repro:
+            if repro["kind"] == FIX_REPRO_RUN:
+                status = repro["exit_status"]
+                out.append(f"- Reproduction, run{'' if status is None else f', exit {status}'}:\n")
+            elif repro["kind"] == FIX_REPRO_BLOCKED:
+                out.append("- Reproduction, blocked by the review's environment and not run:\n")
+            else:
+                out.append("- Reproduction, proposed and not run:\n")
+            out += _command_lines(repro["argv"], repro["cwd"])
+            if repro["expect"]:
+                out += _item("  - Expect: ", repro["expect"])
+            if repro["shows"]:
+                out += _item("  - What it shows: ", repro["shows"])
+            if repro["output"]:
+                out.append(f"  - Output{', the end of it' if repro['output_cut'] else ''}:\n")
+                out += _fenced(repro["output"].splitlines(), indent="    ")
+    return out
+
+
+# What the tests to write are, said once above them, in the report's words.
+FIX_BRIEF_GAPS_LEAD = (
+    "Inputs the code handles differently that no test in scope constructs. **None of these "
+    "says the code is wrong.** Each is a test to write, at the lines that decide the input, "
+    "under the test class that owes it.")
+
+
+def _fix_brief_gap(defect: dict) -> list[str]:
+    out = [f"\n## {defect['id']}. {_one_line(defect['heading'])}\n\n",
+           f"- Test to write · Sites: {len(defect['sites'])}\n"]
+    for site in defect["sites"]:
+        location = f"{site['file']}:{_lines(site)}"
+        shown = (f"`{location}`" if "`" not in location and _collapse(location) == location
+                 else _one_line(location))
+        owed = f" · owed by {_one_line(site['test_class'])}" if site["test_class"] else ""
+        out.append(f"\n### {site['id']} · {shown} · {site['outcome']}{owed}\n\n")
+        out += _item("- Not exercised here: ", site["uncovered"])
+        out += _item("- No test constructs: ", site["no_test_constructs"])
+        out += _item("- Proposed: ", site["proposed"])
+        if site["test_first"]:
+            out += _item("- Test that should fail first: ", site["test_first"])
+        if site["check_found"]:
+            out += _item("- What the check found: ", site["check_found"])
+        unsettled = site["unsettled"]
+        if unsettled:
+            out.append(f"- Not settled ({unsettled['label']}): {unsettled['what_to_do']}\n")
+            for account in unsettled["accounts"]:
+                out += _item("  - What stopped the check: ", account)
+            if unsettled["needs_files"]:
+                out += _item("  - Files it needs: ", ", ".join(unsettled["needs_files"]))
+    return out
+
+
+def _fix_brief_gaps_head() -> list[str]:
+    return [f"\n## {SECTION_COVERAGE_GAPS}\n\n{FIX_BRIEF_GAPS_LEAD}\n"]
+
+
+def render_fix_brief(doc: dict) -> str:
+    """``fix-brief.md``: :func:`fix_brief_document`'s records, rendered, and nothing else."""
+    lead = FIX_BRIEF_LEAD.format(report=REPORT_NAME)
+    out = [f"# {FIX_BRIEF_TITLE}\n\n{lead}\n\n", *_fix_brief_setup(doc)]
+    if not doc["defects"] and not doc["tests_to_write"]:
+        out.append("\nThe review established no defect and left none unresolved, and no "
+                   "coverage gap stood, so there is nothing here to do.\n")
+    for defect in doc["defects"]:
+        out += _fix_brief_entry(defect)
+    if doc["tests_to_write"]:
+        out += _fix_brief_gaps_head()
+    for defect in doc["tests_to_write"]:
+        out += _fix_brief_gap(defect)
+    return "".join(out)
+
+
+def render_fix_brief_defects(doc: dict) -> dict[str, str]:
+    """``fix-brief/D<n>.md``: the setup, then exactly one defect's entry, as the whole
+    brief renders it."""
+    lead = FIX_BRIEF_LEAD.format(report=f"../{REPORT_NAME}")
+
+    def head(defect_id: str) -> list[str]:
+        return [f"# {FIX_BRIEF_TITLE}: {defect_id}\n\n{lead}\n\n", *_fix_brief_setup(doc)]
+
+    out = {defect["id"]: "".join([*head(defect["id"]), *_fix_brief_entry(defect)])
+           for defect in doc["defects"]}
+    out.update({defect["id"]: "".join([*head(defect["id"]), *_fix_brief_gaps_head(),
+                                       *_fix_brief_gap(defect)])
+                for defect in doc["tests_to_write"]})
+    return out
+
+
+def fix_brief_entries(path: Path) -> list[Path]:
+    """What the per-defect directory holds, refused unless the report wrote every entry.
+
+    Empty where there is no directory. A link, a junction or a file at the name, and inside
+    it anything but a regular ``D<n>.md`` or the scratch a write of one leaves, is not this
+    stage's, and is refused by name rather than removed.
+    """
+    info = _lstat_or_absent(path, "the fix brief directory", RunDirError)
+    if info is None:
+        return []
+    if not stat.S_ISDIR(info.st_mode) or _is_junction(path):
+        raise RunDirError(
+            f"{path} is in the way and is not the directory the report wrote; the report "
+            f"replaces its own outputs and nothing else, so move it aside and run again")
+    try:
+        entries = sorted(path.iterdir())
+    except OSError as exc:
+        raise RunDirError(f"cannot read {path}: {_os_reason(exc)}") from exc
+    for entry in entries:
+        name = entry.name
+        if name.endswith(_SCRATCH_TAIL):
+            stem, _dot, pid = name[:-len(_SCRATCH_TAIL)].rpartition(".")
+            name = stem if _PID_ONLY.match(pid) else name
+        found = _lstat_or_absent(entry, "a fix brief file", RunDirError)
+        if found is None:
+            continue
+        if (not _FIX_BRIEF_ENTRY.match(name) or not stat.S_ISREG(found.st_mode)
+                or _is_junction(entry)):
+            raise RunDirError(
+                f"{path} holds {entry.name!r}, which the report did not write there; move it "
+                f"aside and run again")
+    return entries
+
+
+def remove_fix_brief(path: Path) -> None:
+    """Take the per-defect directory away: each file the report wrote there, then the
+    directory. The directory goes by ``rmdir``, never a recursive delete, so anything that
+    arrived after the check is left and the removal fails naming the directory."""
+    for entry in fix_brief_entries(path):
+        try:
+            entry.unlink()
+        except FileNotFoundError:
+            pass
+    try:
+        path.rmdir()
+    except FileNotFoundError:
+        pass
+
+
+# --------------------------------------------------------------------------- #
 # redo — the last two rounds taken back off a run
 # --------------------------------------------------------------------------- #
-# Clustering and synthesis go back TOGETHER, and not for convenience. A defect's id is its
-# POSITION in the clustering (see `build_clusters`), so regrouping the same candidates reuses
-# D1 and D2 for different members. A synthesis kept across that passes every id check the
-# engine has while describing defects that are no longer those defects.
-REDO_KINDS = (CLUSTERER_KIND, SYNTHESIZER_KIND)
+# Clustering and every round after it go back TOGETHER, and not for convenience. A site's
+# id is its POSITION in the clustering (see `build_clusters`), so regrouping the same
+# candidates reuses S1 and S2 for different members. A merge, its check or a synthesis kept
+# across that passes every id check the engine has while describing sites that are no longer
+# those sites.
+REDO_KINDS = (CLUSTERER_KIND, MERGER_KIND, MERGE_CHECKER_KIND, SYNTHESIZER_KIND)
 # Everything a redo publishes over. The lock is NOT here: it is a claim, not an output.
 # The stamp IS, and for the opposite reason to the one that keeps it out of a recovery's
 # manifest: a recovery rebuilds the report a run already had, while a redo re-dispatches
 # rounds and the report that follows is a new rendering of new data, which should say so.
-REDO_OUTPUTS = (REPORT_NAME, HTML_NAME, FINDINGS_NAME, REPORT_STAMP_NAME)
+REDO_OUTPUTS = (REPORT_NAME, HTML_NAME, FINDINGS_NAME, FIX_BRIEF_NAME, FIX_BRIEF_DATA_NAME,
+                REPORT_STAMP_NAME)
 
 # What `route --redo` takes back, and it is EVERY round after reading rather than route's
 # own. A candidate's id is its position in the routing, exactly as a defect's is its
@@ -12286,12 +14801,14 @@ REDO_OUTPUTS = (REPORT_NAME, HTML_NAME, FINDINGS_NAME, REPORT_STAMP_NAME)
 #
 # The reading round itself is untouched, which is the point: it is the expensive one, and
 # re-dispatching ONE of its units and routing again is what this exists to make possible.
-ROUTE_REDO_KINDS = (VERIFIER_KIND, CLUSTERER_KIND, SYNTHESIZER_KIND)
+ROUTE_REDO_KINDS = (VERIFIER_KIND, CLUSTERER_KIND, MERGER_KIND, MERGE_CHECKER_KIND,
+                    SYNTHESIZER_KIND)
 ROUTE_REDO_OUTPUTS = (CANDIDATES_FILE_NAME, *REDO_OUTPUTS)
 
 
 def plan_redo(rundir: Path, units_doc: dict, kinds: Sequence[str] = REDO_KINDS,
-              stage: str = VERIFICATION_STAGE, what: str = "clustering or synthesis",
+              stage: str = VERIFICATION_STAGE,
+              what: str = "clustering, merge, merge check or synthesis",
               carry_on: str = "cluster") -> tuple[tuple[str, ...], dict]:
     """What a redo takes back, and the listing the stage runs with once it has — decided
     WITHOUT writing anything, so that every refusal below it still holds.
@@ -12322,14 +14839,16 @@ def plan_redo(rundir: Path, units_doc: dict, kinds: Sequence[str] = REDO_KINDS,
             f"{lock} exists, so a report is writing this run directory or one was "
             f"interrupted; --redo will not reset a run out from under a report"
         )
+    # The per-defect directory goes with the report, and only if the report wrote all of it.
+    fix_brief_entries(rundir / FIX_BRIEF_DIR)
     taking = tuple(unit["id"] for unit in units_doc["units"]
                    if unit.get("kind") in kinds and isinstance(unit.get("id"), str))
     # Refused only where the run is ALREADY at the stage this resets to: there the plain
-    # command really does run normally from here. A stage that has moved on with nothing
-    # to take back is the other case -- a route over readers that all failed or found
-    # nothing writes the verification stage with zero batches -- and refusing it here
-    # while the plain command refuses the stage left the run with no command that would
-    # accept it. The reset is what such a run needs, and there is nothing it would delete.
+    # command really does run normally from here. A stage that has moved on with nothing to
+    # take back is the other case -- a route over readers that all failed or found nothing
+    # writes the verification stage with zero batches -- and refusing it here while the
+    # plain command refuses the stage would leave the run with no command that would accept
+    # it. The reset is what such a run needs, and there is nothing it would delete.
     if not taking and units_doc.get("stage") == stage:
         raise RunDirError(
             f"--redo found no {what} unit to take back, and "
@@ -12361,6 +14880,12 @@ def apply_redo(rundir: Path, taking: Sequence[str], doc: dict,
     # entirely, where `rmtree` then does exactly what it was asked. `_inside` resolves both
     # sides and answers False for anything it cannot place, so a path this cannot prove
     # belongs to the run is left alone rather than removed.
+    #
+    # The per-defect directory is refused before anything goes, as `plan_redo` refused it,
+    # and removed with the report's files: a `D<n>.md` kept across a regroup names a defect
+    # the new grouping may not have.
+    fix_dir = rundir / FIX_BRIEF_DIR
+    fix_brief_entries(fix_dir)
     for unit_id in taking:
         for parent in (UNITS_DIR, DISPATCH_DIR):
             target = rundir / parent / unit_id
@@ -12373,6 +14898,10 @@ def apply_redo(rundir: Path, taking: Sequence[str], doc: dict,
             pass
         except OSError as exc:
             raise RunDirError(f"cannot remove {rundir / name}: {_os_reason(exc)}") from exc
+    try:
+        remove_fix_brief(fix_dir)
+    except OSError as exc:
+        raise RunDirError(f"cannot remove {fix_dir}: {_os_reason(exc)}") from exc
     write_json(rundir / UNITS_FILE_NAME, doc)
 
 
@@ -12432,7 +14961,7 @@ def _quoted_where(quote: QuotedRange) -> str:
 
 
 def _found_where(quote: QuotedRange) -> str:
-    """The FILE line the range had reached, labelled as a file line.
+    """The FILE line the range had reached, labeled as a file line.
 
     Spelled the way the citation above it is spelled, so the dispatcher can see at a glance
     whether the number is inside the range the finding claims.
@@ -12454,6 +14983,36 @@ class CheckOutcome:
     dropped: int = 0
 
 
+def _run_sites(rundir: Path, units_doc: dict) -> Clustering:
+    """The run's sites as every stage after clustering builds them: the listing proved
+    against the route record, then each clustering unit read."""
+    routed = _read_candidates(rundir)
+    cluster_units = [u for u in units_doc["units"] if u.get("kind") == CLUSTERER_KIND]
+    check_clustering(routed["candidates"], cluster_units)
+    return build_clusters(routed["candidates"], cluster_units,
+                          read_clustering_results(rundir, cluster_units))
+
+
+def _run_grouping(rundir: Path, units_doc: dict, clustering: Clustering | None = None,
+                  ) -> tuple[dict | None, dict | None, list[list[str]]]:
+    """The merge round, its check and the grouping of sites into defects they decide, as
+    every stage after the check reads them: each listing proved — the merge's against the
+    sites, the check's against the groups the merge proposes now — then every result
+    read. A group the check did not uphold leaves each of its sites its own defect."""
+    clustering = _run_sites(rundir, units_doc) if clustering is None else clustering
+    merge_units = [u for u in units_doc["units"] if u.get("kind") == MERGER_KIND]
+    check_merge(clustering, merge_units)
+    merge = build_merge(merge_units, read_merge_results(
+        rundir, merge_units, {site.id: site.asks for site in clustering.clusters}))
+    proposed = proposed_groups(merge)
+    check_units = [u for u in units_doc["units"] if u.get("kind") == MERGE_CHECKER_KIND]
+    check_merge_check(proposed, check_units)
+    merge_check = build_merge_check(check_units, read_merge_check_results(rundir, check_units),
+                                    proposed)
+    return merge, merge_check, accepted_grouping(
+        (site.id for site in clustering.clusters), merge_check)
+
+
 def check_result(rundir: Path, unit_id: str, payload: object) -> CheckOutcome:
     """Run the parse the engine WILL run on ``payload`` as unit ``unit_id``'s result, and
     compare every quotation in it with the tree the run is pinned to.
@@ -12463,15 +15022,15 @@ def check_result(rundir: Path, unit_id: str, payload: object) -> CheckOutcome:
 
     **The quotation comparison is here because ``route`` runs it too late to act on.** It
     is the one thing the engine checks that it checks after the single re-dispatch the
-    protocol allows is gone, so a unit that cited thirteen wrong ranges could only be
+    protocol allows is gone, so a unit that cited many wrong ranges could only be
     flagged in the report. Run at landing it is the same comparison, :func:`compare_quote`,
     at the moment the dispatcher can still send the unit back. A wrong quotation still does
     not refuse the result: it costs that finding's credibility and not the unit, and
     ``route`` still records what landed.
 
-    **The point is that it is the same parse and not a second one.** A dispatcher's landing
-    check was "the file parses and holds the count its reply claimed", which is strictly
-    weaker than what the stage enforces an hour later: a result could land clean and be
+    **The point is that it is the same parse and not a second one.** A landing check of
+    "the file parses and holds the count its reply claimed" is strictly weaker than what
+    the stage enforces an hour later: a result could land clean and be
     refused after the re-dispatch the protocol allows is no longer possible. A check that
     approximated the stage would reintroduce that gap one layer along, so this dispatches on
     the unit's own kind and calls the stage's parser with the stage's own inputs.
@@ -12548,8 +15107,27 @@ def check_result(rundir: Path, unit_id: str, payload: object) -> CheckOutcome:
     if kind == CLUSTERER_KIND:
         parse_clusterer_result(payload, unit_id, unit.get("candidates", ()))
         return CheckOutcome(())
+    if kind == MERGER_KIND:
+        # Each site's kind comes from the clustering the stage will read, because a group
+        # mixing kinds is one of the rules the stage refuses a reply for.
+        kinds = {site.id: site.asks for site in _run_sites(rundir, units_doc).clusters}
+        unknown = [sid for sid in unit.get("sites", ()) if sid not in kinds]
+        if unknown:
+            raise RunDirError(
+                f"unit {unit_id} is listed with {unknown[0]!r}, which is not a site of this "
+                f"run; the listing and the clustering disagree about this run"
+            )
+        parse_merger_result(payload, unit_id, {sid: kinds[sid] for sid in unit["sites"]})
+        return CheckOutcome(())
+    if kind == MERGE_CHECKER_KIND:
+        # The listing is proved against the groups the merge proposes, as the report will
+        # prove it, so a unit planned over groups that have since moved is refused here too.
+        _run_grouping(rundir, units_doc)
+        parse_merge_checker_result(payload, unit_id, _handed_groups(unit))
+        return CheckOutcome(())
     if kind == SYNTHESIZER_KIND:
-        parsed = parse_synthesizer_result(payload, unit_id, unit.get("defects", ()))
+        parsed = parse_synthesizer_result(payload, unit_id, unit.get("defects", ()),
+                                          unit.get("defect_sites"))
         return CheckOutcome(tuple(parsed["rejected"]))
     raise RunDirError(f"unit {unit_id} has kind {kind!r}, which this engine cannot parse")
 
@@ -12564,7 +15142,8 @@ def build_parser() -> argparse.ArgumentParser:
                     "synthesize, report.",
     )
     sub = parser.add_subparsers(dest="command", required=True,
-                                metavar="{plan,route,cluster,synthesize,report,check}")
+                                metavar="{plan,route,cluster,merge,merge-check,synthesize,"
+                                        "report,check}")
     plan = sub.add_parser("plan", help="partition a job into blind reading units")
     plan.add_argument("job", help="path to job.json")
     plan.add_argument(
@@ -12581,7 +15160,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="take every round after reading back off a run that has "
                             "already routed, then route again: the reading results are "
                             "reused and only a unit you re-dispatch yourself changes. "
-                            "Deletes the verification, clustering and synthesis units, "
+                            "Deletes the verification, clustering, merge, merge check and "
+                            "synthesis units, "
                             "their dispatch directories, the route record and any "
                             "published report")
     cluster = sub.add_parser("cluster", help="group each area's verified candidates into "
@@ -12589,15 +15169,25 @@ def build_parser() -> argparse.ArgumentParser:
     cluster.add_argument("rundir", help="the run directory route wrote, its verification units "
                                         "dispatched")
     cluster.add_argument("--redo", action="store_true",
-                         help="take clustering and synthesis back off a run that has "
-                              "already had them, then cluster again: the reading and "
-                              "verification rounds are reused and only the last two are "
+                         help="take clustering, merge, merge check and synthesis back off "
+                              "a run that "
+                              "has already had them, then cluster again: the reading and "
+                              "verification rounds are reused and only the later rounds are "
                               "dispatched afresh. Deletes those units, their dispatch "
                               "directories and any published report")
+    merge = sub.add_parser("merge", help="write the unit that proposes which sites, across "
+                                         "the whole run, are one mistake")
+    merge.add_argument("rundir", help="the run directory cluster wrote, its clustering units "
+                                      "dispatched")
+    merge_check = sub.add_parser("merge-check", help="write the unit, on the lane the merge "
+                                                     "did not run on, that checks each "
+                                                     "proposed group site by site")
+    merge_check.add_argument("rundir", help="the run directory merge wrote, its merge units "
+                                            "dispatched")
     synthesize = sub.add_parser("synthesize", help="write the one unit that names this "
                                                    "run's tiers and accounts for every defect")
-    synthesize.add_argument("rundir", help="the run directory cluster wrote, its clustering "
-                                           "units dispatched")
+    synthesize.add_argument("rundir", help="the run directory merge-check wrote, its merge "
+                                           "check units dispatched")
     check = sub.add_parser("check", help="run the engine's own parse over a result before "
                                         "it is landed, so a reply that would be refused "
                                         "an hour later is refused now")
@@ -12690,10 +15280,10 @@ def _run_plan(args: argparse.Namespace) -> int:
         sys.stderr.write(f"{_PROG}: {exc}\n")
         return 2
     # Where it ran, FIRST, and on success only. A minted name cannot be guessed and every
-    # stage after this one takes the directory as an argument, so a plan that printed a
-    # preview and not the path left the caller to search the host's temporary directory —
-    # ambiguous the moment two runs are planned close together, and the wrong answer is
-    # another run's evidence.
+    # stage after this one takes the directory as an argument, so the path is printed
+    # ahead of the preview: this line is where the caller learns it. Searching the host's
+    # temporary directory instead is ambiguous the moment two runs are planned close
+    # together, and the wrong answer is another run's evidence.
     sys.stdout.write(f"{RUNDIR_LINE}{rundir}\n\n")
     sys.stdout.write(preview(job, inventory, areas))
     return 0
@@ -12781,8 +15371,8 @@ def _run_route(args: argparse.Namespace) -> int:
             # answer.
             units_doc = _read_units_at_stage(
                 rundir,
-                (READING_STAGE, VERIFICATION_STAGE, CLUSTERED_STAGE, SYNTHESIZED_STAGE,
-                 REPORTED_STAGE)
+                (READING_STAGE, VERIFICATION_STAGE, CLUSTERED_STAGE, MERGED_STAGE,
+                 MERGE_CHECKED_STAGE, SYNTHESIZED_STAGE, REPORTED_STAGE)
                 if args.redo else READING_STAGE,
                 "route runs once, after the reading units are dispatched"
                 + (" — and --redo needs a run that has already routed" if args.redo else ""))
@@ -12790,7 +15380,7 @@ def _run_route(args: argparse.Namespace) -> int:
             if args.redo:
                 taking, units_doc = plan_redo(
                     rundir, units_doc, ROUTE_REDO_KINDS, READING_STAGE,
-                    "verification, clustering or synthesis", "route")
+                    "verification, clustering, merge, merge check or synthesis", "route")
             problem = _read_problem(rundir)
             owner = _read_owner(rundir)
             companions = load_route_companions()
@@ -12838,7 +15428,8 @@ def _run_cluster(args: argparse.Namespace) -> int:
         try:
             units_doc = _read_units_at_stage(
                 rundir,
-                (VERIFICATION_STAGE, CLUSTERED_STAGE, SYNTHESIZED_STAGE, REPORTED_STAGE)
+                (VERIFICATION_STAGE, CLUSTERED_STAGE, MERGED_STAGE, MERGE_CHECKED_STAGE,
+                 SYNTHESIZED_STAGE, REPORTED_STAGE)
                 if args.redo else VERIFICATION_STAGE,
                 "cluster runs once, after route and after the verification units are "
                 "dispatched"
@@ -12869,6 +15460,96 @@ def _run_cluster(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_merge(args: argparse.Namespace) -> int:
+    # Everything that can refuse runs before anything is written: the listing must be at the
+    # clustering stage, the route record and the companions readable, the routing and the
+    # clustering proved and every result read, and every payload measured against the
+    # ceilings — and only then does the first unit directory land.
+    try:
+        rundir = _resolve(Path(args.rundir), "rundir", RunDirError)
+        # Route's reasoning again: the claim before the marker, held through the marker
+        # write, so a second merge cannot take back the units this one just wrote.
+        lock = _claim_stage(rundir, "merge")
+        try:
+            units_doc = _read_units_at_stage(
+                rundir, CLUSTERED_STAGE,
+                "merge runs once, after cluster and after the clustering units are "
+                "dispatched")
+            routed = _read_candidates(rundir)
+            problem = _read_problem(rundir)
+            companions = load_merge_companions()
+            batches = [u for u in units_doc["units"] if u.get("kind") == VERIFIER_KIND]
+            reproducible = {c["id"]: any(r["reproduction"] is not None for r in c["raised_by"])
+                            for c in routed["candidates"]}
+            holder = check_routing(routed["candidates"], batches)
+            states = read_verification_results(rundir, batches, reproducible)
+            rationales = verified_rationales(routed["candidates"], holder, states)
+            clustering = _run_sites(rundir, units_doc)
+            material = merge_material(clustering, routed["candidates"], rationales)
+            units = plan_merge(companions.merger_brief, problem, material,
+                               companions.merger_schema)
+            write_merge(rundir, units_doc, units, material, companions, problem)
+        finally:
+            _released(lock)
+    except ReviewPanelError as exc:
+        sys.stderr.write(f"{_PROG}: {exc}\n")
+        return 2
+    sys.stdout.write(merge_summary(units, clustering))
+    return 0
+
+
+def _run_merge_check(args: argparse.Namespace) -> int:
+    # Everything that can refuse runs before anything is written: the listing must be at the
+    # merge stage, the route record and the companions readable, the routing, the
+    # clustering and the merge proved and every result read, and every payload measured
+    # against the ceilings — and only then does the first unit directory land.
+    try:
+        rundir = _resolve(Path(args.rundir), "rundir", RunDirError)
+        lock = _claim_stage(rundir, "merge-check")
+        try:
+            units_doc = _read_units_at_stage(
+                rundir, MERGED_STAGE,
+                "merge-check runs once, after merge and after the merge units are "
+                "dispatched")
+            routed = _read_candidates(rundir)
+            problem = _read_problem(rundir)
+            companions = load_merge_check_companions()
+            batches = [u for u in units_doc["units"] if u.get("kind") == VERIFIER_KIND]
+            reproducible = {c["id"]: any(r["reproduction"] is not None for r in c["raised_by"])
+                            for c in routed["candidates"]}
+            holder = check_routing(routed["candidates"], batches)
+            states = read_verification_results(rundir, batches, reproducible)
+            rationales = verified_rationales(routed["candidates"], holder, states)
+            resolved = resolve(routed["candidates"], holder, states)
+            clustering = _run_sites(rundir, units_doc)
+            merge_units = [u for u in units_doc["units"] if u.get("kind") == MERGER_KIND]
+            check_merge(clustering, merge_units)
+            proposed = proposed_groups(build_merge(merge_units, read_merge_results(
+                rundir, merge_units, {site.id: site.asks for site in clustering.clusters})))
+            statuses = {site.id: site_status(site.asks, (resolved[cid].status
+                                                         for cid in site.members))
+                        for site in clustering.clusters}
+            in_groups = {site for group in proposed for site in group["sites"]}
+            quoted = {cid for site in clustering.clusters if site.id in in_groups
+                      for cid in site.members}
+            snippets = {cand["id"]: extract_snippet(rundir / "snapshot", cand["file"],
+                                                    cand["line_start"], cand["line_end"])
+                        for cand in routed["candidates"] if cand["id"] in quoted}
+            material = merge_check_material(proposed, clustering, routed["candidates"],
+                                            rationales, statuses, snippets)
+            units = plan_merge_check(companions.merge_checker_brief, problem, material,
+                                     companions.merge_checker_schema)
+            write_merge_check(rundir, units_doc, units, material, proposed, companions,
+                              problem)
+        finally:
+            _released(lock)
+    except ReviewPanelError as exc:
+        sys.stderr.write(f"{_PROG}: {exc}\n")
+        return 2
+    sys.stdout.write(merge_check_summary(units, proposed))
+    return 0
+
+
 def _run_synthesize(args: argparse.Namespace) -> int:
     # Everything that can refuse runs before anything is written: the listing must be at the
     # clustering stage and unsynthesized, the route record and the companions readable, the
@@ -12887,9 +15568,9 @@ def _run_synthesize(args: argparse.Namespace) -> int:
         lock = _claim_stage(rundir, "synthesize")
         try:
             units_doc = _read_units_at_stage(
-                rundir, CLUSTERED_STAGE,
-                "synthesize runs once, after cluster and after the clustering units are "
-                "dispatched")
+                rundir, MERGE_CHECKED_STAGE,
+                "synthesize runs once, after merge-check and after the merge check units "
+                "are dispatched")
             routed = _read_candidates(rundir)
             problem = _read_problem(rundir)
             companions = load_synthesis_companions()
@@ -12903,15 +15584,20 @@ def _run_synthesize(args: argparse.Namespace) -> int:
             check_clustering(routed["candidates"], cluster_units)
             cluster_states = read_clustering_results(rundir, cluster_units)
             clustering = build_clusters(routed["candidates"], cluster_units, cluster_states)
-            material = synthesis_material(clustering, routed["candidates"], rationales)
-            units = plan_synthesis(clustering.clusters)
+            # The defects are the grouping the merge check upheld, so a defect of several
+            # sites is narrated once with every site's material.
+            _merge, check, grouping = _run_grouping(rundir, units_doc, clustering)
+            defects = group_sites(clustering, grouping)
+            material = synthesis_material(clustering, routed["candidates"], rationales,
+                                          defects, _prove_grouping(defects, check))
+            units = plan_synthesis(defects)
             write_synthesis(rundir, units_doc, units, material, companions, problem)
         finally:
             _released(lock)
     except ReviewPanelError as exc:
         sys.stderr.write(f"{_PROG}: {exc}\n")
         return 2
-    sys.stdout.write(synthesis_summary(units, clustering.clusters))
+    sys.stdout.write(synthesis_summary(units, defects))
     return 0
 
 
@@ -12935,8 +15621,16 @@ def _run_report(args: argparse.Namespace) -> int:
         target, data_target = rundir / REPORT_NAME, rundir / FINDINGS_NAME
         html_target = rundir / HTML_NAME
         outputs = (target, data_target, html_target)
-        for path in outputs:
+        # The fix brief is written BEFORE the report's three files, so the three present
+        # with the stamp still means a publication that finished, whichever engine wrote it:
+        # a run reported before the fix brief existed is finished too, and gets one only
+        # from --rerender.
+        brief_target, brief_data_target = rundir / FIX_BRIEF_NAME, rundir / FIX_BRIEF_DATA_NAME
+        fix_dir = rundir / FIX_BRIEF_DIR
+        written = (brief_data_target, brief_target, data_target, target, html_target)
+        for path in written:
             _replaceable(path)
+        fix_brief_entries(fix_dir)
         # **What is on disk says which of three things happened, and a file alone says
         # none of them.** The stamp lands before the first of the three and nothing lands
         # after the last, so: all three and the stamp is a report that finished, and
@@ -12947,7 +15641,7 @@ def _run_report(args: argparse.Namespace) -> int:
         # rules that kept no such record, and is somebody's rather than this run's. The flag
         # is how somebody says they meant to replace either of the two that are refused.
         if not args.rerender:
-            present = [path for path in outputs
+            present = [path for path in (*written, fix_dir)
                        if _lstat_or_absent(path, "the report output", RunDirError)
                        is not None]
             if present and read_report_stamp(rundir) is None:
@@ -13011,8 +15705,9 @@ def _run_report(args: argparse.Namespace) -> int:
         check_clustering(routed["candidates"], cluster_units)
         cluster_states = read_clustering_results(rundir, cluster_units)
         clustering = build_clusters(routed["candidates"], cluster_units, cluster_states)
+        merge, merge_check, grouping = _run_grouping(rundir, units_doc, clustering)
         synthesis_units = [u for u in units_doc["units"] if u.get("kind") == SYNTHESIZER_KIND]
-        check_synthesis(clustering.clusters, synthesis_units)
+        check_synthesis(group_sites(clustering, grouping), synthesis_units)
         # ``check_synthesis`` above is what proves the listing is over THIS run's defects;
         # the parse then proves the reply is over the listing. Neither needs the clusters
         # again, so this takes the unit row and the state and nothing else.
@@ -13023,10 +15718,11 @@ def _run_report(args: argparse.Namespace) -> int:
                     for cand in routed["candidates"]}
         findings = build_findings(dispatch, routed["candidates"], resolved, clustering,
                                   cluster_states, inventory["commit"], snippets, synthesis,
-                                  states, batches)
+                                  states, batches, grouping=grouping, merge=merge,
+                                  merge_check=merge_check)
         # Checked against the defects just built, so a note naming a defect this run does
         # not have is refused before anything is published.
-        report_notes = _read_report_notes(rundir, [c["id"] for c in findings.clusters])
+        report_notes = _read_report_notes(rundir, [c["id"] for c in findings.defects])
         # All three files are one output and they publish under one lock, and so do the
         # stamp they state and the marker that commits them. The lock is a file of its own
         # and NOT one of the three: a claim that is also a published artifact stops being a
@@ -13047,6 +15743,11 @@ def _run_report(args: argparse.Namespace) -> int:
         # leave the file alone, and the only way to be wrong is to keep a file this call
         # never made rather than to delete one somebody else did.
         existed: dict[Path, bool] = {}
+        # The per-defect directory, by the same rule: moved aside whole where it was there,
+        # made fresh, and put back if anything fails. Only a directory this call made is
+        # ever removed.
+        dir_aside: Path | None = None
+        dir_made = False
         try:
             # The completion check at the top of this stage ran BEFORE the lock, so two
             # first runs can both have passed it. Asked again here, under the lock, it means
@@ -13066,8 +15767,9 @@ def _run_report(args: argparse.Namespace) -> int:
                 )
             # A leftover of THIS stage is still the stage's to refuse if it is a link or a
             # directory — what the file says about completion says nothing about its kind.
-            for path in outputs:
+            for path in written:
                 _replaceable(path)
+            fix_brief_entries(fix_dir)
             # The scratch files an interrupted report left beside its own four writes, taken
             # back under the lock and before the first of those writes. The pid comes round
             # again, and `_create_scratch` creates exclusively, so one left behind refuses a
@@ -13078,7 +15780,7 @@ def _run_report(args: argparse.Namespace) -> int:
             # where it found them.
             #
             # **`units.json` is deliberately NOT among them, and this is the one entry worth
-            # a sentence.** Report does write that file now — the terminal marker is its
+            # a sentence.** Report does write that file — the terminal marker is its
             # last write — so by the ordinary rule its scratch would be report's to take
             # back. It is not, and the reason is what a synthesis does with the same name: a
             # synthesis holding its own claim writes `units.json.<pid>.tmp` and then
@@ -13090,7 +15792,7 @@ def _run_report(args: argparse.Namespace) -> int:
             # round again — is refused by name until somebody removes it. One operator
             # clearing a named file is the cheaper failure.
             _reclaim("report", rundir, (), (),
-                     (rundir / REPORT_STAMP_NAME, target, data_target, html_target))
+                     (rundir / REPORT_STAMP_NAME, *written))
             # **The stamp is chosen and persisted under the same exclusion as the
             # publication, and read again now that this report owns it.** Chosen before the
             # lock it can be a losing report's, written over a winner's after the winner has
@@ -13098,9 +15800,9 @@ def _run_report(args: argparse.Namespace) -> int:
             # next re-render moves the bytes the stamp exists to hold still. Every later
             # rendering of one run has to reproduce what it is replacing: a re-render
             # rewrites unchanged data, and a report rebuilt after an interrupted one is the
-            # same rendering finished. Reading the clock a second time made that true only
-            # while both landed inside one minute, and a slow runner turned it into a red
-            # job on a change that touched no timestamp code.
+            # same rendering finished. Reading the clock a second time would make that true
+            # only while both landed inside one minute, so a slow machine would change the
+            # bytes of a rendering nothing about the data changed.
             #
             # Its own file, which a reclaim does not take, so it survives the report being
             # taken back; ``report.md`` is the fallback for a run directory that carries a
@@ -13117,14 +15819,14 @@ def _run_report(args: argparse.Namespace) -> int:
             #
             # The stamp this call wrote is taken back if the render fails. It is written
             # first so the three files can be judged against it, and a render that raised
-            # left it standing over no report at all -- the next plain `report` then read
-            # the run as already published and rendered nothing. A stamp that was already
-            # there is somebody else's record and stays.
+            # would leave it standing over no report at all. A stamp that was already there
+            # is somebody else's record and stays.
             try:
                 text = render_report(job, dispatch, inventory, areas["areas"], findings,
                                      routed["units"], batches, states, routed["probe"],
                                      job_notes=job_notes, report_notes=report_notes,
-                                     rundir=rundir, generated=generated)
+                                     rundir=rundir, generated=generated,
+                                     before_sites=made_before_sites(units_doc))
             except BaseException:
                 if wrote_stamp:
                     with contextlib.suppress(OSError):
@@ -13141,7 +15843,13 @@ def _run_report(args: argparse.Namespace) -> int:
             # other, because there is only one place either of them is decided. Converted
             # AFTER the escape above, so the page inherits a prose that is already writable.
             page = render_html(text)
-            published = ((data_target, findings_document(findings)), (target, text),
+            brief = fix_brief_document(findings, routed["probe"])
+            brief_text = render_fix_brief(brief).encode("utf-8", "backslashreplace").decode("utf-8")
+            per_defect = {name: body.encode("utf-8", "backslashreplace").decode("utf-8")
+                          for name, body in render_fix_brief_defects(brief).items()}
+            # In the order they land, the report's three LAST: see `written`.
+            published = ((brief_data_target, brief), (brief_target, brief_text),
+                         (data_target, findings_document(findings)), (target, text),
                          (html_target, page))
             # What was there when the lock was taken, so the recovery can put back that
             # state rather than the files it happened to touch. A path that did not exist is
@@ -13169,8 +15877,28 @@ def _run_report(args: argparse.Namespace) -> int:
                         f"cannot take {path} aside to re-render it: {exc}"
                     ) from exc
                 aside[path] = spare
+            if _lstat_or_absent(fix_dir, "the fix brief directory", RunDirError) is not None:
+                spare = _temp_beside(fix_dir.with_name(fix_dir.name + ".previous"))
+                # Refused where the name is taken, as a file's backup is: a backup an
+                # interrupted run left is the only copy of what it held.
+                if _lstat_or_absent(spare, "the fix brief backup", RunDirError) is not None:
+                    raise RunDirError(f"cannot take {fix_dir} aside to re-render it: {spare} "
+                                      f"already exists")
+                try:
+                    os.rename(fix_dir, spare)
+                except OSError as exc:
+                    raise RunDirError(
+                        f"cannot take {fix_dir} aside to re-render it: {exc}") from exc
+                dir_aside = spare
+            try:
+                fix_dir.mkdir()
+            except OSError as exc:
+                raise RunDirError(f"cannot create {fix_dir}: {exc}") from exc
+            dir_made = True
+            for defect_id, body in per_defect.items():
+                write_text(fix_dir / f"{defect_id}.md", body)
             for path, content in published:
-                if path is data_target:
+                if path in (data_target, brief_data_target):
                     write_json(path, content)
                 else:
                     write_text(path, content)
@@ -13191,7 +15919,22 @@ def _run_report(args: argparse.Namespace) -> int:
             # describing different data is the one state this stage exists to make
             # impossible.
             stranded: list[str] = []
-            for path in (data_target, target, html_target):
+            if dir_made:
+                try:
+                    remove_fix_brief(fix_dir)
+                except (OSError, RunDirError):
+                    stranded.append(str(fix_dir))
+                else:
+                    dir_made = False
+            if dir_aside is not None:
+                if dir_made:
+                    stranded.append(f"{fix_dir} (its previous content is at {dir_aside})")
+                else:
+                    try:
+                        os.rename(dir_aside, fix_dir)
+                    except OSError:
+                        stranded.append(f"{fix_dir} (its previous content is at {dir_aside})")
+            for path in written:
                 spare = aside.get(path)
                 if spare is None:
                     # Already there and never moved: this call did not touch it. Only a path
@@ -13229,12 +15972,16 @@ def _run_report(args: argparse.Namespace) -> int:
             raise
         for spare in aside.values():
             _discard(spare)
+        if dir_aside is not None:
+            with contextlib.suppress(OSError, RunDirError):
+                remove_fix_brief(dir_aside)
         _released(lock)
     except ReviewPanelError as exc:
         sys.stderr.write(f"{_PROG}: {exc}\n")
         return 2
     sys.stdout.write(report_summary(states, findings,
-                                    (data_target, target, html_target)))
+                                    (data_target, target, html_target, brief_target,
+                                     brief_data_target, fix_dir)))
     return 0
 
 
@@ -13260,6 +16007,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_route(args)
     if args.command == "cluster":
         return _run_cluster(args)
+    if args.command == "merge":
+        return _run_merge(args)
+    if args.command == "merge-check":
+        return _run_merge_check(args)
     if args.command == "synthesize":
         return _run_synthesize(args)
     return _run_report(args)

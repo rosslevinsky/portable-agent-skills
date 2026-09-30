@@ -1,0 +1,1 @@
+{"verdicts": [{"candidate": "cand-002", "status": "confirmed_by_reading", "evidence": null, "rationale": "The guide is silent on the doubling.", "revision": null, "test_first": "tests/test_engine.py: call helper(3) and assert it returns 5.", "unresolved_reason": null}], "summary": "checked 1"}

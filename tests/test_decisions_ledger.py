@@ -33,8 +33,8 @@ MIN_WORDS = 15
 
 
 # Per-line decoration that repeats down a block: shell/Markdown comment markers and
-# blockquote markers. Relocated rationale often LIVED as `# ` comment lines inside a bash
-# fence, and whitespace-only normalization leaves those prefixes interleaved through the
+# blockquote markers. Rationale can sit as `# ` comment lines inside a bash fence, and
+# whitespace-only normalization leaves those prefixes interleaved through the
 # text — so the same prose re-added in that shape would not substring-match the plain
 # paragraph in the ledger, and this guard would pass while the duplication was back.
 _LINE_MARKER = re.compile(r"^[ \t]*(?:[>#]+[ \t]?)+", re.MULTILINE)
@@ -71,11 +71,11 @@ def _rel(path: Path, root: Path) -> Path:
 def skill_reference_pairs(skills_dir: Path) -> list[tuple[Path, Path]]:
     """Every ``(SKILL.md, companion .md)`` pair under ``skills_dir``.
 
-    Scope comes from the validator's traversal, not from a glob written here. The glob it
-    replaces was ``references/*.md`` -- markdown at exactly one level, under exactly one
-    directory name -- which is one of the four incompatible answers this phase collapsed. A
-    test holding its own copy of a scope rule stops testing the moment production's moves,
-    and it stops silently, which is the same failure the production drift had.
+    Scope comes from the validator's traversal, not from a glob written here. A glob such
+    as ``references/*.md`` -- markdown at exactly one level, under exactly one directory
+    name -- is a second, incompatible answer to which files a skill has. A test holding its
+    own copy of a scope rule stops testing the moment production's moves, and it stops
+    silently.
     """
     return [
         (skill_md, path)
@@ -129,8 +129,8 @@ def ledgers() -> list[Path]:
 def runtime_documents() -> list[Path]:
     """What a runtime actually reads: every markdown file installed with the skill.
 
-    Was ``*/SKILL.md`` plus ``*/references/*.md``. The installer ships ``skills/<name>/``
-    whole, so a document at any depth is on the runtime path; the two globs described a
+    Not ``*/SKILL.md`` plus ``*/references/*.md``. The installer ships ``skills/<name>/``
+    whole, so a document at any depth is on the runtime path; those two globs describe a
     narrower tree than the one that actually gets installed.
     """
     return sorted(
@@ -223,9 +223,8 @@ class DecisionsLedgerTests(unittest.TestCase):
 
         **This catches copy-paste only, and that is the whole claim.** The comparison is a
         substring test on normalized text, so the same rule restated in different words is
-        invisible to it — which is exactly the shape the duplication found by hand had.
-        Detecting *that* is out of scope: a redundancy detector produces candidates, and
-        deciding which copy is the home is a judgment a check cannot make.
+        invisible to it. Detecting *that* is out of scope: a redundancy detector produces
+        candidates, and deciding which copy is the home is a judgment a check cannot make.
         """
         offences = duplication_offences(SKILLS, REPO_ROOT)
         self.assertEqual(
@@ -236,7 +235,7 @@ class DecisionsLedgerTests(unittest.TestCase):
         )
 
     def test_the_skill_versus_references_check_can_actually_fail(self):
-        """The guard above has never fired on this tree, so prove it is able to.
+        """The guard above stays green on this tree, so prove it is able to fire.
 
         Driving :func:`duplication_offences` over a fixture tree rather than asserting on
         substring behavior: a companion that only checked ``in`` would stay green if a
@@ -279,12 +278,12 @@ class DecisionsLedgerTests(unittest.TestCase):
         )
 
     def test_a_comment_prefixed_reintroduction_is_still_caught(self):
-        """Regression: the shape the relocated rationale actually had.
+        """Rationale written as `# ` lines inside a bash fence is still recognized.
 
-        `plan-run`'s defeated-alternatives commentary lived as `# ` lines inside a bash
-        fence. With whitespace-only normalization those prefixes stayed interleaved through
-        the text, so the same prose re-added in that shape did not substring-match the plain
-        paragraph in the ledger and this guard passed while the duplication was back.
+        `_normalise` strips each line's `#` or `>` marker before it collapses whitespace,
+        so the same prose re-added in that shape still substring-matches the plain
+        paragraph in the ledger. Collapsing whitespace alone leaves the markers
+        interleaved through the text, and the match fails.
         """
         shared = " ".join(f"word{i}" for i in range(MIN_WORDS + 5))
         for prefix in ("# ", "#", "> ", "># "):

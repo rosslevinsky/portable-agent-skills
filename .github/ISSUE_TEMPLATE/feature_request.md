@@ -8,7 +8,7 @@ assignees: ""
 
 ## What problem are you solving?
 
-<!-- What workflow is awkward today, or what outcome is hard to get? Prefer describing the pain point over proposing a solution. -->
+<!-- What workflow is awkward today, or what outcome is hard to get? Describe the problem first; save any solution for the next section. -->
 
 ## Proposed change
 
@@ -16,7 +16,7 @@ assignees: ""
 
 ## Alternatives considered
 
-<!-- Other ways to solve the same problem, and why they're less good. -->
+<!-- Other ways to solve the same problem, and why they're worse. -->
 
 ## Portability notes
 

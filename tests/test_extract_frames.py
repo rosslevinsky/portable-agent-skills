@@ -124,7 +124,7 @@ class SceneThreshold(unittest.TestCase):
                  "the ffmpeg stub is a `#!/bin/sh` script, which Windows cannot run as a "
                  "command at all")
 class TheOutputPathIsHandledAsAPathNotAsSyntax(unittest.TestCase):
-    """Three ways the output directory's own name broke the run.
+    """Three ways the output directory's own name can break the run.
 
     Every case here needs to reach the ffmpeg calls, which the rest of this module
     deliberately never does — so ffmpeg is stubbed on PATH. The stub records the argv it
@@ -209,9 +209,9 @@ class TheOutputPathIsHandledAsAPathNotAsSyntax(unittest.TestCase):
 class LineEndingsAreTheRepositorysDecisionNotTheClonesTests(unittest.TestCase):
     """A shell script checked out with CRLF is a shell script that does not run.
 
-    Measured by cloning this repository with `core.autocrlf=true` — the Git for Windows
-    installer default. The checkout gets 161 CRLF pairs and both ways of invoking the script
-    die::
+    A clone made with `core.autocrlf=true` — the Git for Windows installer default — checks
+    the script out with CRLF line endings unless `.gitattributes` says otherwise, and both
+    ways of invoking it die::
 
         $ ./extract-frames.sh     env: 'bash\\r': No such file or directory        exit 127
         $ bash extract-frames.sh  $'\\r': command not found
@@ -238,7 +238,7 @@ class LineEndingsAreTheRepositorysDecisionNotTheClonesTests(unittest.TestCase):
         if proc.returncode != 0:
             return None
         # Bytes, then `os.fsdecode` — git writes raw path bytes and text mode would decode
-        # them with the locale's codec. The same trap the validator was carrying.
+        # them with the locale's codec.
         names = [os.fsdecode(p) for p in proc.stdout.split(b"\0") if p]
         return names or None
 

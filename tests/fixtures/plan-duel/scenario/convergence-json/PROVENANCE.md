@@ -15,6 +15,6 @@ landed and one written after are therefore interchangeable, which is what makes 
 over an older workdir safe.
 
 The judge files are **bare single-line objects** with no markdown fence and no prose,
-because that is exactly what both CLIs produce with the schema flag alone (verified
-live). The engine's tolerance for fenced/prose-wrapped JSON is covered by unit tests
-rather than here, since no adapter in the pack produces that shape.
+because that is the shape a CLI produces with the schema flag alone. The engine's
+tolerance for fenced/prose-wrapped JSON is covered by unit tests rather than here, since no
+adapter in the pack produces that shape.

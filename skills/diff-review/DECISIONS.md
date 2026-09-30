@@ -22,10 +22,9 @@ skill says never to make. Discarding is the conservative direction: it costs a r
 the other error costs a defect shipped on the strength of a review that never happened.
 
 Worth knowing, for anyone reading the code to fix this: the failure almost never arrives the
-way the proposal assumes. Recorded runs show the terminal event reporting success in its type
-field and carrying the failure in a separate error flag — a usage limit, an interrupted
-session — so a fix written against the type field alone would change nothing that happens in
-practice.
+way the proposal assumes. The terminal event typically reports success in its type field and
+carries the failure in a separate error flag — a usage limit, an interrupted session — so a
+fix written against the type field alone would change nothing that happens in practice.
 
 **The text is not lost, though.** Discarding the verdict need not take the reviewer's words
 with it. A failed transcript-mode run writes what the reviewer had produced to

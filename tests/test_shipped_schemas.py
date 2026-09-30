@@ -30,6 +30,8 @@ READER_SCHEMA = _SKILLS / "review-panel" / "reader-schema.json"
 VERIFIER_SCHEMA = _SKILLS / "review-panel" / "verifier-schema.json"
 PROBE_SCHEMA = _SKILLS / "review-panel" / "probe-schema.json"
 CLUSTERER_SCHEMA = _SKILLS / "review-panel" / "clusterer-schema.json"
+MERGER_SCHEMA = _SKILLS / "review-panel" / "merger-schema.json"
+MERGE_CHECKER_SCHEMA = _SKILLS / "review-panel" / "merge-checker-schema.json"
 SYNTHESIZER_SCHEMA = _SKILLS / "review-panel" / "synthesizer-schema.json"
 
 _PY_TYPES = {
@@ -79,6 +81,11 @@ def _validate(instance, schema, path="$"):
         if len(instance) < schema["minLength"]:
             errors.append(
                 f"{path}: length {len(instance)} < minLength {schema['minLength']}"
+            )
+    if isinstance(instance, str) and "maxLength" in schema:
+        if len(instance) > schema["maxLength"]:
+            errors.append(
+                f"{path}: length {len(instance)} > maxLength {schema['maxLength']}"
             )
     if isinstance(instance, int) and not isinstance(instance, bool):
         if "minimum" in schema and instance < schema["minimum"]:
@@ -151,6 +158,13 @@ class ValidatorSelfTest(unittest.TestCase):
         self.assertEqual(_validate("x", schema), [])
         self.assertTrue(_validate("", schema))
 
+    def test_max_length_is_enforced(self):
+        # Without it a schema's length limit is a keyword this validator skips, and a
+        # fixture over the limit passes here while a runtime that enforces it refuses.
+        schema = {"type": "string", "maxLength": 3}
+        self.assertEqual(_validate("abc", schema), [])
+        self.assertTrue(_validate("abcd", schema))
+
     def test_min_items_is_enforced(self):
         schema = {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
         self.assertEqual(_validate(["x"], schema), [])
@@ -164,7 +178,8 @@ class PortabilityInvariants(unittest.TestCase):
 
     def _all(self):
         return [JUDGE_SCHEMA, REVIEW_SCHEMA, WORKER_SCHEMA, READER_SCHEMA, VERIFIER_SCHEMA,
-                PROBE_SCHEMA, CLUSTERER_SCHEMA, SYNTHESIZER_SCHEMA]
+                PROBE_SCHEMA, CLUSTERER_SCHEMA, MERGER_SCHEMA, MERGE_CHECKER_SCHEMA,
+                SYNTHESIZER_SCHEMA]
 
     def test_no_dollar_schema_key_anywhere(self):
         # A draft-2020-12 $schema ref is accepted by one runtime and REJECTED by the
@@ -204,6 +219,21 @@ class PortabilityInvariants(unittest.TestCase):
                         set(node.get("required", [])), set(node["properties"]),
                         f"{where}: required must list every property",
                     )
+                for key, value in node.items():
+                    walk(value, f"{where}.{key}")
+            elif isinstance(node, list):
+                for index, item in enumerate(node):
+                    walk(item, f"{where}[{index}]")
+
+        for path in self._all():
+            walk(_load(path), path.name)
+
+    def test_no_unique_items_anywhere(self):
+        # One runtime rejects a structured-output schema carrying `uniqueItems` before any
+        # model call, so a repeated id or tier is the engine's to refuse, never the schema's.
+        def walk(node, where):
+            if isinstance(node, dict):
+                self.assertNotIn("uniqueItems", node, f"uniqueItems present at {where}")
                 for key, value in node.items():
                     walk(value, f"{where}.{key}")
             elif isinstance(node, list):
@@ -361,7 +391,7 @@ class ReaderSchemaContract(unittest.TestCase):
                 self.assertTrue(_validate(spiked, document))
 
     def test_the_source_a_reader_read_is_carried_as_quote_never_as_evidence(self):
-        # Spec section 6 asks a reader to quote what it actually read, so a wrong line range
+        # A reader quotes what it actually read, so a wrong line range
         # is detectable. That is a quotation, not evidence: `evidence` stays forbidden above,
         # and the quotation gets its own name so both facts hold at once.
         finding = _load(READER_SCHEMA)["properties"]["findings"]["items"]
@@ -518,8 +548,8 @@ class VerifierSchemaContract(unittest.TestCase):
         self.assertIn("needs_files", reason["description"])
 
     def test_unresolved_reason_is_the_four_values_the_report_groups_by(self):
-        # Spec section 9 groups the unresolved set by what would settle each, and section 7
-        # reports an environment failure as its own thing rather than as an open question
+        # The report groups the unresolved set by what would settle each, and reports an
+        # environment failure as its own thing rather than as an open question
         # about the code. Both read this enum, so its values are locked here.
         reason = _load(VERIFIER_SCHEMA)["properties"]["verdicts"]["items"]["properties"]["unresolved_reason"]
         self.assertEqual(reason["type"], ["string", "null"])
@@ -688,19 +718,178 @@ class ClustererSchemaContract(unittest.TestCase):
                           "findings", "evidence"} & set(names(_load(CLUSTERER_SCHEMA))))
 
 
+class MergerSchemaContract(unittest.TestCase):
+    """Locks what the merge unit returns. It groups sites and does nothing else, and no
+    object in it is keyed by a site id: a closed schema cannot describe keys it does not
+    know, so every per-site answer is a record naming its site, and the engine builds the
+    map and refuses an unknown or repeated id."""
+
+    PAIR = {"sites": ["S1", "S2"],
+            "mechanism": "An empty input is indexed before it is checked; check it first.",
+            "instances": [{"site": "S1", "instance": "core indexes an empty list."},
+                          {"site": "S2", "instance": "run.py indexes an empty argv."}],
+            "reason_kept_apart": None}
+    SINGLE = {"sites": ["S3"], "mechanism": None, "instances": None,
+              "reason_kept_apart": "A different cause at a different place."}
+    COMPOUND = {"site": "S3", "second_claim": "It also leaves the file open."}
+
+    def test_declares_groups_compound_and_a_summary(self):
+        document = _load(MERGER_SCHEMA)
+        self.assertEqual(set(document["required"]), {"groups", "compound", "summary"})
+        group = document["properties"]["groups"]["items"]
+        self.assertEqual(set(group["required"]),
+                         {"sites", "mechanism", "instances", "reason_kept_apart"})
+
+    def test_every_per_site_answer_is_a_record_and_never_a_map(self):
+        document = _load(MERGER_SCHEMA)
+        group = document["properties"]["groups"]["items"]["properties"]
+        self.assertEqual(group["instances"]["type"], ["array", "null"])
+        self.assertEqual(set(group["instances"]["items"]["required"]), {"site", "instance"})
+        compound = document["properties"]["compound"]
+        self.assertEqual(compound["type"], "array")
+        self.assertEqual(set(compound["items"]["required"]), {"site", "second_claim"})
+        self.assertTrue(_validate({"groups": [], "compound": {"S3": "a second claim"},
+                                   "summary": "s"}, document))
+        self.assertTrue(_validate({"groups": [{**self.PAIR, "instances": {"S1": "a", "S2": "b"}}],
+                                   "compound": [], "summary": "s"}, document))
+
+    def test_a_real_merge_result_validates(self):
+        document = _load(MERGER_SCHEMA)
+        self.assertEqual(_validate({"groups": [self.PAIR, self.SINGLE],
+                                    "compound": [self.COMPOUND],
+                                    "summary": "One group of two."}, document), [])
+
+    def test_a_missing_field_and_an_extra_one_are_rejected(self):
+        document = _load(MERGER_SCHEMA)
+        for field in self.PAIR:
+            with self.subTest(missing=field):
+                thin = {k: v for k, v in self.PAIR.items() if k != field}
+                self.assertTrue(_validate({"groups": [thin], "compound": [],
+                                           "summary": "s"}, document))
+        self.assertTrue(_validate({"groups": [{**self.PAIR, "verdict": "refuted"}],
+                                   "compound": [], "summary": "s"}, document))
+        self.assertTrue(_validate({"groups": [self.PAIR], "summary": "s"}, document))
+        self.assertTrue(_validate({"groups": [self.PAIR], "compound": [
+            {**self.COMPOUND, "severity": "major"}], "summary": "s"}, document))
+
+    def test_the_merger_cannot_judge_or_drop_a_site(self):
+        def names(node):
+            if isinstance(node, dict):
+                for key, value in node.get("properties", {}).items():
+                    yield key
+                    yield from names(value)
+                for value in node.values():
+                    if isinstance(value, (dict, list)) and value is not node.get("properties"):
+                        yield from names(value)
+            elif isinstance(node, list):
+                for item in node:
+                    yield from names(item)
+
+        self.assertFalse({"status", "verdict", "severity", "dropped", "discarded", "spurious",
+                          "findings", "evidence"} & set(names(_load(MERGER_SCHEMA))))
+
+    def test_a_repeated_site_is_the_engines_to_refuse(self):
+        # The schema cannot say "each site once" without `uniqueItems`, which one runtime
+        # rejects; `parse_merger_result` refuses the repeat instead.
+        repeated = {**self.PAIR, "sites": ["S1", "S1"]}
+        self.assertEqual(_validate({"groups": [repeated], "compound": [], "summary": "s"},
+                                   _load(MERGER_SCHEMA)), [])
+
+
+class MergeCheckerSchemaContract(unittest.TestCase):
+    """Locks what the merge check unit returns. It judges whether each site of a proposed
+    group is that one mistake and does nothing else, and no object in it is keyed by a site
+    id: every per-site answer is a record naming its site, and the engine builds the map
+    and refuses an unknown or repeated id."""
+
+    GROUP = {"group": "G1",
+             "sites": [{"site": "S1", "verdict": "fits", "reason": "It is that mistake."},
+                       {"site": "S2", "verdict": "does_not_fit", "reason": "Another cause."}],
+             "hidden_claims": [{"site": "S1", "claim": "It also leaves the file open."}],
+             "fix_touches_refuted": {"value": False, "sites": []}}
+
+    def test_declares_groups_and_a_summary(self):
+        document = _load(MERGE_CHECKER_SCHEMA)
+        self.assertEqual(set(document["required"]), {"groups", "summary"})
+        group = document["properties"]["groups"]["items"]
+        self.assertEqual(set(group["required"]),
+                         {"group", "sites", "hidden_claims", "fix_touches_refuted"})
+
+    def test_every_per_site_answer_is_a_record_and_never_a_map(self):
+        document = _load(MERGE_CHECKER_SCHEMA)
+        group = document["properties"]["groups"]["items"]["properties"]
+        self.assertEqual(group["sites"]["type"], "array")
+        self.assertEqual(set(group["sites"]["items"]["required"]),
+                         {"site", "verdict", "reason"})
+        self.assertEqual(group["hidden_claims"]["type"], "array")
+        self.assertEqual(set(group["hidden_claims"]["items"]["required"]), {"site", "claim"})
+        self.assertTrue(_validate({"groups": [{**self.GROUP, "sites": {
+            "S1": {"verdict": "fits", "reason": "x"}}}], "summary": "s"}, document))
+        self.assertTrue(_validate({"groups": [{**self.GROUP, "hidden_claims": {"S1": "x"}}],
+                                   "summary": "s"}, document))
+
+    def test_a_real_merge_check_result_validates(self):
+        self.assertEqual(_validate({"groups": [self.GROUP], "summary": "One upheld."},
+                                   _load(MERGE_CHECKER_SCHEMA)), [])
+
+    def test_a_verdict_is_one_of_two(self):
+        bad = {**self.GROUP, "sites": [{"site": "S1", "verdict": "maybe", "reason": "x"}]}
+        self.assertTrue(_validate({"groups": [bad], "summary": "s"},
+                                  _load(MERGE_CHECKER_SCHEMA)))
+
+    def test_a_missing_field_and_an_extra_one_are_rejected(self):
+        document = _load(MERGE_CHECKER_SCHEMA)
+        for field in self.GROUP:
+            with self.subTest(missing=field):
+                thin = {k: v for k, v in self.GROUP.items() if k != field}
+                self.assertTrue(_validate({"groups": [thin], "summary": "s"}, document))
+        self.assertTrue(_validate({"groups": [{**self.GROUP, "accepted": True}],
+                                   "summary": "s"}, document))
+        self.assertTrue(_validate({"groups": [self.GROUP]}, document))
+        self.assertTrue(_validate({"groups": [{**self.GROUP, "fix_touches_refuted": {
+            "value": False, "sites": [], "why": "x"}}], "summary": "s"}, document))
+
+    def test_the_checker_cannot_judge_a_site_or_propose_a_group(self):
+        def names(node):
+            if isinstance(node, dict):
+                for key, value in node.get("properties", {}).items():
+                    yield key
+                    yield from names(value)
+                for value in node.values():
+                    if isinstance(value, (dict, list)) and value is not node.get("properties"):
+                        yield from names(value)
+            elif isinstance(node, list):
+                for item in node:
+                    yield from names(item)
+
+        self.assertFalse({"status", "severity", "dropped", "mechanism", "instances",
+                          "findings", "evidence"} & set(names(_load(MERGE_CHECKER_SCHEMA))))
+
+    def test_a_repeated_site_is_the_engines_to_refuse(self):
+        # The schema cannot say "each site once" without `uniqueItems`, which one runtime
+        # rejects; `parse_merge_checker_result` refuses the repeat instead.
+        repeated = {**self.GROUP, "sites": [self.GROUP["sites"][0]] * 2}
+        self.assertEqual(_validate({"groups": [repeated], "summary": "s"},
+                                   _load(MERGE_CHECKER_SCHEMA)), [])
+
+
 class SynthesizerResultContract(unittest.TestCase):
     """The fifth round's contract. It carries one vocabulary for the whole run and one
     entry per defect, and it gives the unit no way to say a defect is wrong, no way to
     re-rank it, and no way to leave it out."""
 
     TIERS = ["Money can be taken twice", "A run stops instead of finishing"]
-    ONE = {"defect": "D1", "tier": "Money can be taken twice",
+    ONE = {"defect": "D1", "heading": "A retried payment is charged twice.",
+           "tier": "Money can be taken twice",
            "what_goes_wrong": "A retry re-posts the charge because nothing keys the request.",
            "fix": "Key the request and reject a repeat of the same key.",
+           "site_notes": [{"site": "S2", "note": "The refund path retries the same way."}],
            "cross_references": ["D4"]}
-    OTHER = {"defect": "D2", "tier": "A run stops instead of finishing",
+    OTHER = {"defect": "D2", "heading": "An empty input stops the run.",
+             "tier": "A run stops instead of finishing",
              "what_goes_wrong": "An empty list is indexed and the call dies.",
              "fix": "Return early on an empty input.",
+             "site_notes": [],
              "cross_references": []}
 
     def test_declares_the_tiers_the_defects_and_a_summary(self):
@@ -708,7 +897,47 @@ class SynthesizerResultContract(unittest.TestCase):
         self.assertEqual(set(document["required"]), {"tiers", "defects", "summary"})
         entry = document["properties"]["defects"]["items"]
         self.assertEqual(set(entry["required"]),
-                         {"defect", "tier", "what_goes_wrong", "fix", "cross_references"})
+                         {"defect", "heading", "tier", "what_goes_wrong", "fix", "site_notes",
+                          "cross_references"})
+
+    def test_a_site_note_is_a_record_and_never_a_map(self):
+        # A closed schema cannot describe keys it does not know, so a note keyed by its
+        # site id is refused here; the engine builds the map and refuses an unknown or
+        # repeated site.
+        document = _load(SYNTHESIZER_SCHEMA)
+        notes = document["properties"]["defects"]["items"]["properties"]["site_notes"]
+        self.assertEqual(notes["type"], "array")
+        self.assertEqual(set(notes["items"]["required"]), {"site", "note"})
+        self.assertTrue(_validate({"tiers": self.TIERS, "defects": [
+            {**self.ONE, "site_notes": {"S2": "The refund path retries."}}],
+            "summary": "s"}, document))
+        self.assertTrue(_validate({"tiers": self.TIERS, "defects": [
+            {**self.ONE, "site_notes": [{"site": "S2", "note": "x", "why": "y"}]}],
+            "summary": "s"}, document))
+
+    def test_every_text_a_defect_carries_has_a_length_limit(self):
+        # The limits are the engine's to enforce, word by word; the schema states them in
+        # characters as well, so a runtime that enforces the schema refuses early.
+        document = _load(SYNTHESIZER_SCHEMA)
+        entry = document["properties"]["defects"]["items"]["properties"]
+        self.assertEqual(entry["heading"]["maxLength"], 120)
+        for field in ("what_goes_wrong", "fix"):
+            with self.subTest(field=field):
+                self.assertIn("maxLength", entry[field])
+        note = entry["site_notes"]["items"]["properties"]["note"]
+        self.assertIn("maxLength", note)
+        self.assertTrue(_validate({"tiers": self.TIERS,
+                                   "defects": [{**self.ONE, "heading": "x" * 121}],
+                                   "summary": "s"}, document))
+        self.assertEqual(_validate({"tiers": self.TIERS,
+                                    "defects": [{**self.ONE, "heading": "x" * 120}],
+                                    "summary": "s"}, document), [])
+        self.assertTrue(_validate({"tiers": self.TIERS, "defects": [
+            {**self.ONE, "what_goes_wrong": "x" * (entry["what_goes_wrong"]["maxLength"] + 1)}],
+            "summary": "s"}, document))
+        self.assertTrue(_validate({"tiers": self.TIERS, "defects": [
+            {**self.ONE, "site_notes": [{"site": "S2", "note": "x" * (note["maxLength"] + 1)}]}],
+            "summary": "s"}, document))
 
     def test_the_tier_list_belongs_to_the_run_and_not_to_a_defect(self):
         # One vocabulary per run is the property this round exists for. A tier list nested
@@ -726,10 +955,11 @@ class SynthesizerResultContract(unittest.TestCase):
         # with no account of it is what the round exists to end; a nullable tier would take
         # the defect out of the grouping the unit was asked to produce.
         entry = _load(SYNTHESIZER_SCHEMA)["properties"]["defects"]["items"]["properties"]
-        for field in ("defect", "tier", "what_goes_wrong", "fix"):
+        for field in ("defect", "heading", "tier", "what_goes_wrong", "fix"):
             with self.subTest(field=field):
                 self.assertEqual(entry[field]["type"], "string")
         self.assertEqual(entry["cross_references"]["type"], "array")
+        self.assertEqual(entry["site_notes"]["type"], "array")
 
     def test_a_real_synthesis_result_validates(self):
         document = _load(SYNTHESIZER_SCHEMA)
@@ -798,11 +1028,16 @@ class SynthesizerResultContract(unittest.TestCase):
                                   document))
         self.assertTrue(_validate({"tiers": [""], "defects": [self.ONE], "summary": "s"},
                                   document))
-        for field in ("defect", "tier", "what_goes_wrong", "fix"):
+        for field in ("defect", "heading", "tier", "what_goes_wrong", "fix"):
             with self.subTest(empty=field):
                 self.assertTrue(_validate({"tiers": self.TIERS,
                                            "defects": [{**self.ONE, field: ""}],
                                            "summary": "s"}, document))
+        for field in ("site", "note"):
+            with self.subTest(empty=field):
+                self.assertTrue(_validate({"tiers": self.TIERS, "defects": [
+                    {**self.ONE, "site_notes": [{**self.ONE["site_notes"][0], field: ""}]}],
+                    "summary": "s"}, document))
         self.assertTrue(_validate({"tiers": self.TIERS,
                                    "defects": [{**self.ONE, "cross_references": [""]}],
                                    "summary": "s"}, document))
@@ -926,9 +1161,9 @@ class PhaseWorkerUnionContract(unittest.TestCase):
                     self.assertEqual(prop.get("minLength"), 1)
 
     def test_blocked_can_report_the_paths_its_cleanup_protocol_needs(self):
-        # plan-run tells the orchestrator to scope a BLOCKED cleanup to "the paths the
-        # worker reported changing" rather than a blanket reset. That was unexecutable
-        # while the BLOCKED branch had no field able to carry them.
+        # plan-run tells the orchestrator to scope a BLOCKED cleanup to "only the paths
+        # its result lists" rather than a blanket reset. That instruction is
+        # unexecutable unless the BLOCKED branch has a field able to carry them.
         blocked = next(
             b for b in _load(WORKER_SCHEMA)["properties"]["outcome"]["anyOf"]
             if b["title"] == "BLOCKED"
@@ -950,8 +1185,8 @@ class PhaseWorkerUnionContract(unittest.TestCase):
     def test_every_json_example_in_the_contract_doc_validates(self):
         # The worker is briefed by the DOC, not the schema, so drift between them means
         # the model is asked for one shape and graded against another. Substring checks
-        # cannot catch that — one example could revert to the old flat shape while every
-        # field name still appears somewhere. So parse each ```json block and validate
+        # cannot catch that — one example could take a flat shape the schema rejects while
+        # every field name still appears somewhere. So parse each ```json block and validate
         # it, with the doc's angle-bracket placeholders filled in.
         doc = (WORKER_SCHEMA.parent / "phase-worker-contract.md").read_text(
             encoding="utf-8"

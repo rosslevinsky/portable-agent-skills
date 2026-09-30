@@ -54,8 +54,8 @@ project at all, so there is nothing to ignore.
    # cannot even be entered is not a base. A bind mount is NOT covered — it is not a link,
    # and no pathname comparison sees through one.
    base=$( (cd -P -- "$base" 2>/dev/null && pwd -P) ) || base=$( (cd -P -- /tmp 2>/dev/null && pwd -P) )
-   # A root that cannot be resolved is refused, not compared as text: text is the comparison
-   # these two lines exist to replace.
+   # A root that cannot be resolved is refused, not compared as text, which a symlink or a
+   # second spelling of the same directory defeats.
    root_real=$( (cd -P -- "$root" 2>/dev/null && pwd -P) ) \
      || { echo "project root could not be resolved — see step 1" >&2; exit 1; }
    # The trailing slash comes OFF, because `pwd -P` answers `/` for the filesystem root and
@@ -66,7 +66,7 @@ project at all, so there is nothing to ignore.
    case "$base/" in "$root_real"/*) base=$( (cd -P -- /tmp 2>/dev/null && pwd -P) ) ;; esac
    # The FALLBACK is checked too, and refused rather than used: an audit rooted at /tmp
    # itself would otherwise put the report inside the tree being read. The PowerShell block
-   # below already refuses that case; this one accepted it.
+   # below refuses the same case.
    [ -n "$base" ] || { echo "no temp directory outside the audited tree; set TMPDIR" >&2; exit 1; }
    case "$base/" in "$root_real"/*)
      echo "no temp directory outside the audited tree; set TMPDIR and re-run" >&2; exit 1 ;;
@@ -105,8 +105,7 @@ project at all, so there is nothing to ignore.
    # WHERE IT LEADS, not how it is spelled. GetFullPath collapses a `..` segment, and then
    # EVERY component is followed to its target -- not just the leaf. A junction above the
    # candidate moves everything below it: `C:\work` linked to `D:\repo` leaves `C:\work\tmp`
-   # looking unrelated to the root it sits inside, and the textual comparison this replaced
-   # caught exactly that. Bounded, so a cycle cannot spin; a relative target resolves
+   # looking unrelated to the root it sits inside, which a textual comparison cannot see. Bounded, so a cycle cannot spin; a relative target resolves
    # against its own link's directory, not the caller's.
    function Resolve-Physical($p) {
        try { $p = [System.IO.Path]::GetFullPath($p) } catch { return $null }
@@ -125,7 +124,7 @@ project at all, so there is nothing to ignore.
                    if (-not [System.IO.Path]::IsPathRooted($target)) {
                        # Combine, not string concatenation: it joins with the platform's
                        # separator, and GetFullPath collapses a `..` only across one it
-                       # recognises. The parent of a top-level entry is the ROOT, which
+                       # recognizes. The parent of a top-level entry is the ROOT, which
                        # `Split-Path` reports as nothing -- and combining a relative target
                        # with nothing yields a relative path, which then resolves against
                        # whatever directory the caller happened to be in. On macOS the
@@ -275,15 +274,29 @@ classification names — so it forgoes more than the wall-clock win of paralleli
 per component concurrently, each with the inputs above; as each returns, write its
 `<run-dir>/03-<component-slug>.md` and flip its checkbox.
 
+**How a reviewer starts, and which way it ran.** An in-process sub-agent runs the host's own
+model, so no backend applies to it. A reviewer launched as a program goes through the supervisor
+the `diff-review` skill ships, `review_runner.py`, where `--backend <name>` picks its model and
+credentials from the user's backends file. If `diff-review` is not installed and the host has no
+in-process sub-agent, both are unavailable: review the components sequentially in this context,
+as above. Do the same for any component whose supervisor status is not `ok`. `REPORT.md` says
+which path ran, and why a component fell back.
+
 > **Claude adapter:** Launch all component sub-agents in a single message (one Agent tool call
 > per component, all in the same response). Run them as foreground agents so you receive all
 > results before Phase 4. Do not use `run_in_background: true`.
 
-> **Codex adapter:** Dispatch each component review as an **argv list**, with the prompt as
-> one element — `["codex", "exec", "-s", "read-only", "-c", "approval_policy=never",
-> "--skip-git-repo-check", "-C", "<dir>", "<prompt>"]`, **with stdin closed** — `codex exec`
-> reads stdin even when the prompt is already in argv, so a scripted call that leaves it open
-> blocks before it reaches the model, with no output to diagnose the hang by. **Never build
+> **Codex adapter:** Launch each component review through the supervisor as an **argv
+> list**, with the prompt as one element, where `<diff-review dir>` is that skill's installed
+> directory — `["<python>", "<diff-review dir>/review_runner.py", "--cwd", "<dir>",
+> "--deadline", "3600", "--result-mode", "stream-transcript", "--findings", "<run-dir>/03-<component-slug>.transcript",
+> "--", "codex", "exec", "--json", "-s", "read-only", "-c", "approval_policy=never",
+> "--skip-git-repo-check", "-C", "<dir>", "<prompt>"]`. For a backend, add `"--backend",
+> "<name>"` before the `"--"` and `"-m", "⟪model⟫", "⟪backend_args⟫"` after `"exec"`. The
+> supervisor writes the reviewer's transcript to `--findings`, from which you write
+> `03-<component-slug>.md`, and launches it **with stdin closed** — `codex exec` reads stdin
+> even when the prompt is already in argv, so a reviewer whose stdin is left open blocks
+> before it reaches the model, with no output to diagnose the hang by. **Never build
 > the command as a shell string with the prompt interpolated into quotes.** The prompt carries the attack-surface
 > document, which is derived from the repository under audit; inside a double-quoted shell
 > argument, `$(…)`, a backtick or a stray quote in that content becomes execution on the
@@ -331,6 +344,7 @@ Final report structure:
 # Security Review: <Project Name>
 Date: <YYYY-MM-DD>
 Run directory: <the absolute path printed at setup>
+Component reviews: <the supervisor, with the backend's name and model or on the CLI's own sign-in; in-process sub-agents; or sequentially in this context>
 
 ## Summary
 <total finding counts by severity>

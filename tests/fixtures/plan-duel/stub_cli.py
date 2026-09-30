@@ -19,12 +19,23 @@ handle:
   * ``--append PATH --content TEXT`` — appends TEXT to PATH (progress-file shape).
   * ``--sleep SECONDS`` — blocks, to exercise the timeout path.
   * ``--exit-code N`` — final exit status (defaults 0), to exercise failure paths.
+  * ``--stderr TEXT`` — diagnostics on stderr, which no capture policy may keep.
+  * ``--read-stdin-to PATH`` — reads stdin to end-of-file and writes how many bytes
+    arrived to PATH. Hangs on an open stdin, which is the property it probes.
+  * ``--spawn-grandchild PIDFILE`` — starts a long-sleeping child of its own and writes
+    that child's pid to PIDFILE, so a test can see whether a kill reached the tree.
+  * ``--verbose`` — accepted and ignored: an operational flag, the kind a resume may add.
+  * ``--env-digest NAME=PATH`` (repeatable) — writes the SHA-256 of variable NAME's value to
+    PATH, or ``unset``, so a test can see a value arrive without that value landing on disk.
 
-Order of operations is fixed: sleep, then side-effect writes, then stdout, then exit.
+Order of operations is fixed: grandchild, stdin, sleep, then side-effect writes (digests
+first), then stdout and stderr, then exit.
 """
 
 import argparse
+import hashlib
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -51,10 +62,32 @@ def main() -> int:
     parser.add_argument("--cwd-file")
     parser.add_argument("--sleep", type=float)
     parser.add_argument("--exit-code", type=int, default=0)
+    parser.add_argument("--stderr")
+    parser.add_argument("--read-stdin-to")
+    parser.add_argument("--spawn-grandchild")
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--env-digest", action="append", default=[])
     args = parser.parse_args()
+
+    if args.spawn_grandchild is not None:
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+        Path(args.spawn_grandchild).write_text(str(child.pid), encoding="utf-8")
+
+    if args.read_stdin_to is not None:
+        received = sys.stdin.buffer.read()
+        Path(args.read_stdin_to).write_text(str(len(received)), encoding="utf-8")
 
     if args.sleep:
         time.sleep(args.sleep)
+
+    for pair in args.env_digest:
+        name, _, path = pair.partition("=")
+        value = os.environ.get(name)
+        digest = ("unset" if value is None
+                  else hashlib.sha256(value.encode("utf-8")).hexdigest())
+        Path(path).write_text(digest, encoding="utf-8")
 
     if args.append is not None:
         # Append-only; never truncates a shared progress log.
@@ -76,6 +109,8 @@ def main() -> int:
         sys.stdout.write(args.stdout)
     if args.stdout_bytes:
         sys.stdout.write("y" * args.stdout_bytes)
+    if args.stderr is not None:
+        sys.stderr.write(args.stderr)
 
     return args.exit_code
 

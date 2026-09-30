@@ -1,0 +1,1 @@
+{"clusters": [{"members": ["cand-001"], "consequence": "The README calls the tree small, which it may not stay.", "split_reason": null}, {"members": ["cand-002"], "consequence": "The guide describes the engine without the helper's doubling, so a reader trusts it.", "split_reason": null}], "summary": "2 groups"}

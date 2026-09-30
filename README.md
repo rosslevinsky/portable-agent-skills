@@ -9,11 +9,18 @@ A collection of portable, cross-runtime agent skills for [Claude Code](https://d
 
 AI coding agents benefit from reusable, well-shaped workflows — "write a failing test first, then implement," "audit this codebase for security issues," "break a large task into committable phases." This repository packages those workflows as plain-markdown `SKILL.md` files that both **Claude Code** (Anthropic) and **Codex CLI** (OpenAI) can invoke, with equivalent behavior enforced by an automated portability contract.
 
-One install command drops 17 skills into the right places for both runtimes. CI enforces a contract that forbids runtime-specific tool names, requires a fallback wherever a skill leans on a companion skill, and flags private paths before they ship.
+One install command copies 17 skills to where both runtimes look for them. CI enforces a
+contract that forbids runtime-specific tool names, requires a fallback wherever a skill depends
+on a companion skill, and flags private paths before they ship.
+
+When a skill starts a second agent, that agent can run on a model you choose, including
+open-weight models served by OpenRouter or Fireworks. See [Choosing the model a second agent
+runs on](#choosing-the-model-a-second-agent-runs-on).
 
 ## How to use these skills
 
-The skills in this pack compose into a simple end-to-end workflow. If you only read one section of this README, read this one.
+The skills in this pack fit together into one simple workflow, from plan to finished feature. If
+you only read one section of this README, read this one.
 
 **How you invoke one.** You type these to the agent, in the same box you type anything else
 — never at a shell prompt. `/name` is Claude Code's shorthand, and this README uses it
@@ -27,11 +34,25 @@ its name. None of this works until the skills are installed — see
 
 `/cyw` runs a structured critical-review → fix → verify loop over whatever you just did. It is the single most useful skill in this pack. Use it after *any* non-trivial change — a bug fix, a refactor, a plan, a migration script, a commit message. It does not require a plan or phase structure; it just reviews the recent turn.
 
-**Run it more than once.** The skill already loops internally (up to 3 passes, stopping early once a *second or later* pass finds zero issues — a clean first pass still triggers a confirming review), but a *fresh* `/cyw` invocation — started as a separate call, not another pass inside the same one — starts from a clean context rather than one already shaped by the first review, and tends to surface different things. This is an observation from using it, not a measured result. Each fresh pass costs another round of model time, so spend the second and third on changes where being wrong would be expensive.
+**Run it more than once.** The skill already loops internally: up to 3 passes, stopping early
+once a *second or later* pass finds zero issues, so a clean first pass still triggers a
+confirming review. A *fresh* `/cyw` invocation, started as a separate call rather than another
+pass inside the same one, starts from a clean context instead of one already shaped by the first
+review. It tends to find different things. This is an observation from using it, not a measured
+result. Each fresh pass costs another round of model time, so spend the second and third on
+changes where being wrong would be expensive.
 
 ### `/clarify` — understand anything, grounded and honest
 
-`/clarify` explains something you don't understand — a concept, a term, code, a doc, an error, or an explanation that just didn't land. **Type it bare and it explains the last response**, with no round-trip asking which part you meant. Point it at something instead and it finds where that thing actually lives — this conversation, pasted text, a doc, code, or a link — reads that source, and explains it in plain, jargon-free English: what it is and why it matters first, any unavoidable term defined in the same sentence, the easy-to-miss part called out, everything else pruned. Its rule is *grounded or honest* — it never invents an explanation of something it can't actually read or verify; when it can't ground the referent, it tells you what's missing and asks. Works with or without a repository.
+`/clarify` explains something you don't understand — a concept, a term, code, a doc, an error,
+or an explanation that just didn't land. **Type it bare and it explains the last response**,
+without first asking which part you meant. Point it at something instead and it finds where that
+thing actually lives (this conversation, pasted text, a doc, code, or a link), reads that
+source, and explains it in plain, jargon-free English: what it is and why it matters first, any
+unavoidable term defined in the same sentence, the easy-to-miss part called out, everything else
+left out. Its rule is *grounded or honest*: it never invents an explanation of something it
+can't actually read or verify. When it can't find and read the thing you mean, it tells you
+what's missing and asks. Works with or without a repository.
 
 ### The planning cycle
 
@@ -44,17 +65,17 @@ For work bigger than a one-shot edit, the intended flow is:
 - **`/plan-init <task>`** — interviews you, explores the codebase, and writes `plans/<slug>/plan.md`: goal, checkable success criteria, constraints, non-goals, affected files. It stamps the plan `Format: v2`, registers it in the `plans/README.md` index, and adds a visual-verification success criterion when UI is in scope. It does *not* break the work into phases.
 - **`/plan-phase <path>`** — reads the plan and proposes an ordered **phase list** for your approval. Where phases are genuinely independent it says so in prose and names the phase that reconciles them; everything else is simply sequential, which is the common case. It then writes one phase document per phase plus the `execution.md` tracker — a checkbox list, one box per phase. A phase document is Goal, Work, Tests, Verification, two gate boxes and a compact **evidence record** — under 350 words of structure — and each phase is independently committable.
 - **`/plan-run <path>`** — executes phases in order, resuming from the **first unticked
-  box** and re-reading that phase's document before running it (so a crash at any point is
-  recoverable: the phase document's own checkboxes are the state, and the tracker is a
-  derived index). Mid-phase test runs stay filtered to the change, and each phase makes
-  **at most** one commit + push — none at all when it stages nothing, and one more only for
-  a CI remediation, which goes through the gate like any other change. That gate runs scoped
-  tests plus **`/web-verify`** (screenshot-first UI verification) where the phase has UI, and
-  a single-pass **`/cyw`** author review plus **`/diff-review`** (independent, diff-first
-  review — cross-runtime when a second runtime is available) wherever the phase produced a
-  reviewable diff; a phase that only touched plan metadata skips both and records why. It
-  fills each evidence record, and assembles an `as-built.md` drift report for a non-trivial
-  plan. Safe to restart — already-completed phases are skipped.
+  box** and re-reading that phase's document before running it. So it can recover from a
+  crash at any point: the phase document's own checkboxes hold the state, and the tracker is
+  an index built from them. Mid-phase test runs stay filtered to the change. Each phase makes
+  **at most** one commit + push: none at all when it stages nothing, and one more only for
+  a CI fix, which goes through the gate like any other change. That gate runs scoped tests,
+  plus **`/web-verify`** (screenshot-first UI verification) where the phase has UI. Wherever
+  the phase produced a reviewable diff, the gate also runs a single-pass **`/cyw`** author
+  review and **`/diff-review`** (independent, diff-first review, cross-runtime when a second
+  runtime is available); a phase that only touched plan metadata skips both and records why.
+  It fills each evidence record, and assembles an `as-built.md` drift report for a
+  non-trivial plan. Safe to restart: already-completed phases are skipped.
 
 Insert `/cyw` freely between steps. Common spots: after `/plan-init` (sanity-check the plan before breaking it down), after `/plan-phase` (sanity-check the breakdown before executing), and after `/plan-run` finishes (final sweep).
 
@@ -68,8 +89,8 @@ The three planning skills above are the **current** suite. The generation they r
 ships alongside them as **`/plan-init-v1`**, **`/plan-phase-v1`** and **`/plan-run-v1`**, on
 open-ended **bugfix-only** support — no removal date, and no new features backported.
 
-**Start new work with `/plan-init`.** Use a `-v1` skill only to finish a plan already in
-flight under it.
+**Start new work with `/plan-init`.** Use a `-v1` skill only to finish a plan already
+started under it.
 
 **What the current suite changed:**
 
@@ -86,11 +107,11 @@ flight under it.
 | Where a phase runs | in the one conversation | may be handed to a fresh worker per phase, so context does not pile up across phases |
 | At the end of the run | — | `plan-run` writes an `as-built.md` recording where the work departed from the plan — for a non-trivial plan only (three or more phases, or any plan with independent phases) |
 
-The row that matters most is the review one. Under `-v1` a phase is committed on the
-strength of the agent checking its own work. The current suite adds a second reviewer, and
-how independent that reviewer is depends on the host: another runtime is best, a fresh
-sub-agent in the same runtime is next, and where neither can be spawned it falls to the same
-context re-reading the diff from scratch with the rationale set aside. Only the last of those
+The row that matters most is the review one. Under `-v1` a phase is committed once the
+agent has checked its own work, and nobody else has. The current suite adds a second
+reviewer, and how independent that reviewer is depends on the host. Another runtime is best,
+and a fresh sub-agent in the same runtime is next. Where neither can be started, the same
+context re-reads the diff from scratch with the rationale set aside. Only the last of those
 has seen the reasoning behind the code. Coverage is the same either way; the strength of the
 second opinion is not.
 
@@ -103,7 +124,23 @@ from a file's contents.
 
 ### `/plan-duel <task>` — two models write the plan
 
-Swap it in for the plan-writing step when you have both Claude and Codex available. It runs from **either** runtime as the controller, with the other as the participant: each writes a plan following the condensed v2 methodology embedded in the skill (mirroring `/plan-init`'s content model), then they iteratively critique and refine against each other. Three exits: **convergence** (judge score ≥ 8/10, from round 3 onward), **stagnation** (no score improvement over 3 consecutive rounds), or the **10-round cap**. It produces a winning plan stamped `Format: v2` — feed it to `/plan-phase`. The duel is driven by a bundled, stdlib-only Python engine (`plan_duel.py`), so it has two prerequisites: a **Python 3.10+** interpreter, and **both** runtimes' CLIs on `PATH` — the three roles span the controller's own CLI (Agent A and the judge) as well as the participant's, and the engine resolves all three up front and halts naming any that are missing. **Budget for it before you start:** a round is three model calls (two plans, one judge), so a duel that runs to the cap is around thirty, each reading and writing a full plan document. That is minutes of wall clock and real spend on a metered plan. Use it on work where the plan itself is the risk, not on routine changes.
+Use it in place of the plan-writing step when you have both Claude and Codex available. You can
+start it from **either** runtime. The one you start it from is the controller, and the other
+takes part as the participant. Each writes a plan following the condensed v2 methodology
+embedded in the skill (mirroring `/plan-init`'s content model). Then, round by round, each
+critiques the other's plan and revises its own. Three exits: **convergence** (judge score ≥
+8/10, from round 3 onward), **stagnation** (no score improvement over 3 consecutive rounds), or
+the **10-round cap**. It produces a winning plan stamped `Format: v2`; feed it to `/plan-phase`.
+A bundled Python engine that uses only the standard library (`plan_duel.py`) runs the duel, so
+it has three prerequisites: a **Python 3.10+** interpreter; the **`diff-review`** skill
+installed beside it, because its bundled launcher starts every role; and, with the settings it
+ships, **both** runtimes' CLIs on `PATH`. That last one is because the three roles use both
+CLIs: the controller's own CLI runs Agent A and the judge, and the participant's CLI runs Agent
+B. The engine looks up the CLI for all three roles before it starts, and halts naming any that
+are missing. **Budget for it before you start:** a round is three model calls (two plans, one
+judge), so a duel that runs to the cap makes around thirty, each reading and writing a full plan
+document. That takes minutes and costs real money on a metered plan. Use it on work where the
+plan itself is the risk, not on routine changes.
 
 ### Cross-model adversarial review (install both Claude and Codex)
 
@@ -115,24 +152,29 @@ reviews Codex's.** A different model has different training and different blind 
 bugs, wrong assumptions, and missed edge cases the authoring model is systematically unlikely to
 catch on its own. It is an **adversarial** second opinion, not a restatement of the author's own view.
 
-This is the review-time counterpart to `/plan-duel` at plan time. Install both runtimes and you get
-a second, differently-minded model at the two highest-leverage moments — **designing the plan**
+This does at review time what `/plan-duel` does at plan time. Install both runtimes and you get
+a second, different model at the two moments where it matters most: **designing the plan**
 (`/plan-duel`) and **reviewing the code** (`/diff-review`).
 
-It degrades in steps, each of which still works, and runs in either direction (Claude-driven or Codex-driven):
+When something is missing it falls back in steps, and each step still works. It runs in either
+direction (Claude-driven or Codex-driven):
 
-- **Both runtimes present** → the review runs cross-model, in the *other* runtime, via a small
-  bundled Python 3 supervisor that streams the reviewer's output live and bounds it (idle/heartbeat
-  timeout + deadline) so a hung reviewer never blocks you.
+- **Both runtimes present** → the review runs cross-model, in the *other* runtime, through a
+  small bundled Python 3 program, the supervisor. It shows the reviewer's output as it arrives
+  and stops the reviewer at a time limit (a timeout when no output arrives for too long, and an
+  overall deadline), so a reviewer that hangs never blocks you.
 - **Only one runtime (or no Python 3)** → it falls back to a fresh **same-model** reviewer — still
-  independent of the authoring conversation, just not a different model.
+  independent of the authoring conversation, just not a different model. With a backend (see
+  [Choosing the model a second agent runs on](#choosing-the-model-a-second-agent-runs-on)), a
+  single runtime can still run the reviewer on a different model.
 - **No independent reviewer can be spawned at all** → the review still happens, in the authoring
-  context, by deliberately setting the rationale aside and re-reading the diff as an outsider. It
-  is reported as in-context, because that reviewer has seen the reasoning. Coverage holds all the
-  way down; only the strength of the second opinion varies with what the host offers.
+  context, by deliberately setting the rationale aside and re-reading the diff as an outsider.
+  It is reported as in-context, because that reviewer has seen the reasoning. At every step the
+  reviewer reads the same diff; only the strength of the second opinion varies with what the
+  host offers.
 
-Either way, only **blocker/major** findings gate a commit; style nits are recorded as non-blocking
-follow-ups. Turn the cross-model rung off for a run with `/plan-run --no-cross-review`.
+Either way, only **blocker/major** findings block a commit; style nits are recorded as non-blocking
+follow-ups. Turn the cross-model step off for a run with `/plan-run --no-cross-review`.
 
 **Five skills here could all be called "a review", and they are not interchangeable.**
 [`REVIEWS.md`](REVIEWS.md) sets them side by side: who reads the work, how much that reader
@@ -157,24 +199,31 @@ which settles the claim by *running* it in a separate copy of the tree rather th
 about it, and reports the command, the exit status and the output. A claim nothing can run is
 judged by reading the code instead, and says which of the two it was; a run that only searched
 the source is labeled as that rather than as a run of your code. With both runtimes installed,
-that challenger is the other model.
+the agent that checks a finding runs on the other model.
 
-One round asks a different question — **which shapes of input none of your tests construct** —
-and what it finds is reported as a test to write rather than as a defect, because a missing
-test is not a failure and a report that files it as one buries it among the dismissals.
+One round asks a different question: **which shapes of input none of your tests construct**.
+What it finds is reported as a test to write rather than as a defect, because a missing test
+is not a failure, and a report that lists it as one hides it among the dismissed findings.
 
 Those two rules give you something nothing else in the pack offers: **it proves it read
-everything you gave it.** Every file is accounted for, and the run fails and names the path if anything
-was left unassigned. Every other review here is bounded by something — a diff, a set of
-components chosen by judgment — and none of them can tell you what they missed.
+everything you gave it.** Every file is accounted for, and if anything was left unassigned the
+run fails and names the path. Every other review here is limited by something it chose, such as
+a diff or a set of components the agent picked, and none of them can tell you what they missed.
 
-It reports and never edits your tree. It needs Python 3.10+ for its bundled engine, and it is
-not a cheap run: two readers per area, plus a check for every finding. Use it before publishing
-something, not at every commit.
+**You get two things back.** A report for you to read (`report.md`, and `report.html`, the
+same content as a web page), where each defect is one mistake listed with every place it has to
+be fixed. And a fix brief for a coding agent (`fix-brief.md`, plus one `fix-brief/D<n>.md` per
+defect), holding only what an agent needs to make the fix. Hand the whole brief to one agent,
+or one defect's file to each. Give them the tree the review read: the commit the brief names,
+plus any uncommitted changes the review saw. The brief does not carry notes you add to the
+report, so leave out, or tell the agent about, any defect you marked as wrong.
 
-It does not replace the two reviews above it. `/diff-review` is anchored to a change set and
-`/security-review-codebase` sweeps a whole tree for vulnerabilities; this one reads whatever
-you point it at, for whatever problem you state.
+It never edits your tree. It needs Python 3.10+ for its bundled engine and the `diff-review`
+skill installed beside it. It is not a cheap run: two readers per area, plus a check for every
+finding. Use it before publishing something, not at every commit.
+
+It does not replace `/diff-review` or `/security-review-codebase`. `/diff-review` is limited to a change set, and `/security-review-codebase` sweeps a whole tree for vulnerabilities; this one
+reads whatever you point it at, for whatever problem you state.
 
 ### The rest of the pack
 
@@ -193,16 +242,17 @@ them have not been described yet:
   exploitable vulnerabilities, not general code smells. Single-pass by default; ask for a
   *deep* or *thorough* review and it splits the codebase into components, reviews each
   separately, then follows data across the boundaries between them. Neither mode writes
-  anything into the repository it is auditing: the single-pass review writes no files at all
-  and hands you its report directly, and deep mode's working files go to a directory under
-  your OS temp path, checked to be outside the audited tree, whose absolute path it prints.
+  anything into the repository it is auditing. The single-pass review writes no files at all
+  and hands you its report directly. Deep mode writes its working files to a directory under
+  your OS temp path, checks that the directory is outside the audited tree, and prints its
+  absolute path.
 - **`/web-verify`** — proves a web UI renders and behaves by looking at it, because a passing
   unit test does not mean the page shows what it should. It finds the Playwright setup the
   repo already has, drives the app through the flow under review, captures a screenshot at
-  each state (and frames from a video where ffmpeg is present), then inspects the images
-  against assertions **anchored** to content-bearing elements — a heading with the right
-  text, a table with rows — never "the page returned 200" or "a container exists", which
-  pass while the page is blank. A saved screenshot is evidence to inspect, never a
+  each state (and frames from a video where ffmpeg is present). It then checks the images
+  against assertions **anchored** to elements that carry content, such as a heading with the
+  right text or a table with rows. It never accepts "the page returned 200" or "a container
+  exists", which pass while the page is blank. A saved screenshot is evidence to inspect, never a
   conclusion: nothing counts as verified until the expected content is confirmed in an
   actual image. It never installs Playwright; without one it hands you a manual click-through
   checklist and says the verification ran in degraded mode. `/plan-run` runs it on every
@@ -210,7 +260,7 @@ them have not been described yet:
 - **`/demo-video`** — records a guided-tour walkthrough of a finished feature, driven slowly
   with pauses, with timed subtitles derived from `as-built.md`. Two prerequisites degrade it
   differently. Without **ffmpeg** you still get Playwright's own video with a subtitle file
-  beside it; only muxed-in captions, music and frame extraction are lost. Without
+  beside it; you lose only captions merged into the video file, music and frame extraction. Without
   **Playwright** there is no driver to capture anything with, so you get a narration script
   and a storyboard you assemble from stills of your own — not screenshots it took for you. It
   writes subtitles, not speech; narration audio is out of scope.
@@ -229,9 +279,9 @@ runtimes.
 | `plan-init` | Interviews you and writes a `Format: v2` plan registered in `plans/README.md`. The start of any non-trivial feature or refactor | Full |
 | `plan-phase` | Breaks a plan into an ordered phase list plus the `execution.md` tracker. After `/plan-init` or `/plan-duel` | Full |
 | `plan-run` | Executes the phases in order with a per-phase gate, and writes `as-built.md` for a non-trivial plan. After `/plan-phase` | Full |
-| `plan-duel` | Two models write competing plans and refine them against each other; needs Python 3.10+ and **both** CLIs. In place of `/plan-init` when the plan itself is the risk | Degraded |
+| `plan-duel` | Two models write competing plans and refine them against each other; needs Python 3.10+, the `diff-review` skill and **both** CLIs. In place of `/plan-init` when the plan itself is the risk | Degraded |
 | `diff-review` | Diff-first review by a second reviewer, as independent as the host allows and cross-model when both CLIs are present; never edits the tree. Before a merge, and inside the `/plan-run` gate | Degraded |
-| `review-panel` | Blind multi-agent sweep of a file set: bounded areas, readers who see nothing of each other, every finding checked by one who did not raise it; reports, never edits. Before publishing something. Needs a host that runs two workers at once and refuses one that cannot | Runtime-limited |
+| `review-panel` | Blind multi-agent sweep of a file set: bounded areas, readers who see nothing of each other, every finding checked by one who did not raise it; writes a report for you and a fix brief for an agent, never edits. Before publishing something. Needs a host that runs two workers at once and refuses one that cannot | Runtime-limited |
 | `security-review-codebase` | Whole-codebase audit for exploitable vulnerabilities; single-pass by default, hierarchical deep mode on request | Degraded |
 | `tdd` | Red/green/refactor, with the failing test confirmed before any implementation. When getting the behavior right matters more than getting it quickly | Full |
 | `commit` | Stages the paths the change touched, never a sweep of the tree, and writes the message from the diff; pushes only when asked | Full |
@@ -240,7 +290,7 @@ runtimes.
 | `extract-hooks` | Moves non-UI logic out of `.tsx` components into custom hooks. React and TypeScript only | Full |
 | `plan-init-v1` | Superseded: writes a v1 plan (bugfix-only support) | Full |
 | `plan-phase-v1` | Superseded: breaks a v1 plan into phases plus `phases.md` (bugfix-only) | Full |
-| `plan-run-v1` | Superseded: executes a `phases.md`-driven plan (bugfix-only). Only to finish a plan already in flight under v1 | Full |
+| `plan-run-v1` | Superseded: executes a `phases.md`-driven plan (bugfix-only). Only to finish a plan already started under v1 | Full |
 
 Not sure which of the review skills you want? Read [`REVIEWS.md`](REVIEWS.md).
 
@@ -285,17 +335,17 @@ python3 install.py --force      # replace a same-name skill it did not install
 python3 install.py --target DIR # one directory instead of the two defaults
 ```
 
-**`install.py` requires Python 3.10+**, and two skills need it whether or not you use the
-installer: `plan-duel` refuses to run without it, and `diff-review`'s cross-model rung
-needs it too. Needing it at
-install time reports that once, clearly, instead of leaving you with a skill that fails days
-later. Install as a plugin or by hand and you need no interpreter — every other skill in the
-pack is plain Markdown.
+**`install.py` requires Python 3.10+**, and three skills need it whether or not you use the
+installer: `plan-duel` and `review-panel` refuse to run without it, and `diff-review`'s
+cross-model step needs it too. Because the installer needs it as well, a missing interpreter
+is reported once, clearly, at install time, instead of leaving you with a skill that fails
+days later. Install as a plugin or by hand and you need no interpreter for the others — every other
+skill in the pack is plain Markdown.
 
-Three things worth knowing about how it behaves:
+Four things worth knowing about how it behaves:
 
 - **It removes skills it installed that this pack no longer ships.** A retired skill would
-  otherwise keep loading for ever — the runtimes find skills by looking for directories,
+  otherwise keep loading forever — the runtimes find skills by looking for directories,
   with no list to consult. Only directories recorded in its own manifest are removed, so
   anything you created is untouched.
 - **It will not replace a skill directory it did not install.** If you have your own
@@ -305,6 +355,209 @@ Three things worth knowing about how it behaves:
   leave a skill incomplete — `--verify` reports it, and another run replaces it. Ownership
   is recorded *before* anything is copied, which is what makes the repeat an ordinary run
   rather than one that refuses directories the installer itself created.
+- **It creates your backends file when you have none, and never touches one you have.** A
+  default install (no `--target`) writes `~/.portable-agent-skills/backends.json` from
+  `backends.default.json`, and beside it an empty key file for you to fill in. See below.
+
+### Choosing the model a second agent runs on
+
+Five skills start a second agent: `diff-review` (its reviewer), `plan-duel` (both sides and the
+judge), `review-panel` (each group of its readers and checkers), `plan-run` (a phase worker) and
+`security-review-codebase` (a component reviewer). By default that agent runs on Claude Code's
+or Codex's own sign-in. You can instead run it on another model by naming a **backend**,
+including open-weight models such as GLM, DeepSeek and Kimi. Open-weight means the model's
+weights are published, so many providers can serve it; you pay a provider such as OpenRouter or
+Fireworks rather than Anthropic or OpenAI.
+
+**A backend** is a named entry in one file you keep,
+`~/.portable-agent-skills/backends.json`. It says four things: which CLI runs the agent (Claude
+Code or Codex), which model, which provider serves it, and which environment variable holds
+the provider's key. The key itself is never in the file. [BACKENDS.md](BACKENDS.md) describes
+the file in full.
+
+**You do not need any of this.** With no file, or no folder, every agent runs on your Claude
+Code or Codex sign-in. Name no backend and the agent uses your sign-in. Sign-in and backends mix
+freely: one side of a duel can run on your Claude login while the other runs on Kimi K3.
+
+#### Set it up
+
+1. **Install as usual** (`python3 install.py`). A default install creates, only if they do not
+   exist yet:
+   - `~/.portable-agent-skills/backends.json` — the backends listed below;
+   - `~/.portable-agent-skills/keys.env` (`keys.ps1` on Windows) — each key empty. On Linux
+     and macOS only you can read it; on Windows it takes your home folder's permissions, which
+     by default admit only you;
+   - `~/.portable-agent-skills/.gitignore` — naming both key files. If you already have one
+     there, the installer adds whichever key file names it does not list, at the end, and
+     changes nothing else in it. If that `.gitignore` is a symbolic link, which git does not
+     read, the installer leaves it alone, creates no key file, and says why.
+
+   It never overwrites or deletes any of them afterwards, on reinstall, upgrade or uninstall.
+2. **Get an API key** from OpenRouter, Fireworks, or both, in each provider's account
+   settings. You need only the provider whose backends you use.
+3. **Put the key in the key file**, between the quotes:
+
+   ```bash
+   export FIREWORKS_API_KEY="<your Fireworks key>"
+   export OPENROUTER_API_KEY="<your OpenRouter key>"
+   ```
+
+   On Windows, `keys.ps1` holds `$env:FIREWORKS_API_KEY = "..."` lines instead. Leave a line
+   empty if you do not use that provider. An empty line still sets its variable to empty, over
+   any value your startup file exported earlier, so delete the line instead if you already
+   export that key elsewhere.
+4. **Load the key file from your shell's startup file.** The key file's first lines show the
+   line to add. The installer never edits your startup file. For bash (`~/.bashrc`) or zsh
+   (`~/.zshrc`):
+
+   ```bash
+   [ -f ~/.portable-agent-skills/keys.env ] && . ~/.portable-agent-skills/keys.env
+   ```
+
+   For PowerShell, add `. $HOME\.portable-agent-skills\keys.ps1` to your `$PROFILE`.
+5. **Open a new terminal, then start Claude Code or Codex from it.** A program started before
+   that line has run never sees the keys. To check without printing a key:
+
+   ```bash
+   test -n "$OPENROUTER_API_KEY" && echo "OpenRouter key is set"
+   test -n "$FIREWORKS_API_KEY"  && echo "Fireworks key is set"
+   ```
+
+   In PowerShell: `if ($env:OPENROUTER_API_KEY) { "OpenRouter key is set" }`.
+6. **Check a backend resolves.** This reads the file and makes no network call:
+
+   ```bash
+   python3 ~/.claude/skills/diff-review/review_runner.py --resolve-backend kimik3-codex-fireworks
+   ```
+
+   It prints `"status": "ok"` and the backend, or names what is wrong. On Windows, run `py -3
+   $HOME\.claude\skills\diff-review\review_runner.py --resolve-backend kimik3-codex-fireworks`.
+   An install with `--target` creates no backends file; copy `backends.default.json` to
+   `~/.portable-agent-skills/backends.json` yourself.
+7. **Try one real run.** Ask for a small review: "Review my last commit with the reviewer on
+   backend `kimik3-codex-fireworks`." The review report names the backend and model that ran.
+   If the key is missing, the run is refused before it starts, naming the variable.
+
+#### The installed backends
+
+Names read `<model>-<cli>-<provider>`.
+
+| Model | Claude Code | Codex |
+|---|---|---|
+| GLM-5.3 | `glm53-claude-openrouter`, `glm53-claude-fireworks` | `glm53-codex-fireworks` |
+| DeepSeek V4.1 Flash | `deepseek41-claude-openrouter`, `deepseek41-claude-fireworks` | `deepseek41-codex-openrouter`, `deepseek41-codex-fireworks` |
+| Kimi K3 | `kimik3-claude-openrouter`, `kimik3-claude-fireworks` | `kimik3-codex-openrouter`, `kimik3-codex-fireworks` |
+
+Of the three models, Kimi K3 costs the most and DeepSeek V4.1 Flash the least.
+
+A twelfth, Codex with GLM-5.3 on OpenRouter, is **set aside**: its name starts with `//`, so
+nothing can select it. Its answers do not reliably match the format a skill asks for, so a judge
+or a review-panel reader on it would fail. The same model works through Fireworks. The file's
+`why` note says how to switch it back on.
+
+**A reviewer can still change files.** The skills launch a reviewer with flags meant to stop
+it writing, and neither CLI guarantees that it cannot:
+
+- **Claude Code** (`--permission-mode plan`) checks each action itself, and your own settings
+  can allow more. If they pre-approve every shell command, a model that
+  decides to write a file through the shell can do so.
+- **Codex** (`-s read-only`) has the operating system refuse shell writes on Linux and macOS,
+  and less reliably on native Windows. Its own file-edit tool is checked only inside Codex,
+  so a bug there could let a write through.
+
+In practice a reviewer is told to change nothing and rarely tries. The realistic risks are a
+model "fixing" a bug it found, or text in the reviewed code telling it to run a command.
+Commit or stash work you cannot lose before reviewing code you did not write.
+
+#### Using a backend in each skill
+
+Ask in plain words and name the backend; the skill passes it on.
+
+| Skill | What to say |
+|---|---|
+| `diff-review` | "Review this diff with the reviewer on backend `kimik3-codex-fireworks`." |
+| `plan-duel` | "Duel this, with the Codex side on backend `deepseek41-codex-fireworks`." The skill adds the backend to that side's settings. |
+| `review-panel` | "Run the panel with its second group of readers on backend `glm53-claude-fireworks`." The panel runs two groups of readers, called lanes, and each can take its own backend. |
+| `plan-run` | "Run the plan, with phase workers on backend `kimik3-codex-fireworks`." |
+| `security-review-codebase` | "Deep review, with component reviewers on backend `glm53-codex-fireworks`." |
+
+Pick a backend whose middle word matches the CLI that runs that agent: `-claude-` for an agent
+Claude Code runs, `-codex-` for one Codex runs. A mismatch is refused before launch. Two skills
+can use only a `-codex-` backend. `plan-run` starts a phase worker as a separate program only
+when Codex runs the plan without you, and `security-review-codebase` only when Codex runs the
+deep review. Under Claude Code their workers run Claude's own model.
+
+Every skill says in its output which model actually ran. A backend applies only to an agent
+started as a separate program. An agent your host starts itself — a Claude Code sub-agent, for
+instance — runs the host's own model, and the skill says so.
+
+#### Where your data goes
+
+**Every installed backend asks its provider to run the model in the United States.** Each
+*provider enforces that request differently, and some only partly, and the file carries these
+*notes as `//` entries.
+
+- **OpenRouter** — the backends use its US address, `us.openrouter.ai`, which needs a
+  Business or Enterprise plan. OpenRouter sends those requests only to providers whose
+  hardware is in the US, and fails rather than sending them anywhere else.
+- **Fireworks** — Fireworks' normal service sends requests to data centers in several
+  countries. The backends use its US-only models, the ones whose names end in `-us`, which
+  Fireworks says "serve inference exclusively from the US" and prices at 1.5 times the
+  normal rate. On an ordinary account the `-us` name is the only thing keeping a request in
+  the US: a model name without it runs wherever Fireworks chooses, with no error. Only
+  Fireworks Enterprise accounts can make the whole account refuse non-US requests.
+
+**What is kept.** Fireworks stores no prompts or outputs for these models unless you opt in, and
+Codex tells it not to keep conversations. OpenRouter stores no prompts or outputs unless you
+turn on its logging, and currently skips that logging for requests through its US address even
+when it is on. The provider OpenRouter picks follows its own policy, which is why step 2 below
+matters.
+
+**What nobody can check from outside.** No response says which machine answered it. All of
+the above is each provider's published promise.
+
+**To have the providers refuse, not just avoid, sending your data elsewhere** (do these once, by
+hand):
+
+1. **OpenRouter guardrail.** Under Workspaces → Default → Guardrails, create a guardrail
+   whose *Data regions* allows only `us`, save it, and assign it to your API key under its
+   *API Keys* section — a guardrail does nothing until assigned. A request that reaches the
+   global address `openrouter.ai` by mistake is then refused with a 403.
+2. **OpenRouter zero data retention.** In Settings → Privacy, turn on Zero Data Retention for
+   *all other models* (the group GLM, DeepSeek and Kimi belong to), and check that *Private
+   Input & Output Logging* is off. OpenRouter will then use only providers that keep nothing.
+3. **Fireworks residency (Enterprise accounts only).** Settings → Governances → Data
+   Residency → US, or `firectl policy residency set US`. On other plans that page does not
+   exist; your safeguard is the `-us` model names, or reaching the same models through
+   OpenRouter's US address instead.
+
+#### Keeping keys safe
+
+- The backends file names a key's **variable**, never its value, so it is safe to share or
+  commit. The key file is not: only you can read it, the `.gitignore` beside it and this
+  repository's own `.gitignore` both name it, and it should never be synced. Sync
+  `backends.json` alone.
+- The pack never reads the key file. Keys reach an agent only from the shell you started it
+  in, which it inherits as any program does; the backend decides which of them the CLI
+  presents to the provider.
+- Every installed backend hands the CLI the provider's own key. A Claude Code backend also
+  blanks `ANTHROPIC_API_KEY`, and a Codex backend names a provider of its own, so your Anthropic
+  or OpenAI login is not sent to the provider.
+
+#### When something goes wrong
+
+| What you see | What it means |
+|---|---|
+| "these credentials read a variable that is not set, or is empty" | The key is not exported in the shell that started your agent. Fill it in, open a new terminal, start the agent from there. |
+| "no backend named …; defined: …" | A typo in the name, or the entry is set aside with `//`. The message lists the names that exist. |
+| "there is no backends file at …" | You named a backend but have no file. Run the installer, or copy `backends.default.json` there. |
+| 429 "temporarily rate-limited upstream" | The provider is out of capacity for that model. Wait a minute, or use the same model on the other provider. |
+| A 403 from `openrouter.ai` | Your US-only guardrail is working: the request went to the global address. Use a backend's `us.openrouter.ai` address. |
+| A reviewer's verdict is unreadable | Some model and provider pairs do not reliably keep to a requested format. Use another backend for that role. |
+
+To stop using a backend, name none. To set one aside, rename it `// name`; to remove all of
+them, delete `backends.json` — nothing else depends on it. [BACKENDS.md](BACKENDS.md) has the
+full format, the three ways a key can reach a model, and recipes for writing your own entries.
 
 ### Windows
 
@@ -397,9 +650,10 @@ git checkout v2026.06.0            # or whichever you want back
 and the two steps need different trees. The uninstall has to run the installer you are
 leaving, because it is the one whose manifest records what is on your machine; after the
 checkout that manifest is still there but the installer reading it is an older one. An older
-installer does not prune — it installs its own skills, writes a manifest listing only those,
-and leaves every skill it has never heard of on disk, unowned, where a later `--uninstall`
-skips it and a later run refuses to replace it without `--force`. Uninstalling first gives
+installer does not remove skills it no longer ships. It installs its own skills, writes a
+manifest listing only those, and leaves every skill it has never heard of on disk, unowned.
+A later `--uninstall` skips such a skill, and a later run refuses to replace it without
+`--force`. Uninstalling first gives
 you that version's skill set exactly.
 
 **Then run whatever installer that tag shipped**, which is why the last line above is not
@@ -464,7 +718,8 @@ python3 install.py --uninstall   # Windows: py -3 install.py --uninstall
 Only removes skills installed by this pack, tracked via an ownership manifest. A skill you
 created yourself is never in that manifest, so a same-named directory of your own is left
 untouched. Note the manifest records the *directory name*, not its contents: if you edited
-a skill this pack installed, uninstall still removes it, edits and all.
+a skill this pack installed, uninstall still removes it, edits and all. Your backends file
+and anything else in `~/.portable-agent-skills` are left in place.
 
 ## Development Setup
 
@@ -474,7 +729,7 @@ a skill this pack installed, uninstall still removes it, edits and all.
 python3 install.py
 ```
 
-Installing 17 skills is a copy of about 55,000 words — fast enough to be the inner loop.
+Installing 17 skills is a copy of about 55,000 words, fast enough to run after every edit.
 The runtimes read the installed copy, not this checkout, so an edit here changes nothing
 until it is reinstalled.
 
@@ -519,9 +774,9 @@ The workflow for skill authors who iterate this way:
    systems.
 
 Step 2 is deliberate: an edit an agent made to its own instructions is worth reading
-before it becomes the instructions. Step 3 is the one people miss, and a red run there
-says nothing about whether the edit is right — the budget is a size ratchet, and it only
-says the file grew.
+before it becomes the instructions. Step 3 is the one people miss. A failure there
+says nothing about whether the edit is right: the budget checks size and nothing else, and
+it only says the size changed.
 
 ### Checking an install
 
@@ -547,19 +802,19 @@ procedure relies on and a state it cannot see is a state nobody fixes.
 It compares **paths, then sizes, then bytes** — and in that order, so the cheap answers
 settle most of it. A path list catches a skill that is missing or has gained a file. Sizes
 catch what an interrupted copy leaves, since the destination name is created before the
-bytes are written. Only where the name and size already agree does it read the two files,
-which is what catches an edit that happens to preserve a file's length — for a pack of
+bytes are written. Only where the name and size already agree does it read the two files.
+That catches an edit that happens to keep a file's length the same. For a pack of
 instruction files that matters, because a skill is text a model obeys.
 
 If you edited a skill in place, `DIFFERS` will report it. That is the answer to the
 question asked, not an accusation: your install no longer matches the pack.
 
-Running `python3 install.py` with no flag reconciles everything above.
+Running `python3 install.py` with no flag fixes every case above.
 
 ### Consuming from another repo
 
-If you maintain another repository for machine setup, keep this pack as the single source
-of truth and point that setup at this checkout — run `python3 install.py` from it, or
+If you maintain another repository for machine setup, keep this pack as the one place
+the skills come from, and point that setup at this checkout — run `python3 install.py` from it, or
 `--target` a directory of your choosing.
 
 ## Validation
@@ -572,9 +827,10 @@ python3 scripts/validate_cross_runtime.py --test-fixtures tests  # Run fixture t
 python3 -m unittest discover -s tests -p 'test_*.py'        # Every Python suite
 ```
 
-Those three commands are the whole gate, and CI runs them on **Ubuntu, macOS and
-Windows**, the suites split into four shards per platform, plus a Linux pass under the C
-locale, which is the closest stand-in for the Windows console encoding. Windows is where a
+Those three commands are the whole gate. CI runs them on **Ubuntu, macOS and
+Windows**, with the suites split into four shards (parts run as separate jobs) per platform.
+It also runs a Linux pass under the C locale, which is the closest stand-in for the Windows
+console encoding. Windows is where a
 path-separator or text-encoding mistake actually surfaces, so it runs the same set rather
 than a subset. A **private** fork runs Linux only, because its runner minutes are billed;
 it gets all three platforms by starting the workflow by hand with its `all_platforms` input

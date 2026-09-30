@@ -128,8 +128,8 @@ class TheRunnerRefusesAnImpossibleShard(unittest.TestCase):
 
     def test_the_children_write_no_bytecode_beside_the_skills(self):
         """What makes running them at once safe rather than only faster. Concurrent
-        interpreters race to write the same `__pycache__`, and the projection tests then
-        find bytecode under `skills/` that the manifest does not classify — a suite that
+        interpreters race to write the same `__pycache__`, and a test that inventories the
+        tree then finds bytecode under `skills/` that nothing classifies — a suite that
         passes alone failing in company."""
         for stale in (REPO_ROOT / "skills").rglob("__pycache__"):
             shutil.rmtree(stale, ignore_errors=True)

@@ -85,7 +85,7 @@
                   "executed",
                   "documentary"
                 ],
-                "description": "What this run did. `executed` = the command ran the code under review and the output is what that code did. `documentary` = the command inspected the tree without running that code — a search for a string, a listing, a checksum — and the output shows what is written rather than what happens. Both are legitimate evidence and the status is judged the same way; they are counted and labelled apart, because a report that calls a text search a reproduction promises a reader a run that never happened."
+                "description": "What this run did. `executed` = the command ran the code under review and the output is what that code did. `documentary` = the command inspected the tree without running that code — a search for a string, a listing, a checksum — and the output shows what is written rather than what happens. Both are legitimate evidence and the status is judged the same way; they are counted and labeled apart, because a report that calls a text search a reproduction promises a reader a run that never happened."
               },
               "shows": {
                 "type": "string",

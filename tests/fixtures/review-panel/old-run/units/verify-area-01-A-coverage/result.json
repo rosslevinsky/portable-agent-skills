@@ -1,0 +1,1 @@
+{"verdicts": [{"candidate": "cand-005", "status": "gap_confirmed", "evidence": null, "rationale": "No test constructs a negative y.", "revision": null, "test_first": "tests/test_engine.py: call helper(3) and assert it returns 5.", "unresolved_reason": null, "covered_by": null}], "summary": "checked 1"}

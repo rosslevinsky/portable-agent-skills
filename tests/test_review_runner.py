@@ -386,7 +386,7 @@ class Robustness(unittest.TestCase):
 
     def test_child_stdin_is_devnull_not_a_hang(self):
         # A reviewer CLI that reads stdin must get immediate EOF, not block forever
-        # (a real cross-model dogfood hung here until stdin was redirected to DEVNULL).
+        # (an inherited stdin that stays open would leave it waiting here).
         with tempfile.TemporaryDirectory() as d:
             f = str(Path(d) / "findings.txt")
             child = "import sys; sys.stdin.read(); open(sys.argv[1],'w').write('EOF-OK')"
@@ -577,7 +577,7 @@ class VerdictExtraction(unittest.TestCase):
             self.assertEqual(json.loads(Path(v).read_text())["overall"], "final")
 
     def test_verdict_keys_absent_from_the_status_when_not_requested(self):
-        # Strictly additive: a caller that never asks for a verdict sees the old
+        # Strictly additive: a caller that never asks for a verdict sees the base
         # one-line status contract unchanged.
         with tempfile.TemporaryDirectory() as d:
             f = str(Path(d) / "findings.txt")
@@ -599,8 +599,8 @@ class VerdictExtraction(unittest.TestCase):
             self.assertEqual(json.loads(Path(v).read_text())["blocking_count"], 0)
 
     def test_structured_output_on_the_terminal_event_is_found(self):
-        # The load-bearing case, confirmed live: a runtime honoring an inline schema
-        # flag returns the validated object on its terminal result event while its
+        # The case the extractor exists for: a runtime honoring an inline schema flag
+        # returns the validated object on its terminal result event while its
         # assistant text stays PROSE. A transcript-only scan finds nothing there.
         with tempfile.TemporaryDirectory() as d:
             f, v = str(Path(d) / "findings.txt"), str(Path(d) / "verdict.json")
@@ -707,9 +707,10 @@ class VerdictExtraction(unittest.TestCase):
             self.assertEqual(json.loads(Path(v).read_text())["blocking_count"], 1)
 
     def test_off_enum_severity_never_lowers_the_claimed_count(self):
-        # Regression, and it was a merge-the-broken-thing bug: on the unenforced rungs
-        # the severity string is unvalidated model output, so an exact-match recount
-        # rewrote a two-blocker review to blocking_count 0 and a gate read it as clean.
+        # On the unenforced rungs the severity string is unvalidated model output. The
+        # recount compares severities case-insensitively and never lowers a count it
+        # cannot derive, so this two-blocker review keeps blocking_count >= 2 rather than
+        # going out as 0, which a gate reads as clean.
         with tempfile.TemporaryDirectory() as d:
             f, v = str(Path(d) / "findings.txt"), str(Path(d) / "verdict.json")
             off_enum = json.dumps({
@@ -732,8 +733,8 @@ class VerdictExtraction(unittest.TestCase):
             # The sentence has to describe the rule the code implements. Claiming each
             # unrecognized finding "was counted as blocking" is the rule the docstring
             # records as tried and rejected, and it contradicts its own number whenever the
-            # floor lands below the count of unknowns: a human reconciling "2 blocking"
-            # against four findings fixed two and merged with the other two unaddressed.
+            # floor lands below the count of unknowns: a reader reconciling "2 blocking"
+            # against four findings would fix two and leave the other two unaddressed.
             self.assertNotIn("each was counted as blocking", res["verdict_reason"])
             self.assertIn("NOT in it", res["verdict_reason"])
 
@@ -795,9 +796,9 @@ class VerdictExtraction(unittest.TestCase):
 
     def test_a_verdict_whose_only_finding_is_critical_is_not_published_as_clean(self):
         # `critical` is not in the enum, and it is the obvious word for a model to reach
-        # for. Both the derived count and the claimed one were 0, so max() published 0 and a
-        # gate merged a review that had just reported a critical finding. The rule is
-        # minimal: an underivable count must not be zero.
+        # for. Both the derived count and the claimed one are 0, and max(0, 0) is 0, so
+        # the recount floors an underivable count at 1 instead of publishing the 0 a gate
+        # reads as clean. The rule is minimal: an underivable count must not be zero.
         with tempfile.TemporaryDirectory() as d:
             f, v = str(Path(d) / "findings.txt"), str(Path(d) / "verdict.json")
             only_critical = json.dumps({
@@ -832,23 +833,24 @@ class VerdictExtraction(unittest.TestCase):
 
     def test_deeply_nested_json_does_not_convert_a_good_review_into_an_error(self):
         # raw_decode recurses once per nesting level, and RecursionError is not a
-        # ValueError - so it raised straight past the scan loop, AFTER the supervision
-        # loop had exited with every timeout already spent.
+        # ValueError - so unguarded it raises straight past the scan loop, AFTER the
+        # supervision loop has exited with every timeout already spent.
         deep = "{" * 6000 + "}" * 6000
         text = deep + "\n" + json.dumps(
             {"findings": [], "overall": "fine", "blocking_count": 0})
         self.assertIsNotNone(review_runner._scan_verdict(text))
 
     def test_the_scan_stays_fast_on_a_large_transcript(self):
-        # It ran once per `{` in a document that reaches megabytes, and nothing bounded
-        # it: --idle and --deadline both belong to the supervision loop, which has
-        # already exited by then. Measured at 7.9s before, 0.05s after, on this input.
+        # A forward scan decodes once per `{` in a document that can reach megabytes, which
+        # is quadratic, and nothing else bounds it: --idle and --deadline both belong to the
+        # supervision loop, which has already exited by then. The backward scan stops at the
+        # last verdict; a forward one takes seconds on this input.
         verdict = json.dumps({"findings": [], "overall": "fine", "blocking_count": 0})
         big = ("prose {not a verdict} more prose " * 40000) + verdict
         started = time.monotonic()
         self.assertIsNotNone(review_runner._scan_verdict(big))
         self.assertLess(time.monotonic() - started, 2.0,
-                        "the verdict scan is quadratic again")
+                        "the verdict scan is quadratic")
 
     def test_the_last_verdict_still_wins(self):
         # Anti-regression: scanning from the end must not change which object is chosen.
@@ -860,13 +862,13 @@ class VerdictExtraction(unittest.TestCase):
 
     @unittest.skipUnless(
         os.name == "posix",
-        "POSIX only, and skipped rather than weakened. The fix reaps the child's PROCESS "
-        "GROUP, and Windows has no group to reach — _terminate's own docstring declines "
-        "to over-claim containment there for the same reason. A descendant that outlives "
-        "the reviewer on Windows still holds the pipe until it exits; that limitation is "
-        "unchanged by this commit and is documented at _reap_group. Asserting the POSIX "
-        "outcome on Windows would fail for a real reason, and relaxing the assertion so "
-        "both platforms pass would cost the coverage on the platform that HAS the fix.")
+        "POSIX only, and skipped rather than weakened. The supervisor reaps the child's "
+        "PROCESS GROUP, and Windows has no group to reach — _terminate's own docstring "
+        "declines to over-claim containment there for the same reason. A descendant that "
+        "outlives the reviewer on Windows still holds the pipe until it exits, a limitation "
+        "documented at _reap_group. Asserting the POSIX outcome on Windows would fail for a "
+        "real reason, and relaxing the assertion so both platforms pass would cost the "
+        "coverage on the platform that HAS the group reap.")
     def test_a_grandchild_holding_the_pipe_does_not_cost_the_review(self):
         # The reviewer exits CLEANLY and leaves a helper holding the inherited stdout pipe,
         # so the reader never sees EOF. _terminate cannot help — it returns early when the
@@ -911,12 +913,12 @@ class VerdictExtraction(unittest.TestCase):
             self.assertFalse(Path(v).exists())
 
     def test_a_previous_verdict_can_never_be_read_as_this_runs_output(self):
-        """The invariant the old up-front `unlink` defended, kept a different way.
+        """A previous run's verdict is refused rather than deleted.
 
-        A gate must never act on run 1's verdict believing it describes run 2. The `unlink`
-        bought that by deleting the path before every early return, and needed a
-        tracked-file guard bolted on so it would not delete source. Refusing the collision
-        outright is stronger: run 2 never starts, so it cannot report anything at all.
+        A gate must never act on run 1's verdict believing it describes run 2. Deleting the
+        path before every early return would buy that only with a tracked-file guard so it
+        did not delete source. Refusing the collision outright is stronger: run 2 never
+        starts, so it cannot report anything at all.
         """
         with tempfile.TemporaryDirectory() as d:
             f, v = str(Path(d) / "findings.txt"), Path(d) / "verdict.json"
@@ -934,8 +936,8 @@ class VerdictExtraction(unittest.TestCase):
     def test_the_refusal_precedes_every_other_check(self):
         """`--idle 0` returning above the invalidation loop is the ordering this pins.
 
-        The collision refusal has to come first for the same reason the `unlink` did: a
-        check that returns earlier would let a run report on a path it never owned.
+        The collision refusal has to come first: a check that returns earlier would let a
+        run report on a path it never owned.
         """
         with tempfile.TemporaryDirectory() as d:
             f, v = Path(d) / "findings.txt", Path(d) / "verdict.json"
@@ -951,12 +953,12 @@ class VerdictExtraction(unittest.TestCase):
             self.assertTrue(v.exists())
 
     def test_a_positive_claim_is_never_lowered_to_zero(self):
-        """The shape the docstring's "FAILS CLOSED" did not cover, and the one that ships.
+        """A shape "FAILS CLOSED" has to cover, and the one the unenforced runtime ships.
 
         `blocking_count: 3` with an EMPTY findings array is what the unenforced runtime
         produces: the model totals its prose and then omits the structured list. Every
         severity present is recognized (there are none), so the off-enum floor never fires,
-        `claimed != counted` fires instead, and three blockers were republished as
+        `claimed != counted` fires instead, and three blockers must not be republished as
         `blocking_count: 0` — machine-clean, for a gate that reads the number.
         """
         with tempfile.TemporaryDirectory() as d:
@@ -1051,7 +1053,7 @@ class VerdictExtraction(unittest.TestCase):
 
     def test_a_review_with_no_verdict_object_writes_no_verdict_file(self):
         # A gate reads this path, so a file must exist there only when a verdict was
-        # actually extracted. (The stale-file half of this is now impossible by
+        # actually extracted. (The stale-file half of this is impossible by
         # construction: a run whose verdict path already exists refuses to start.)
         with tempfile.TemporaryDirectory() as d:
             f, v = str(Path(d) / "findings.txt"), Path(d) / "verdict.json"
@@ -1076,13 +1078,13 @@ class ReviewerTextThatCannotBeEncoded(unittest.TestCase):
     """One unpaired surrogate is enough to discard a COMPLETED cross-model review.
 
     JSON permits a lone ``\\ud800`` escape and Python's decoder produces the lone surrogate
-    faithfully, so it reaches the transcript intact. `write_text` then raises
-    `UnicodeEncodeError` — a `ValueError`, not an `OSError` — so the routing block's
-    `except OSError` did not see it and it escaped `run()` entirely. The caller fell open to
-    a same-model reviewer: the one trade the skill says must never be made, over a single
-    byte of prose.
+    faithfully, so it reaches the transcript intact. A plain `write_text` of it raises
+    `UnicodeEncodeError`, which is a `ValueError`, not an `OSError`.
 
-    The two reads on this path were already tolerant. The writes were not.
+    So every reviewer-derived write on this path takes `errors="replace"`, as the reads do,
+    and the routing block catches `ValueError` beside `OSError`. The review is reported
+    `ok` with `?` in place of the one bad character, rather than as an error that sends
+    the caller to a same-model reviewer: the one trade the skill says must never be made.
     """
 
     SURROGATE = "\ud800"
@@ -1125,7 +1127,7 @@ class ReviewerTextThatCannotBeEncoded(unittest.TestCase):
             self.assertNotIn(self.SURROGATE, written)
 
     def test_the_result_event_mode_survives_it_too(self):
-        """The sibling write, at the other result mode — same bug, same fix."""
+        """The sibling write, at the other result mode — same failure, same guard."""
         payload = f"one major {self.SURROGATE} finding"
         with tempfile.TemporaryDirectory() as d:
             f = str(Path(d) / "findings.txt")
@@ -1454,18 +1456,18 @@ class DisplayDecoderWiring(unittest.TestCase):
             self.wiring["built_in_loop"],
             "a decoder built inside the read loop is a fresh decoder per chunk — the "
             "regression exactly, and one a call COUNT of 1 cannot see.")
-        # Deliberately NOT `len(decoders) == 1`: `decoders` now holds every alias the
+        # Deliberately NOT `len(decoders) == 1`: `decoders` holds every alias the
         # object reaches, and an alias is not by itself a defect. `builds` is the count
         # that answers "how many decoders exist".
 
     def test_the_stderr_drain_is_wired_the_same_way(self):
         """The second reader must not be exempt from the rule the first one has.
 
-        `stderr` moved to its own pipe so a warning could no longer land mid-JSONL-line
-        and split it. That put a SECOND decode loop in the file — and this class only ever
-        checked `run`, so the new one could have re-introduced the per-chunk decoder the
-        whole class exists to forbid, silently. It lives at module level rather than inside
-        `run` precisely so both stay single-read, single-decoder, and both are now checked.
+        `stderr` has its own pipe so a warning cannot land mid-JSONL-line and split it.
+        That puts a SECOND decode loop in the file, `_drain_stderr`, beside
+        `_Stream._read_stdout`, and a check of the stdout reader alone says nothing about
+        it. This test holds `_drain_stderr` to the same rules: one decoder, built outside
+        the loop, one read site, its bytes fed to that decoder, and an EOF flush.
         """
         wiring = reader_wiring(self.source, func="_drain_stderr")
         self.assertEqual(wiring["builds"], 1,
@@ -1629,9 +1631,9 @@ class DisplayLogDecoding(unittest.TestCase):
             self.assertNotIn("\ufffd", text)
 
     def test_the_jsonl_path_is_unaffected_by_the_same_split(self):
-        # Green before and after: the JSONL reader accumulates raw BYTES and decodes per
-        # line, so a split inside a line never reaches it. Asserted anyway, because the
-        # display fix runs in the same reader and must leave this path alone.
+        # The JSONL reader accumulates raw BYTES and decodes per line, so a split inside
+        # a line never reaches it. Asserted anyway, because the display decoding runs in
+        # the same reader and must leave this path alone.
         with tempfile.TemporaryDirectory() as d:
             f, _ = self._run_split(d)
             self.assertEqual(Path(f).read_text(encoding="utf-8").strip(), "before—after")
@@ -1652,18 +1654,19 @@ class DisplayLogDecoding(unittest.TestCase):
 
 
 class TheStatusLineSurvivesAnUndrainedStderr(unittest.TestCase):
-    """The display log was closed on stdout's drain alone, under a live stderr thread.
+    """The display log is closed only once BOTH drains finish, never on stdout's alone.
 
     A reviewer that exits cleanly but leaves a helper holding the inherited stderr gives
-    ``drained=True`` and ``err_drained=False``. Closing the shared handle there turned
-    ``_drain_stderr``'s next write into an uncaught ``ValueError``, and the thread traceback
-    printed AHEAD of the JSON status line. A caller capturing with ``2>&1`` — the shape
-    SKILL.md's polling recipe invites — then never got parseable JSON and read a finished
-    ``status: ok`` review as a hang.
+    ``drained=True`` and ``err_drained=False``. The runner then reaps the process group,
+    waits for stderr again, and closes the shared handle only when both have drained.
+    ``write_display`` catches ``OSError`` only, so a write to a closed handle raises an
+    uncaught ``ValueError`` in ``_drain_stderr``, whose thread traceback prints AHEAD of the
+    JSON status line. A caller capturing with ``2>&1`` — the shape SKILL.md's polling recipe
+    invites — must get parseable JSON from a finished ``status: ok`` review.
 
-    A real subprocess with a combined capture, because that IS the defect. The transcript is
-    large on purpose: the window is however much work ``run()`` still has to do after the
-    close, and a small one did not fire it.
+    A real subprocess with a combined capture, because the combined stream is what that
+    caller reads. The transcript is large on purpose: the window is however much work
+    ``run()`` still has to do after the close, and a large transcript keeps it open.
     """
 
     def test_the_combined_capture_is_parseable_json(self):
@@ -1705,18 +1708,18 @@ class TheStatusLineSurvivesAnUndrainedStderr(unittest.TestCase):
                 self.fail(f"the combined capture is not parseable JSON:\n{combined[:2000]}")
             self.assertEqual(status["status"], "ok")
             # The whole capture, not merely its last line: a caller reading the stream as
-            # one object is the case that broke.
+            # one object is the case at risk.
             self.assertEqual(json.loads(combined.strip())["status"], "ok")
 
 
 class TheProgramCheckedIsTheProgramRun(unittest.TestCase):
-    """`os.path.isfile(cmd[0])` and `Popen(cmd, cwd=...)` did not resolve the same path.
+    """`os.path.isfile(cmd[0])` and `Popen(cmd, cwd=...)` do not resolve the same path.
 
     `os.path.isfile` answers relative to the SUPERVISOR's working directory. On POSIX the
     exec happens after the chdir, so `Popen` resolves a relative program path against
     `--cwd` instead — a different file, checked in one place and run from another. On
     Windows CreateProcess resolves it against the calling process's directory, so the two
-    platforms did not even agree with each other.
+    platforms do not even agree with each other.
 
     Refused rather than resolved against `--cwd`. `--cwd` is the checkout being reviewed,
     and running a program out of it is exactly what the PATH-only lookup above exists to
@@ -1806,14 +1809,14 @@ class TheProgramCheckedIsTheProgramRun(unittest.TestCase):
 class ItOwnsOnlyWhatItCreates(unittest.TestCase):
     """The supervisor writes files it creates and removes only those. Nothing else.
 
-    This replaces ~115 lines that asked git whether an output path was tracked, so the
-    unconditional up-front `unlink` would not destroy source. That guard had to reconstruct
-    an answer git owns and failed open three times over three rounds — on a git error, on
-    repository discovery, on a case-folding filesystem.
+    The alternative is an unconditional up-front `unlink` guarded by asking git whether an
+    output path is tracked, so it would not destroy source. Such a guard has to reconstruct
+    an answer git owns and fails open in more than one way — on a git error, on repository
+    discovery, on a case-folding filesystem.
 
     Refusing a path that already exists removes the question. Anything at those paths
-    afterwards was created by this run, which is stronger than the invariant the `unlink`
-    defended: a gate cannot read a previous run's verdict as this one's.
+    afterwards was created by this run, which also means a gate cannot read a previous
+    run's verdict as this one's.
     """
 
     def _child_writing(self, path, text="one blocker\n"):
@@ -2046,17 +2049,19 @@ class OwnershipIsTakenNotObserved(unittest.TestCase):
 
     def test_a_relative_output_path_with_cwd_is_refused_rather_than_guessed(self):
         """Two directories, one name. The supervisor resolves against its own cwd while
-        the child runs in --cwd, so each created or looked for a different file: the run
-        reported that the reviewer wrote nothing and left the real output behind."""
+        the child runs in --cwd, so a relative name means a different file to each. The
+        run refuses a relative output path whenever --cwd is set, before it creates
+        anything, and asks for an absolute one."""
         out = _run(*["--idle", "5", "--deadline", "10", "--cwd", str(self.dir), "--findings", "findings.md",
                            "--result-mode", "stream-transcript", "--", "true"])
         self.assertEqual(out.get("status"), "error")
         self.assertIn("absolute", out.get("reason", ""))
 
     def test_display_is_in_the_same_path_guard(self):
-        """It was compared for findings against verdict only. Sharing a path with
-        --display in external-file mode let the display handle wrap start/end markers
-        around the reviewer's write, and the corrupted file was read as the result."""
+        """Every pair of output paths is compared, --display included, not only findings
+        against verdict. The display handle writes its own start/end markers into the file
+        it names, and the findings file is what the supervisor reads as the result, so a
+        shared path is refused as "the same path"."""
         shared = self.dir / "same.md"
         out = _run(*["--idle", "5", "--deadline", "10", "--display", str(shared), "--findings", str(shared),
                            "--result-mode", "stream-transcript", "--", "true"])
@@ -2077,14 +2082,14 @@ class OwnershipIsTakenNotObserved(unittest.TestCase):
 
 
 class AFailedLaunchReleasesWhatItClaimed(unittest.TestCase):
-    """Claiming the outputs and then failing to launch left them behind.
+    """Claiming the outputs and then failing to launch must not leave them behind.
 
     The supervisor takes `--findings` and `--verdict-json` with `O_CREAT | O_EXCL`, which
     is how it can say "this is mine" rather than "nothing was here a moment ago". A refused
-    CLAIM already unlinks what it made. A refused LAUNCH did not — so two empty files
-    survived, and the next attempt refused a path it had not created. The retry then failed
-    for a reason that had nothing to do with the retry, and the operator deleted files by
-    hand to run the same command again. A bad `--cwd` is enough to reach it.
+    CLAIM unlinks what it made, and a refused LAUNCH must too — otherwise two empty files
+    survive, and the next attempt refuses a path it had not created. The retry then fails
+    for a reason that has nothing to do with the retry, and the operator has to delete files
+    by hand to run the same command again. A bad `--cwd` is enough to reach it.
     """
 
     def _run(self, findings, verdict, cwd):
@@ -2645,8 +2650,9 @@ class AVerdictPathTheClaimSkippedIsNotDeleted(unittest.TestCase):
 
 
 class ABlockingCountThatIntCannotRead(unittest.TestCase):
-    """`isdigit()` is not `int()`. Each of these reached `int()` and raised, out of a review
-    that had already succeeded, from outside every handler in the program."""
+    """`isdigit()` is not `int()`. Each of these, handed to `int()` unguarded, raises, and
+    the runner's last-resort handler then reports a review that had already succeeded as an
+    unexpected error."""
 
     def test_strings_int_refuses_are_read_as_no_claim(self):
         for text in ("++2", "²", "9" * 5000, " ", "2.5"):
@@ -2854,7 +2860,8 @@ class TheOutcomeIsDecidedFromWhatArrived(unittest.TestCase):
             self.assertEqual(Path(args.findings).read_text(encoding="utf-8"), "the review\n")
 
     def test_an_undrained_pipe_is_fatal_only_when_the_terminal_event_never_arrived(self):
-        """The rule DR12 asked for, asked of the step that decides it."""
+        """An undrained pipe is fatal only when no terminal event arrived; a successful terminal
+        event lets the completed transcript be published."""
         for terminal, expected in (("ok", "ok"), (None, "error")):
             with self.subTest(terminal=terminal), tempfile.TemporaryDirectory() as d:
                 args = self._args(d)
@@ -3049,9 +3056,9 @@ class TheStreamWatchesTheReviewerWhileItRuns(unittest.TestCase):
 
 class TheInterruptsObjectOwnsTheOneStatusLine(unittest.TestCase):
     """Cancellation in one place: what to terminate, what to remove, and the rule that exactly
-    one JSON status line is printed however the run ends. That rule broke three times while it
-    was spread across `run` — printing nothing, printing twice, and printing before a handler
-    could know a status existed — so these ask the object for it directly."""
+    one JSON status line is printed however the run ends. Spread across `run`, that rule is
+    easy to break three ways — printing nothing, printing twice, and printing before a
+    handler can know a status exists — so these ask the object for it directly."""
 
     def _guard(self):
         guard = review_runner._Interrupts()
@@ -3820,6 +3827,759 @@ class AnExceptionNobodyHandledStillStopsTheReviewer(unittest.TestCase):
             self.assertFalse(alive, "the reviewer outlived the supervisor's unexpected exit")
             self.assertFalse(findings.exists(), "the claimed findings file was not released")
 
+
+# --- backends and the agent's environment -------------------------------------------------
+# A backend is a named entry in a user-level JSON file saying which model, where, and with
+# what credentials. These classes drive the supervisor with a stub agent that writes its own
+# argv and environment to the findings file, so what reached the child is read back exactly.
+
+_BACKENDS_VAR = "PORTABLE_AGENT_SKILLS_BACKENDS"
+
+# The stub agent: `-c <this> <findings> <rest...>` writes {"argv": rest, "env": environ}.
+_DUMP_CHILD = ("import io, json, os, sys; "
+               "io.open(sys.argv[1], 'w', encoding='utf-8').write("
+               "json.dumps({'argv': sys.argv[2:], 'env': dict(os.environ)}))")
+
+
+def _this_harness():
+    """The harness name the supervisor reads off this interpreter's argv0."""
+    return review_runner.harness_of(PY)
+
+
+class _BackendCase(unittest.TestCase):
+    """Shared set-up: a scratch directory, a backends file, and a supervised stub agent."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+        self.backends_file = self.dir / "backends.json"
+        patcher = unittest.mock.patch.dict(os.environ, {_BACKENDS_VAR: str(self.backends_file)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self._runs = 0
+
+    def write_backends(self, backends):
+        self.backends_file.write_text(json.dumps(backends), encoding="utf-8")
+
+    def findings(self):
+        self._runs += 1
+        return str(self.dir / f"findings-{self._runs}.json")
+
+    def supervise(self, *flags, agent_args=None, findings=None):
+        """Run the supervisor over the dump stub; return (status, what the child saw).
+
+        With a backend and no argv given, the stub is handed `--model ⟪model⟫`: a backend's
+        model has to reach the argv, or the run is refused.
+        """
+        findings = findings or self.findings()
+        if agent_args is None:
+            agent_args = ("--model", "⟪model⟫") if "--backend" in flags else ()
+        status = _run("--idle", "20", "--deadline", "60", "--findings", findings,
+                      "--result-mode", "external-file", *flags,
+                      "--", PY, "-c", _DUMP_CHILD, findings, *agent_args)
+        seen = None
+        if status["status"] == "ok":
+            seen = json.loads(_read_utf8(findings))
+        return status, seen
+
+    def resolve(self, name):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            code = review_runner.main(["--resolve-backend", name])
+        return code, json.loads(buf.getvalue().strip().splitlines()[-1])
+
+
+class ABackendReachesTheAgent(_BackendCase):
+    def test_a_named_backend_reaches_the_agent_as_argv_and_settings(self):
+        self.write_backends({"alt": {"harness": _this_harness(), "model": "model-one",
+                                     "args": ["--provider-flag", "value"],
+                                     "env": {"STUB_BASE_URL": "http://127.0.0.1:9/v1"}}})
+        status, seen = self.supervise("--backend", "alt",
+                                      agent_args=("--model", "⟪model⟫", "⟪backend_args⟫"))
+        self.assertEqual(status["status"], "ok", status)
+        self.assertEqual(seen["argv"], ["--model", "model-one", "--provider-flag", "value"])
+        self.assertEqual(seen["env"]["STUB_BASE_URL"], "http://127.0.0.1:9/v1")
+
+    def test_resolve_backend_prints_exactly_the_backends_fields(self):
+        self.write_backends({"full": {"harness": "some-cli", "model": "m",
+                                      "args": ["-c", "x=1"], "env": {"A": "1"},
+                                      "env_from_parent": {"CHILD_KEY": "PARENT_KEY"}},
+                             "bare": {"harness": "some-cli", "model": "m2"}})
+        code, out = self.resolve("full")
+        self.assertEqual(code, 0)
+        self.assertEqual(out, {"status": "ok", "backend": {
+            "harness": "some-cli", "model": "m", "args": ["-c", "x=1"], "env": {"A": "1"},
+            "env_from_parent": {"CHILD_KEY": "PARENT_KEY"}}})
+        # The optional fields are filled with their empty defaults, so a caller reads one
+        # shape whatever the user wrote.
+        code, out = self.resolve("bare")
+        self.assertEqual(code, 0)
+        self.assertEqual(out["backend"], {"harness": "some-cli", "model": "m2", "args": [],
+                                          "env": {}, "env_from_parent": {}})
+
+    def test_an_unknown_backend_is_refused_naming_the_defined_ones(self):
+        self.write_backends({"alpha": {"harness": "a", "model": "m"},
+                             "beta": {"harness": "b", "model": "m"}})
+        findings = self.findings()
+        status, _ = self.supervise("--backend", "gamma", findings=findings)
+        self.assertEqual(status["status"], "error")
+        for word in ("gamma", "alpha", "beta"):
+            self.assertIn(word, status["reason"])
+        self.assertFalse(Path(findings).exists(), "a refused request created its output")
+        code, out = self.resolve("gamma")
+        self.assertEqual(code, 1)
+        self.assertEqual(out["status"], "error")
+        self.assertIn("alpha", out["reason"])
+
+    def test_an_entry_named_with_a_leading_double_slash_is_a_comment(self):
+        """JSON has no comments, so `//` before a name is how a user sets an entry aside
+        and says why. It is skipped whatever it holds, cannot be selected, and is not listed
+        among the defined backends."""
+        self.write_backends({"// off": {"why": "held the schema 1 of 3",
+                                        "harness": "a", "model": "m", "surplus": 1},
+                             "//": "a note of any shape",
+                             "alpha": {"harness": "a", "model": "m"}})
+        code, out = self.resolve("alpha")
+        self.assertEqual((code, out["status"]), (0, "ok"))
+        code, out = self.resolve("// off")
+        self.assertEqual(code, 1)
+        self.assertNotIn("// off", out["reason"].split("defined:")[-1])
+
+    def test_a_missing_backends_file_is_refused_naming_where_it_looked(self):
+        status, _ = self.supervise("--backend", "alt")
+        self.assertEqual(status["status"], "error")
+        self.assertIn(str(self.backends_file), status["reason"])
+        self.assertIn(_BACKENDS_VAR, status["reason"])
+
+    def test_a_malformed_field_is_refused_when_the_file_is_read(self):
+        good = {"harness": "cli", "model": "m"}
+        cases = {
+            "an env value that is not a string": {"b": {**good, "env": {"KEY": 1}}},
+            "args that is not a list": {"b": {**good, "args": "--flag"}},
+            "an args element that is not a string": {"b": {**good, "args": ["--x", 2]}},
+            "an unknown key": {"b": {**good, "slots": 2}},
+            "no harness": {"b": {"model": "m"}},
+            "no model": {"b": {"harness": "cli"}},
+            "an empty model": {"b": {**good, "model": ""}},
+            "a model that is not a string": {"b": {**good, "model": 5}},
+            "a forwarded name that is not a string": {"b": {**good,
+                                                            "env_from_parent": {"A": 3}}},
+            "an env name holding '='": {"b": {**good, "env": {"A=B": "1"}}},
+            "a backend that is not an object": {"b": ["cli", "m"]},
+            "a file that is not an object": [good],
+        }
+        for label, content in cases.items():
+            with self.subTest(label):
+                self.write_backends(content)
+                code, out = self.resolve("b")
+                self.assertEqual(code, 1, out)
+                self.assertEqual(out["status"], "error")
+                self.assertIn(str(self.backends_file), out["reason"])
+        with self.subTest("invalid JSON"):
+            self.backends_file.write_text("{not json", encoding="utf-8")
+            code, out = self.resolve("b")
+            self.assertEqual(code, 1)
+        with self.subTest("one backend named twice"):
+            self.backends_file.write_text(
+                '{"b": {"harness": "cli", "model": "m"}, "b": {"harness": "cli", "model": "n"}}',
+                encoding="utf-8")
+            code, out = self.resolve("b")
+            self.assertEqual(code, 1)
+            self.assertIn("more than once", out["reason"])
+
+    def test_the_default_file_lives_under_the_home_folder(self):
+        home = self.dir / "home"
+        with unittest.mock.patch.dict(os.environ), \
+                unittest.mock.patch.object(review_runner.Path, "home", lambda: home):
+            os.environ.pop(_BACKENDS_VAR, None)
+            self.assertEqual(review_runner.backends_path(),
+                             home / ".portable-agent-skills" / "backends.json")
+            os.environ[_BACKENDS_VAR] = str(self.dir / "elsewhere.json")
+            self.assertEqual(review_runner.backends_path(), self.dir / "elsewhere.json")
+
+
+class ABackendFitsTheCommandItIsGiven(_BackendCase):
+    def test_both_markers_are_filled_wherever_they_stand(self):
+        self.write_backends({"alt": {"harness": _this_harness(), "model": "m-2",
+                                     "args": ["-c", "provider=x"]}})
+        status, seen = self.supervise("--backend", "alt",
+                                      agent_args=("--model=⟪model⟫", "⟪backend_args⟫", "tail"))
+        self.assertEqual(status["status"], "ok", status)
+        self.assertEqual(seen["argv"], ["--model=m-2", "-c", "provider=x", "tail"])
+
+    def test_empty_backend_args_expand_to_nothing(self):
+        self.write_backends({"alt": {"harness": _this_harness(), "model": "m"}})
+        status, seen = self.supervise("--backend", "alt",
+                                      agent_args=("⟪backend_args⟫", "--model", "⟪model⟫"))
+        self.assertEqual(status["status"], "ok", status)
+        self.assertEqual(seen["argv"], ["--model", "m"])
+
+    def test_a_backend_written_for_another_harness_is_refused_before_launch(self):
+        self.write_backends({"other": {"harness": "a-different-cli", "model": "m"}})
+        findings = self.findings()
+        status, _ = self.supervise("--backend", "other", findings=findings)
+        self.assertEqual(status["status"], "error")
+        self.assertIn("a-different-cli", status["reason"])
+        self.assertIn(_this_harness(), status["reason"])
+        self.assertFalse(Path(findings).exists(), "the agent ran on a mismatched backend")
+
+    def test_backend_args_with_nowhere_to_go_are_refused(self):
+        self.write_backends({"alt": {"harness": _this_harness(), "model": "m",
+                                     "args": ["-c", "provider=x"]}})
+        findings = self.findings()
+        status, _ = self.supervise("--backend", "alt", agent_args=("--model", "m"),
+                                   findings=findings)
+        self.assertEqual(status["status"], "error")
+        self.assertIn("⟪backend_args⟫", status["reason"])
+        self.assertFalse(Path(findings).exists())
+
+    def test_an_argv_whose_markers_the_caller_filled_passes_through_unchanged(self):
+        self.write_backends({"alt": {"harness": _this_harness(), "model": "m-3",
+                                     "args": ["-c", "provider=x"]}})
+        filled = ("--model", "m-3", "-c", "provider=x", "--verbose")
+        status, seen = self.supervise("--backend", "alt", agent_args=filled)
+        self.assertEqual(status["status"], "ok", status)
+        self.assertEqual(seen["argv"], list(filled))
+
+    def test_the_model_marker_is_filled_inside_the_backends_own_args_too(self):
+        self.write_backends({"alt": {"harness": _this_harness(), "model": "m-4",
+                                     "args": ["-c", "model=\"⟪model⟫\""]}})
+        status, seen = self.supervise("--backend", "alt", agent_args=("⟪backend_args⟫",))
+        self.assertEqual(status["status"], "ok", status)
+        self.assertEqual(seen["argv"], ["-c", "model=\"m-4\""])
+        # A caller that filled the markers itself carries the args with the model in them.
+        status, seen = self.supervise("--backend", "alt", agent_args=("-c", "model=\"m-4\""))
+        self.assertEqual(status["status"], "ok", status)
+        self.assertEqual(seen["argv"], ["-c", "model=\"m-4\""])
+
+    def test_an_empty_backend_name_is_refused_not_ignored(self):
+        self.write_backends({"alt": {"harness": _this_harness(), "model": "m"}})
+        status, _ = self.supervise("--backend", "")
+        self.assertEqual(status["status"], "error")
+        self.assertIn("alt", status["reason"])
+
+    def test_a_marker_with_no_backend_is_refused(self):
+        for marker in ("⟪model⟫", "⟪backend_args⟫"):
+            with self.subTest(marker):
+                status, _ = self.supervise(agent_args=("--model", marker))
+                self.assertEqual(status["status"], "error")
+                self.assertIn("--backend", status["reason"])
+
+    def test_a_marker_inside_a_prompt_is_left_alone(self):
+        """A review prompt is an argument too, and may mention either marker. Only an argument
+        that IS the marker, or a setting whose value is the model marker, is filled."""
+        # The markers must reach the child unfilled, so they travel as argv — which an ASCII
+        # filesystem encoding (LC_ALL=C) cannot carry: `Popen` raises before the child starts.
+        try:
+            os.fsencode("⟪")
+        except UnicodeEncodeError:
+            self.skipTest("the filesystem encoding cannot carry a marker in argv")
+        prompt = "Check how ⟪model⟫ and ⟪backend_args⟫ are filled; see --model=⟪model⟫ here."
+        with self.subTest("no backend"):
+            status, seen = self.supervise(agent_args=(prompt,))
+            self.assertEqual(status["status"], "ok", status)
+            self.assertEqual(seen["argv"], [prompt])
+        with self.subTest("with a backend"):
+            self.write_backends({"alt": {"harness": _this_harness(), "model": "m-5",
+                                         "args": ["-x"]}})
+            status, seen = self.supervise(
+                "--backend", "alt",
+                agent_args=(prompt, "pre⟪backend_args⟫", "--model", "⟪model⟫",
+                            "⟪backend_args⟫", "--m=⟪model⟫", 'model="⟪model⟫"'))
+            self.assertEqual(status["status"], "ok", status)
+            self.assertEqual(seen["argv"], [prompt, "pre⟪backend_args⟫", "--model", "m-5",
+                                            "-x", "--m=m-5", 'model="m-5"'])
+
+    def test_a_model_that_never_reaches_the_argv_is_refused(self):
+        self.write_backends({"alt": {"harness": _this_harness(), "model": "m-6"}})
+        findings = self.findings()
+        status, _ = self.supervise("--backend", "alt", agent_args=("--verbose",),
+                                   findings=findings)
+        self.assertEqual(status["status"], "error")
+        self.assertIn("m-6", status["reason"])
+        self.assertFalse(Path(findings).exists(), "the agent ran on a model nobody passed")
+        for carried in (("--model", "m-6"), ("--model=m-6",), ('model="m-6"',),
+                        ("model='m-6'",)):
+            with self.subTest(carried=carried):
+                status, _ = self.supervise("--backend", "alt", agent_args=carried)
+                self.assertEqual(status["status"], "ok", status)
+
+    def test_the_harness_is_the_program_name_without_path_or_launcher_suffix(self):
+        self.assertEqual(review_runner.harness_of("/usr/local/bin/some-cli"), "some-cli")
+        self.assertEqual(review_runner.harness_of("Some-Cli.EXE"), "some-cli")
+        self.assertEqual(review_runner.harness_of("C:\\tools\\some-cli.cmd"), "some-cli")
+        self.assertEqual(review_runner.harness_of("some-cli.v2"), "some-cli.v2")
+
+
+class TheEnvironmentIsExtendedNotReplaced(_BackendCase):
+    def test_settings_merge_onto_a_copy_of_this_processs_environment(self):
+        self.write_backends({"alt": {"harness": _this_harness(), "model": "m",
+                                     "env": {"STUB_SETTING": "literal"},
+                                     "env_from_parent": {"STUB_CHILD_KEY": "STUB_PARENT_KEY"}}})
+        with unittest.mock.patch.dict(os.environ, {"STUB_PARENT_KEY": "from-the-parent"}):
+            status, seen = self.supervise("--backend", "alt")
+            parent_path = os.environ.get("PATH")
+        self.assertEqual(status["status"], "ok", status)
+        self.assertEqual(seen["env"]["STUB_SETTING"], "literal")
+        self.assertEqual(seen["env"]["STUB_CHILD_KEY"], "from-the-parent")
+        self.assertEqual(seen["env"].get("PATH"), parent_path)
+
+    def test_the_callers_own_flags_reach_the_agent_without_a_backend(self):
+        with unittest.mock.patch.dict(os.environ, {"STUB_PARENT_KEY": "from-the-parent"}):
+            status, seen = self.supervise("--env", "STUB_SETTING=a=b",
+                                          "--env", "STUB_BLANKED=",
+                                          "--env-from-parent", "STUB_CHILD_KEY=STUB_PARENT_KEY")
+        self.assertEqual(status["status"], "ok", status)
+        self.assertEqual(seen["env"]["STUB_SETTING"], "a=b")
+        self.assertEqual(seen["env"]["STUB_BLANKED"], "")
+        self.assertEqual(seen["env"]["STUB_CHILD_KEY"], "from-the-parent")
+
+    def test_with_no_backend_and_no_flags_the_agent_gets_this_processs_environment(self):
+        # A malformed backends file beside an ordinary run changes nothing: the file is read
+        # only when a backend is named.
+        self.backends_file.write_text("{not json", encoding="utf-8")
+        status, seen = self.supervise(agent_args=("a", "b"))
+        self.assertEqual(status["status"], "ok", status)
+        self.assertEqual(seen["argv"], ["a", "b"])
+        expected, got = dict(os.environ), seen["env"]
+        if os.name == "nt":
+            # Windows deletes a variable set to the empty string, and restoring a patched
+            # os.environ sets every variable again, so an inherited empty one (CI has several)
+            # leaves the real environment while os.environ still lists it.
+            expected = {name: value for name, value in expected.items() if value}
+            got = {name: value for name, value in got.items() if value}
+        self.assertEqual(sorted(set(expected) ^ set(got)), [], "names differ")
+        self.assertEqual(got, expected)
+
+    def test_one_name_set_twice_is_refused(self):
+        self.write_backends({"alt": {"harness": _this_harness(), "model": "m",
+                                     "env": {"STUB_SETTING": "one"}}})
+        status, _ = self.supervise("--backend", "alt", "--env", "STUB_SETTING=two")
+        self.assertEqual(status["status"], "error")
+        self.assertIn("STUB_SETTING", status["reason"])
+
+    def test_a_value_outside_ascii_arrives_or_is_refused_by_name(self):
+        value = "caf\u00e9-\u00fc"
+        self.write_backends({"alt": {"harness": _this_harness(), "model": "m",
+                                     "env": {"STUB_WIDE": value}}})
+        status, seen = self.supervise("--backend", "alt")
+        try:
+            os.fsencode(value)
+            carried = True
+        except UnicodeEncodeError:
+            carried = False
+        if carried:
+            self.assertEqual(status["status"], "ok", status)
+            self.assertEqual(seen["env"]["STUB_WIDE"], value)
+        else:
+            # This platform's encoding cannot carry the value to a child. Refused before the
+            # launch, naming the variable, rather than raised from inside the spawn.
+            self.assertEqual(status["status"], "error")
+            self.assertIn("STUB_WIDE", status["reason"])
+            self.assertNotIn("launch failed", status["reason"])
+
+
+class AnInheritedKeyIsReplacedNotForwarded(_BackendCase):
+    def test_the_harness_name_carries_the_provider_key_not_the_inherited_one(self):
+        self.write_backends({"alt": {"harness": _this_harness(), "model": "m",
+                                     "env_from_parent": {"STUB_HARNESS_KEY": "STUB_PROVIDER_KEY"}}})
+        inherited = "SENTINEL-INHERITED-7f3a"
+        with unittest.mock.patch.dict(os.environ, {"STUB_HARNESS_KEY": inherited,
+                                                   "STUB_PROVIDER_KEY": "provider-value"}):
+            status, seen = self.supervise("--backend", "alt")
+        self.assertEqual(status["status"], "ok", status)
+        self.assertEqual(seen["env"]["STUB_HARNESS_KEY"], "provider-value")
+        self.assertNotIn(inherited, seen["env"].values())
+
+
+class ABackendIsHeldToTheDigestItWasPinnedAt(_BackendCase):
+    """An engine pins what a backend resolved to when its run began and passes that digest
+    on every launch, so an entry edited while the run is in progress starts no worker."""
+
+    ADDRESS = "https://private-gateway.invalid/team"
+
+    def pinned(self, name):
+        """The digest an engine takes of `--resolve-backend`'s fields, computed here from
+        the printed fields rather than by the supervisor's own helper."""
+        code, out = self.resolve(name)
+        self.assertEqual(code, 0, out)
+        import hashlib
+        return hashlib.sha256(json.dumps(out["backend"], sort_keys=True)
+                              .encode("utf-8")).hexdigest()[:16]
+
+    def test_the_digest_it_was_pinned_at_launches_as_before(self):
+        self.write_backends({"alt": {"harness": _this_harness(), "model": "model-one",
+                                     "env": {"STUB_BASE_URL": self.ADDRESS}}})
+        status, seen = self.supervise("--backend", "alt", "--backend-digest",
+                                      self.pinned("alt"))
+        self.assertEqual(status["status"], "ok", status)
+        self.assertEqual(seen["argv"], ["--model", "model-one"])
+        self.assertEqual(seen["env"]["STUB_BASE_URL"], self.ADDRESS)
+
+    def test_an_entry_edited_since_it_was_pinned_is_refused_and_nothing_launches(self):
+        base = {"harness": _this_harness(), "model": "model-one",
+                "env": {"STUB_BASE_URL": self.ADDRESS},
+                "env_from_parent": {"STUB_KEY": "STUB_PARENT_KEY"}}
+        for edited in ({"env": {"STUB_BASE_URL": "https://elsewhere.invalid"}},
+                       {"env_from_parent": {"STUB_KEY": "STUB_OTHER_PARENT_KEY"}},
+                       {"args": ["--provider", "other"]}):
+            with self.subTest(edited=edited), \
+                    unittest.mock.patch.dict(os.environ, {"STUB_PARENT_KEY": "v",
+                                                          "STUB_OTHER_PARENT_KEY": "v"}):
+                self.write_backends({"alt": base})
+                pin = self.pinned("alt")
+                self.write_backends({"alt": {**base, **edited}})
+                findings = self.findings()
+                status, _ = self.supervise("--backend", "alt", "--backend-digest", pin,
+                                           findings=findings,
+                                           agent_args=("--model", "⟪model⟫",
+                                                       "⟪backend_args⟫"))
+                self.assertNotEqual(status["status"], "ok")
+                self.assertIn("'alt'", status["reason"])
+                self.assertIn("changed since the run pinned it", status["reason"])
+                self.assertNotIn("exit_code", status)
+                for value in ("elsewhere.invalid", self.ADDRESS, "STUB_OTHER_PARENT_KEY",
+                              "STUB_PARENT_KEY"):
+                    self.assertNotIn(value, status["reason"])
+                self.assertFalse(Path(findings).exists(), "an edited backend was launched")
+
+    def test_a_digest_without_a_backend_is_refused(self):
+        findings = self.findings()
+        status, _ = self.supervise("--backend-digest", "0123456789abcdef", findings=findings)
+        self.assertEqual(status["status"], "error")
+        self.assertIn("--backend-digest", status["reason"])
+        self.assertIn("--backend", status["reason"])
+        self.assertFalse(Path(findings).exists(), "a refused invocation launched its agent")
+
+
+class AnUnsetForwardedNameIsRefused(_BackendCase):
+    def test_an_unset_launching_side_is_refused_before_launch_and_named(self):
+        self.write_backends({"alt": {"harness": _this_harness(), "model": "m",
+                                     "env_from_parent": {"STUB_CHILD_KEY": "STUB_NOT_SET"}}})
+        findings = self.findings()
+        with unittest.mock.patch.dict(os.environ):
+            os.environ.pop("STUB_NOT_SET", None)
+            status, _ = self.supervise("--backend", "alt", findings=findings)
+            flag_status, _ = self.supervise("--env-from-parent", "STUB_CHILD_KEY=STUB_NOT_SET")
+        for result in (status, flag_status):
+            self.assertEqual(result["status"], "error")
+            self.assertIn("STUB_CHILD_KEY", result["reason"])
+            # Never the launching side: a key pasted there would be printed.
+            self.assertNotIn("STUB_NOT_SET", result["reason"])
+        self.assertFalse(Path(findings).exists(), "the agent launched without its key")
+
+    def test_an_empty_launching_side_counts_as_unset(self):
+        self.write_backends({"alt": {"harness": _this_harness(), "model": "m",
+                                     "env_from_parent": {"STUB_CHILD_KEY": "STUB_EMPTY_KEY"}}})
+        findings = self.findings()
+        with unittest.mock.patch.dict(os.environ, {"STUB_EMPTY_KEY": ""}):
+            status, _ = self.supervise("--backend", "alt", findings=findings)
+        self.assertEqual(status["status"], "error")
+        self.assertIn("STUB_CHILD_KEY", status["reason"])
+        self.assertNotIn("STUB_EMPTY_KEY", status["reason"])
+        self.assertFalse(Path(findings).exists(), "the agent launched with an empty key")
+
+    def test_the_childs_side_is_never_required_to_be_set(self):
+        self.write_backends({"alt": {"harness": _this_harness(), "model": "m",
+                                     "env_from_parent": {"STUB_CHILD_UNSET": "STUB_PARENT_KEY"}}})
+        with unittest.mock.patch.dict(os.environ, {"STUB_PARENT_KEY": "v"}):
+            os.environ.pop("STUB_CHILD_UNSET", None)
+            status, seen = self.supervise("--backend", "alt")
+        self.assertEqual(status["status"], "ok", status)
+        self.assertEqual(seen["env"]["STUB_CHILD_UNSET"], "v")
+
+    def test_a_malformed_pair_is_refused(self):
+        with unittest.mock.patch.dict(os.environ, {"STUB_PARENT_KEY": "v"}):
+            for flags in (("--env", "NO_EQUALS_SIGN"), ("--env", "=value"),
+                          ("--env-from-parent", "CHILD_ONLY"),
+                          ("--env-from-parent", "CHILD="),
+                          ("--env-from-parent", "=STUB_PARENT_KEY")):
+                with self.subTest(flags=flags):
+                    status, _ = self.supervise(*flags)
+                    self.assertEqual(status["status"], "error")
+                    self.assertIn(flags[0], status["reason"])
+
+
+class ASecretNeverReachesTheOutput(_BackendCase):
+    SENTINEL = "SENTINEL-SECRET-VALUE-91c2e"
+
+    # The agent confirms the key arrived by comparing it with the parent's copy — both are in
+    # its environment — and writes only the answer, never the value.
+    _CHECKING_CHILD = (
+        "import io, os, sys; "
+        "ok = os.environ.get('STUB_CHILD_KEY') == os.environ.get('STUB_SECRET_SOURCE'); "
+        "sys.stdout.write('checked\\n'); sys.stdout.flush(); "
+        "io.open(sys.argv[1], 'w', encoding='utf-8').write("
+        "'MATCH ' + str(ok) + chr(10) + "
+        "'{\"findings\": [], \"overall\": \"clean\", \"blocking_count\": 0}')")
+
+    def _everything_written(self, stdout, stderr):
+        texts = [stdout, stderr]
+        for path in self.dir.rglob("*"):
+            if path.is_file():
+                texts.append(path.read_bytes().decode("utf-8", "replace"))
+        return texts
+
+    def _supervise_raw(self, *argv):
+        buf, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+            review_runner.main(list(argv))
+        return buf.getvalue(), err.getvalue()
+
+    def test_a_forwarded_value_appears_in_nothing_the_supervisor_writes(self):
+        self.write_backends({"alt": {"harness": _this_harness(), "model": "m",
+                                     "env_from_parent": {"STUB_CHILD_KEY": "STUB_SECRET_SOURCE"}}})
+        findings = str(self.dir / "out" / "findings.md")
+        # A file that exists but cannot be executed, so the failure is the launch itself.
+        not_a_program = self.dir / "not-a-program.txt"
+        not_a_program.write_text("plain text\n", encoding="utf-8")
+        with unittest.mock.patch.dict(os.environ, {"STUB_SECRET_SOURCE": self.SENTINEL}):
+            out, err = self._supervise_raw(
+                "--idle", "20", "--deadline", "60", "--findings", findings,
+                "--verdict-json", str(self.dir / "out" / "verdict.json"),
+                "--display", str(self.dir / "out" / "display.log"),
+                "--result-mode", "external-file", "--backend", "alt",
+                "--", PY, "-c", self._CHECKING_CHILD, findings, "--model", "⟪model⟫")
+            # The failure paths too: a launch that fails, and a refusal after the key was read.
+            fail_out, fail_err = self._supervise_raw(
+                "--idle", "20", "--deadline", "60",
+                "--findings", str(self.dir / "fail" / "findings.md"),
+                "--result-mode", "external-file",
+                "--env-from-parent", "STUB_CHILD_KEY=STUB_SECRET_SOURCE",
+                "--", str(not_a_program), "x")
+            conflict_out, conflict_err = self._supervise_raw(
+                "--idle", "20", "--deadline", "60",
+                "--findings", str(self.dir / "conflict" / "findings.md"),
+                "--result-mode", "external-file", "--backend", "alt",
+                "--env-from-parent", "STUB_CHILD_KEY=STUB_SECRET_SOURCE",
+                "--", PY, "-c", "pass")
+        self.assertEqual(json.loads(out.strip().splitlines()[-1])["status"], "ok", out)
+        self.assertIn("MATCH True", _read_utf8(findings))
+        self.assertTrue((self.dir / "out" / "verdict.json").exists())
+        self.assertTrue((self.dir / "out" / "display.log").exists())
+        self.assertIn("launch failed", json.loads(fail_out.strip().splitlines()[-1])["reason"])
+        self.assertEqual(json.loads(conflict_out.strip().splitlines()[-1])["status"], "error")
+        for text in (self._everything_written(out, err)
+                     + [fail_out, fail_err, conflict_out, conflict_err]):
+            self.assertNotIn(self.SENTINEL, text)
+
+
+    def test_a_key_typed_where_a_variable_name_belongs_is_never_echoed(self):
+        """A key pasted in place of a name is refused for not looking like a name — and the
+        refusal names the entry by its other side or its position, never by what was typed."""
+        key = "sk-or-v1-PASTED-KEY-3b7d"
+        good = {"harness": _this_harness(), "model": "m"}
+        texts = []
+        for label, flags, backends in (
+                ("flag, launching side", ("--env-from-parent", f"STUB_CHILD_KEY={key}"), None),
+                ("flag, child side", ("--env-from-parent", f"{key}=STUB_PARENT_KEY"), None),
+                ("flag, literal name", ("--env", f"{key}=x"), None),
+                ("file, launching side", ("--backend", "alt"),
+                 {"alt": {**good, "env_from_parent": {"STUB_CHILD_KEY": key}}}),
+                ("file, child side", ("--backend", "alt"),
+                 {"alt": {**good, "env_from_parent": {key: "STUB_PARENT_KEY"}}}),
+                ("file, literal name", ("--backend", "alt"),
+                 {"alt": {**good, "env": {key: "x"}}})):
+            with self.subTest(label):
+                if backends is not None:
+                    self.write_backends(backends)
+                with unittest.mock.patch.dict(os.environ, {"STUB_PARENT_KEY": "v"}):
+                    buf, err = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+                        review_runner.main(["--idle", "20", "--deadline", "60",
+                                            "--findings", self.findings(),
+                                            "--result-mode", "external-file", *flags,
+                                            "--", PY, "-c", "pass", "--model", "⟪model⟫"])
+                    status = json.loads(buf.getvalue().strip().splitlines()[-1])
+                self.assertEqual(status["status"], "error")
+                texts += [buf.getvalue(), err.getvalue()]
+                if backends is not None:
+                    code, out = self.resolve("alt")
+                    self.assertEqual(code, 1)
+                    texts.append(json.dumps(out))
+        for text in texts:
+            self.assertNotIn(key, text)
+            self.assertNotIn("PASTED-KEY", text)
+
+    def test_a_key_shaped_like_a_variable_name_is_never_echoed_either(self):
+        """Many keys are only letters, digits and underscores — Fireworks' start `fw_` — so
+        they pass the name rule. Pasted on the launching side they name a variable that is
+        not set, and that refusal must not quote the launching side at all."""
+        key = "fw_3ZfJpQ9xYk2LmN8aPASTED"
+        good = {"harness": _this_harness(), "model": "m"}
+        texts = []
+        for label, flags, backends in (
+                ("flag", ("--env-from-parent", f"STUB_CHILD_KEY={key}"), None),
+                ("file", ("--backend", "alt"),
+                 {"alt": {**good, "env_from_parent": {"STUB_CHILD_KEY": key}}})):
+            with self.subTest(label):
+                if backends is not None:
+                    self.write_backends(backends)
+                with unittest.mock.patch.dict(os.environ, {}):
+                    os.environ.pop(key, None)
+                    buf, err = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+                        review_runner.main(["--idle", "20", "--deadline", "60",
+                                            "--findings", self.findings(),
+                                            "--result-mode", "external-file", *flags,
+                                            "--", PY, "-c", "pass", "--model", "⟪model⟫"])
+                    status = json.loads(buf.getvalue().strip().splitlines()[-1])
+                self.assertEqual(status["status"], "error")
+                self.assertIn("STUB_CHILD_KEY", status["reason"],
+                              "the refusal must still say which entry to fix")
+                texts += [buf.getvalue(), err.getvalue()]
+        for text in texts:
+            self.assertNotIn(key, text)
+            self.assertNotIn("PASTED", text)
+
+
+class AGatewayBackendCarriesNoSecret(_BackendCase):
+    def test_the_harness_fetches_its_own_token_and_the_pack_passes_none(self):
+        helper = self.dir / "token_helper.py"
+        helper.write_text("print('TOKEN-FROM-HELPER-5d1e')\n", encoding="utf-8")
+        # Only a model and a literal setting naming the helper: no forwarded name, no args.
+        self.write_backends({"gateway": {"harness": _this_harness(), "model": "m",
+                                         "env": {"STUB_TOKEN_HELPER": str(helper)}}})
+        agent = ("import io, os, subprocess, sys; "
+                 "token = subprocess.run([sys.executable, os.environ['STUB_TOKEN_HELPER']], "
+                 "capture_output=True, text=True).stdout.strip(); "
+                 "io.open(sys.argv[1], 'w', encoding='utf-8').write('token=' + token)")
+        findings = self.findings()
+        code, resolved = self.resolve("gateway")
+        self.assertEqual(code, 0)
+        self.assertEqual(resolved["backend"]["env_from_parent"], {})
+        self.assertEqual(resolved["backend"]["args"], [])
+        status = _run("--idle", "20", "--deadline", "60", "--findings", findings,
+                      "--result-mode", "external-file", "--backend", "gateway",
+                      "--", PY, "-c", agent, findings, "--model", "⟪model⟫")
+        self.assertEqual(status["status"], "ok", status)
+        self.assertEqual(_read_utf8(findings), "token=TOKEN-FROM-HELPER-5d1e")
+        self.assertNotIn("TOKEN-FROM-HELPER-5d1e", json.dumps(dict(os.environ)))
+
+
+class RawStdoutMode(unittest.TestCase):
+    """`--result-mode raw-stdout`: an agent whose reply is plain text on stdout, kept byte for
+    byte, with nothing from stderr and no stream format read into it."""
+
+    def _run_raw(self, child, *extra):
+        with tempfile.TemporaryDirectory() as d:
+            findings = Path(d) / "reply.md"
+            status = _run("--idle", "10", "--deadline", "20", "--findings", str(findings),
+                          "--result-mode", "raw-stdout", *extra, "--", PY, "-c", child)
+            data = findings.read_bytes() if findings.exists() else None
+        return status, data
+
+    def test_the_reply_is_stdout_alone(self):
+        status, data = self._run_raw(
+            "import sys; sys.stdout.buffer.write(b'SCORE: 9\\n\\nPREFERRED: A\\n'); "
+            "sys.stderr.write('SCORE: 1 noise')")
+        self.assertEqual(status["status"], "ok", status)
+        self.assertEqual(data, b"SCORE: 9\n\nPREFERRED: A\n")
+
+    def test_bytes_that_are_not_utf8_are_kept_as_written(self):
+        status, data = self._run_raw("import sys; sys.stdout.buffer.write(b'plan\\x92s x')")
+        self.assertEqual(status["status"], "ok", status)
+        self.assertEqual(data, b"plan\x92s x")
+
+    def test_plain_text_is_not_read_as_a_stream_of_events(self):
+        # The stream modes read JSON events and find none in plain text.
+        status, data = self._run_raw("print('not json at all')")
+        self.assertEqual(status["status"], "ok", status)
+        self.assertEqual(data.decode("utf-8").strip(), "not json at all")
+
+    def test_no_output_is_no_reply(self):
+        status, data = self._run_raw("pass")
+        self.assertEqual(status["status"], "error")
+        self.assertEqual(status["exit_code"], 0)
+        self.assertIsNone(data, "an empty reply file was left behind")
+
+    def test_a_nonzero_exit_is_an_error(self):
+        status, data = self._run_raw("import sys; print('x'); sys.exit(3)")
+        self.assertEqual(status["status"], "error")
+        self.assertEqual(status["exit_code"], 3)
+        self.assertIsNone(data)
+
+    def test_a_reply_over_the_cap_is_refused_not_shortened(self):
+        status, data = self._run_raw("print('y' * 5000)", "--max-capture-bytes", "100")
+        self.assertEqual(status["status"], "error")
+        self.assertIn("capture overflow", status["reason"])
+        self.assertIsNone(data)
+
+
+class TheDisplayLogIsNotWrittenThroughALink(unittest.TestCase):
+    """A display log planted as a symlink is not followed out of the directory it names."""
+
+    @unittest.skipUnless(os.name == "posix", "symlink creation differs on Windows")
+    def test_a_linked_display_log_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as d:
+            outside = Path(d) / "outside.txt"
+            outside.write_text("PRECIOUS\n", encoding="utf-8")
+            display = Path(d) / "status.md"
+            display.symlink_to(outside)
+            findings = str(Path(d) / "findings.txt")
+            status = _run("--idle", "10", "--deadline", "20", "--findings", findings,
+                          "--display", str(display), "--result-mode", "raw-stdout",
+                          "--", PY, "-c", "print('reply')")
+            self.assertEqual(status["status"], "ok", status)
+            self.assertEqual(outside.read_text(encoding="utf-8"), "PRECIOUS\n")
+
+
+
+class ARawReplyNeverWritesThroughALink(unittest.TestCase):
+    """A write-capable agent can replace the claimed findings file with a link before it
+    exits. Where the platform has no O_NOFOLLOW (Windows), opening the path followed that link
+    and truncated whatever it named. The reply lands in a new file moved over the path, and a
+    move replaces a link rather than following it."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.outside = self.root / "outside.txt"
+        self.outside.write_bytes(b"not the agent's")
+        self.findings = self.root / "run" / "findings.md"
+        self.findings.parent.mkdir()
+
+    def _link(self):
+        try:
+            self.findings.symlink_to(self.outside)
+        except (OSError, NotImplementedError):
+            self.skipTest("this platform/user cannot create a symlink")
+
+    def test_a_link_at_the_path_is_replaced_and_its_target_left_alone(self):
+        self._link()
+        # O_NOFOLLOW off stands in for Windows, which has none.
+        with unittest.mock.patch.object(review_runner.os, "O_NOFOLLOW", 0, create=True):
+            review_runner._write_reply(str(self.findings), b"the reply\xff")
+        self.assertEqual(self.outside.read_bytes(), b"not the agent's")
+        self.assertFalse(self.findings.is_symlink())
+        self.assertEqual(self.findings.read_bytes(), b"the reply\xff")
+
+    def test_a_plain_claimed_file_gets_the_reply_byte_for_byte(self):
+        self.findings.write_bytes(b"")
+        review_runner._write_reply(str(self.findings), b"a\r\nb\x00")
+        self.assertEqual(self.findings.read_bytes(), b"a\r\nb\x00")
+        self.assertEqual([p.name for p in self.findings.parent.iterdir()], ["findings.md"])
+
+    def test_a_name_at_the_length_limit_still_gets_its_reply(self):
+        """The file written beside the path has a short name of its own, so a findings name
+        the file system accepts is never made too long by it."""
+        long = self.root / "run" / ("f" * 240 + ".md")
+        try:
+            long.write_bytes(b"")
+        except OSError:
+            self.skipTest("this file system refuses a 243-character name")
+        review_runner._write_reply(str(long), b"reply")
+        self.assertEqual(long.read_bytes(), b"reply")
+
+    def test_no_free_name_beside_the_path_is_an_os_error_and_writes_nothing(self):
+        self.findings.write_bytes(b"claimed")
+        with unittest.mock.patch.object(review_runner.os, "open",
+                                        side_effect=FileExistsError("taken")):
+            with self.assertRaises(OSError):
+                review_runner._write_reply(str(self.findings), b"reply")
+        self.assertEqual(self.findings.read_bytes(), b"claimed")
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,8 +2,8 @@
 
 A skill that names a companion once and states its degraded path there, then goes on
 referring to that companion wherever the workflow reaches it. The fallback is a fact about
-the companion, not about the sentence — restating it at every mention is the duplication
-this pack spent a whole plan removing.
+the companion, not about the sentence — restating it at every mention repeats text a
+skill should state once.
 
 ## Step 1 — Build
 

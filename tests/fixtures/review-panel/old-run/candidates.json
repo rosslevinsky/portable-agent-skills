@@ -1,0 +1,367 @@
+{
+  "candidates": [
+    {
+      "area": "area-02",
+      "failure": "The README's description is a claim about size.",
+      "file": "README.md",
+      "id": "cand-001",
+      "line_end": 3,
+      "line_start": 3,
+      "quote_check": "matches",
+      "raised_by": [
+        {
+          "area": "area-02",
+          "consequence": "The README calls the tree small, which it may not stay.",
+          "direction": "Drop the size claim.",
+          "fix_size": "1 line",
+          "kind": "reader",
+          "lane": "B",
+          "lens": "top-down from the contract",
+          "quote": "A small tree the review-panel engine suite inventories and partitions.",
+          "reproduction": null,
+          "severity": "minor",
+          "unit": "area-02-B1"
+        }
+      ]
+    },
+    {
+      "area": "area-02",
+      "failure": "The guide says nothing of helper doubling its input.",
+      "file": "docs/guide.md",
+      "id": "cand-002",
+      "line_end": 3,
+      "line_start": 3,
+      "quote_check": "matches",
+      "raised_by": [
+        {
+          "area": "area-02",
+          "consequence": "The guide describes the engine without the helper's doubling, so a reader trusts it.",
+          "direction": "State what helper returns.",
+          "fix_size": "1 line",
+          "kind": "reader",
+          "lane": "A",
+          "lens": "bottom-up from the code",
+          "quote": "How the engine is used.",
+          "reproduction": null,
+          "severity": "minor",
+          "unit": "area-02-A1"
+        }
+      ]
+    },
+    {
+      "area": "area-01",
+      "failure": "core adds 1 to x with no check that x is a number.",
+      "file": "engine/core.py",
+      "id": "cand-003",
+      "line_end": 2,
+      "line_start": 1,
+      "quote_check": "matches",
+      "raised_by": [
+        {
+          "area": "area-01",
+          "consequence": "A string passed to core raises instead of being refused with a message.",
+          "direction": "Check the type of x first.",
+          "fix_size": "small",
+          "kind": "reader",
+          "lane": "A",
+          "lens": "bottom-up from the code",
+          "quote": "def core(x):\n    return x + 1",
+          "reproduction": null,
+          "severity": "minor",
+          "unit": "area-01-A1"
+        }
+      ]
+    },
+    {
+      "area": "area-01",
+      "failure": "core(x) raises TypeError on a string argument.",
+      "file": "engine/core.py",
+      "id": "cand-004",
+      "line_end": 2,
+      "line_start": 1,
+      "quote_check": "matches",
+      "raised_by": [
+        {
+          "area": "area-01",
+          "consequence": "A string passed to core raises instead of being refused with a message.",
+          "direction": "Check the type of x first.",
+          "fix_size": "small",
+          "kind": "reader",
+          "lane": "B",
+          "lens": "top-down from the contract",
+          "quote": "def core(x):\n    return x + 1",
+          "reproduction": null,
+          "severity": "major",
+          "unit": "area-01-B1"
+        }
+      ]
+    },
+    {
+      "area": "area-01",
+      "failure": "helper distinguishes y below zero and no test constructs one.",
+      "file": "engine/core.py",
+      "id": "cand-005",
+      "line_end": 6,
+      "line_start": 5,
+      "quote_check": "matches",
+      "raised_by": [
+        {
+          "area": "area-03",
+          "consequence": "A negative multiplier is never exercised.",
+          "direction": "Add a case in tests/test_engine.py with y = -1.",
+          "fix_size": "small",
+          "kind": "auditor",
+          "lane": "A",
+          "lens": null,
+          "quote": "def helper(y):\n    return y * 2",
+          "reproduction": null,
+          "severity": "major",
+          "unit": "audit-area-03-A"
+        }
+      ]
+    },
+    {
+      "area": "area-01",
+      "failure": "helper multiplies by two; the documented behavior adds two.",
+      "file": "engine/core.py",
+      "id": "cand-006",
+      "line_end": 6,
+      "line_start": 5,
+      "quote_check": "matches",
+      "raised_by": [
+        {
+          "area": "area-01",
+          "consequence": "Every total built on helper comes out twice as large as the contract says.",
+          "direction": "Return y + 2.",
+          "fix_size": "1 line",
+          "kind": "reader",
+          "lane": "B",
+          "lens": "top-down from the contract",
+          "quote": "def helper(y):\n    return y * 2",
+          "reproduction": null,
+          "severity": "blocker",
+          "unit": "area-01-B1"
+        }
+      ]
+    },
+    {
+      "area": "area-01",
+      "failure": "helper returns y * 2 where the contract says it returns y + 2.",
+      "file": "engine/core.py",
+      "id": "cand-007",
+      "line_end": 6,
+      "line_start": 5,
+      "quote_check": "matches",
+      "raised_by": [
+        {
+          "area": "area-01",
+          "consequence": "Every total built on helper comes out twice as large as the contract says.",
+          "direction": "Return y + 2.",
+          "fix_size": "1 line",
+          "kind": "reader",
+          "lane": "A",
+          "lens": "bottom-up from the code",
+          "quote": "def helper(y):\n    return y * 2",
+          "reproduction": {
+            "argv": [
+              "python3",
+              "-c",
+              "from engine.core import helper; print(helper(3))"
+            ],
+            "cwd": ".",
+            "expect": "prints 6 where the contract says 5"
+          },
+          "severity": "major",
+          "unit": "area-01-A1"
+        }
+      ]
+    },
+    {
+      "area": "area-01",
+      "failure": "util ignores every input and returns 'util'.",
+      "file": "engine/util.py",
+      "id": "cand-008",
+      "line_end": 2,
+      "line_start": 1,
+      "quote_check": "matches",
+      "raised_by": [
+        {
+          "area": "area-01",
+          "consequence": "util returns a constant string, so callers cannot tell two calls apart.",
+          "direction": "Return something derived from the call.",
+          "fix_size": "small",
+          "kind": "reader",
+          "lane": "B",
+          "lens": "top-down from the contract",
+          "quote": "def util():\n    return \"util\"",
+          "reproduction": null,
+          "severity": "minor",
+          "unit": "area-01-B1"
+        }
+      ]
+    },
+    {
+      "area": "area-01",
+      "failure": "main returns 0 unconditionally.",
+      "file": "run.py",
+      "id": "cand-009",
+      "line_end": 2,
+      "line_start": 1,
+      "quote_check": "matches",
+      "raised_by": [
+        {
+          "area": "area-01",
+          "consequence": "The tool exits 0 even when it did nothing.",
+          "direction": "Return non-zero when no work was done.",
+          "fix_size": "medium",
+          "kind": "reader",
+          "lane": "A",
+          "lens": "bottom-up from the code",
+          "quote": "def main():\n    return 0",
+          "reproduction": {
+            "argv": [
+              "python3",
+              "run.py"
+            ],
+            "cwd": ".",
+            "expect": "exit 0 with no output"
+          },
+          "severity": "major",
+          "unit": "area-01-A1"
+        }
+      ]
+    }
+  ],
+  "probe": {
+    "build": {
+      "answer": "yes",
+      "argv": [
+        "python3",
+        "-m",
+        "compileall",
+        "-q",
+        "."
+      ],
+      "cwd": ".",
+      "exit_status": 0,
+      "output": "",
+      "truncated": false
+    },
+    "reason": null,
+    "state": "complete",
+    "summary": "Compiles; the suite runs and its one test fails to import.",
+    "tests": {
+      "answer": "yes",
+      "argv": [
+        "python3",
+        "-m",
+        "unittest",
+        "discover"
+      ],
+      "cwd": ".",
+      "exit_status": 1,
+      "output": "FAILED (errors=1)\n",
+      "truncated": false
+    },
+    "unit": "probe-A"
+  },
+  "stage": "routed",
+  "units": [
+    {
+      "area": "area-01",
+      "dropped": 0,
+      "findings": 3,
+      "id": "area-01-A1",
+      "kind": "reader",
+      "lane": "A",
+      "lens": "bottom-up from the code",
+      "reason": null,
+      "rejected": [],
+      "state": "complete"
+    },
+    {
+      "area": "area-01",
+      "dropped": 0,
+      "findings": 3,
+      "id": "area-01-B1",
+      "kind": "reader",
+      "lane": "B",
+      "lens": "top-down from the contract",
+      "reason": null,
+      "rejected": [],
+      "state": "complete"
+    },
+    {
+      "area": "area-02",
+      "dropped": 0,
+      "findings": 1,
+      "id": "area-02-A1",
+      "kind": "reader",
+      "lane": "A",
+      "lens": "bottom-up from the code",
+      "reason": null,
+      "rejected": [],
+      "state": "complete"
+    },
+    {
+      "area": "area-02",
+      "dropped": 0,
+      "findings": 1,
+      "id": "area-02-B1",
+      "kind": "reader",
+      "lane": "B",
+      "lens": "top-down from the contract",
+      "reason": null,
+      "rejected": [],
+      "state": "complete"
+    },
+    {
+      "area": "area-03",
+      "dropped": 0,
+      "findings": 0,
+      "id": "area-03-A1",
+      "kind": "reader",
+      "lane": "A",
+      "lens": "bottom-up from the code",
+      "reason": null,
+      "rejected": [],
+      "state": "complete"
+    },
+    {
+      "area": "area-03",
+      "dropped": 0,
+      "findings": 0,
+      "id": "area-03-B1",
+      "kind": "reader",
+      "lane": "B",
+      "lens": "top-down from the contract",
+      "reason": null,
+      "rejected": [],
+      "state": "complete"
+    },
+    {
+      "area": "area-03",
+      "dropped": 0,
+      "findings": 1,
+      "id": "audit-area-03-A",
+      "kind": "auditor",
+      "lane": "A",
+      "lens": null,
+      "reason": null,
+      "rejected": [],
+      "state": "complete"
+    },
+    {
+      "area": "area-03",
+      "dropped": 0,
+      "findings": 0,
+      "id": "audit-area-03-B",
+      "kind": "auditor",
+      "lane": "B",
+      "lens": null,
+      "reason": null,
+      "rejected": [],
+      "state": "complete"
+    }
+  ]
+}

@@ -53,8 +53,8 @@ findings instead.
 
 `/plan-run` is not a review skill, and it is left out of the chart above on purpose. It
 executes a plan, and at the end of **every phase** it stops and runs reviews for you. That
-makes it where most reviewing in this pack happens. It is worth understanding separately,
-because it does not have the shape of a single review.
+makes it where most reviewing in this pack happens. It needs its own explanation,
+because it does not work like a single review.
 
 **It runs two reviews, and they are opposites.**
 
@@ -69,13 +69,13 @@ So the gate is not somewhere between the two rows in the chart. It is **both row
 after the other**, on every phase, automatically. That is what the gate is for: you get the
 cheap self-check and the expensive independent check without having to remember either.
 
-**What happens to a finding is the weak part.** Whichever review raised it, the loop is
-capped at two passes, and then the **author** decides. The author is the one party whose own
-code is in question, and the least independent challenger anywhere on this page. Three rules
-keep that honest. The author may fix the finding. The author may refute it, with evidence
-written into the phase document. The author may **never** quietly downgrade it. A finding it
-can neither fix nor refute stays **open**: the phase's box is left unticked, and nothing is
-committed past an open blocker.
+**What happens to a finding is the weak part.** Whichever review raised it, the loop is capped
+at two passes, and then the **author** decides. The author is the one party whose own code is in
+question, and the least independent challenger anywhere on this page. Three rules stop the
+author from simply waving a finding away. The author may fix the finding. The author may refute
+it, with evidence written into the phase document. The author may **never** quietly downgrade
+it. A finding it can neither fix nor refute stays **open**: the phase's box is left unticked,
+and nothing is committed past an open blocker.
 
 This is the least independent check in the pack, and it is the one that decides whether a
 commit happens.
@@ -100,13 +100,13 @@ so.
 **`/security-review-codebase` uses one model throughout.** This is the row most often
 misread. Its sub-agents are separate contexts inside whatever runtime is hosting it, and
 nothing in it dispatches to the other tool. Its finding check is stronger than it first
-appears: a finding is routed to a work unit that did not produce it, on the stated grounds
-that the context which found a vulnerability judges it poorly, with a real burden of proof
-and the expectation that many findings will fail. Same model, separate context, not the
-finder.
+appears. A finding is routed to a work unit that did not produce it, because the skill holds
+that the context which found a vulnerability judges it poorly. That check carries a real
+burden of proof, and many findings are expected to fail it. Same model, separate context,
+not the finder.
 
-**`/plan-duel` works at the design stage, and is the only one where the two models can see
-each other's work.** Mutual criticism is the mechanism, so independence is traded away on
+**`/plan-duel` works at the design stage, and is the only one where the two models can see each
+other's work.** Each model criticizing the other is how it works, so it gives up independence on
 purpose. The judge is a third party whose verdict must fit a fixed structure, and which plan
 came from which model is withheld from everyone, the judge included, until the summary is
 written.
@@ -120,7 +120,7 @@ reports only; it never edits.
 
 ## What this pack does not give you
 
-The chart above reads as more reassuring than it is, so this section says what is missing.
+The chart above makes the pack look safer than it is. These are the gaps.
 
 - **Independent readers are well covered. Independent *challengers* are not.** `/cyw` and
   `/diff-review`, the two you will reach for most often, do not challenge findings at all;
@@ -144,6 +144,6 @@ The chart above reads as more reassuring than it is, so this section says what i
 | You face a large decision and no code exists yet | `/plan-duel` |
 | You are about to publish | `/security-review-codebase` for vulnerabilities, `/review-panel` for correctness. They do not substitute for each other |
 
-One overlap is worth watching: at a gate, `/cyw` and `/diff-review` both read the same diff.
-They ask different questions of it, so the overlap is defensible, but it is the first place
-you would notice duplicated effort.
+Watch one overlap: at a gate, `/cyw` and `/diff-review` both read the same diff. They ask
+different questions of it, so the overlap has a reason. It is still the first place you
+would notice duplicated effort.
