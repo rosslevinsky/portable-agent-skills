@@ -1251,8 +1251,8 @@ def _preflight(args, backend=None):
     # Two operations, deliberately, because they answer two different questions and the
     # ordering contract for one is not the ordering contract for the other.
     #
-    # This is the REFUSAL: it runs before every other check, so a colliding path is reported
-    # first and nothing else is attempted. `lexists`, so a dangling symlink counts as present
+    # This is the REFUSAL: it runs before anything is created, so a colliding path is refused
+    # and nothing else is attempted. `lexists`, so a dangling symlink counts as present
     # rather than being followed. It creates nothing.
     #
     # The CLAIM — exclusive creation, which is what actually establishes ownership — happens
@@ -1864,7 +1864,7 @@ def _preserve_partial(findings_path, transcript, reason):
         # walking it forever would be a second one. Giving up loses only the text.
         for candidate in (base, *(f"{base}.{n}" for n in range(1, PARTIAL_ALTERNATES + 1))):
             try:
-                fd = os.open(candidate, flags, 0o600)
+                fd = os.open(candidate, flags, 0o666)   # the reply's text, like --findings
             except FileExistsError:
                 continue     # a file, a FIFO, a symlink or a directory -- none of them ours
             try:
@@ -1913,7 +1913,9 @@ def _write_reply(path, data):
     for n in range(100):
         temp = os.path.join(folder, f".reply-{os.getpid()}-{n}.tmp")
         try:
-            fd = os.open(temp, flags, 0o600)
+            # 0o666 less the umask, like any file the user makes: this becomes the reply the
+            # caller reads, and a plan-duel plan is read by others on a shared host.
+            fd = os.open(temp, flags, 0o666)
             break
         except FileExistsError:
             continue
@@ -2150,7 +2152,9 @@ def run(args):
         if not path:
             continue
         try:
-            os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+            # The umask's mode, not owner-only: the agent writes its answer into this file
+            # and keeps its mode, and the answer is the user's to share.
+            os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666))
         except FileExistsError:
             guard.release()
             # Cleaned up BEFORE reporting: a signal recorded during this refusal finds

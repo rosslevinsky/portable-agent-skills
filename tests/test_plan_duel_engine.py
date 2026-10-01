@@ -6487,6 +6487,30 @@ class AStampKeepsThePlansPermissions(unittest.TestCase):
                 os.umask(old)
             self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o644)
 
+    def test_a_copied_plan_gets_the_umasks_mode_not_mkstemps(self):
+        """Round snapshots and the final named plan are copies, made the same atomic way,
+        and they are the files a user shares."""
+        import os, stat, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            src, dst = plan_duel.Path(d) / "plan-a.md", plan_duel.Path(d) / "plan-final.md"
+            src.write_text("# Plan\n", encoding="utf-8")
+            old = os.umask(0o022)
+            try:
+                plan_duel.copy_bytes(src, dst)
+            finally:
+                os.umask(old)
+            self.assertEqual(dst.read_bytes(), b"# Plan\n")
+            self.assertEqual(stat.S_IMODE(os.stat(dst).st_mode), 0o644)
+
+    def test_a_copy_over_an_existing_file_keeps_that_files_mode(self):
+        import os, stat, tempfile
+        with tempfile.TemporaryDirectory() as d:
+            src, dst = plan_duel.Path(d) / "a.md", plan_duel.Path(d) / "b.md"
+            src.write_text("new\n", encoding="utf-8"); dst.write_text("old\n", encoding="utf-8")
+            os.chmod(dst, 0o640)
+            plan_duel.copy_bytes(src, dst)
+            self.assertEqual(stat.S_IMODE(os.stat(dst).st_mode), 0o640)
+
 
 class LaunchParityTests(_ResumeHarness, unittest.TestCase):
     """What plan-duel's launch path does, pinned apart from the program that launches.

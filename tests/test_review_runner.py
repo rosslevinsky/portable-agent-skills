@@ -4458,6 +4458,32 @@ class AGatewayBackendCarriesNoSecret(_BackendCase):
         self.assertNotIn("TOKEN-FROM-HELPER-5d1e", json.dumps(dict(os.environ)))
 
 
+@unittest.skipIf(os.name != "posix", "file mode bits are POSIX")
+class OutputFilesFollowTheUsersUmask(unittest.TestCase):
+    """The files a run leaves are the user's, readable as the umask allows, like anything
+    else in the workdir: plan-duel's plans are read by others on a shared host."""
+
+    def setUp(self):
+        self.old = os.umask(0o022)
+        self.addCleanup(os.umask, self.old)
+
+    def _mode(self, *mode_and_child):
+        with tempfile.TemporaryDirectory() as d:
+            findings = Path(d) / "out.md"
+            *mode, child = mode_and_child
+            status = _run("--idle", "10", "--deadline", "20", "--findings", str(findings),
+                          *mode, "--", PY, "-c", child.replace("OUT", repr(str(findings))))
+            self.assertEqual(status["status"], "ok", status)
+            return findings.stat().st_mode & 0o777
+
+    def test_a_raw_stdout_reply_is_readable_by_others(self):
+        self.assertEqual(self._mode("--result-mode", "raw-stdout", "print('reply')"), 0o644)
+
+    def test_a_file_the_agent_writes_itself_is_readable_by_others(self):
+        self.assertEqual(self._mode("--result-mode", "external-file",
+                                    "open(OUT, 'w').write('# Plan A\\n')"), 0o644)
+
+
 class RawStdoutMode(unittest.TestCase):
     """`--result-mode raw-stdout`: an agent whose reply is plain text on stdout, kept byte for
     byte, with nothing from stderr and no stream format read into it."""

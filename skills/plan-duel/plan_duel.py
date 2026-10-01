@@ -1342,6 +1342,19 @@ def write_text_atomic(path: str | os.PathLike[str], text: str) -> None:
     _write_bytes_atomic(path, data)
 
 
+def _mode_for(path: Path) -> int:
+    """The mode a file written to ``path`` through a temporary should end with. `mkstemp`
+    creates 0600 and `os.replace` keeps whatever the temporary had, so a plan every teammate
+    could read would become readable only by whoever ran the duel. An existing file keeps its
+    own mode; a new one gets what a plain create would have, which is the umask's answer."""
+    try:
+        return os.stat(path).st_mode & 0o7777
+    except FileNotFoundError:
+        current = os.umask(0)
+        os.umask(current)
+        return 0o666 & ~current
+
+
 def _write_bytes_atomic(path: Path, data: bytes) -> None:
     """``data`` into ``path`` by a temporary file beside it and ``os.replace``: the file is the
     old one or the new one, never a truncated one. ``os.replace`` swaps a link standing at
@@ -1353,18 +1366,7 @@ def _write_bytes_atomic(path: Path, data: bytes) -> None:
             out.write(data)
             out.flush()
             os.fsync(out.fileno())
-        # The mode travels with the content. `mkstemp` creates 0600 and `os.replace` keeps
-        # whatever the temporary had, so a plan every teammate could read would become
-        # readable only by whoever ran the duel the moment it was stamped. An existing file
-        # keeps its own mode; a new one gets what a plain create would have, which is the
-        # umask's answer.
-        try:
-            mode = os.stat(path).st_mode & 0o7777
-        except FileNotFoundError:
-            current = os.umask(0)
-            os.umask(current)
-            mode = 0o666 & ~current
-        os.chmod(tmp, mode)
+        os.chmod(tmp, _mode_for(path))   # the mode travels with the content
         os.replace(tmp, path)
     finally:
         if tmp.exists():
@@ -1390,6 +1392,7 @@ def copy_bytes(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None
     try:
         with os.fdopen(handle, "wb") as out:
             out.write(data)
+        os.chmod(tmp, _mode_for(dst))   # a snapshot or a named plan is shared like any file
         os.replace(tmp, dst)
     finally:
         if tmp.exists():

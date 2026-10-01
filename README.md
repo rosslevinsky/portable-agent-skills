@@ -356,7 +356,7 @@ Four things worth knowing about how it behaves:
   is recorded *before* anything is copied, which is what makes the repeat an ordinary run
   rather than one that refuses directories the installer itself created.
 - **It creates your backends file when you have none, and never touches one you have.** A
-  default install (no `--target`) writes `~/.portable-agent-skills/backends.json` from
+  default install (no `--target`) that succeeds writes `~/.portable-agent-skills/backends.json` from
   `backends.default.json`, and beside it an empty key file for you to fill in. See below.
 
 ### Choosing the model a second agent runs on

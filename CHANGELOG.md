@@ -8,6 +8,32 @@ Versions use [Calendar Versioning](https://calver.org/) in the form
 A MICRO bump in the same month indicates a follow-up release; a new month
 starts from `.0` again.
 
+## [2026.09.7] - 2026-10-01
+
+### Fixed
+
+- **Files the skills' agents save are readable the way your other files are.** Every answer
+  an agent saves through the shared supervisor — `/diff-review`'s findings and verdict file,
+  `/plan-duel`'s plans and judge files, `/review-panel`'s per-unit transcripts, a `/plan-run`
+  phase worker's answer, a reply kept word for word, and what is kept of an interrupted run —
+  was created readable only by you. New ones now follow your usual file permissions, like
+  anything else you create, and so do `/plan-duel`'s round snapshots and final named plan. A
+  plan or snapshot `/plan-duel` overwrites keeps the permissions it has, so one written before
+  this release stays readable only by you until you change it (on Linux or macOS, `chmod 644`
+  and the file's name). The display log, which holds the agent's raw tool output, stays
+  readable only by you.
+- **`/review-panel` orders merge-check groups by number.** In a run with ten or more groups,
+  G10 no longer comes before G2.
+- **`/review-panel`'s path legend covers every file a coverage gap prints.** In a gap that spans
+  several files, the other files now print under their short names with a row in the legend,
+  like the first, instead of as full paths.
+- **`/review-panel`'s result check refuses a malformed merge unit by name.** A merge unit listed
+  without a list of site ids is refused with a message saying the unit listing is not the
+  engine's, instead of stopping with a bare or misleading error.
+- **The installer writes your backends file only after a clean install.** An install that is
+  refused or partly fails no longer creates the backends file or the key file beside it; the
+  next install that succeeds does.
+
 ## [2026.09.6] - 2026-09-30
 
 ### Added
@@ -783,6 +809,7 @@ release](README.md#installing-a-previous-release) to return to it.
 
 Initial release.
 
+[2026.09.7]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.7
 [2026.09.6]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.6
 [2026.09.5]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.5
 [2026.09.4]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.4
