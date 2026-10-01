@@ -10272,7 +10272,8 @@ def _id_rank(cluster_id: str) -> tuple[int, str]:
     sequence. The fallback keeps the sort total for anything not of that shape, so a
     hand-built structure orders rather than raising.
     """
-    digits = cluster_id[1:] if cluster_id[:1] in (DEFECT_ID_PREFIX, SITE_ID_PREFIX) else ""
+    numbered = (DEFECT_ID_PREFIX, SITE_ID_PREFIX, GROUP_ID_PREFIX)
+    digits = cluster_id[1:] if cluster_id[:1] in numbered else ""
     return (int(digits) if digits.isdigit() else -1, cluster_id)
 
 
@@ -12491,6 +12492,8 @@ def _printed_paths(inventory: dict, files_of: dict, reading: Sequence[dict],
     # heading, the covered ones in the appendix table — and a path the document prints and
     # the legend does not decode is a short name a reader cannot place.
     paths += [cluster["file"] for cluster in findings.coverage_defects]
+    # A multi-site gap renders each site at its own location, which can be another file.
+    paths += [site["file"] for site in findings.coverage_sites]
     paths += list(inventory["excluded"])
     paths += [entry["path"] for entry in inventory["skipped"]]
     for unit in reading:
@@ -15110,8 +15113,14 @@ def check_result(rundir: Path, unit_id: str, payload: object) -> CheckOutcome:
     if kind == MERGER_KIND:
         # Each site's kind comes from the clustering the stage will read, because a group
         # mixing kinds is one of the rules the stage refuses a reply for.
+        # Refused as the merge stage refuses it, rather than as a KeyError or a string read
+        # one character at a time.
+        if (not isinstance(unit.get("sites"), list)
+                or not all(isinstance(sid, str) for sid in unit["sites"])):
+            raise RunDirError(f"merge unit {unit_id} has no list of site ids; "
+                              f"{UNITS_FILE_NAME} is not the engine's")
         kinds = {site.id: site.asks for site in _run_sites(rundir, units_doc).clusters}
-        unknown = [sid for sid in unit.get("sites", ()) if sid not in kinds]
+        unknown = [sid for sid in unit["sites"] if sid not in kinds]
         if unknown:
             raise RunDirError(
                 f"unit {unit_id} is listed with {unknown[0]!r}, which is not a site of this "

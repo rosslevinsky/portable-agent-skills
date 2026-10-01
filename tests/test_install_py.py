@@ -1842,6 +1842,12 @@ class ADefaultInstallSeedsTheBackendsFile(unittest.TestCase):
         self.assertEqual((self.folder / install.KEY_FILE).read_bytes(),
                          b"# export OPENROUTER_API_KEY=\n")
 
+    def test_a_failed_install_seeds_nothing(self):
+        with unittest.mock.patch.object(install, "do_install", return_value=1):
+            code, _ = self.run_installer()
+        self.assertEqual(code, 1)
+        self.assertFalse(self.folder.exists(), "a refused install still wrote the backends folder")
+
     def test_a_targeted_install_leaves_the_home_folder_alone(self):
         self.run_installer("--target", str(self.root / "elsewhere"))
         self.assertFalse(self.folder.exists())

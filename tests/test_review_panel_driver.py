@@ -1703,6 +1703,28 @@ class AFullRun(_Case):
         self.assertEqual(len(merged), 1, findings["defects"])
         self.assertEqual(merged[0]["sites"], findings["merge_check"]["groups"][0]["accepted"])
 
+    def test_a_merge_unit_listed_without_a_list_of_sites_is_refused_by_name(self):
+        """The landing check refuses what the merge stage refuses, and in the same words: a
+        merge unit whose `sites` is missing or not a list of ids is not the engine's."""
+        payload = json.loads((self.rundir / "units" / review_panel.MERGE_UNIT_ID / "result.json")
+                             .read_text(encoding="utf-8"))
+        real = review_panel._read_run_json
+        for broken in ({}, {"sites": "S1"}):
+            def read(rundir, name, broken=broken):
+                doc = real(rundir, name)
+                if name != review_panel.UNITS_FILE_NAME:
+                    return doc
+                units = [dict(u) for u in doc["units"]]
+                for u in units:
+                    if u["kind"] == review_panel.MERGER_KIND:
+                        u.pop("sites", None); u.update(broken)
+                return {**doc, "units": units}
+            with self.subTest(broken=broken), \
+                    mock.patch.object(review_panel, "_read_run_json", side_effect=read):
+                with self.assertRaises(review_panel.RunDirError) as cm:
+                    review_panel.check_result(self.rundir, review_panel.MERGE_UNIT_ID, payload)
+                self.assertIn("no list of site ids", str(cm.exception))
+
     def test_the_merge_unit_lands_a_result_the_engine_accepts(self):
         """The stub answers the merge kind with a real result, so the run's merge unit ends
         in `result.json`, and the report read it as complete rather than as a unit that

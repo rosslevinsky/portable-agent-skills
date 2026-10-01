@@ -15,6 +15,7 @@ import html
 from html.parser import HTMLParser
 import json
 import threading
+import types
 import contextlib
 import os
 import shutil
@@ -13521,6 +13522,22 @@ class TheDefectIdIsShortAndStable(_FindingsCase):
         # A hand-built structure orders rather than raising: the fallback keeps the sort
         # total for anything not of that shape.
         self.assertEqual(review_panel._id_rank("Dx"), (-1, "Dx"))
+        # Merge-check groups are numbered the same way and sort by number too.
+        self.assertEqual(sorted(["G10", "G2", "G1"], key=review_panel._id_rank), ["G1", "G2", "G10"])
+
+
+class ACoverageGapPrintsEverySiteFile(unittest.TestCase):
+    def test_every_file_of_a_multi_site_gap_is_a_printed_path(self):
+        """A multi-site coverage gap renders each site at its own location, so each site's
+        file is a path the legend must decode, not only the gap's own."""
+        findings = types.SimpleNamespace(
+            defects=(), sites=(),
+            coverage_defects=({"id": "D1", "file": "a/one.py"},),
+            coverage_sites=({"id": "S1", "file": "a/one.py"}, {"id": "S2", "file": "b/two.py"}))
+        inventory = {"excluded": [], "skipped": []}
+        with mock.patch.object(review_panel, "_reachability_dirs", return_value=[]):
+            paths = review_panel._printed_paths(inventory, {}, [], findings, {})
+        self.assertIn("b/two.py", paths)
 
 
 class EveryFactInTheStructureReachesTheProse(_FindingsCase):

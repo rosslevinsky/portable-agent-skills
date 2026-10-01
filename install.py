@@ -1237,7 +1237,9 @@ def main(argv=None) -> int:
     code = do_install(targets, args.source, force=args.force)
     # Only a default install touches the home folder: `--target` names where skills go and
     # nothing else, so a run aimed at a scratch directory leaves the user's settings alone.
-    if not args.target:
+    # And only a clean one: a refused or partly failed install seeds nothing, and the re-run
+    # that succeeds seeds then.
+    if not args.target and code == 0:
         seed_backends()
     return code
 
