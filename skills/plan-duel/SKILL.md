@@ -21,7 +21,7 @@ description: >
 
 _Classification: Degraded — the duel runs from **either** runtime as controller with
 the other runtime as participant (both directions are implemented), but every LLM
-judgment point is now a subprocess, so three hard prerequisites apply. (1) **Both**
+judgment point is a subprocess, so three hard prerequisites apply. (1) **Both**
 runtimes' CLIs must be present on `PATH` — the three roles span the controller's own
 CLI (Agent A and the judge) as well as the participant's; the engine resolves all
 three via `shutil.which` and halts naming any that are missing. (2) A **Python

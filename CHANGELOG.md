@@ -8,6 +8,38 @@ Versions use [Calendar Versioning](https://calver.org/) in the form
 A MICRO bump in the same month indicates a follow-up release; a new month
 starts from `.0` again.
 
+## [2026.09.8] - 2026-10-03
+
+### Changed
+
+- **`/commit` adds a `Co-Authored-By` trailer only when your instructions ask for one.** It
+  used to add one whenever the tool running it supplied an identity. Now it adds none unless
+  your own or your project's instructions ask for it, and never when they say not to.
+- **`/tdd` reports in plain prose.** In place of a fixed summary form, it says what the new
+  tests cover and leave out, where they live, the command that runs them, and which tests it
+  ran to check nothing else broke, so the report no longer implies a full-suite run that did
+  not happen.
+- **`/tdd` follows a plan's rule on which tests to run.** When `/plan-run` hands its test loop
+  to `/tdd`, the plan's rule for which tests to run while working now wins over `/tdd`'s own
+  rule of running the full suite, or at least the affected layer, after every green.
+- **`/plan-phase`'s evidence record has a "Ran by" line.** It records where the phase ran (the
+  supervisor with its backend and model, a sub-agent, or the current session) and whether the
+  cross-model review was skipped on request. `/plan-run` already asked for both; the template
+  now has a place to put them.
+
+### Fixed
+
+- **`/plan-init` links a plan from the plans index the way its template does.** A plan kept
+  under the plans directory is linked relative to the index file in that directory, as
+  `./<slug>/`. The instructions also gave a second form that does not resolve from inside the
+  directory, and one of their sentences broke off mid-way; both are corrected.
+- **`/plan-run-v1` stops and asks on a resume state none of its steps creates.** When a phase's
+  Exit Criteria are partly ticked and its own work files are also modified, it now asks you
+  rather than re-running the phase's checks on edits it did not make.
+- **`/security-review-codebase`'s deep mode no longer depends on a background setting some
+  Claude Code configurations do not have.** Under Claude it now says only to wait for every
+  component review before the cross-component pass.
+
 ## [2026.09.7] - 2026-10-01
 
 ### Fixed
@@ -809,6 +841,7 @@ release](README.md#installing-a-previous-release) to return to it.
 
 Initial release.
 
+[2026.09.8]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.8
 [2026.09.7]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.7
 [2026.09.6]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.6
 [2026.09.5]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.5

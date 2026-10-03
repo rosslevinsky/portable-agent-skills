@@ -99,7 +99,7 @@ of resetting the tree. **Whatever you revert, untick the boxes it had ticked** â
 or Gate. A box that outlives the work behind it is worse than no box at all: the
 fresh worker reads it as done and skips work that no longer exists.
 
-The `outcome` wrapper is load-bearing, not decoration: both runtimes reject a
+The `outcome` wrapper is required: both runtimes reject a
 structured-output schema whose root is a union, and accept one nested a level down.
 
 ## On-disk state is authoritative, not the return formatting

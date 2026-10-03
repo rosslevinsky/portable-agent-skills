@@ -25,48 +25,11 @@ tests and confirming the expected outcome.**
 
 ## Phase 1 — Understand
 
-Before writing any code:
-
-### 1a — Read the feature spec
-
-The argument passed to `/tdd` is the feature to implement. Parse it to identify:
-- What behavior needs to exist
-- What layer it lives in (API, business logic, UI component, hook, utility)
-- What the expected inputs and outputs are
-
-### 1b — Discover the project structure
-
-Do not assume paths. Explore the actual codebase:
-
-- Find the test runner config: look for `pytest.ini`, `pyproject.toml` (pytest section),
-  `vitest.config.*`, `jest.config.*`
-- Find existing test directories: search for directories matching `**/tests/` and
-  `**/__tests__/`, and files matching `**/*.test.*` and `**/*.spec.*`
-- Find the nearest existing code in the relevant layer and read it
-- Find existing tests for similar features — identify patterns to follow (naming,
-  fixture usage, assertion style)
-
-### 1c — Identify the test layer
-
-Based on what you find, determine:
-
-| Feature type | Typical test layer | Notes |
-|---|---|---|
-| Pure function / utility | Unit test | Fastest, no I/O |
-| API endpoint / DB interaction | Integration test | Needs DB fixture |
-| React hook | Frontend unit (renderHook) | Mock network with MSW or similar |
-| React component | Frontend unit | Render + assert |
-| Full user flow | E2E | Manual or Playwright |
-
-Confirm which test runner and commands apply to this project before proceeding.
-
-### 1d — Find reusable test utilities
-
-Before writing anything, check for:
-- Backend: conftest.py files with fixtures (sessions, clients, factories, users)
-- Frontend: test utility wrappers, MSW handlers, mock servers
-
-Note what's available — do not reinvent what already exists.
+Read the code and tests nearest the feature before writing anything. Work out what behavior
+must exist, which layer it lives in (pure function, API/DB, hook, component, full flow), and
+which runner and command test that layer in this project. Follow the nearest existing tests'
+placement, naming, fixtures and assertion style, and reuse the project's test helpers
+(conftest.py fixtures, MSW handlers, render wrappers) instead of adding new infrastructure.
 
 ---
 
@@ -114,6 +77,8 @@ Write the **minimum** code to make the failing tests pass:
 
 All tests in the new file must pass. No previously passing tests may regress.
 Run the full test suite (or at minimum the affected layer) to confirm no regressions.
+When this loop runs inside a plan that sets its own rule for which tests to run while
+working, that rule wins.
 
 If tests still fail, fix the implementation — do not modify the tests to make them pass.
 
@@ -133,23 +98,9 @@ If nothing needs cleanup, skip this phase.
 
 ## Phase 5 — Report
 
-After tests are green, summarize:
-
-```
-## TDD Summary: <feature name>
-
-**Tests written:** <count> tests in <file(s)>
-**Test layer:** <unit / integration / E2E>
-**Test command:** <exact command to run these tests>
-**All passing:** yes / no
-
-**What's covered:**
-- <behavior 1>
-- <behavior 2>
-
-**Known gaps (not covered by these tests):**
-- <gap 1 if any>
-```
+After tests are green, report what the new tests cover and what they leave out, which files
+they live in, the exact command that runs them, and which tests you ran to check for
+breakage and whether they passed.
 
 ---
 

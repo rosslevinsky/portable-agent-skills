@@ -69,6 +69,8 @@ independent review reads the diff, not this._
   delivered, plus any risk worth watching. This is the line `as-built.md` reads.>
 - **Changed:** <files / modules touched>
 - **Verified:** <commands run and their outcomes>
+- **Ran by:** <supervisor (backend and model), sub-agent, or this context; note a
+  cross-model review skipped by request>
 - **Deviations:** <doc-vs-reality corrections made during execution, or "none">
 - **Follow-ups:** <non-blocking minors/nits, and any post-cap blocker/major disposition —
   fixed, or refuted-with-evidence — or "none">

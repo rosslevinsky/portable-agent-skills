@@ -1,16 +1,16 @@
 {
   "clarify": 499,
-  "commit": 1815,
+  "commit": 1826,
   "cyw": 642,
   "demo-video": 1880,
   "diff-review": 3595,
-  "extract-hooks": 871,
-  "plan-duel": 5224,
-  "plan-init": 2455,
-  "plan-phase": 3233,
-  "plan-run": 10009,
-  "review-panel": 20606,
-  "security-review-codebase": 5610,
-  "tdd": 970,
-  "web-verify": 1923
+  "extract-hooks": 862,
+  "plan-duel": 5223,
+  "plan-init": 2289,
+  "plan-phase": 3256,
+  "plan-run": 9870,
+  "review-panel": 20592,
+  "security-review-codebase": 5578,
+  "tdd": 771,
+  "web-verify": 1927
 }

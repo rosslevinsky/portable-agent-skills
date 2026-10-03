@@ -5,7 +5,7 @@ description: "This skill should be used when the user asks to 'security review t
 
 # Security Review: Full Codebase
 
-_Classification: Degraded — the default single-pass review runs in any runtime (parallelism is optional; the sequential fallback preserves full coverage). The optional deep mode (`references/hierarchical-mode.md`) uses fresh sub-agents for per-component reviews where available; without them it runs the same decomposition and cross-component pass sequentially in one context. That keeps the method intact, but on a **very large** codebase a single accumulating context can thin the thoroughness of later components' reviews — a coverage risk, not just a speed/hygiene loss, which is why this is Degraded rather than Full. (It differs from `plan-run`, which stays Full because its per-phase execution units are individually bounded and need not all fit in one context.)_
+_Classification: Degraded — the default single-pass review runs in any runtime (parallelism is optional; the sequential fallback preserves full coverage). The optional deep mode (`references/hierarchical-mode.md`) uses fresh sub-agents for per-component reviews where available; without them it runs the same decomposition and cross-component pass sequentially in one context. That keeps the method intact, but on a **very large** codebase a single accumulating context can thin the thoroughness of later components' reviews — a coverage risk, not just a speed/hygiene loss, which is why this is Degraded rather than Full._
 
 _Progress: bounded — each per-component sub-agent returns its findings on completion; deep mode adds parallel fan-out, not a live progress channel, so no progress file is used._
 

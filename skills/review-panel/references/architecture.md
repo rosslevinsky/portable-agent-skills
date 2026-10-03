@@ -2,7 +2,7 @@
 
 Not a brief, and not a step. Nothing in a run sends a worker or a dispatcher here: this is
 for somebody about to change `review_panel.py`, `review_panel_run.py` or the skill text, who
-would otherwise have to infer the boundaries from ten thousand lines of Python.
+would otherwise have to infer the boundaries from the Python alone.
 
 ## Where the control flow lives
 

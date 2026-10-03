@@ -112,10 +112,8 @@ or the CLI's own sign-in), an in-process sub-agent, or this context.
 > fifteen minutes with no output, or thirty in all, and a worker may print nothing for as long
 > as it runs. For a backend, add
 > `--backend <name>` before the `--` and `-m ⟪model⟫ ⟪backend_args⟫` after `exec`.
-> **The brief is that trailing positional argument.** It is spelled out because the
-> paragraph below says the prompt is already in argv, and a template with nowhere to put it
-> reads as though the flags alone were the command — dispatching a worker with no brief at
-> all, which fails for reasons that point nowhere near the missing prompt. Those two permission
+> **The brief is that trailing positional argument** — a worker dispatched without it
+> fails for reasons that point nowhere near the missing prompt. Those two permission
 > flags are **not** optional, and neither is a closed stdin: `codex exec` reads stdin even
 > when the prompt is already in argv, so a worker whose stdin is left open blocks before it
 > reaches the model — a hang with no output to diagnose it by. The supervisor launches it
@@ -169,9 +167,6 @@ never reads `phases.md`).
 you just read lives in, whatever it turns out to be. Discovery accepts a plan anywhere, so
 a plan at `docs/proposal.md` has its `execution.md`, its phase documents and its
 `as-built.md` in `docs/`, and this skill never invents a `plans/` directory to put them in.
-`/plan-phase` states the same rule about its own writes and is where those files came from;
-without it stated here too, nine literal-looking paths in the steps below read as a
-requirement rather than the shorthand they are.
 
 If `execution.md` does not exist, stop and tell the user:
 "This plan has no execution tracker yet. Run `/plan-phase <path>` first."
@@ -274,9 +269,7 @@ and branch 3 ends at a `git add -A` that commits it unverified.
      one case: the Work describes that push and it never happened — and **scoped to that push
      alone**, the way branch 1 scopes to what is dirty. When it lands, run **Publish's push
      block alone** — not the whole of Publish, whose finalization commit is already made and
-     which would otherwise add a second one carrying nothing but a tick. (The v1 suite
-     states the same rule; it is named here rather than cited, because an installed skill
-     is self-contained and cannot reach a sibling skill's file.) Never re-run Work whose
+     which would otherwise add a second one carrying nothing but a tick. Never re-run Work whose
      box is already ticked: an unscoped return either does nothing and lands you back here,
      or repeats an action Satisfy's repeat guard does not cover, because that guard is
      scoped to *unchecked* items. Do not read that as "everything is ticked" — the
@@ -598,7 +591,7 @@ resumes from here once it is.
 
 **Then tick any post-publish box in the phase document, and then this phase's box in
 `execution.md`** — never before the commit and push above. **Commit → push → tick is the whole
-ordering rule, and every part of it is load-bearing.** A box ticked before the commit claims a
+ordering rule, and dropping any part of it breaks a resume.** A box ticked before the commit claims a
 phase is settled while its work is uncommitted, and a resumed run believes it and walks
 straight past. One ticked before the push strands the commit locally, so the CI round the
 phase may be waiting on never starts. And child before index, because a ticked box makes the
@@ -663,14 +656,12 @@ Its cleanup follows the same ownership rule: revert **only** the paths its resul
 if it reported `changed_surface: "none"` while the tree still shows edits the phase appears
 to own, stop and ask.
 
-**Untick every box the reverted work had ticked** — Work, Test or Gate. The contract puts
-this duty on the worker, which discharges it whenever the worker reverts its own edits; on
-the branch where it hands you a path list instead, it reverted nothing, so the sentence is
-vacuous and the duty lands here. A box that outlives the work behind it is worse than no box
+**Untick every box the reverted work had ticked** — Work, Test or Gate. A worker that
+reverts its own edits unticks its own boxes; when a BLOCKED worker hands you a path list
+instead, the unticking is yours. A box that outlives the work behind it is worse than no box
 at all: the fresh worker you dispatch next reads it as done and skips work that no longer
-exists — and then the phase gates, commits and ticks with that work simply missing. The
-scoped tests and the independent review are a partial backstop and neither is obliged to
-notice absent work, which is exactly why the duty is written down rather than inferred.
+exists, and the phase then gates, commits and ticks with that work missing. Neither the
+scoped tests nor the independent review is obliged to notice absent work.
 
 ---
 

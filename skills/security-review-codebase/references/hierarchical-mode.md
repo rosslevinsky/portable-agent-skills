@@ -283,8 +283,7 @@ as above. Do the same for any component whose supervisor status is not `ok`. `RE
 which path ran, and why a component fell back.
 
 > **Claude adapter:** Launch all component sub-agents in a single message (one Agent tool call
-> per component, all in the same response). Run them as foreground agents so you receive all
-> results before Phase 4. Do not use `run_in_background: true`.
+> per component, all in the same response), and wait until every one has returned before Phase 4.
 
 > **Codex adapter:** Launch each component review through the supervisor as an **argv
 > list**, with the prompt as one element, where `<diff-review dir>` is that skill's installed

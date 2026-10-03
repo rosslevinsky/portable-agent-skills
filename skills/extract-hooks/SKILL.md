@@ -16,8 +16,6 @@ Move non-UI logic out of `.tsx` files into custom `use*.ts` hooks, so that `.tsx
 
 ## Phase 1 — Inventory
 
-Do not assume anything. Explore the actual codebase first.
-
 1. Find all `.tsx` files. For each, read it and record:
    - Total lines and approximate lines of non-UI logic vs. layout/JSX
    - Categories of logic present (state, API calls, event handlers, validation, derived state, etc.)

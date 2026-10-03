@@ -86,8 +86,8 @@ risky changes isolated; a final verification-gate phase). **Every phase that int
 new behavior is test-first:** for logic, API endpoints, and utilities the failing test
 is written before the implementation (TDD); for UI and wiring, tests are written
 alongside — no phase is complete until its tests pass. This ordering flows into each
-emitted phase doc's Tests section (the template's test-first note is load-bearing —
-keep it). Then decide which, if any, are genuinely **independent**.
+emitted phase doc's Tests section (keep the template's test-first note —
+it carries this rule into every phase doc). Then decide which, if any, are genuinely **independent**.
 
 **Independent phases are rare, and that is correct.** Almost every phase is a single
 sequential unit. Note independence when it is real; do not reach for it to signal that

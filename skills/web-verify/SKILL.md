@@ -21,7 +21,7 @@ _Classification: Degraded — assertions and captures run in any runtime, but a 
 Confirm a web UI is genuinely correct by exercising it and **looking at the
 result**, not by trusting that a test or artifact exists.
 
-**The load-bearing rule:** a green run or a saved screenshot/video is *evidence to
+**The core rule:** a green run or a saved screenshot/video is *evidence to
 inspect*, never a conclusion. Visual verification is satisfied only when the
 expected, content-bearing UI is confirmed present in an actual captured image (or,
 where images can't be viewed, by anchored assertions plus a human screenshot

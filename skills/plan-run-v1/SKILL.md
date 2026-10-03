@@ -104,8 +104,9 @@ decides where you re-enter:
 - **Exit Criteria partly ticked** → 3i ticks them one at a time, so a crash inside it
   leaves exactly this, and the gate has already passed. Read it as the bookkeeping branch
   below, not as ungated work: re-entering at 3e re-runs a gate that passed and lands the
-  bookkeeping-only commit that branch exists to avoid. The one case where the gate did
-  *not* finish is work files this phase owns being dirty too — that is the branch above.
+  bookkeeping-only commit that branch exists to avoid. If work files this phase owns are
+  dirty too, no step of this skill made that state: 3h commits the work before 3i ticks
+  anything, so those edits came from outside the run. Stop and ask the user.
 - **Tasks, Tests and Exit Criteria all ticked, `phases.md` still `- [ ]`** → the work is
   done and gated, and only bookkeeping is outstanding, whether or not the push got as far as
   the remote. Go to **3i** to finish the bookkeeping, then run **3h's push block alone** —
@@ -122,7 +123,7 @@ decides where you re-enter:
 Dirty *bookkeeping* proves nothing either way and is expected at this point: a phase-document
 status or an Exit Criteria tick written just before the crash is exactly what 3i writes.
 
-**The third branch names three sections rather than saying "everything".** Entry Criteria are
+**The fourth branch names three sections rather than saying "everything".** Entry Criteria are
 a fourth section of boxes and nothing here ever ticks them — 3b *confirms* they are true,
 which is not the same edit. So "everything ticked" would describe a state a completed phase
 never reaches; and because the first branch asks only about Task and Test boxes, a finished

@@ -30,7 +30,7 @@ assertion to specific, content-bearing evidence so a regression cannot slip thro
    network-idle condition that fails loudly on timeout.
 3. **Pin to stable anchors.** Prefer roles, labels, test-ids, or user-visible text
    over brittle nth-child/CSS chains.
-4. **One visible, load-bearing assertion per checkpoint.** If the page rendered
+4. **One visible assertion per checkpoint that a wrong render breaks.** If the page rendered
    wrong, at least one anchored assertion must go red.
 5. **Distinguish empty from broken.** Assert the difference between an intentional
    empty state ("No items yet") and a failed render (blank / error).
