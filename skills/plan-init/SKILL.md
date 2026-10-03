@@ -20,20 +20,8 @@ Produce a structured plan document for the given task, marked as **v2** so the
 document becomes the anchor for all future work breakdown and execution. Once
 written, it is never modified by subsequent skills — it is a stable reference.
 
-This is the v2 variant of `/plan-init-v1`. Three differences change what the skill
-*does*; the rest of the divergence between the two files is wording:
-
-1. The plan's Status table is **replaced**, not extended: `Format: v2` and `Suite`
-   are the only two rows, and v1's `Phase` / `State` / `Blocker` / `Last updated`
-   are gone (Step 6 says why).
-2. The plan is registered in the `plans/README.md` discovery index — **when it lives under
-   `plans/`**. The index row is a relative link resolved from `plans/README.md`, so a plan
-   the user asked for somewhere else has no row that would resolve (Step 7).
-3. When UI is in scope, a visual-verification success criterion is added.
-
-Everything else about the plan's content model is identical to v1. In particular,
-this skill stays **breakdown-unaware**: it writes no phases and no grouping —
-that is `/plan-phase`'s job.
+This skill stays **breakdown-unaware**: it writes no phases and no grouping — that is
+`/plan-phase`'s job.
 
 ---
 
@@ -207,7 +195,7 @@ it and leave it alone. So it carries no `State`, `Phase`, `Blocker` or `Last upd
 (v1 plans do) — a status field in an immutable document can only ever be stale. Live status
 lives in `execution.md` and the phase documents, as checkboxes.
 
-The `| Format | v2 |` row is the load-bearing marker: `/plan-phase` and
+The `| Format | v2 |` row is the marker the other skills look for: `/plan-phase` and
 `/plan-run` act only on plans that carry it, and the v1 skills never do. Emit it
 exactly as the two-cell table row shown in the template.
 
@@ -215,16 +203,14 @@ exactly as the two-cell table row shown in the template.
 
 ## Step 7 — Register the plan in the discovery index
 
-**Only when the plan lives under `plans/`** — that is, the user accepted the default in
-**The test is the plan's path, not the slug.** A plan under `plans/` gets a row, and the
-row's link is its own directory relative to `plans/README.md` — `plans/<slug>/` on the
-default path, `custom/` for a plan the user wrote to `plans/custom/plan.md`. Keying on the
-generated slug instead left that second plan out of an index the Overview promises it a row
-in. A plan written anywhere else has no row that would resolve: skip this step, and **never
-create `plans/` to hold a row** — `docs/proposal.md` would be indexed as `plans/<slug>/`, a
-link to nothing in a directory invented to hold it. `/plan-phase` and `/plan-run` both refuse to invent that directory; this must too.
+**Only when the plan lives under `plans/`.** The test is the plan's path, not whether a slug
+was generated: a plan the user wrote to `plans/custom/plan.md` gets a row too. The row's link
+is the plan's own directory relative to `plans/README.md` — `./<slug>/` on the default path,
+`./custom/` in that example. A plan written anywhere else has no row that would resolve:
+skip this step, and **never create `plans/` to hold a row** — `/plan-phase` and `/plan-run`
+both refuse to invent that directory; this must too.
 
-On the default path, maintain `plans/README.md` as the discovery index (it renders on
+For a plan under `plans/`, maintain `plans/README.md` as the discovery index (it renders on
 GitHub/GitLab), using the create/append snippets in `references/plan-template.md`:
 
 - If `plans/README.md` does **not** exist, create it with the index title and table header
@@ -245,7 +231,7 @@ Print a brief summary:
 - How many success criteria were identified (note if a UI-verification criterion was added)
 - How many files are in "will change"
 - That the plan is stamped `Format: v2`, and that it is indexed in `plans/README.md` —
-  or, off the default path, that it was **not** indexed and why
+  or, for a plan outside `plans/`, that it was **not** indexed and why
 - Next step: "Run `/plan-phase <path>` to break this into executable phases and generate the `execution.md` tracker."
 
 ---

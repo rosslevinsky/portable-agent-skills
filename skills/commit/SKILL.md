@@ -150,12 +150,14 @@ Analyze `git diff HEAD` (or the cached diff if changes were already staged befor
 
 <optional body — explain the why, not the what; wrap at 72 chars>
 
-<optional Co-Authored-By trailer if the runtime provides a valid identity>
+<optional Co-Authored-By trailer, only when the user's instructions ask for one>
 ```
 
-Include a `Co-Authored-By` trailer only when the runtime provides an explicit,
-valid name and email identity for the current agent. If no such identity is
-available, omit the trailer.
+Add a `Co-Authored-By` trailer only when the user's or the project's instructions
+ask for one, using the name and email they give or that the runtime provides.
+Otherwise omit it, and omit it whenever an instruction says not to add one: a
+trailer can carry a session link, and a published link can expose what the
+session held.
 
 **Subject line rules:**
 - Imperative mood: "Add", "Fix", "Rename", "Remove", "Update", not "Added", "Fixes", "Renaming"
@@ -169,13 +171,6 @@ available, omit the trailer.
 - Explain *why*, not *what* (the diff shows what)
 - Wrap lines at 72 characters
 - Use a blank line between subject and body
-
-**Bad examples (do not write these):**
-- "Update files"
-- "Fix stuff"
-- "WIP"
-- "Changes"
-- "Misc updates"
 
 ---
 

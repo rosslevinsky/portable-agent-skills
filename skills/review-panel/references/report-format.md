@@ -77,8 +77,8 @@ the quoted source at each site, or why none is quoted. Without a synthesis accou
 defect of several sites shows the mechanism the merge check upheld.
 
 **Evidence** follows, one entry per site in site order, headed by its number, location,
-outcome and defect. It holds every line the site's readers and checkers recorded, as a
-defect of that one site rendered it before sites existed, less exactly these: the defect's
+outcome and defect. It holds every line the site's readers and checkers recorded, less
+exactly these: the defect's
 account; the line giving the full path and the commit, stated once at the top; the quoted
 source, the first test and what is not settled, which the defect entry shows; a clustering
 note on a site the merge put in a defect of several, moved to the appendix; and a block
