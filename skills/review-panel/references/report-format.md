@@ -34,7 +34,9 @@ anything, which from the run directory look the same — and one whose worker wr
 diagnostic it left; the report says which, because "nobody ran it" and "it ran and broke"
 are different things to know about a round. There is no synthesis record where no unit was
 written: a run where `synthesize` was never invoked, and equally one where it ran over a
-tree that raised nothing, since a run with no defects has nothing to judge.
+tree with nothing to write up. The round is handed only defects with a site that stood or
+stayed open; a defect refuted at every site and a coverage gap need no heading, fix or
+tier, and render as they would with no round.
 The round itself writes only its unit and the listing beside it; its answer reaches
 `findings.json` because **`report` reads the result and records it there**, which is why the
 document is a pure function of the run directory and not of anything the round did while it

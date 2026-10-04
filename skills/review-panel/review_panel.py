@@ -3834,7 +3834,7 @@ QUOTE_MATCHES, QUOTE_DIFFERS, QUOTE_UNREADABLE = "matches", "differs", "unreadab
 QUOTE_STATES = (QUOTE_MATCHES, QUOTE_DIFFERS, QUOTE_UNREADABLE)
 # A reader invents its findings, so no set exists to prove its list complete against — the
 # check that catches a short clustering or synthesis reply has nothing to compare here. The
-# worker therefore declares its own count and is held to it.
+# worker therefore declares its own count, and the array may not fall short of it.
 #
 # **This does not catch a truncated reply.** A reply cut off inside the array is not valid
 # JSON and fails to decode long before this runs. Closing such an object by hand would make
@@ -3842,6 +3842,10 @@ QUOTE_STATES = (QUOTE_MATCHES, QUOTE_DIFFERS, QUOTE_UNREADABLE)
 # result at all. What this catches is a worker that MISCOUNTS: one whose object is
 # well-formed and whose array is shorter than the number it stated in the same object. That
 # is the only completeness handle a reading round has, which is why it is kept.
+#
+# **Only a shorter array is refused.** An array LONGER than the declared count lost nothing:
+# every finding in it is still parsed and judged on its own, so refusing it would discard a
+# unit's whole reading over a number that undercounted what arrived.
 #
 # Named in the schema and REQUIRED there, so an enforced runtime always sends it; optional
 # to the parser, which is why the required tuple below is the shorter one. The asymmetry
@@ -4258,7 +4262,7 @@ def _parse_finding(raw: object, field: str, files, cwd_files=None,
 
 
 def _check_declared_count(obj: dict, found: int) -> None:
-    """Hold a reading result to the count its own writer declared.
+    """Refuse a reading result whose array is shorter than the count its writer declared.
 
     ``bool`` is an ``int`` in Python, so it is excluded by name: ``True`` would otherwise
     pass as a declared count of one.
@@ -4273,7 +4277,7 @@ def _check_declared_count(obj: dict, found: int) -> None:
             f"field '{READER_COUNT_KEY}' must be a non-negative whole number "
             f"(found {declared!r})"
         )
-    if declared != found:
+    if found < declared:
         raise ResultError(
             f"the reply declares {declared} findings and carries {found}; a reply that "
             f"lost part of its array is this unit's failure, not a shorter list"
@@ -7130,6 +7134,12 @@ def site_status(asks: str, statuses: Iterable[str]) -> str:
     return DEFECT_UNRESOLVED
 
 
+def site_statuses(clustering: Clustering, resolved: dict) -> dict[str, str]:
+    """Every site's outcome by site id, from :func:`resolve`'s answer for its candidates."""
+    return {site.id: site_status(site.asks, (resolved[cid].status for cid in site.members))
+            for site in clustering.clusters}
+
+
 def merge_check_material(groups: Sequence[dict], clustering: Clustering,
                          candidates: Sequence[dict], rationales: dict[str, str | None],
                          statuses: dict[str, str],
@@ -7631,7 +7641,8 @@ TO_JUDGE_HEADING = "\n## Your defects\n"
 
 @dataclass(frozen=True)
 class SynthesisUnit:
-    """The synthesis round's one unit: every defect in the run, addressed to one lane."""
+    """The synthesis round's one unit: every defect that needs a write-up, addressed to one
+    lane."""
 
     id: str
     lane: str
@@ -7683,12 +7694,33 @@ def load_synthesis_companions() -> SynthesisCompanions:
     )
 
 
-def plan_synthesis(defects: Sequence[Defect]) -> tuple[SynthesisUnit, ...]:
-    """One unit holding every defect, or none at all where the run found nothing.
+def needs_a_write_up(defects: Sequence[Defect],
+                     statuses: dict[str, str]) -> tuple[Defect, ...]:
+    """The defects the synthesis round is handed: every defect with a site still standing
+    or still open, with all of its sites.
 
-    A run with no defect gets no unit for the reason an area that raised nothing gets no
-    clustering unit: a payload with an empty list asks a worker nothing, and the answer it
-    would have to return is the empty one.
+    **Left out: a coverage gap, and a defect refuted at every site.** Neither needs a
+    heading, an account, a fix or a tier. The report lists a refuted defect under Refuted
+    with its dismissal reason, headed by its consequence, and renders a gap from its own
+    record; prose the round wrote for either would be text nobody acts on. A defect refuted
+    at SOME site is still work and keeps every site, the refuted one included, because its
+    account is of the whole defect.
+
+    ``statuses`` is :func:`site_statuses`. The report asks the same question of the same
+    run directory, which is what lets :func:`check_synthesis` hold the listing to it.
+    """
+    return tuple(defect for defect in defects
+                 if defect.asks == DEFECT_ASKS
+                 and any(statuses[sid] != DEFECT_REFUTED for sid in defect.sites))
+
+
+def plan_synthesis(defects: Sequence[Defect]) -> tuple[SynthesisUnit, ...]:
+    """One unit holding every defect it is given, or none at all where there is none.
+
+    ``defects`` is :func:`needs_a_write_up`'s answer. A run with nothing to write up gets no
+    unit for the reason an area that raised nothing gets no clustering unit: a payload with
+    an empty list asks a worker nothing, and the answer it would have to return is the
+    empty one.
     """
     if not defects:
         return ()
@@ -8046,10 +8078,19 @@ def read_synthesis_result(rundir: Path, units: Sequence[dict]) -> SynthesisState
                           parsed["assignments"], tuple(parsed["rejected"]), parsed["summary"])
 
 
-def check_synthesis(defects: Sequence[Defect], units: Sequence[dict]) -> None:
+def check_synthesis(defects: Sequence[Defect], units: Sequence[dict],
+                    written: Sequence[Defect] | None = None) -> None:
     """The synthesis listing against the run's own defects: at most one unit, holding
-    exactly the defect ids this run has. Refused by name before any result is read, as
-    :func:`check_clustering` refuses the same shape one stage earlier.
+    exactly the defect ids that need a write-up. Refused by name before any result is read,
+    as :func:`check_clustering` refuses the same shape one stage earlier.
+
+    ``defects`` is every defect in the run and ``written`` is :func:`needs_a_write_up`'s
+    answer over them; ``None`` is every defect. **The listing must cover every defect that
+    needs a write-up, name nothing that is not this run's, and name nothing twice** — not
+    equal ``written`` exactly. A listing of every defect, from a round planned before
+    refuted defects and coverage gaps were left out, passes; so does one planned before a
+    verification result moved a defect into or out of refuted, which is the engine's own
+    listing of a run that has since changed, not a foreign one.
 
     The partition check proves a reply against the ids its own unit was HANDED, so a
     listing naming a different set of defects would pass it and the report would carry a
@@ -8075,12 +8116,15 @@ def check_synthesis(defects: Sequence[Defect], units: Sequence[dict]) -> None:
             f"synthesis unit {unit.get('id', '(unnamed)')!s} has no list of defect ids; "
             f"{UNITS_FILE_NAME} is not the engine's"
         )
-    ids = [defect.id for defect in defects]
-    if sorted(unit["defects"]) != sorted(ids):
+    ids = [defect.id for defect in (defects if written is None else written)]
+    listed = unit["defects"]
+    if (len(set(listed)) != len(listed) or not set(listed) <= {d.id for d in defects}
+            or not set(ids) <= set(listed)):
         raise RunDirError(
             f"synthesis unit {unit['id']} is listed with defects that are not this run's "
-            f"defects ({len(unit['defects'])} listed, {len(ids)} in the run); the round is "
-            f"handed every defect exactly once, so {UNITS_FILE_NAME} is not the engine's"
+            f"defects ({len(unit['defects'])} listed, {len(ids)} in the run need a "
+            f"write-up); the round is handed each of those exactly once, so "
+            f"{UNITS_FILE_NAME} is not the engine's"
         )
     # A listing written before defects could hold several sites has no record of them, and
     # every defect in it is one site. Where the record is there, a regrouping since the
@@ -8113,12 +8157,16 @@ def build_synthesis(units: Sequence[dict], state: SynthesisState | None) -> Synt
     if state is None or state.state != UNIT_COMPLETE:
         return Synthesis(assignments={}, record={
             "unit": unit["id"],
+            "defects": list(unit["defects"]),
             "state": state.state if state is not None else UNIT_MISSING,
             "reason": state.reason if state is not None else None,
             "tiers": [], "rejected": [], "summary": None,
         })
     return Synthesis(assignments=dict(state.assignments), record={
         "unit": unit["id"],
+        # The defects the round was handed. A defect not among them needed no write-up, so
+        # its missing tier is not an entry the round lost.
+        "defects": list(unit["defects"]),
         "state": state.state,
         "reason": state.reason,
         "tiers": list(state.tiers),
@@ -8261,12 +8309,15 @@ def write_synthesis(rundir: Path, units_doc: dict, units: Sequence[SynthesisUnit
         raise
 
 
-def synthesis_summary(units: Sequence[SynthesisUnit], defects: Sequence[Defect]) -> str:
-    out = [f"{_plural(len(defects), 'defect')} to judge"]
+def synthesis_summary(units: Sequence[SynthesisUnit], defects: Sequence[Defect],
+                      left_out: int = 0) -> str:
+    out = [f"{_plural(len(defects), 'defect')} to judge"
+           + (f"; {left_out} refuted at every site or a coverage gap, which need no write-up"
+              if left_out else "")]
     for unit in units:
         out.append(f"  {unit.id}  {_plural(len(unit.defects), 'defect')}  lane {unit.lane}")
     if not units:
-        out.append("  no synthesis unit: the run found nothing to judge")
+        out.append("  no synthesis unit: the run found nothing that needs a write-up")
     return "\n".join(out) + "\n"
 
 
@@ -11915,8 +11966,11 @@ def _render_synthesis_notes(findings: Findings) -> list[str]:
         out += _item(f"- {record['unit']} — {record['state']}: ",
                      record["reason"] or "no reason was recorded", SYNTHESIS_DEGRADED)
         return out
+    # A record written before the round's defects were recorded was handed every defect.
+    handed = record.get("defects")
+    named = len(handed) if handed is not None else len(findings.defects)
     out.append(f"- {record['unit']} — complete: {_plural(len(record['tiers']), 'tier')} "
-               f"named for {_plural(len(findings.defects), 'defect')}.\n")
+               f"named for {_plural(named, 'defect')}.\n")
     for message in record["rejected"]:
         out += _item("- an entry could not be read, and only its own defect is affected: ",
                      message, "That defect carries no tier and no account of itself, and "
@@ -12111,7 +12165,11 @@ def _grouping_notes(findings: Findings, before_sites: bool) -> list[str]:
     if synthesis is not None and synthesis["state"] != UNIT_COMPLETE:
         out.append(f"- {GROUPING_NO_SYNTHESIS}\n")
     elif synthesis is not None and synthesis["rejected"]:
-        lost = [d for d in findings.defects if d["tier"] is None]
+        # Only what the round was HANDED can be lost by it: a defect left out of it for
+        # needing no write-up has no tier either, and is not a refused entry.
+        handed = synthesis.get("defects")
+        lost = [d for d in findings.defects if d["tier"] is None
+                and (handed is None or d["id"] in handed)]
         if lost:
             out.append(f"- {synthesis_refused_note(lost)}\n")
     return out
@@ -15535,9 +15593,7 @@ def _run_merge_check(args: argparse.Namespace) -> int:
             check_merge(clustering, merge_units)
             proposed = proposed_groups(build_merge(merge_units, read_merge_results(
                 rundir, merge_units, {site.id: site.asks for site in clustering.clusters})))
-            statuses = {site.id: site_status(site.asks, (resolved[cid].status
-                                                         for cid in site.members))
-                        for site in clustering.clusters}
+            statuses = site_statuses(clustering, resolved)
             in_groups = {site for group in proposed for site in group["sites"]}
             quoted = {cid for site in clustering.clusters if site.id in in_groups
                       for cid in site.members}
@@ -15589,6 +15645,7 @@ def _run_synthesize(args: argparse.Namespace) -> int:
             holder = check_routing(routed["candidates"], batches)
             states = read_verification_results(rundir, batches, reproducible)
             rationales = verified_rationales(routed["candidates"], holder, states)
+            resolved = resolve(routed["candidates"], holder, states)
             cluster_units = [u for u in units_doc["units"] if u.get("kind") == CLUSTERER_KIND]
             check_clustering(routed["candidates"], cluster_units)
             cluster_states = read_clustering_results(rundir, cluster_units)
@@ -15596,9 +15653,11 @@ def _run_synthesize(args: argparse.Namespace) -> int:
             # The defects are the grouping the merge check upheld, so a defect of several
             # sites is narrated once with every site's material.
             _merge, check, grouping = _run_grouping(rundir, units_doc, clustering)
-            defects = group_sites(clustering, grouping)
+            every = group_sites(clustering, grouping)
+            upheld = _prove_grouping(every, check)
+            defects = needs_a_write_up(every, site_statuses(clustering, resolved))
             material = synthesis_material(clustering, routed["candidates"], rationales,
-                                          defects, _prove_grouping(defects, check))
+                                          defects, upheld)
             units = plan_synthesis(defects)
             write_synthesis(rundir, units_doc, units, material, companions, problem)
         finally:
@@ -15606,7 +15665,7 @@ def _run_synthesize(args: argparse.Namespace) -> int:
     except ReviewPanelError as exc:
         sys.stderr.write(f"{_PROG}: {exc}\n")
         return 2
-    sys.stdout.write(synthesis_summary(units, defects))
+    sys.stdout.write(synthesis_summary(units, defects, len(every) - len(defects)))
     return 0
 
 
@@ -15716,7 +15775,9 @@ def _run_report(args: argparse.Namespace) -> int:
         clustering = build_clusters(routed["candidates"], cluster_units, cluster_states)
         merge, merge_check, grouping = _run_grouping(rundir, units_doc, clustering)
         synthesis_units = [u for u in units_doc["units"] if u.get("kind") == SYNTHESIZER_KIND]
-        check_synthesis(group_sites(clustering, grouping), synthesis_units)
+        every = group_sites(clustering, grouping)
+        check_synthesis(every, synthesis_units,
+                        needs_a_write_up(every, site_statuses(clustering, resolved)))
         # ``check_synthesis`` above is what proves the listing is over THIS run's defects;
         # the parse then proves the reply is over the listing. Neither needs the clusters
         # again, so this takes the unit row and the state and nothing else.

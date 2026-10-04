@@ -8,6 +8,35 @@ Versions use [Calendar Versioning](https://calver.org/) in the form
 A MICRO bump in the same month indicates a follow-up release; a new month
 starts from `.0` again.
 
+## [2026.10.0] - 2026-10-04
+
+### Changed
+
+- **`/review-panel`'s adapter guide says every worker runs outside any git repository.** A
+  runtime that refuses to start outside a repository or a folder it trusts has to be told to
+  skip that check in both of a lane's commands; for Codex that is `--skip-git-repo-check`.
+  Without it every worker on that lane fails within seconds.
+
+### Fixed
+
+- **`/review-panel` no longer spends a unit on checks of a paused account.** When a lane's
+  account paused, each check of whether it had recovered ran as one of the lane's units and
+  was charged to it, so three failed checks could turn that unit into a permanent error that
+  resuming the run did not undo. A failed check now charges nothing. A unit an earlier
+  version already failed this way stays failed; plan a new run to have it read.
+- **A paused `/review-panel` lane says why.** The pause message quotes the end of the latest
+  failing worker's display log, where a runtime that would not start explains itself. It no
+  longer says the paused units were charged nothing, which was not true.
+- **`/review-panel` keeps a reader whose reply holds more findings than it said it would.**
+  A reader states how many findings it is returning, and a reply that came back with more
+  than that number used to be thrown away whole, losing that reader's area. Now only a reply
+  with fewer findings than it stated is refused; a longer one is kept, and each finding in it
+  is still checked on its own.
+- **`/review-panel`'s write-up round skips what needs no write-up.** A defect dismissed
+  everywhere it was reported, and a missing test, no longer go to the round that writes
+  headings, fixes and groupings. The report lists them as before, under Refuted and in the
+  coverage sections, and does not count them as anything the round failed to write.
+
 ## [2026.09.8] - 2026-10-03
 
 ### Changed
@@ -841,6 +870,7 @@ release](README.md#installing-a-previous-release) to return to it.
 
 Initial release.
 
+[2026.10.0]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.10.0
 [2026.09.8]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.8
 [2026.09.7]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.7
 [2026.09.6]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.6

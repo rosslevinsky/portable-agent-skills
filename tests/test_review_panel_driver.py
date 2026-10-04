@@ -2825,6 +2825,76 @@ class UnexplainedFailuresPauseAProviderOnce(_Providers):
         self.assertEqual(self.state(run).paused, "")
 
 
+class AProbeThatFailsChargesItsUnitNothing(_Providers):
+    """A probe is the run's question to a paused provider, and every probe goes to the first
+    eligible unit. Charged to that unit, a lane that cannot start at all spends its three
+    probes publishing one unit's error, which no resume takes back."""
+
+    def unexplained(self, unit, index, **kw):
+        return self.failing(unit, index, detail=None, **kw)
+
+    def test_three_failed_probes_leave_their_unit_open(self):
+        self.unexplained("u1", 0)
+        self.unexplained("u2", 0)
+        for index in range(3):
+            self.unexplained("u1", index + 1, probe=True)
+        run = self.adopted()
+        dispositions = [a.disposition for a in run.attempts("u1")]
+        self.assertEqual([d.get("probe", False) for d in dispositions],
+                         [False, True, True, True])
+        budget = driver.replay(dispositions, 0)
+        self.assertEqual(budget.failure_charges, 1, "a failed probe charged its unit")
+        self.assertFalse(budget.exhausted)
+        self.assertEqual(dispositions[-1]["intended_publication"], "none")
+        self.assertEqual(list(self.rundir.glob("units/*/error.txt")), [])
+
+    def test_an_ordinary_failure_still_charges(self):
+        for index in range(3):
+            self.failing("u1", index, detail="the reply was not an object")
+        run = self.adopted()
+        dispositions = [a.disposition for a in run.attempts("u1")]
+        self.assertTrue(driver.replay(dispositions, 0).exhausted)
+        self.assertEqual(dispositions[-1]["intended_publication"], "error")
+
+    def test_a_probe_that_never_launched_is_marked_too(self):
+        self.unexplained("u1", 0)
+        run = self.adopted()
+        path = self.attempt("u2", 0, argv={"probe": True, "lane": "A",
+                                           "account": self.ACCOUNT})
+        run._record_no_launch("u2", path, 0, OSError("no such program"), True)
+        record = json.loads((path / driver.DISPOSITION_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(record["outcome"], driver.LAUNCH_FAILED)
+        self.assertTrue(record["probe"])
+        self.assertEqual(driver.replay([record], 0).charging, 0)
+
+
+class APauseQuotesWhatTheFailingWorkerSaid(_Providers):
+    """A runtime that will not start usually says why on stderr, which reaches the display
+    log and no status field. The pause names that line so nobody has to go looking."""
+
+    def test_the_latest_failures_log_ends_the_pause_message(self):
+        self.failing("u1", 0, detail=None, spawn_time=time.time() - 60)
+        latest = self.failing("u2", 0, detail=None, spawn_time=time.time())
+        (latest / driver.DISPLAY_NAME).write_text(
+            "Reading additional input from stdin...\n"
+            "Not inside a trusted directory \u2014 skip the check.\n", encoding="utf-8")
+        run = self.adopted()
+        run.reconcile_providers()
+        said = " ".join(run.out.getvalue().split())
+        self.assertIn("Not inside a trusted directory \\u2014 skip the check.", said)
+        self.assertIn(str(latest / driver.DISPLAY_NAME), said)
+        self.assertNotIn("charged nothing", said)
+        said.encode("ascii")
+
+    def test_a_missing_log_leaves_the_message_as_it_was(self):
+        self.failing("u1", 0, detail=None)
+        self.failing("u2", 0, detail=None)
+        run = self.adopted()
+        run.reconcile_providers()
+        self.assertIn("explained nothing", run.out.getvalue())
+        self.assertNotIn("ended:", run.out.getvalue())
+
+
 class ADrainedProviderIsRetriedWhenTheRunIsStartedAgain(_Providers):
     """A drain is where this section's rules end, and nothing inside the run can undo one.
 

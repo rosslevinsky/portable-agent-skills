@@ -3800,6 +3800,14 @@ class ReadingResultsAreParsedStrictly(_RouteCase):
         self.refuse({"finding_count": 1, "findings": [], "summary": "s"},
                     "declares 1", "carries 0")
 
+    def test_a_reply_carrying_more_findings_than_it_declares_is_kept_whole(self):
+        # Only a SHORT array is a lost answer. A longer one lost nothing — the worker
+        # miscounted upward — and every finding in it is still checked on its own, so
+        # refusing it would throw away a unit's whole reading over a wrong number.
+        self.assertEqual(len(self.parse({"finding_count": 0, "findings": [FINDING], "summary": "s"})), 1)
+        self.assertEqual(
+            len(self.parse({"finding_count": 1, "findings": [FINDING, FINDING], "summary": "s"})), 2)
+
     def test_a_declared_count_is_optional_here_and_required_in_the_schema(self):
         # Optional to the parser so a result written before the field existed still reads,
         # and required in the shipped schema so an enforced runtime always sends one. The
@@ -4905,8 +4913,9 @@ CLUSTER_TABLE = {
 }
 
 
-# Synthesis round: ONE unit, handed every defect in the run. It names the run's tiers once
-# and places every defect under one of them, which is why a second unit would be a second
+# Synthesis round: ONE unit, handed every defect that needs a write-up — D1 and D2; D3 is
+# refuted at its only site and is left out. It names the run's tiers once and places every
+# defect it was handed under one of them, which is why a second unit would be a second
 # vocabulary. D1 and D3 are two sites of one story, so D1 cites D3.
 SYNTH_TABLE = {
     "synth-A": {
@@ -4924,16 +4933,20 @@ SYNTH_TABLE = {
                                 "printing the help it has.",
              "fix": "Print the usage text when the argument list is empty.",
              "site_notes": [], "cross_references": []},
-            {"defect": "D3", "heading": "A missing value makes the total too large.",
-             "tier": "The total comes out wrong",
-             "what_goes_wrong": "A missing value is doubled rather than skipped, so the "
-                                "total is quietly too large.",
-             "fix": "Skip a missing value instead of arithmetic on it.",
-             "site_notes": [], "cross_references": []},
         ],
         "summary": "Two tiers: the run stopping, and the arithmetic being wrong.",
     },
 }
+# D3's entry, for a run whose verification leaves D3 standing or open rather than refuted:
+# that run hands the round D3 as well, and a reply without it is refused whole.
+SYNTH_D3 = {"defect": "D3", "heading": "A missing value makes the total too large.",
+            "tier": "The total comes out wrong",
+            "what_goes_wrong": "A missing value is doubled rather than skipped, so the "
+                               "total is quietly too large.",
+            "fix": "Skip a missing value instead of arithmetic on it.",
+            "site_notes": [], "cross_references": []}
+SYNTH_TABLE_ALL = {"synth-A": {**SYNTH_TABLE["synth-A"],
+                               "defects": [*SYNTH_TABLE["synth-A"]["defects"], SYNTH_D3]}}
 
 
 # Merge round: ONE unit over every site in the run, proposing which sites are one mistake.
@@ -10669,7 +10682,7 @@ class AnUnresolvedDefectSaysWhatWouldSettleIt(_FindingsCase):
                  "split_reason": None},
                 {"members": ["cand-004"], "consequence": FINDING_B["consequence"],
                  "split_reason": None}], "summary": "three"}},
-            synthesis=SYNTH_TABLE)
+            synthesis=SYNTH_TABLE_ALL)
         # D1's own block. The section holds the other two defects as well, so a count or an
         # ordering taken over the whole of it would answer about whichever defect happened
         # to be adjacent.
@@ -10716,7 +10729,7 @@ class AnUnresolvedDefectSaysWhatWouldSettleIt(_FindingsCase):
                 _verdict("cand-001", "unresolved", rationale="The caller is elsewhere.",
                          unresolved_reason="needs_a_file_outside_the_scope"),
                 _verdict("cand-003", "reproduced", EVIDENCE)], "summary": "two"},
-            "verify-area-01-B": None}, synthesis=SYNTH_TABLE)
+            "verify-area-01-B": None}, synthesis=SYNTH_TABLE_ALL)
         text = self.text()
         body = self.body(text, "Unresolved")
         body = self.defect_block(text, "D1")
@@ -16347,6 +16360,9 @@ class TheSynthesisRoundIsOneUnitWithOneVocabulary(_ReportCase):
     """
 
     UNIT = "synth-A"
+    # The defects the round is handed over the standard tables: D3 is refuted at its only
+    # site, so it needs no write-up and is left out.
+    WRITTEN = ("D1", "D2")
 
     def clustered_only(self, verify=VERIFY_TABLE):
         """plan, land reading, verification, clustering, the merge and its check, and stop
@@ -16402,16 +16418,16 @@ class TheSynthesisRoundIsOneUnitWithOneVocabulary(_ReportCase):
                       "cand-004": "helper is never given None."}
         return clustering, review_panel.synthesis_material(
             clustering, self.candidates()["candidates"], rationales,
-            review_panel.group_sites(clustering), {})
+            [d for d in review_panel.group_sites(clustering) if d.id in self.WRITTEN], {})
 
-    @staticmethod
-    def index(clustering):
-        """Every defect's id and heading: one defect per site, headed by that site's."""
+    def index(self, clustering):
+        """Every handed defect's id and heading: one defect per site, headed by that
+        site's."""
         site_of = {c.id: c for c in clustering.clusters}
         return [{"id": d.id, "consequence": site_of[d.sites[0]].consequence}
-                for d in review_panel.group_sites(clustering)]
+                for d in review_panel.group_sites(clustering) if d.id in self.WRITTEN]
 
-    def test_one_unit_carries_every_defect_and_the_stage_moves(self):
+    def test_one_unit_carries_every_defect_needing_a_write_up_and_the_stage_moves(self):
         self.clustered_only()
         self.synthesize()
         units = self.synthesizers()
@@ -16420,7 +16436,7 @@ class TheSynthesisRoundIsOneUnitWithOneVocabulary(_ReportCase):
         self.assertIsNone(units[0]["area"])
         self.assertIsNone(units[0]["lens"])
         self.assertIn(units[0]["lane"], review_panel.LANES)
-        self.assertEqual(units[0]["defects"], ["D1", "D2", "D3"])
+        self.assertEqual(units[0]["defects"], list(self.WRITTEN))
         self.assertEqual(self.units()["stage"], "synthesized")
 
     def test_a_run_that_found_nothing_gets_no_unit_and_still_moves_the_stage(self):
@@ -16442,8 +16458,8 @@ class TheSynthesisRoundIsOneUnitWithOneVocabulary(_ReportCase):
         self.synthesize()
         text = (self.rundir / self.synthesizers()[0]["payload"]).read_text(encoding="utf-8")
         index = text.split(review_panel.TO_JUDGE_HEADING)[0]
-        for defect in ("D1", "D2", "D3"):
-            self.assertIn(f"- {defect}: ", index, "every defect can be cited")
+        for defect in self.WRITTEN:
+            self.assertIn(f"- {defect}: ", index, "every handed defect can be cited")
             self.assertIn(f"\n### {defect}\n", text)
         self.assertIn(FINDING["failure"], text)
         self.assertIn(FINDING["direction"], text)
@@ -16500,7 +16516,7 @@ class TheSynthesisRoundIsOneUnitWithOneVocabulary(_ReportCase):
         # The verdicts that WERE readable still reach both payloads, so the fallback is
         # per candidate and not a blanket silence.
         self.assertIn("The run raised as claimed.", synth)
-        self.assertIn("helper is never given None.", synth)
+        self.assertIn("Lines 2-3 index without a guard.", synth)
         # Anti-vacuity: the rejection really happened, and the report still says so where a
         # reader needs it. A run where nothing was rejected would pass every assertion above.
         self.report()
@@ -16697,17 +16713,18 @@ class TheSynthesisRoundIsOneUnitWithOneVocabulary(_ReportCase):
         self.clustered_only()
         self.synthesize()
         clusters = review_panel.group_sites(self.clustering())
+        written = [d for d in clusters if d.id in self.WRITTEN]
         row = dict(self.synthesizers()[0])
         for name, edit, fragment in (
-            ("short", [{**row, "defects": ["D1", "D2"]}], "not this run's defects"),
-            ("foreign", [{**row, "defects": ["D1", "D2", "D3", "D9"]}], "not this run's defects"),
+            ("short", [{**row, "defects": ["D1"]}], "not this run's defects"),
+            ("foreign", [{**row, "defects": ["D1", "D2", "D9"]}], "not this run's defects"),
             ("twice", [row, {**row, "id": "synth-B"}], "both name the synthesis round"),
             ("null list", [{**row, "defects": None}], "no list of defect ids"),
             ("id not a string", [{**row, "defects": ["D1", "D2", 7]}], "no list of defect ids"),
         ):
             with self.subTest(listing=name):
                 with self.assertRaises(review_panel.RunDirError) as caught:
-                    review_panel.check_synthesis(clusters, edit)
+                    review_panel.check_synthesis(clusters, edit, written)
                 message = str(caught.exception)
                 self.assertIn(fragment, message)
                 self.assertIn("units.json", message)
@@ -16716,8 +16733,9 @@ class TheSynthesisRoundIsOneUnitWithOneVocabulary(_ReportCase):
         # The anchor: every refusal above is only meaningful if the real listing passes.
         self.clustered_only()
         self.synthesize()
-        review_panel.check_synthesis(review_panel.group_sites(self.clustering()),
-                                     self.synthesizers())
+        clusters = review_panel.group_sites(self.clustering())
+        review_panel.check_synthesis(clusters, self.synthesizers(),
+                                     [d for d in clusters if d.id in self.WRITTEN])
 
     def test_report_refuses_a_synthesis_listing_that_is_not_this_engines(self):
         self.clustered_only()
@@ -16725,12 +16743,189 @@ class TheSynthesisRoundIsOneUnitWithOneVocabulary(_ReportCase):
         doc = self.units()
         for unit in doc["units"]:
             if unit["id"] == self.UNIT:
-                unit["defects"] = ["D1", "D2"]
+                unit["defects"] = ["D1"]
         (self.rundir / "units.json").write_text(json.dumps(doc), encoding="utf-8")
         stub_dispatch(self.rundir, SYNTH_TABLE)
         proc = self.report(expect=2)
         self.assertIn("not this run's defects", proc.stderr)
         self.assertFalse((self.rundir / "report.md").exists())
+
+
+class TheSynthesisRoundIsHandedOnlyWhatNeedsAWriteUp(_CoverageCase):
+    """A defect refuted at every site, and every coverage gap, are left out of the round.
+
+    The report already says everything those need: a refuted defect is listed under
+    Refuted, in raise order, with its dismissal reason and headed by its consequence, and a
+    gap renders in the coverage sections from its own record. A heading, a fix and a tier
+    for either is prose nobody acts on, and a payload carrying them is longer for nothing.
+    What stays is every defect with a live site — a defect refuted at one site and not at
+    another is still work, and keeps every site.
+
+    Over the standard tables D3 is the refuted one (cand-004 is refuted) and D1 and D2 stand.
+    """
+
+    UNIT = "synth-A"
+    # What a unit handed D1 and D2 returns: their entries, with D1 citing nothing, because the
+    # only defect it would cite is D3 and D3 is not in the unit.
+    SENT = {UNIT: {**SYNTH_TABLE[UNIT],
+                   "defects": [{**SYNTH_TABLE[UNIT]["defects"][0], "cross_references": []},
+                               SYNTH_TABLE[UNIT]["defects"][1]]}}
+    REFUTED_CONSEQUENCE = CLUSTER_TABLE["cluster-area-01"]["clusters"][2]["consequence"]
+    CLEAN = {**READING_TABLE, "audit-area-01-B": {"findings": [], "summary": "no gap"}}
+
+    def through_the_check(self, reading=READING_TABLE, verify=VERIFY_TABLE, merge=None):
+        """plan, reading, verification, clustering, the merge and its check; then stop."""
+        self.plan_into(self.rundir)
+        stub_dispatch(self.rundir, reading, DISPATCH)
+        proc = _run("route", str(self.rundir))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        stub_dispatch(self.rundir, verify)
+        self.clustered()
+        self.merged(table=merge)
+        self.merge_checked()
+
+    def payload(self):
+        return (self.rundir / self.synthesizers()[0]["payload"]).read_text(encoding="utf-8")
+
+    def doc(self):
+        return json.loads((self.rundir / "findings.json").read_text(encoding="utf-8"))
+
+    def test_a_defect_refuted_at_every_site_is_not_handed_to_the_round(self):
+        self.through_the_check()
+        self.synthesize()
+        self.assertEqual(self.synthesizers()[0]["defects"], ["D1", "D2"])
+        text = self.payload()
+        self.assertNotIn("\n### D3\n", text)
+        self.assertNotIn("- D3: ", text.split(review_panel.TO_JUDGE_HEADING)[0],
+                         "the index offers a defect the round was not handed")
+        self.assertNotIn("helper is never given None.", text)
+        # Anti-vacuity: D3 is in the run.
+        self.assertIn("D3", [d.id for d in review_panel.group_sites(self.clustering())])
+
+    def test_a_coverage_gap_is_not_handed_to_the_round(self):
+        self.routed()
+        stub_dispatch(self.rundir, self.verify_table(), None)
+        self.cluster()
+        stub_dispatch(self.rundir, {
+            u["id"]: {"clusters": [{"members": [cid], "consequence": f"c {cid}",
+                                    "split_reason": None} for cid in u["candidates"]],
+                      "summary": "s"} for u in self.clusterers()}, None)
+        self.synthesize()
+        defects = review_panel.group_sites(self.clustering())
+        gaps = {d.id for d in defects if d.asks == review_panel.COVERAGE_ASKS}
+        self.assertTrue(gaps, "the fixture raised no gap, so this asserts nothing")
+        handed = self.synthesizers()[0]["defects"]
+        self.assertEqual(sorted(handed, key=review_panel._id_rank),
+                         [d.id for d in defects if d.id not in gaps])
+        text = self.payload()
+        for gap in gaps:
+            self.assertNotIn(f"\n### {gap}\n", text)
+        self.assertNotIn(GAP["failure"], text)
+
+    def test_a_defect_refuted_at_one_site_and_standing_at_another_is_handed_whole(self):
+        # S1 stands and S3 is refuted; merged, they are one defect with a live site.
+        pair = {"sites": ["S1", "S3"],
+                "mechanism": "A value is used before it is checked; check it first.",
+                "instances": [{"site": "S1", "instance": "core indexes an empty list."},
+                              {"site": "S3", "instance": "helper doubles a missing value."}],
+                "reason_kept_apart": None}
+        self.through_the_check(merge={MERGE_UNIT: _merge_reply([pair, _single("S2")])})
+        self.synthesize()
+        unit = self.synthesizers()[0]
+        self.assertEqual(unit["defects"], ["D1", "D2"])
+        self.assertEqual(unit["defect_sites"], [["S1", "S3"], ["S2"]])
+        text = self.payload()
+        self.assertIn("\n#### S3\n", text, "the refuted site of a live defect is left out")
+        self.assertIn("helper is never given None.", text)
+
+    def test_the_check_holds_a_listing_to_cover_the_defects_sent(self):
+        self.through_the_check()
+        self.synthesize()
+        defects = review_panel.group_sites(self.clustering())
+        sent = [d for d in defects if d.id != "D3"]
+        row = self.synthesizers()[0]
+        review_panel.check_synthesis(defects, [row], sent)
+        with self.assertRaises(review_panel.RunDirError) as caught:
+            review_panel.check_synthesis(defects, [{**row, "defects": ["D1"],
+                                                    "defect_sites": [["S1"]]}], sent)
+        self.assertIn("not this run's defects", str(caught.exception))
+
+    def test_a_listing_planned_over_every_defect_still_reads(self):
+        """A round planned before refuted defects and gaps were left out was handed every
+        defect. Its listing is still the engine's own, so a re-render reads it."""
+        self.through_the_check()
+        self.synthesize()
+        defects = review_panel.group_sites(self.clustering())
+        row = {**self.synthesizers()[0], "defects": ["D1", "D2", "D3"],
+               "defect_sites": [["S1"], ["S2"], ["S3"]]}
+        review_panel.check_synthesis(defects, [row], [d for d in defects if d.id != "D3"])
+
+    def test_a_listing_planned_before_a_defect_moved_into_refuted_still_reads(self):
+        """The set needing a write-up is worked out again at report time. A defect the
+        round was handed that has since come to need none is still this run's, so the
+        listing covers what it must and names nothing foreign."""
+        self.through_the_check()
+        self.synthesize()
+        defects = review_panel.group_sites(self.clustering())
+        row = self.synthesizers()[0]
+        review_panel.check_synthesis(defects, [row], [d for d in defects if d.id == "D1"])
+        for listed, sites, why in ((["D1", "D9"], [["S1"], ["S9"]], "a defect this run lacks"),
+                                   (["D1", "D1"], [["S1"], ["S1"]], "a defect named twice")):
+            with self.subTest(why=why), self.assertRaises(review_panel.RunDirError):
+                review_panel.check_synthesis(
+                    defects, [{**row, "defects": listed, "defect_sites": sites}],
+                    [d for d in defects if d.id == "D1"])
+
+    def test_the_report_renders_a_left_out_defect_as_before_and_counts_no_failure(self):
+        self.run_all(reading=self.CLEAN, synthesis=self.SENT)
+        text, doc = self.text(), self.doc()
+        record = doc["synthesis"]
+        self.assertEqual(record["state"], review_panel.UNIT_COMPLETE, record["reason"])
+        self.assertEqual(record["rejected"], [])
+        self.assertEqual(record["defects"], ["D1", "D2"])
+        defects = {d["id"]: d for d in doc["defects"]}
+        self.assertEqual(defects["D3"]["status"], review_panel.DEFECT_REFUTED)
+        self.assertIsNone(defects["D3"]["heading"])
+        self.assertIsNone(defects["D3"]["tier"])
+        self.assertEqual(defects["D1"]["tier"], self.SENT[self.UNIT]["tiers"][0])
+        # Headed by its consequence under Refuted, as a run with no round heads it.
+        refuted = text.partition(f" {review_panel.SECTION_REFUTED} (")[2]
+        self.assertRegex(refuted, rf"(?m)^### D3\. {re.escape(self.REFUTED_CONSEQUENCE)}")
+        # Nothing says the round failed, lost an entry or left a unit unanswered.
+        self.assertIn(review_panel.EVERY_UNIT_RETURNED, text)
+        self.assertNotIn("could not be used", text)
+        self.assertNotIn(review_panel.GROUPING_NO_SYNTHESIS, text)
+        self.assertIn("named for 2 defects", text)
+
+    def test_a_refused_entry_names_its_own_defect_and_not_the_one_left_out(self):
+        bad = {self.UNIT: {**self.SENT[self.UNIT], "defects": [
+            {**self.SENT[self.UNIT]["defects"][0], "tier": "A tier nobody declared"},
+            self.SENT[self.UNIT]["defects"][1]]}}
+        self.run_all(reading=self.CLEAN, synthesis=bad)
+        text, doc = self.text(), self.doc()
+        self.assertEqual(len(doc["synthesis"]["rejected"]), 1)
+        lost = [d for d in doc["defects"] if d["id"] == "D1"]
+        self.assertIn(review_panel.synthesis_refused_note(lost), text)
+
+    def test_a_run_with_nothing_to_write_up_plans_no_unit(self):
+        everything_refuted = {
+            "verify-area-01-A": {"verdicts": [
+                _verdict("cand-001", "refuted", rationale="The list is never empty."),
+                _verdict("cand-003", "refuted", EVIDENCE, rationale="The run does not do it.")],
+                "summary": "both dismissed"},
+            "verify-area-01-B": {"verdicts": [
+                _verdict("cand-002", "refuted", rationale="The list is never empty."),
+                _verdict("cand-004", "refuted", rationale="helper is never given None.")],
+                "summary": "both dismissed"},
+        }
+        self.through_the_check(verify=everything_refuted)
+        proc = self.synthesize()
+        self.assertEqual(self.synthesizers(), [])
+        self.assertEqual(self.units()["stage"], review_panel.SYNTHESIZED_STAGE)
+        self.assertIn("no synthesis unit", proc.stdout)
+        self.report()
+        self.assertIsNone(self.doc()["synthesis"])
+        self.assertNotIn(review_panel.SUBSECTION_SYNTHESIS, self.text())
 
 
 class ASynthesisResultMustBeAPartition(_ReportCase):
@@ -17082,6 +17277,13 @@ class ASynthesisFromBeforeSitesIsReadInTheShapeItWasAskedFor(unittest.TestCase):
 
 # The merge round over the standard run, upheld: D1 is S1 and S2, one mistake; D2 is S3.
 MERGED_PAIR = {MERGE_UNIT: _merge_reply([MERGE_PAIR, _single("S3")])}
+# The standard verification with cand-004 upheld rather than refuted, so S3 — D2 once S1 and
+# S2 are merged — is work, and the synthesis round is handed it.
+VERIFY_S3_STANDS = {**VERIFY_TABLE, "verify-area-01-B": {
+    "verdicts": [_verdict("cand-002", "confirmed_by_reading"),
+                 _verdict("cand-004", "confirmed_by_reading",
+                          rationale="helper doubles a None it is given.")],
+    "summary": "read two"}}
 SYNTH_MERGED = {
     "synth-A": {
         "tiers": ["A run stops instead of finishing", "The total comes out wrong"],
@@ -17111,7 +17313,7 @@ class ADefectOfSeveralSitesIsNarratedOnce(_FindingsCase):
     site still renders whatever the round did."""
 
     def merged_run(self, synthesis=SYNTH_MERGED):
-        self.run_all(merge=MERGED_PAIR, synthesis=synthesis)
+        self.run_all(merge=MERGED_PAIR, verify=VERIFY_S3_STANDS, synthesis=synthesis)
         defects = self.defects()
         self.assertEqual(defects["D1"]["sites"], ["S1", "S2"],
                          "the merge check did not uphold the pair, so this proves nothing")
@@ -17246,10 +17448,10 @@ class ASynthesisRoundThatDidNotComeBackLeavesTheStatusGrouping(_ReportCase):
 
     def test_a_result_that_is_not_a_partition_degrades_the_same_way(self):
         landed = {**SYNTH_TABLE[self.UNIT],
-                  "defects": SYNTH_TABLE[self.UNIT]["defects"][:2]}
+                  "defects": SYNTH_TABLE[self.UNIT]["defects"][:1]}
         doc = self.degraded(landed)
         self.assert_nothing_judged(doc, "failed")
-        self.assertIn("D3", doc["synthesis"]["reason"])
+        self.assertIn("D2", doc["synthesis"]["reason"])
 
     def test_a_reason_quoting_a_lone_surrogate_is_escaped_where_it_is_recorded(self):
         doc = self.degraded({**SYNTH_TABLE[self.UNIT], "bad \ud800 key": 1})
@@ -17336,9 +17538,9 @@ class TheSynthesisLandsInTheStructureAndInBothDocuments(_FindingsCase):
         self.assertNotIn(ident, pages["none"], "the page kept a section the report dropped")
 
     def test_every_judgment_of_a_defect_the_body_carries_reaches_both_documents(self):
-        # SYNTH_TWO_TIERS so both tier names head a group: the standard table files the
-        # second tier's only defect under Refuted, and a tier holding nothing is a heading
-        # the report does not write.
+        # SYNTH_TWO_TIERS so both tier names head a group: the standard table places no
+        # defect under its second tier, since that tier's defect is refuted and not handed to
+        # the round, and a tier holding nothing is a heading the report does not write.
         self.run_all(synthesis=SYNTH_TWO_TIERS)
         prose = self.reads_as()
         page = (self.rundir / "report.html").read_text(encoding="utf-8")
@@ -17369,7 +17571,9 @@ class TheSynthesisLandsInTheStructureAndInBothDocuments(_FindingsCase):
         self.assertNotEqual(self.documents(judged), self.documents(plain))
         doc = self.findings(judged)
         self.assertEqual(doc["synthesis"]["tiers"], SYNTH_TABLE[self.UNIT]["tiers"])
-        self.assertTrue(all(c["tier"] for c in doc["defects"]))
+        # Every defect the round was handed; the refuted one was not.
+        self.assertTrue(all(c["tier"] for c in doc["defects"]
+                            if c["status"] != review_panel.DEFECT_REFUTED))
 
     def test_the_round_adds_no_dependence_on_the_order_units_landed_in(self):
         """Two runs over one tree, one of them landing every unit concurrently, produce the
@@ -17411,7 +17615,8 @@ class TheSynthesisLandsInTheStructureAndInBothDocuments(_FindingsCase):
                 continue
             self.assertEqual(one[name], two[name], name)
         assert_same_but_for_where_and_when_it_ran(self, first, second, states)
-        self.assertTrue(all(c["tier"] for c in self.findings(first)["defects"]),
+        self.assertTrue(all(c["tier"] for c in self.findings(first)["defects"]
+                            if c["status"] != review_panel.DEFECT_REFUTED),
                         "the fixture judged nothing, so this compares two empty rounds")
 
     def test_rerender_rewrites_byte_identically_and_dispatches_nothing(self):
@@ -18011,7 +18216,7 @@ class UnresolvedDefectsSubGroupBySubstanceWhereTheRoundGaveOne(_FindingsCase):
         return verify
 
     def test_the_group_heading_names_the_settling_reason_and_then_the_tier(self):
-        self.run_all(verify=self.tables(), synthesis=SYNTH_TABLE)
+        self.run_all(verify=self.tables(), synthesis=SYNTH_TABLE_ALL)
         headings = re.findall(r"(?m)^### (.+)$", self.body(self.text(), "Unresolved"))
         self.assertEqual(headings, [
             f"{review_panel.UNRESOLVED_GROUPS['needs_a_run']} — {self.TIERS[1]} (1)",
@@ -18031,7 +18236,7 @@ class UnresolvedDefectsSubGroupBySubstanceWhereTheRoundGaveOne(_FindingsCase):
         # It is nested under the `Reported` line it elaborates. With that line in the
         # appendix the bullet above it is the defect's own `Fix.` or `Related.`, and an
         # indented bullet reads as belonging to the one above it — so it comes out.
-        self.run_all(verify=self.tables(), synthesis=SYNTH_TABLE)
+        self.run_all(verify=self.tables(), synthesis=SYNTH_TABLE_ALL)
         judged = self.defect_block(self.text(), "D2")
         self.assertIn("\n- Proposed reproduction, not run: ", judged)
         self.assertNotIn("\n  - Proposed reproduction", judged)
@@ -18042,7 +18247,7 @@ class UnresolvedDefectsSubGroupBySubstanceWhereTheRoundGaveOne(_FindingsCase):
         self.assertIn("\n  - Proposed reproduction, not run: ", plain)
 
     def test_every_unresolved_defect_still_sits_under_exactly_one_group(self):
-        self.run_all(verify=self.tables(), synthesis=SYNTH_TABLE)
+        self.run_all(verify=self.tables(), synthesis=SYNTH_TABLE_ALL)
         section = self.body(self.text(), "Unresolved")
         placed = re.findall(r"(?m)^#### (D\d+)\. ", section)
         self.assertEqual(sorted(placed), ["D1", "D2", "D3"])
@@ -18916,6 +19121,27 @@ class ACrossReferenceIsRenderedOrNamedAsDropped(_FindingsCase):
         self.judged([])
         self.assertNotIn(review_panel.RELATED_LABEL, self.text())
 
+    def over_every_defect(self, table):
+        """The standard run with its synthesis round planned over EVERY defect, the refuted
+        D3 included, as a round planned before a refuted defect was left out of it was. Such
+        a listing still reads, and it is the one way a refuted defect carries the round's
+        prose — so it is what the rendering below has to handle."""
+        self.plan_into(self.rundir)
+        stub_dispatch(self.rundir, READING_TABLE, DISPATCH)
+        proc = _run("route", str(self.rundir))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        stub_dispatch(self.rundir, VERIFY_TABLE)
+        self.clustered()
+        self.synthesize()
+        doc = self.units()
+        for unit in doc["units"]:
+            if unit["kind"] == "synthesizer":
+                unit["defects"] = ["D1", "D2", "D3"]
+                unit["defect_sites"] = [["S1"], ["S2"], ["S3"]]
+        (self.rundir / "units.json").write_text(json.dumps(doc), encoding="utf-8")
+        stub_dispatch(self.rundir, table)
+        self.report()
+
     def refuted_cites(self, references):
         """The standard run with the REFUTED defect citing whatever this test wants.
 
@@ -18923,11 +19149,11 @@ class ACrossReferenceIsRenderedOrNamedAsDropped(_FindingsCase):
         reference from it to D1 passes both checks and has to render somewhere.
         """
         table = {self.UNIT: {
-            **SYNTH_TABLE[self.UNIT],
+            **SYNTH_TABLE_ALL[self.UNIT],
             "defects": [{**entry, "cross_references": list(references)}
                         if entry["defect"] == "D3" else entry
-                        for entry in SYNTH_TABLE[self.UNIT]["defects"]]}}
-        self.run_all(synthesis=table)
+                        for entry in SYNTH_TABLE_ALL[self.UNIT]["defects"]]}}
+        self.over_every_defect(table)
         self.assertEqual(self.defects()["D3"]["status"], review_panel.DEFECT_REFUTED,
                          "D3 is not the run's refuted defect, so this proves nothing")
         return self.text()
@@ -18947,13 +19173,13 @@ class ACrossReferenceIsRenderedOrNamedAsDropped(_FindingsCase):
         # entry is valid and cites a defect it shares a file with. The round's only
         # surviving output on the page is therefore that one link.
         entries = []
-        for entry in SYNTH_TABLE[self.UNIT]["defects"]:
+        for entry in SYNTH_TABLE_ALL[self.UNIT]["defects"]:
             if entry["defect"] == "D3":
                 entries.append({**entry, "cross_references": ["D1"]})
             else:
                 entries.append({**entry, "tier": "A tier nobody declared",
                                 "cross_references": []})
-        self.run_all(synthesis={self.UNIT: {**SYNTH_TABLE[self.UNIT], "defects": entries}})
+        self.over_every_defect({self.UNIT: {**SYNTH_TABLE_ALL[self.UNIT], "defects": entries}})
         text, defects = self.text(), self.defects()
         self.assertEqual(defects["D3"]["status"], review_panel.DEFECT_REFUTED)
         self.assertIsNone(defects["D1"]["tier"], "the work entries were not refused")
@@ -19065,7 +19291,9 @@ class TheRoundRendersTheSameTwoDocumentsTwice(_FindingsCase):
                                               ("report.md", "report.html"))
         # Anti-vacuity: the documents really do carry the round.
         self.assertIn(SYNTH_TWO_TIERS["synth-A"]["tiers"][1], self.text(first))
-        self.assertTrue(all(c["tier"] for c in self.findings(first)["defects"]))
+        # Every defect the round was handed carries a tier; the refuted one was not handed.
+        self.assertTrue(all(c["tier"] for c in self.findings(first)["defects"]
+                            if c["status"] != review_panel.DEFECT_REFUTED))
 
 class _FixedClock:
     """``review_panel.datetime`` with one answer for ``now``, so a test can put two renderings
@@ -21350,7 +21578,7 @@ class EachDegradedLayoutNamesItself(_FindingsCase):
         self.assertEqual([d["sites"] for d in defects.values()], [["S1"], ["S2"], ["S3"]])
 
     def test_a_finished_run_names_nothing(self):
-        self.run_all(merge=MERGED_PAIR, synthesis=SYNTH_MERGED)
+        self.run_all(merge=MERGED_PAIR, verify=VERIFY_S3_STANDS, synthesis=SYNTH_MERGED)
         top = self.top()
         for sentence in (review_panel.GROUPING_NO_MERGE, review_panel.GROUPING_MERGE_DEGRADED,
                          review_panel.GROUPING_HELD, review_panel.GROUPING_CHECK_DEGRADED,
@@ -21393,7 +21621,7 @@ class EachDegradedLayoutNamesItself(_FindingsCase):
     def test_one_defect_over_its_limit_is_named_at_the_top(self):
         entries = [{**e, "fix": _words(review_panel.SYNTHESIS_FIX_WORDS + 1)}
                    if e["defect"] == "D1" else e for e in SYNTH_MERGED["synth-A"]["defects"]]
-        self.run_all(merge=MERGED_PAIR,
+        self.run_all(merge=MERGED_PAIR, verify=VERIFY_S3_STANDS,
                      synthesis={"synth-A": {**SYNTH_MERGED["synth-A"], "defects": entries}})
         self.assertIn(f"- {review_panel.synthesis_refused_note([{'id': 'D1', 'sites': ['S1', 'S2']}])}",
                       self.top())
