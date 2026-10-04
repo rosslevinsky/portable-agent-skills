@@ -1978,7 +1978,8 @@ def _is_supervisor_exit(status: dict) -> bool:
 
 
 def _stderr_tail(path: Path) -> str:
-    """The last ``STDERR_TAIL_BYTES`` of a supervisor's stderr, or an empty string.
+    """The last ``STDERR_TAIL_BYTES`` of a supervisor's stderr or a worker's display log,
+    or an empty string.
 
     Tolerant of a refused read, like :func:`read_status` and for the same reason: this
     decides nothing, it only explains, and an explanation that could not be read is an
@@ -1992,6 +1993,33 @@ def _stderr_tail(path: Path) -> str:
             return handle.read().decode("utf-8", "replace").strip()
     except OSError:
         return ""
+
+
+LOG_HINT_CHARS = 400
+
+
+def _log_hint(attempt_path: Path | None) -> str:
+    """The end of one attempt's display log, quoted for a pause message, or ``""``.
+
+    **Said, never classified.** A failure that "explained nothing" usually explained itself
+    on stderr, which reaches the display log and no status field, and the operator has to
+    read it to fix the lane. Fed back into adjudication it would make every such failure
+    explained and the breaker would never fire, so it goes into the message and nowhere
+    else.
+    """
+    if attempt_path is None:
+        return ""
+    log = attempt_path / DISPLAY_NAME
+    lines = [line.strip() for line in _stderr_tail(log).splitlines() if line.strip()]
+    if not lines:
+        return ""
+    tail = " / ".join(lines[-2:])
+    if len(tail) > LOG_HINT_CHARS:
+        tail = "..." + tail[-LOG_HINT_CHARS:]
+    # A worker's output is in any script at all, and the console this is said on may only
+    # take ASCII; a message that cannot be written would stop the run it is describing.
+    tail = tail.encode("ascii", "backslashreplace").decode("ascii")
+    return f" The latest of them ended: {tail} (in {log})."
 
 
 def _terminal_detail(status: dict) -> str | None:
@@ -2048,6 +2076,8 @@ def adjudicate(ctx: "Run", attempt: Attempt) -> dict:
     """
     record: dict = {"attempt": attempt.name, "unit": attempt.unit,
                     "at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())}
+    if (attempt.argv or {}).get("probe"):
+        record["probe"] = True
     if attempt.state == RESOLVED:
         action = attempt.resolution.get("action")
         record["outcome"] = OPERATOR_RETRY if action == "retry" else OPERATOR_FAILED
@@ -2258,10 +2288,15 @@ def replay(dispositions: Sequence[dict], granted: int = 0) -> Budget:
     contradiction this shape removes. They still count as launches, which is what the
     separate hard stop bounds.
     """
+    # **A probe that failed is the run's question to a paused provider, not the unit's
+    # answer, so it charges nothing.** The claim pass hands every probe to the first eligible
+    # unit, and charged, the three probes a run allows publish that one unit's error — which
+    # no resume undoes. What bounds them is the probe count, not the unit's allowance.
+    failed = [d for d in dispositions
+              if d.get("outcome") in _CHARGES_FAILURE and not d.get("probe")]
     reply = sum(1 for d in dispositions if d.get("outcome") in _CHARGES_REPLY)
-    failure = sum(1 for d in dispositions if d.get("outcome") in _CHARGES_FAILURE)
-    charging = sum(1 for d in dispositions
-                   if d.get("outcome") in (_CHARGES_REPLY | _CHARGES_FAILURE))
+    failure = len(failed)
+    charging = reply + failure
     return Budget(launches=len(dispositions), reply_charges=reply,
                   failure_charges=failure, charging=charging,
                   ceiling=LAUNCH_CEILING + granted)
@@ -2455,6 +2490,7 @@ class ProviderState:
     probe_unaccountable: bool   # a probe nobody can account for blocks any replacement
     uninformative_probes: int
     last_probe_at: float
+    evidence: Path | None = None  # the latest attempt behind the pause, for its log
 
 
 def provider_state(account: str, generation: int,
@@ -2493,11 +2529,11 @@ def provider_state(account: str, generation: int,
         return ProviderState(paused="", drain="", close_generation=True, **common)
 
     unavailable = [a for a in ordinary if outcome(a) == PROVIDER_UNAVAILABLE]
-    unexplained: dict[str, int] = {}
+    unexplained: dict[str, list[Attempt]] = {}
     for attempt in current:
         if (attempt.disposition or {}).get("unexplained"):
             lane = str((attempt.argv or {}).get("lane"))
-            unexplained[lane] = unexplained.get(lane, 0) + 1
+            unexplained.setdefault(lane, []).append(attempt)
 
     drain = ""
     if probe_refused:
@@ -2512,17 +2548,22 @@ def provider_state(account: str, generation: int,
         drain = (f"{len(uninformative)} probes completed without saying whether this "
                  f"provider works")
 
-    paused = ""
+    paused, behind = "", []
     if unavailable:
         paused = (f"{len(unavailable)} attempt(s) launched in generation {generation} "
                   f"reported this provider unavailable")
+        behind = unavailable
     else:
         for lane in sorted(unexplained):
-            if unexplained[lane] >= UNEXPLAINED_PAUSES_AT:
-                paused = (f"{unexplained[lane]} terminal failures on lane {lane} in "
+            if len(unexplained[lane]) >= UNEXPLAINED_PAUSES_AT:
+                paused = (f"{len(unexplained[lane])} terminal failures on lane {lane} in "
                           f"generation {generation} explained nothing")
+                behind = unexplained[lane]
                 break
-    return ProviderState(paused=paused, drain=drain, close_generation=False, **common)
+    evidence = max(behind, key=lambda a: float((a.argv or {}).get("spawn_time") or 0.0),
+                   default=None)
+    return ProviderState(paused=paused, drain=drain, close_generation=False,
+                         evidence=evidence.path if evidence is not None else None, **common)
 
 
 def _generation_of(attempt: Attempt) -> int:
@@ -3668,7 +3709,7 @@ class Run:
             # spawn is, and the disposition records that nothing launched. An attempt with
             # `argv.json` and no status reads as running until its deadline and grace pass,
             # then as `uncertain`, which quarantines its unit for an operator.
-            return self._record_no_launch(unit_id, attempt_path, index, exc)
+            return self._record_no_launch(unit_id, attempt_path, index, exc, probe)
         # Passed only when the lane carries a setting, so a lane with none starts its
         # supervisor exactly as it always has.
         extra = {"env": {**os.environ, **carried}} if carried else {}
@@ -3683,10 +3724,10 @@ class Run:
             # value. Anything else — the argv, a path — is reported as itself.
             if any(not _encodable(value) for value in carried.values()):
                 return self._record_no_launch(unit_id, attempt_path, index, ValueError(
-                    "a setting could not be passed in this platform's encoding"))
-            return self._record_no_launch(unit_id, attempt_path, index, exc)
+                    "a setting could not be passed in this platform's encoding"), probe)
+            return self._record_no_launch(unit_id, attempt_path, index, exc, probe)
         except (OSError, ValueError) as exc:
-            return self._record_no_launch(unit_id, attempt_path, index, exc)
+            return self._record_no_launch(unit_id, attempt_path, index, exc, probe)
         self._children.append((child, attempt_path, unit_id))
         self.invalidate(unit_id)
         return True
@@ -3771,7 +3812,7 @@ class Run:
         self._children = still
 
     def _record_no_launch(self, unit_id: str, attempt_path: Path, index: int,
-                          exc: BaseException) -> bool:
+                          exc: BaseException, probe: bool = False) -> bool:
         """Adjudicate an attempt that was claimed and never started. Returns ``True``,
         because a claim that was adjudicated is a spawn that happened and the caller counts
         it.
@@ -3808,6 +3849,8 @@ class Run:
         }
         if storage:
             failure["storage_fault"] = True
+        if probe:
+            failure["probe"] = True
         others = [(att.index, att.disposition) for att in self.attempts(unit_id)
                   if att.disposition is not None and att.index != index]
         ordered = [record for _index, record
@@ -4280,8 +4323,9 @@ class Run:
                 self.request_drain(f"{account}: {state.drain}")
             elif state.paused and account not in self._paused_said:
                 self._paused_said.add(account)
-                self.say(f"{account} is paused: {state.paused}. Its units are not eligible "
-                         f"and have charged nothing; one probe will ask whether it works")
+                self.say(f"{account} is paused: {state.paused}.{_log_hint(state.evidence)} "
+                         f"Its units wait, and one probe at a time will ask whether it "
+                         f"works; a probe that fails charges its unit nothing")
                 _progress(self.rundir, f"{account} paused: {state.paused}")
             elif not state.paused:
                 self._paused_said.discard(account)

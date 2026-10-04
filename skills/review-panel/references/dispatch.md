@@ -22,14 +22,16 @@ builds and reproductions and write — so each lane declares two commands.
       "slots": 4,
       "provider_fault_patterns": ["usage limit", "rate limit", "5\\d\\d from the API"],
       "read_only": {
-        "command": ["runtime-a", "exec", "--sandbox", "read-only", "-C", "⟪cwd⟫", "⟪prompt⟫"],
+        "command": ["runtime-a", "exec", "--skip-repo-check", "--sandbox", "read-only",
+                    "-C", "⟪cwd⟫", "⟪prompt⟫"],
         "permission": "read-only sandbox, enforced by the runtime",
         "result_mode": "stream-transcript",
         "idle": 900,
         "deadline": 3600
       },
       "write_capable": {
-        "command": ["runtime-a", "exec", "--sandbox", "workspace-write", "-C", "⟪cwd⟫", "⟪prompt⟫"],
+        "command": ["runtime-a", "exec", "--skip-repo-check", "--sandbox", "workspace-write",
+                    "-C", "⟪cwd⟫", "⟪prompt⟫"],
         "permission": "writes confined to the disposable copy it is given"
       }
     },
@@ -51,6 +53,12 @@ builds and reproductions and write — so each lane declares two commands.
 ```
 
 Lane B above takes every default.
+
+**Every worker runs outside any git repository**: its working directory and input sit under
+the run directory, which must be outside every repository. A runtime that refuses to start
+outside a repository or a folder it trusts has to be told to skip that check in both of the
+lane's commands — Codex's `exec` takes `--skip-git-repo-check` — or every attempt fails in
+seconds and the lane pauses having read nothing.
 
 - `lanes` holds exactly `A` and `B`. `runtime`, `adapter` and both mode objects are
   required, and `model` unless a `backend` states it; `slots` defaults to 2, `account` to the
@@ -191,7 +199,10 @@ review_panel_run.py resolve-unit <rundir> <unit> --grant-launches <n>|--fail --r
 
 A **paused** run is not a quarantined unit and needs no resolution: a storage fault, a host
 refusal or a provider outage stops the run having adjudicated nothing. Free the space,
-restore the permission, restart the provider, and run the same command again.
+restore the permission, restart the provider, and run the same command again. A paused
+provider's message quotes the end of the latest failing attempt's `display.log`, which is
+where a runtime that would not start says why; a lane's commands may be corrected before
+the same command is run again.
 
 One ending is neither, and it names a lane: *lane B landed no unit*. That lane answered
 none of the units it was given, so nothing it was asked to read reached the run and every
