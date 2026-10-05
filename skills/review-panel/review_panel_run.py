@@ -717,7 +717,7 @@ RESULT_MODES = frozenset({"external-file", "stream-json-result-event", "stream-t
 
 _LANE_KEYS = frozenset({"runtime", "model", "account", "adapter", "slots",
                         "provider_fault_patterns", "backend", "env", "env_from_parent",
-                        READ_ONLY, WRITE_CAPABLE})
+                        "limits", READ_ONLY, WRITE_CAPABLE})
 # `model` too, unless the lane names a backend, which states it.
 _LANE_REQUIRED = ("runtime", "adapter", READ_ONLY, WRITE_CAPABLE)
 # A variable name and nothing else. A key in an underscore format (`gsk_…`, `hf_…`) passes,
@@ -808,6 +808,10 @@ class LaneSpec:
     env_from_parent: tuple[tuple[str, str], ...] = ()
     account_stated: bool = True
     resolved: ResolvedBackend | None = None
+    # The lane's `limits` as the config states them, checked at parse time; the engine's
+    # defaults fill what it leaves out when `limits.json` is written. **Not pinned**: limits
+    # say how a stage packs its units, not who played, so a resume may lower them.
+    limits: dict | None = None
 
 
 def _env_key(name: str) -> str:
@@ -990,6 +994,10 @@ def parse_adapter_config(data: str | dict) -> dict[str, LaneSpec]:
             raise DriverError(f"lanes.{lane}: {', '.join(both)} is set by both 'env' and "
                               f"'env_from_parent'; set it once")
         modes = {mode: _parse_mode(lane, mode, raw[mode]) for mode in MODES}
+        try:
+            engine.lane_limits(raw.get("limits"), f"lanes.{lane}.limits")
+        except engine.LimitsError as exc:
+            raise DriverError(str(exc)) from exc
         if backend is None:
             for mode, spec in modes.items():
                 if BACKEND_ARGS_MARKER in spec.command:
@@ -1002,7 +1010,7 @@ def parse_adapter_config(data: str | dict) -> dict[str, LaneSpec]:
             slots_stated="slots" in raw, modes=modes,
             fault_patterns=_parse_fault_patterns(lane, raw.get("provider_fault_patterns")),
             backend=backend, env=env, env_from_parent=env_from_parent,
-            account_stated="account" in raw,
+            account_stated="account" in raw, limits=raw.get("limits"),
         )
     _refuse_a_shared_account_the_settings_contradict(lanes)
     if all(spec.model for spec in lanes.values()):
@@ -1329,6 +1337,22 @@ def dispatch_record(lanes: dict[str, LaneSpec],
     return {"rung": _derived_rung(lanes, executed, described), "lanes": described}
 
 
+def generation_dispatch_record(generation: int, lanes: dict[str, LaneSpec],
+                               units: Sequence[dict],
+                               executed: "dict[str, LaneExecution]") -> dict:
+    """``dispatch-g<n>.json``: the lanes generation ``generation``'s units were addressed to,
+    each described with what executed on it.
+
+    **No rung, and never through** :func:`dispatch_record`. The rung is the original
+    stages', whose record stays ``dispatch.json``. Deriving one here would refuse a
+    generation whose units all ran on one lane, as a single-batch generation's do: the
+    rounds after the batches all run on lane A."""
+    described = lane_descriptions(lanes, executed)
+    used = {unit.get("lane") for unit in units}
+    return {"generation": generation,
+            "lanes": {lane: described[lane] for lane in sorted(used) if lane in described}}
+
+
 def no_landing_refusal(stranded: Sequence[str], described: dict[str, dict]) -> str:
     """The message a lane that landed nothing ends the run with, written once.
 
@@ -1380,7 +1404,9 @@ ROUNDS: dict[str, tuple[tuple[str, ...], str]] = {
     engine.CLUSTERED_STAGE: ((engine.CLUSTERER_KIND,), "merge"),
     engine.MERGED_STAGE: ((engine.MERGER_KIND,), "merge-check"),
     engine.MERGE_CHECKED_STAGE: ((engine.MERGE_CHECKER_KIND,), "synthesize"),
-    engine.SYNTHESIZED_STAGE: ((engine.SYNTHESIZER_KIND,), "report"),
+    # Synthesis runs as rounds under one marker: while the engine says a round is still to
+    # plan, the stage after this one is `synthesize` again, and `report` once none is.
+    engine.SYNTHESIZED_STAGE: (engine.SYNTHESIS_KINDS, "report"),
 }
 
 
@@ -1392,6 +1418,15 @@ def _marker(rundir: Path) -> str | None:
     return stage if isinstance(stage, str) else None
 
 
+def _synthesis_units(rundir: Path) -> frozenset[str]:
+    """The synthesis units the listing commits, by id: what a later round adds to."""
+    doc = _read_json(rundir / engine.UNITS_FILE_NAME)
+    units = doc.get("units") if isinstance(doc, dict) else None
+    return frozenset(unit["id"] for unit in units or ()
+                     if isinstance(unit, dict) and unit.get("kind") in engine.SYNTHESIS_KINDS
+                     and isinstance(unit.get("id"), str))
+
+
 def _units(rundir: Path) -> list[dict]:
     doc = _read_json(rundir / engine.UNITS_FILE_NAME)
     if not isinstance(doc, dict) or not isinstance(doc.get("units"), list):
@@ -1399,8 +1434,9 @@ def _units(rundir: Path) -> list[dict]:
     return [unit for unit in doc["units"] if isinstance(unit, dict)]
 
 
-def bootstrap(rundir: Path, job: Path | None) -> None:
-    """Classify the target and, where there is no committed run, plan one.
+def bootstrap(rundir: Path, job: Path | None, limits: dict | None = None) -> None:
+    """Classify the target and, where there is no committed run, plan one, with ``limits``
+    written beside it as ``limits.json`` when given.
 
     The classification deletes nothing it has not examined:
 
@@ -1471,6 +1507,14 @@ def bootstrap(rundir: Path, job: Path | None) -> None:
                 f"cannot copy {notes} into {partial}: {exc}; it records which job fields the "
                 f"interview chose, and a run that dropped it would report that nothing did"
             ) from exc
+    # After plan for the same reason as the notes, and before the rename, so no committed
+    # run directory is ever without the limits its later stages are planned against.
+    if limits is not None:
+        try:
+            engine.write_json(partial / engine.LIMITS_FILE_NAME, limits)
+        except (OSError, engine.ReviewPanelError) as exc:
+            remove_tree(partial, partial.parent)
+            raise DriverError(f"cannot write the run's limits into {partial}: {exc}") from exc
     # **Hardened before the rename commits**, so a committed run directory is always a
     # hardened one and there is no window in which readers could be measured against a tree
     # anything can still write to. Done here rather than by the engine because the engine
@@ -1482,6 +1526,38 @@ def bootstrap(rundir: Path, job: Path | None) -> None:
         raise DriverError(
             f"cannot commit the planned run directory onto {rundir}: {exc}") from exc
     _progress(rundir, f"planned {len(_units(rundir))} units")
+
+
+def limits_document(lanes: dict[str, LaneSpec]) -> dict:
+    """``limits.json`` for these lanes: the engine's defaults under each lane's own."""
+    return engine.limits_document({lane: spec.limits for lane, spec in lanes.items()})
+
+
+def sync_limits(rundir: Path, document: dict) -> bool:
+    """Write ``limits.json`` where it is absent or records other limits, and say whether it
+    did. Every unit records the limits it was planned under, so a rewrite reaches only the
+    units planned after it."""
+    path = rundir / engine.LIMITS_FILE_NAME
+    if _read_json(path) == document:
+        return False
+    _write_json(path, document)
+    return True
+
+
+def refuse_an_old_run_before_reported(rundir: Path) -> None:
+    """Refuse a run directory planned before run formats were recorded, unless it reached
+    ``reported``. Its units carry none of what this driver's later stages read, so resumed
+    here it would be finished by stages it was not planned for."""
+    if engine.read_run_format(rundir) is not None:
+        return
+    marker = _marker(rundir)
+    if marker == engine.REPORTED_STAGE:
+        return
+    raise DriverError(
+        f"{rundir} has no {engine.RUN_FORMAT_FILE_NAME}, so it was planned by v2026.10.0 or "
+        f"earlier, and it stopped at stage {marker!r}, before {engine.REPORTED_STAGE!r}. "
+        f"This driver does not resume such a run: finish it with the v2026.10.0 driver, "
+        f"then run `resynthesize` on it with this one")
 
 
 # The claims the engine's stages take on a run directory. Enumerated rather than swept: a
@@ -2611,8 +2687,10 @@ class LaneExecution:
     modes: frozenset
 
 
-def executed_provenance(run: "Run") -> dict[str, LaneExecution]:
-    """Per lane, what executed — counted from the attempts and from nothing else.
+def executed_provenance(run: "Run",
+                        units: Sequence[dict] | None = None) -> dict[str, LaneExecution]:
+    """Per lane, what executed — counted from the attempts and from nothing else; of
+    ``units`` where given, else of every unit the run lists.
 
     **Proven execution, not a prepared launch, and a landed result, not a published
     error.** An attempt is an execution unless its own disposition says the supervisor could
@@ -2626,7 +2704,7 @@ def executed_provenance(run: "Run") -> dict[str, LaneExecution]:
     unknown = {lane: 0 for lane in run.lanes}
     landings = {lane: 0 for lane in run.lanes}
     modes: dict[str, set] = {lane: set() for lane in run.lanes}
-    for unit in run.units():
+    for unit in (run.units() if units is None else units):
         lane = unit.get("lane")
         if lane not in prepared:
             continue
@@ -3270,6 +3348,28 @@ def _most_severe_rank(levels: Sequence[str]) -> int:
 # --------------------------------------------------------------------------- #
 # the run — everything above, wired to one owned run directory
 # --------------------------------------------------------------------------- #
+BUDGET_NAME = "budget.json"
+
+
+def generation_budget_name(generation: int) -> str:
+    return f"budget-g{generation}.json"
+
+
+def generation_pin_name(generation: int) -> str:
+    return f"adapter-pin-g{generation}.json"
+
+
+def read_budget(path: Path) -> tuple[float, float]:
+    """``(spent, extended)`` in seconds from a budget file; nothing spent where it is absent."""
+    record = _read_json(path)
+    if not isinstance(record, dict):
+        return 0.0, 0.0
+    def _number(key: str) -> float:
+        value = record.get(key)
+        return float(value) if isinstance(value, (int, float)) else 0.0
+    return _number("seconds"), _number("extended")
+
+
 class Run:
     """One owned run directory, its configuration, and the loop over its rounds."""
 
@@ -3280,8 +3380,12 @@ class Run:
                  max_capture_bytes: int = MAX_CAPTURE_BYTES_DEFAULT,
                  keep_repro_bytes: int = KEEP_REPRO_BYTES_DEFAULT,
                  disk_floor: int = DISK_FLOOR_DEFAULT,
-                 build_margin: int = BUILD_MARGIN_DEFAULT):
+                 build_margin: int = BUILD_MARGIN_DEFAULT,
+                 budget_name: str = BUDGET_NAME):
         self.rundir = rundir
+        # The run's budget, or a synthesis generation's own: `resynthesize` starts a budget
+        # of its own rather than inheriting what the run's stages spent.
+        self.budget_path = rundir / budget_name
         # The spelling the operator typed, when it is not the canonical one. Carried only so
         # the drain request works at the path the documentation names for them.
         self.given = given
@@ -3317,6 +3421,7 @@ class Run:
         # exit of a child is a fact only its parent can read, and it is read in `reap`.
         self._children: list[tuple[subprocess.Popen, Path, str]] = []
         self._units_cache: list[dict] | None = None
+        self._undispatched: tuple[list[dict], frozenset[str]] | None = None
         # **A per-pass cache, and the reason is scale.** Eligibility, the capacity count,
         # the quarantine test and the drain test each walk a unit's attempts, so an
         # uncached pass re-reads every attempt of every unit five times per poll — at four
@@ -3361,9 +3466,22 @@ class Run:
         return cached
 
     def terminal(self, unit_id: str) -> bool:
+        if unit_id in self.undispatched():
+            return True
         if unit_id not in self._landed_cache:
             self._landed_cache[unit_id] = landed(self.rundir, unit_id)
         return self._landed_cache[unit_id] is not None
+
+    def undispatched(self) -> frozenset[str]:
+        """The units the engine listed with ``dispatch`` false: an item over its lane's
+        hard ceiling. Never sent to a model and counted finished, so a round ends without
+        them; their evidence stays where the engine put it, and the report names what the
+        stage did not do for them."""
+        units = self.units()
+        if self._undispatched is None or self._undispatched[0] is not units:
+            self._undispatched = (units, frozenset(
+                unit["id"] for unit in units if unit.get("dispatch") is False))
+        return self._undispatched[1]
 
     def invalidate(self, unit_id: str | None = None) -> None:
         """Forget what was read. Called by every write, so the next question is answered
@@ -3394,16 +3512,10 @@ class Run:
 
     # -- the time budget ---------------------------------------------------- #
     def _read_budget(self) -> tuple[float, float]:
-        """``(spent, extended)`` from ``budget.json``. Two numbers, not one: an extension is
-        credit granted, and subtracting it from the spend cannot represent more credit than
-        has been spent — one hour spent and two hours granted bought one hour."""
-        record = _read_json(self.rundir / "budget.json")
-        if not isinstance(record, dict):
-            return 0.0, 0.0
-        def _number(key: str) -> float:
-            value = record.get(key)
-            return float(value) if isinstance(value, (int, float)) else 0.0
-        return _number("seconds"), _number("extended")
+        """``(spent, extended)`` from this run's budget file. Two numbers, not one: an
+        extension is credit granted, and subtracting it from the spend cannot represent more
+        credit than has been spent — one hour spent and two hours granted bought one hour."""
+        return read_budget(self.budget_path)
 
     def spent(self) -> float:
         """Accumulated **driver uptime**, across restarts. Downtime is not counted: a run
@@ -3416,7 +3528,7 @@ class Run:
             return
         self._budget_written = time.monotonic()
         with contextlib.suppress(engine.ReviewPanelError, OSError):
-            _write_json(self.rundir / "budget.json",
+            _write_json(self.budget_path,
                         {"seconds": round(self.spent(), 3),
                          "extended": round(self._extended, 3)})
 
@@ -4423,9 +4535,24 @@ class Run:
             self.sweep_copies()
 
     # -- 4. one round -------------------------------------------------------- #
+    def round_units(self, kinds: Sequence[str]) -> list[dict]:
+        """The listed units of ``kinds`` a round takes. Of the synthesis kinds, only the
+        generation being built: a published generation's units are its record, never
+        dispatched again, and one that never landed must not hold a later round open."""
+        units = [unit for unit in self.units() if unit.get("kind") in kinds]
+        if not set(kinds) & set(engine.SYNTHESIS_KINDS):
+            return units
+        building = engine.building_generation(self.rundir, self.units())
+        return [unit for unit in units if unit.get("kind") not in engine.SYNTHESIS_KINDS
+                or engine.synthesis_generation(unit) == building]
+
     def dispatch_round(self, kinds: Sequence[str]) -> None:
-        mine = [unit for unit in self.units() if unit.get("kind") in kinds]
-        self.say(f"round: {len(mine)} unit(s) of kind {', '.join(kinds)}")
+        skipped = self.undispatched()
+        taken = self.round_units(kinds)
+        mine = [unit for unit in taken if unit["id"] not in skipped]
+        held = sum(1 for unit in taken if unit["id"] in skipped)
+        self.say(f"round: {len(mine)} unit(s) of kind {', '.join(kinds)}"
+                 + (f"; {held} over its lane's hard ceiling, not dispatched" if held else ""))
         # Reset HERE, where the round begins, and not inside the loop below, whose every
         # pass is one poll: a round held back for room sweeps once, not at every poll
         # interval, because the sweep measures every copy on disk — the very cost that
@@ -4579,8 +4706,8 @@ class Run:
     def unfinished(self, kinds: Sequence[str]) -> list[tuple[str, str]]:
         """Units of this round that have no terminal publication, with why."""
         out = []
-        for unit in self.units():
-            if unit.get("kind") not in kinds or self.terminal(unit["id"]):
+        for unit in self.round_units(kinds):
+            if self.terminal(unit["id"]):
                 continue
             out.append((unit["id"], self.quarantined(unit["id"]) or "no answer landed"))
         return out
@@ -4635,8 +4762,9 @@ class Run:
                 stranded, lane_descriptions(self.lanes, executed)))
 
     # -- 4. the loop --------------------------------------------------------- #
-    def loop(self) -> int:
-        """Carry the run to its report, or stop and say why.
+    def loop(self, generation: int | None = None) -> int:
+        """Carry the run to its report — or, given ``generation``, carry that synthesis
+        generation to its publication — or stop and say why.
 
         **A fault of the host ends the run here rather than where it happened.** Every
         driver read and write sits in the middle of a sequence — adjudicate, publish, record
@@ -4651,7 +4779,8 @@ class Run:
             # restarted it. Inside the loop this would undo a recurrence as fast as the
             # breaker could find one.
             self.reset_drained_providers()
-            return self._run_rounds()
+            return (self._run_rounds() if generation is None
+                    else self._resynthesis_rounds(generation))
         except RunPaused as exc:
             self.request_pause(f"{exc}; nothing was adjudicated from it")
             self.say("the run is resumable: put right what the host refused — free space, "
@@ -4699,72 +4828,169 @@ class Run:
             # a read-only attribute does not stop a file being created, which is exactly why
             # the snapshot check verifies the file set and not only the digests.
             self.check_snapshot()
-            # **A stop is reported before a quarantine is**, and the order is the point: a
-            # run that stopped claiming because it was asked to, or because its budget ran
-            # out, leaves units with no answer for that reason and not for a defect. Naming
-            # them as quarantined would send an operator to `resolve-attempt` over a run
-            # that needs nothing but to be started again.
-            if self.stop_requested() or self.over_budget():
-                self.say((f"paused: {self.pause_reason}; the run is resumable"
-                          if self.pause_reason else
-                          (f"drained: {self.drain_reason}; the run is resumable"
-                           if self.drain_reason else
-                           "drained on request; the run is resumable")) if self.draining
-                         else f"the time budget of {self.max_hours} h is spent; run again "
-                              f"with --extend <hours beyond the limit>, larger than "
-                              f"{self._extended / 3600.0:g}")
-                for unit_id, why in self.unfinished(kinds):
-                    self.say(f"  not finished: {unit_id} — {why}")
-                self.save_budget(force=True)
-                # Never rolls into the next round: a signal asking a run to stop must not
-                # be answered by starting the next one's work. **A pause is not a drain**:
-                # both stop claiming, and only the drain is a success.
-                return EXIT_OK if self.draining and not self.pause_reason else EXIT_STOPPED
-            stuck = self.unfinished(kinds)
-            if stuck:
-                for unit_id, why in stuck:
-                    self.say(f"stopped: {unit_id} — {why}")
-                self.say("the run is resumable: resolve these, then run the same command "
-                         "again")
-                self.save_budget(force=True)
-                return EXIT_STOPPED
+            stopped = self._stopped(kinds)
+            if stopped is not None:
+                return stopped
+            if marker == engine.SYNTHESIZED_STAGE and engine.synthesis_needs_round(self.rundir):
+                stage = "synthesize"
+            before = self.listed_ids()
+            listed = _synthesis_units(self.rundir)
             if stage == "report":
                 # `dispatch.json` is committed first, because `report` loads it before it
                 # renders anything.
                 _write_json(self.rundir / engine.DISPATCH_FILE_NAME,
                             dispatch_record(self.lanes, executed_provenance(self)))
-            # Under this driver's lock, so a claim on disk is one nobody holds.
-            for name in clear_engine_claims(self.rundir):
-                self.say(f"cleared {name}, which a killed {name.split('.')[0]} left behind")
-                _progress(self.rundir, f"cleared the stranded claim {name}")
-            code, out, err = _engine_stage(stage, str(self.rundir))
-            if out.strip():
-                self.say(out.rstrip())
-            if code != 0:
-                # **A stage that met the volume is the volume's failure, not the run's.**
-                # The marker is the engine's own last write and a unit's answer is its own
-                # read, so a failing device reaches this program as a stage refusal rather
-                # than as a `RunPaused` of its own — and read as an ordinary refusal it
-                # would end the run non-resumably over something a gigabyte of free space or
-                # a remount fixes. The engine's message carries the path, so the pause names
-                # it by quoting it.
-                if _names_storage_fault(err or out):
-                    self.request_pause(
-                        f"{stage} could not read or write: {(err or out).strip()}")
-                    self.say("the run is resumable: free space, or make the volume "
-                             "writable, and run the same command again")
-                    with contextlib.suppress(RunPaused, engine.ReviewPanelError, OSError):
-                        self.save_budget(force=True)
-                    return EXIT_STOPPED
-                raise DriverError(f"{stage} refused this run:\n{err or out}")
+            stopped = self._run_stage(stage)
+            if stopped is not None:
+                return stopped
+            if stage != "report":
+                self.planned(stage, before)
             # Re-read rather than assume: the marker is the commit record, and a stage that
             # returned 0 without moving it would otherwise loop here forever.
             moved = _marker(self.rundir)
+            # A later synthesis round moves no marker: its commit is the units it lists.
+            if moved == marker and stage == "synthesize" and marker == engine.SYNTHESIZED_STAGE \
+                    and _synthesis_units(self.rundir) > listed:
+                continue
             if moved == marker:
                 raise DriverError(
                     f"{stage} returned success without advancing the marker, which is "
                     f"still {marker!r}; the run directory is not in a state this driver "
                     f"can continue from")
+
+    def _stopped(self, kinds: Sequence[str]) -> int | None:
+        """The exit for a round that ended without finishing — asked to stop, out of budget,
+        or holding a unit no answer landed for — or ``None`` where every unit of it is
+        terminal."""
+        # **A stop is reported before a quarantine is**, and the order is the point: a
+        # run that stopped claiming because it was asked to, or because its budget ran
+        # out, leaves units with no answer for that reason and not for a defect. Naming
+        # them as quarantined would send an operator to `resolve-attempt` over a run
+        # that needs nothing but to be started again.
+        if self.stop_requested() or self.over_budget():
+            self.say((f"paused: {self.pause_reason}; the run is resumable"
+                      if self.pause_reason else
+                      (f"drained: {self.drain_reason}; the run is resumable"
+                       if self.drain_reason else
+                       "drained on request; the run is resumable")) if self.draining
+                     else f"the time budget of {self.max_hours} h is spent; run again "
+                          f"with --extend <hours beyond the limit>, larger than "
+                          f"{self._extended / 3600.0:g}")
+            for unit_id, why in self.unfinished(kinds):
+                self.say(f"  not finished: {unit_id} — {why}")
+            self.save_budget(force=True)
+            # Never rolls into the next round: a signal asking a run to stop must not
+            # be answered by starting the next one's work. **A pause is not a drain**:
+            # both stop claiming, and only the drain is a success.
+            return EXIT_OK if self.draining and not self.pause_reason else EXIT_STOPPED
+        stuck = self.unfinished(kinds)
+        if stuck:
+            for unit_id, why in stuck:
+                self.say(f"stopped: {unit_id} — {why}")
+            self.say("the run is resumable: resolve these, then run the same command "
+                     "again")
+            self.save_budget(force=True)
+            return EXIT_STOPPED
+        return None
+
+    def listed_ids(self) -> frozenset[str]:
+        """The ids the listing on disk holds now, read past the cache: what a stage about
+        to run will add to."""
+        return frozenset(unit["id"] for unit in _units(self.rundir)
+                         if isinstance(unit.get("id"), str))
+
+    def planned(self, stage: str, before: frozenset[str]) -> None:
+        """Say what ``stage`` planned, beside the listing that held ``before``. Every
+        round after reading is sized from what the round before it found, so this is the
+        first moment its size can be told."""
+        line = planned_line(stage, before, _units(self.rundir))
+        self.say(line)
+        _progress(self.rundir, line)
+
+    def _run_stage(self, stage: str) -> int | None:
+        """Run one engine stage on this run: ``None`` where it succeeded, the exit for a
+        pause where it met the volume, and a refusal raised where it refused the run."""
+        # Under this driver's lock, so a claim on disk is one nobody holds.
+        for name in clear_engine_claims(self.rundir):
+            self.say(f"cleared {name}, which a killed {name.split('.')[0]} left behind")
+            _progress(self.rundir, f"cleared the stranded claim {name}")
+        code, out, err = _engine_stage(stage, str(self.rundir))
+        if out.strip():
+            self.say(out.rstrip())
+        if code != 0:
+            # **A stage that met the volume is the volume's failure, not the run's.**
+            # The marker is the engine's own last write and a unit's answer is its own
+            # read, so a failing device reaches this program as a stage refusal rather
+            # than as a `RunPaused` of its own — and read as an ordinary refusal it
+            # would end the run non-resumably over something a gigabyte of free space or
+            # a remount fixes. The engine's message carries the path, so the pause names
+            # it by quoting it.
+            if _names_storage_fault(err or out):
+                self.request_pause(
+                    f"{stage} could not read or write: {(err or out).strip()}")
+                self.say("the run is resumable: free space, or make the volume "
+                         "writable, and run the same command again")
+                with contextlib.suppress(RunPaused, engine.ReviewPanelError, OSError):
+                    self.save_budget(force=True)
+                return EXIT_STOPPED
+            raise DriverError(f"{stage} refused this run:\n{err or out}")
+        return None
+
+    def _resynthesis_rounds(self, generation: int) -> int:
+        """Carry synthesis generation ``generation`` of a reported run to its publication:
+        each round dispatched, the next planned while the engine says one is needed, then
+        its dispatch record written and the report publishing it. A publication a kill left
+        part-way is finished before anything else, because until it is no reader can say
+        which generation the report's files are from."""
+        kinds = engine.SYNTHESIS_KINDS
+        while True:
+            self.invalidate()
+            marker = _marker(self.rundir)
+            if marker != REPORTED_STAGE:
+                raise DriverError(
+                    f"{self.rundir / engine.UNITS_FILE_NAME} is at stage {marker!r}, not "
+                    f"{REPORTED_STAGE!r}; synthesis generation {generation} is carried only "
+                    f"on a reported run")
+            if engine.publication_finished(self.rundir, generation):
+                self.say(f"published synthesis generation {generation}: "
+                         f"{self.rundir / engine.REPORT_NAME}")
+                self.save_budget(force=True)
+                return EXIT_OK
+            self.check_snapshot()
+            publishing = engine.publishing_generation(self.rundir) is not None
+            if not publishing:
+                self.adopt()
+                self.dispatch_round(kinds)
+                self.check_snapshot()
+                stopped = self._stopped(kinds)
+                if stopped is not None:
+                    return stopped
+            stage = ("synthesize" if not publishing and engine.synthesis_needs_round(self.rundir)
+                     else "report")
+            listed = _synthesis_units(self.rundir)
+            before = self.listed_ids()
+            if stage == "report" and not publishing:
+                # Before `report`, which refuses to publish a later generation without it.
+                members = [unit for unit in self.units() if unit.get("kind") in kinds
+                           and engine.synthesis_generation(unit) == generation]
+                _write_json(engine.generation_dispatch_path(self.rundir, generation),
+                            generation_dispatch_record(generation, self.lanes, members,
+                                                       executed_provenance(self, members)))
+            stopped = self._run_stage(stage)
+            if stopped is not None:
+                return stopped
+            # A later round's commit is the units it lists, and a publication's is the
+            # stamp naming its generation; a stage that returned 0 with neither would
+            # otherwise be called again forever.
+            if stage == "synthesize" and _synthesis_units(self.rundir) > listed:
+                self.planned(stage, before)
+                continue
+            if stage == "report" and engine.publication_finished(self.rundir, generation):
+                continue
+            raise DriverError(
+                f"{stage} returned success without committing anything for synthesis "
+                f"generation {generation}; the run directory is not in a state this driver "
+                f"can continue from")
 
 
 # --------------------------------------------------------------------------- #
@@ -4947,6 +5173,63 @@ def resolve_unit(rundir: Path, unit: str, *, grant: int | None,
     return f"{unit}: granted {grant} more launch(es)"
 
 
+UNDISPATCHED_STATUS = "not dispatched, over its lane's hard ceiling"
+
+
+def _never_dispatched(unit: dict) -> bool:
+    return unit.get("dispatch") is False
+
+
+def kind_counts(units: Sequence[dict]) -> list[tuple[str, int, int]]:
+    """``(kind, units, never dispatched)`` for each kind ``units`` holds, in listing order.
+    A unit over its lane's hard ceiling is counted apart, because it is listed and never
+    run: counted with the rest, it would be work the run says it has and will not do."""
+    counts: dict[str, list[int]] = {}
+    for unit in units:
+        count = counts.setdefault(str(unit.get("kind", "?")), [0, 0])
+        count[0] += 1
+        count[1] += _never_dispatched(unit)
+    return [(kind, total, held) for kind, (total, held) in counts.items()]
+
+
+def planned_line(stage: str, before: frozenset[str], units: Sequence[dict]) -> str:
+    """What ``stage`` added to the listing, which held the ids ``before``: how many units,
+    of which kinds, and how many of them will never be dispatched."""
+    new = [unit for unit in units if unit.get("id") not in before]
+    held = sum(1 for unit in new if _never_dispatched(unit))
+    return (f"{stage} planned {len(new)} unit(s)"
+            + (": " + ", ".join(f"{total} {kind}" for kind, total, _held in kind_counts(new))
+               if new else "")
+            + (f"; {held} of them over its lane's hard ceiling, listed and never dispatched"
+               if held else ""))
+
+
+def _generation_lines(run: Run) -> list[str]:
+    """On a reported run: the synthesis generation its report shows, and the one
+    `resynthesize` is building, with how many of its units are finished and the budget
+    that generation has spent."""
+    if _marker(run.rundir) != REPORTED_STAGE:
+        return []
+    units = run.units()
+    lines = []
+    published = engine.published_generation(run.rundir, units)
+    if published is not None:
+        lines.append(f"published synthesis generation: {published}")
+    building = engine.building_generation(run.rundir, units)
+    if building is None:
+        return lines
+    members = [unit for unit in units if unit.get("kind") in engine.SYNTHESIS_KINDS
+               and engine.synthesis_generation(unit) == building]
+    finished = sum(1 for unit in members if run.terminal(unit["id"]))
+    lines.append(f"building synthesis generation {building}: {finished} of {len(members)} "
+                 f"unit(s) finished"
+                 + ("; its publication is part-way, and resynthesize finishes it"
+                    if engine.publishing_generation(run.rundir) == building else ""))
+    spent, _extended = read_budget(run.rundir / generation_budget_name(building))
+    lines.append(f"generation {building} budget spent: {spent / 3600.0:.2f} h")
+    return lines
+
+
 def status_report(run: Run) -> str:
     """What the run directory says, and nothing else. Read-only by construction."""
     lines = [f"run directory: {run.rundir}",
@@ -4955,6 +5238,12 @@ def status_report(run: Run) -> str:
              # Named here as well as at startup: an operator reaching for `status` is
              # usually deciding whether to stop the run, and this is the path that does it.
              f"to stop a run in this directory: create {run.drain_flag}"]
+    lines += _generation_lines(run)
+    lines.append("units planned, by kind:")
+    lines += [f"  {kind}: {total} unit(s)"
+              + (f", {held} of them over its lane's hard ceiling and never dispatched"
+                 if held else "")
+              for kind, total, held in kind_counts(run.units())]
     for account, state in sorted(run.providers().items()):
         if state.paused:
             lines.append(f"provider {account} is paused at generation {state.generation}: "
@@ -4968,6 +5257,7 @@ def status_report(run: Run) -> str:
         attempts = run.attempts(unit_id)
         record = landed(run.rundir, unit_id)
         where = (f"landed {record['publication']} from {record['attempt']}" if record
+                 else UNDISPATCHED_STATUS if unit_id in run.undispatched()
                  else (run.quarantined(unit_id) or "open"))
         lines.append(f"  {unit_id} [{unit.get('kind')}/{unit.get('lane')}] {where}")
         for attempt in attempts:
@@ -5013,12 +5303,50 @@ def default_supervisor() -> Path:
     return _HERE.parent / "diff-review" / "review_runner.py"
 
 
+def _dispatch_options(parser: argparse.ArgumentParser) -> None:
+    """The options of every command that dispatches: the supervisor's, and the budget's."""
+    parser.add_argument("--grace", type=float, default=GRACE_DEFAULT,
+                        help="seconds past an attempt's own deadline before its outcome is "
+                             "called unprovable (default 120). It authorizes nothing")
+    parser.add_argument("--poll", type=float, default=2.0, help=argparse.SUPPRESS)
+    parser.add_argument("--max-hours", type=float, default=None,
+                        help="stop claiming once this much driver uptime has accumulated "
+                             "across restarts (for resynthesize, since that generation began)")
+    parser.add_argument("--extend", type=float, default=None,
+                        help="let the run use this many hours beyond --max-hours. Absolute, "
+                             "not added per invocation: the same command run again grants "
+                             "nothing more, and asking for more is a larger number")
+    parser.add_argument("--supervisor", default=None,
+                        help="path to review_runner.py (default: the sibling skill's)")
+    parser.add_argument("--probe-backoff", type=float, default=PROBE_BACKOFF_DEFAULT,
+                        help="seconds between probes of a paused provider (default 60). One "
+                             "probe at a time, and three that answer nothing end the run")
+    parser.add_argument("--max-capture-bytes", type=int, default=MAX_CAPTURE_BYTES_DEFAULT,
+                        help="what one attempt may make the supervisor hold, per retained "
+                             "representation. A reply larger than this loses its front, and a "
+                             "reply whose closing object itself was cut is infrastructure "
+                             "rather than the unit's answer")
+    parser.add_argument("--keep-repro-bytes", type=int, default=KEEP_REPRO_BYTES_DEFAULT,
+                        help="how much of the working copies whose verdicts name a run that "
+                             "was executed to keep (default 4 GiB; 0 keeps them all). Over "
+                             "it, copies are dropped highest-severity-last and every one is "
+                             "named in the run's record. A copy whose worker cannot be shown "
+                             "to have stopped is never dropped and never counted")
+    parser.add_argument("--disk-floor-bytes", type=int, default=DISK_FLOOR_DEFAULT,
+                        help="free space held back on the run's volume (default 256 MiB). "
+                             "Below it no write-capable unit is claimed; none is failed")
+    parser.add_argument("--build-margin-bytes", type=int, default=BUILD_MARGIN_DEFAULT,
+                        help="room reserved for what a build puts in a working copy, beyond "
+                             "the copy itself (default 256 MiB)")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=_PROG,
         description="Drive one review-panel run: plan, dispatch, land, report.")
     sub = parser.add_subparsers(dest="command", required=True,
-                                metavar="{run,status,resolve-attempt,resolve-unit}")
+                                metavar="{run,resynthesize,status,resolve-attempt,"
+                                        "resolve-unit}")
     run = sub.add_parser("run", help="plan or resume a run and carry it to a report")
     run.add_argument("--job", help="the job file to plan from; required for a new run")
     run.add_argument("--rundir", required=True, help="the run directory")
@@ -5033,39 +5361,16 @@ def build_parser() -> argparse.ArgumentParser:
                           "same where signals are delivered, but only once dispatch has "
                           "begun: during planning no handler is installed yet, so it "
                           "still ends the process. The file is the one that always works")
-    run.add_argument("--grace", type=float, default=GRACE_DEFAULT,
-                     help="seconds past an attempt's own deadline before its outcome is "
-                          "called unprovable (default 120). It authorizes nothing")
-    run.add_argument("--poll", type=float, default=2.0, help=argparse.SUPPRESS)
-    run.add_argument("--max-hours", type=float, default=None,
-                     help="stop claiming once this much driver uptime has accumulated "
-                          "across restarts")
-    run.add_argument("--extend", type=float, default=None,
-                     help="let the run use this many hours beyond --max-hours. Absolute, "
-                          "not added per invocation: the same command run again grants "
-                          "nothing more, and asking for more is a larger number")
-    run.add_argument("--supervisor", default=None,
-                     help="path to review_runner.py (default: the sibling skill's)")
-    run.add_argument("--probe-backoff", type=float, default=PROBE_BACKOFF_DEFAULT,
-                     help="seconds between probes of a paused provider (default 60). One "
-                          "probe at a time, and three that answer nothing end the run")
-    run.add_argument("--max-capture-bytes", type=int, default=MAX_CAPTURE_BYTES_DEFAULT,
-                     help="what one attempt may make the supervisor hold, per retained "
-                          "representation. A reply larger than this loses its front, and a "
-                          "reply whose closing object itself was cut is infrastructure "
-                          "rather than the unit's answer")
-    run.add_argument("--keep-repro-bytes", type=int, default=KEEP_REPRO_BYTES_DEFAULT,
-                     help="how much of the working copies whose verdicts name a run that "
-                          "was executed to keep (default 4 GiB; 0 keeps them all). Over "
-                          "it, copies are dropped highest-severity-last and every one is "
-                          "named in the run's record. A copy whose worker cannot be shown "
-                          "to have stopped is never dropped and never counted")
-    run.add_argument("--disk-floor-bytes", type=int, default=DISK_FLOOR_DEFAULT,
-                     help="free space held back on the run's volume (default 256 MiB). "
-                          "Below it no write-capable unit is claimed; none is failed")
-    run.add_argument("--build-margin-bytes", type=int, default=BUILD_MARGIN_DEFAULT,
-                     help="room reserved for what a build puts in a working copy, beyond "
-                          "the copy itself (default 256 MiB)")
+    _dispatch_options(run)
+    again = sub.add_parser(
+        "resynthesize",
+        help="write a reported run's synthesis again, as a later generation published over "
+             "its report; run again to resume one an earlier call left unpublished")
+    again.add_argument("rundir")
+    again.add_argument("--adapter", required=True,
+                       help="the adapter config; its synthesis limits are what the new "
+                            "generation is planned under, and it may differ from the run's")
+    _dispatch_options(again)
     status = sub.add_parser("status", help="print what the run directory says; writes "
                                            "nothing")
     status.add_argument("rundir")
@@ -5103,7 +5408,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-_SUBCOMMANDS = ("run", "status", "resolve-attempt", "resolve-unit")
+_SUBCOMMANDS = ("run", "resynthesize", "status", "resolve-attempt", "resolve-unit")
 
 
 def _with_default_subcommand(argv: Sequence[str]) -> list[str]:
@@ -5181,6 +5486,8 @@ def _dispatch(args: argparse.Namespace) -> int:
     lock = RunLock(rundir.with_name(rundir.name + LOCK_SUFFIX))
     if args.command == "run":
         return _command_run(args, rundir, lock)
+    if args.command == "resynthesize":
+        return _command_resynthesize(args, rundir, lock)
     if args.command == "status":
         # **`status` does not take the lock, and that is deliberate.** It writes nothing, and
         # the moment an operator most wants it is while a run is going — which is exactly
@@ -5217,7 +5524,9 @@ def _placeholder_lanes() -> dict[str, LaneSpec]:
             for lane in engine.LANES}
 
 
-def _command_run(args: argparse.Namespace, rundir: Path, lock: RunLock) -> int:
+def _dispatch_setup(args: argparse.Namespace) -> tuple[dict[str, LaneSpec], Path]:
+    """The lanes and the supervisor a dispatching command runs with, each checked before
+    the lock is taken or anything is planned."""
     lanes = load_adapter_config(args.adapter)
     # Resolved before it is checked, because it is checked HERE and run THERE: every
     # supervisor is launched with the run directory as its working directory, so a relative
@@ -5252,6 +5561,11 @@ def _command_run(args: argparse.Namespace, rundir: Path, lock: RunLock) -> int:
                         ("--build-margin-bytes", args.build_margin_bytes)):
         if value < 0:
             raise DriverError(f"{flag} cannot be negative")
+    return lanes, supervisor
+
+
+def _command_run(args: argparse.Namespace, rundir: Path, lock: RunLock) -> int:
+    lanes, supervisor = _dispatch_setup(args)
     job = Path(args.job).absolute() if args.job else None
     # **The lock first, before anything is inspected.** Taking it after planning leaves
     # bootstrap unowned, and two drivers could then both see one `.partial` directory with
@@ -5275,10 +5589,15 @@ def _command_run(args: argparse.Namespace, rundir: Path, lock: RunLock) -> int:
             # operator would be the round line AFTER planning. The window this names is the
             # one during planning. A path delivered after it is a path delivered too late.
             sys.stdout.flush()
-        bootstrap(rundir, job)
+        limits = limits_document(lanes)
+        bootstrap(rundir, job, limits=limits)
+        refuse_an_old_run_before_reported(rundir)
         # Pinned at plan time and refused on a resume with a different one: a run whose
         # lanes changed part-way cannot be described truthfully by one record.
         _pin_adapter(rundir, lanes)
+        if sync_limits(rundir, limits):
+            _progress(rundir, f"rewrote {engine.LIMITS_FILE_NAME}: the adapter's limits "
+                              f"changed, and only units planned from here on use them")
         if not args.go:
             sys.stdout.write(_preview(rundir, lanes))
             return EXIT_OK
@@ -5286,36 +5605,120 @@ def _command_run(args: argparse.Namespace, rundir: Path, lock: RunLock) -> int:
         # is about what leaves the machine rather than how long the run takes.
         sys.stdout.write(_copied_outside_scope(rundir))
         sys.stdout.flush()
-        run = Run(rundir, lanes, supervisor, grace=args.grace,
-                  poll=args.poll, max_hours=args.max_hours, given=given,
-                  probe_backoff=args.probe_backoff,
-                  max_capture_bytes=args.max_capture_bytes,
-                  keep_repro_bytes=args.keep_repro_bytes,
-                  disk_floor=args.disk_floor_bytes,
-                  build_margin=args.build_margin_bytes)
-        # `is not None`, not truth: `--extend 0` is how an operator takes an earlier grant
-        # back, and read as "not given" it was silently ignored. A negative number is
-        # refused rather than clamped, because clamped to zero it revoked a grant nobody
-        # meant to revoke.
-        if args.extend is not None and args.extend < 0:
-            raise DriverError("--extend must be zero or more hours; zero takes an earlier "
-                              "grant back")
-        if args.extend is not None:
-            run.extend(args.extend)
-        previous = _arm_drain(run)
-        try:
-            return run.loop()
-        finally:
-            run.save_budget(force=True)
-            # Put the handlers back. Called in-process — which is how the suite calls it —
-            # this would otherwise leave the caller's own interrupt handling replaced by
-            # one that writes into a run that has finished.
-            for signum, handler in previous:
-                with contextlib.suppress(ValueError, OSError, TypeError):
-                    signal.signal(signum, handler)
+        return _drive(_run_from(args, rundir, lanes, supervisor, given), args)
 
 
-def _pin_adapter(rundir: Path, lanes: dict[str, LaneSpec]) -> None:
+def _run_from(args: argparse.Namespace, rundir: Path, lanes: dict[str, LaneSpec],
+              supervisor: Path, given: Path, budget_name: str = BUDGET_NAME) -> Run:
+    return Run(rundir, lanes, supervisor, grace=args.grace,
+               poll=args.poll, max_hours=args.max_hours, given=given,
+               probe_backoff=args.probe_backoff,
+               max_capture_bytes=args.max_capture_bytes,
+               keep_repro_bytes=args.keep_repro_bytes,
+               disk_floor=args.disk_floor_bytes,
+               build_margin=args.build_margin_bytes,
+               budget_name=budget_name)
+
+
+def _drive(run: Run, args: argparse.Namespace, generation: int | None = None) -> int:
+    """Run the loop with the operator's grant applied and the drain armed, and put the
+    caller's signal handling back afterwards."""
+    # `is not None`, not truth: `--extend 0` is how an operator takes an earlier grant
+    # back, and a test of truth would read it as "not given". A negative number is
+    # refused rather than clamped, because clamped to zero it would revoke a grant nobody
+    # meant to revoke.
+    if args.extend is not None and args.extend < 0:
+        raise DriverError("--extend must be zero or more hours; zero takes an earlier "
+                          "grant back")
+    if args.extend is not None:
+        run.extend(args.extend)
+    previous = _arm_drain(run)
+    try:
+        return run.loop(generation)
+    finally:
+        run.save_budget(force=True)
+        # Put the handlers back. Called in-process — which is how the suite calls it —
+        # this would otherwise leave the caller's own interrupt handling replaced by
+        # one that writes into a run that has finished.
+        for signum, handler in previous:
+            with contextlib.suppress(ValueError, OSError, TypeError):
+                signal.signal(signum, handler)
+
+
+def _command_resynthesize(args: argparse.Namespace, rundir: Path, lock: RunLock) -> int:
+    """Write a reported run's synthesis again as a later generation, and publish it over
+    the report the run has; or carry on the generation an earlier call left unpublished.
+
+    **Its own loop, not the run's**, which stops at `reported`: the marker stays there for
+    every later generation, so a plain `run` on the directory still finds it finished. The
+    generation has its own budget and its own adapter pin, so a recovery on another
+    adapter, or long after the run spent its hours, is not refused for what the run did."""
+    lanes, supervisor = _dispatch_setup(args)
+    given = Path(args.rundir).absolute()
+    with lock:
+        # As a run does, and for the same reason: a request left from before this driver
+        # owned the run belongs to a run that is over.
+        clear_drain_request(rundir, given)
+        sys.stdout.write(f"To stop this run: create {drain_flags(rundir)[0]}\n")
+        sys.stdout.flush()
+        marker = _marker(rundir)
+        if marker != REPORTED_STAGE:
+            raise DriverError(
+                f"{rundir} is at stage {marker!r}; resynthesize writes the synthesis of a "
+                f"run that is already {REPORTED_STAGE!r} again, so carry this one to its "
+                f"report with `run` first")
+        generation = (engine.publishing_generation(rundir)
+                      or engine.building_generation(rundir, _units(rundir)))
+        # Asked before anything is written: a run with nothing to write up is left exactly
+        # as it is, its limits, its log and its listing included.
+        if generation is None:
+            try:
+                needed = engine.defects_needing_a_write_up(rundir)
+            except engine.ReviewPanelError as exc:
+                raise DriverError(f"synthesize --new-generation refused this run:\n{exc}") \
+                    from exc
+            if not needed:
+                sys.stdout.write(engine.NOTHING_TO_RESYNTHESIZE + "\n")
+                return EXIT_OK
+        # A generation being resumed is checked against its pin before anything is
+        # rewritten: one generation's write-ups cannot be described by two adapters.
+        if generation is not None:
+            _pin_adapter(rundir, lanes, generation_pin_name(generation),
+                         f"synthesis generation {generation}")
+        # Before planning, so lowered limits reach a run planned before they were set; every
+        # unit records the limits it was planned under, so units already planned keep theirs.
+        if sync_limits(rundir, limits_document(lanes)):
+            _progress(rundir, f"rewrote {engine.LIMITS_FILE_NAME}: the adapter's limits "
+                              f"changed, and only units planned from here on use them")
+        if generation is None:
+            for name in clear_engine_claims(rundir):
+                sys.stdout.write(f"cleared {name}, which a killed {name.split('.')[0]} left "
+                                 f"behind\n")
+            before = frozenset(unit["id"] for unit in _units(rundir)
+                               if isinstance(unit.get("id"), str))
+            code, out, err = _engine_stage("synthesize", str(rundir), "--new-generation")
+            if out.strip():
+                sys.stdout.write(out.rstrip() + "\n")
+            if code != 0:
+                raise DriverError(f"synthesize --new-generation refused this run:\n"
+                                  f"{err or out}")
+            generation = engine.building_generation(rundir, _units(rundir))
+            if generation is None:
+                raise DriverError("synthesize --new-generation returned success without "
+                                  "planning a generation")
+            line = planned_line("synthesize --new-generation", before, _units(rundir))
+            sys.stdout.write(line + "\n")
+            _progress(rundir, line)
+            _pin_adapter(rundir, lanes, generation_pin_name(generation),
+                         f"synthesis generation {generation}")
+            _progress(rundir, f"planned synthesis generation {generation}")
+        sys.stdout.flush()
+        return _drive(_run_from(args, rundir, lanes, supervisor, given,
+                                generation_budget_name(generation)), args, generation)
+
+
+def _pin_adapter(rundir: Path, lanes: dict[str, LaneSpec], name: str = "adapter-pin.json",
+                what: str = "a run") -> None:
     """Record the configuration this run is planned against, and refuse a resume with a
     different one. A run whose lanes changed half way through has no honest provenance:
     the report would name one adapter for work two of them did.
@@ -5340,7 +5743,7 @@ def _pin_adapter(rundir: Path, lanes: dict[str, LaneSpec]) -> None:
             pinned["env_from_parent"] = {child: _name_digest(parent)
                                          for child, parent in spec.env_from_parent}
         fingerprint[lane] = pinned
-    path = rundir / "adapter-pin.json"
+    path = rundir / name
     existing = _read_json(path)
     if existing is None:
         _write_json(path, fingerprint)
@@ -5353,7 +5756,7 @@ def _pin_adapter(rundir: Path, lanes: dict[str, LaneSpec]) -> None:
                 for lane, pinned in fingerprint.items()}
     if existing != compared:
         raise DriverError(
-            f"{path} pins a different adapter configuration than the one given; a run "
+            f"{path} pins a different adapter configuration than the one given; {what} "
             f"cannot change the lanes it is described by half way through")
 
 
@@ -5378,18 +5781,31 @@ def _preview(rundir: Path, lanes: dict[str, LaneSpec]) -> str:
     """What ``--go`` would start, and **how it would be spread**. A unit count alone cannot
     say how long a run will take, so the shape of the run is printed per lane: how many
     units, how many at once, and which ones queue behind each other run-wide."""
-    units = _units(rundir)
-    kinds: dict[str, int] = {}
-    for unit in units:
-        kinds[unit.get("kind", "?")] = kinds.get(unit.get("kind", "?"), 0) + 1
+    listed = _units(rundir)
+    # A unit over its lane's hard ceiling is never sent, so it is no wave's work.
+    dispatchable = [unit for unit in listed if not _never_dispatched(unit)]
+    held = len(listed) - len(dispatchable)
+    # Nor is a unit that has landed, on a resumed run: it is finished, as `Run.terminal`
+    # counts it.
+    units = [unit for unit in dispatchable
+             if not (isinstance(unit.get("id"), str) and landed(rundir, unit["id"]))]
+    done = len(dispatchable) - len(units)
+    stage = _marker(rundir)
     lines = [f"{engine.RUNDIR_LINE}{rundir}", "",
-             f"stage: {_marker(rundir)}",
-             f"units: {len(units)}"]
+             f"stage: {stage}",
+             # The only round whose size is known before reading: every later stage plans
+             # from what this one finds, and says what it planned when it plans it. A run
+             # resumed past reading lists the rounds it has not finished as well.
+             (f"reading round: {len(units)} unit(s) to dispatch"
+              if stage == engine.READING_STAGE else f"units listed: {len(units)}")
+             + (f"; {done} already landed" if done else "")
+             + (f"; {held} more over its lane's hard ceiling, listed and never dispatched"
+                if held else "")]
     copied = _copied_outside_scope(rundir)
     if copied:
         lines.append(copied.rstrip("\n"))
-    for kind in sorted(kinds):
-        lines.append(f"  {kind}: {kinds[kind]}")
+    for kind, total, _held in sorted(kind_counts(units)):
+        lines.append(f"  {kind}: {total}")
     lines.append("")
     for lane, spec in lanes.items():
         mine = [u for u in units if u.get("lane", engine.LANES[0]) == lane]

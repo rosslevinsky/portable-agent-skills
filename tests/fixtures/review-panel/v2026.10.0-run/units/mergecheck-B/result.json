@@ -1,0 +1,1 @@
+{"groups": [{"group": "G1", "sites": [{"site": "S1", "verdict": "fits", "reason": "S1 is this mistake."}, {"site": "S2", "verdict": "fits", "reason": "S2 is this mistake."}], "hidden_claims": [], "fix_touches_refuted": {"value": false, "sites": []}}], "summary": "Checked every group against its mechanism."}

@@ -25,3 +25,9 @@
 # The one place line endings matter off this list is the installer's manifest, which
 # `write_manifest` writes with `newline="\n"`. That belongs in the code: the file is
 # generated on a user's machine and never passes through a checkout.
+
+# The one exception: a checked-in run directory's snapshot. The engine compares every
+# snapshot file byte for byte against the digests its `inventory.json` recorded, and refuses a
+# run whose snapshot changed — so a checkout that rewrote these files' line endings would
+# make the fixture a run that can no longer be continued, on Windows only.
+tests/fixtures/review-panel/v2026.10.0-run/snapshot/** -text

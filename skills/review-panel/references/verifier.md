@@ -12,7 +12,8 @@ is judged against it, not against your taste. Then the candidates, each with an 
 location (file, first and last line), the failure as the reader stated it, a proposed
 severity and direction, and — where a reader proposed one — a reproduction: an argv, a
 working directory and what the run should show. You are not told who raised a candidate,
-and you do not need to know: the same standard applies to every one.
+and you do not need to know: the same standard applies to every one. A large batch is split
+by file, so yours may be one part of it; each candidate is judged on its own either way.
 
 Above them sits what a separate unit found out about this tree by trying it: whether it
 builds and whether its tests run. It is a starting point, never a verdict on your work.

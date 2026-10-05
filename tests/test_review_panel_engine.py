@@ -1672,7 +1672,8 @@ class PlanWritesTheRunDirectory(_TreeCase):
         self.assertEqual(areas["areas"][0]["files"], list(_TREE_FILES))
         self.assertEqual(areas["ceiling"], {"lines": 2000, "bytes": 200 * 1024})
         self.assertEqual(sorted(p.name for p in self.rundir.iterdir()),
-                         ["areas.json", "inventory.json", "job.json", "snapshot", "units", "units.json"])
+                         ["areas.json", "inventory.json", "job.json",
+                          review_panel.RUN_FORMAT_FILE_NAME, "snapshot", "units", "units.json"])
 
     def test_the_job_is_copied_into_the_run_directory_so_a_run_is_self_describing(self):
         # route and report read the problem statement from the run directory and never
@@ -4231,9 +4232,9 @@ class RoutingSendsEveryCandidateToAStranger(_RouteCase):
 
 
 class EveryUnitRecordsItsPayloadSize(_RouteCase):
-    """Recorded, never bounded. DECISIONS.md declines a cap on a verification batch and
-    names a batch too large to read as what would change the answer; the numbers are how
-    that decision finally gets its evidence."""
+    """Recorded on every unit. A verification batch is bounded by the verification limits,
+    not by the reader ceiling: one past the ceiling every reader payload is held to, but
+    within its lane's limits, is still one unit."""
 
     def measured(self, unit):
         raw = (self.rundir / unit["payload"]).read_bytes()
@@ -4250,7 +4251,7 @@ class EveryUnitRecordsItsPayloadSize(_RouteCase):
                 self.assertEqual((unit["payload_lines"], unit["payload_bytes"]), (lines, size))
                 self.assertGreater(unit["payload_bytes"], 0)
 
-    def test_every_verification_batch_carries_its_size_and_is_not_capped(self):
+    def test_every_verification_batch_carries_its_size_and_is_not_held_to_the_reader_ceiling(self):
         self.plan()
         # Sixty findings carrying four kilobytes of failure text each: a batch past the
         # ceiling every reader payload is held to, which route must still accept.
@@ -4268,6 +4269,254 @@ class EveryUnitRecordsItsPayloadSize(_RouteCase):
         biggest = max(batches, key=lambda u: u["payload_bytes"])
         self.assertGreater(biggest["payload_bytes"], review_panel.DEFAULT_CEILING.bytes)
         self.assertEqual(len(self.candidates()["candidates"]), 61)
+
+def _split_candidate(n, file, finder="A", area="area-01", kind="reader", raiser_area=None):
+    """One candidate as ``build_candidates`` makes it, raised by lane ``finder``."""
+    return review_panel.Candidate(
+        id=f"cand-{n:03d}", area=area, file=file, line_start=1, line_end=1,
+        failure=f"Failure {n} in {file}.",
+        raised_by=(review_panel.Raised(
+            unit=f"{'audit-' if kind == 'auditor' else ''}{raiser_area or area}-{finder}1",
+            lane=finder, lens=None, kind=kind, area=raiser_area or area, severity="major",
+            consequence="c", direction="d", fix_size="small", quote="q",
+            reproduction=None),))
+
+
+def _verification_limits(**lanes):
+    """A run's limits with the verification limits of each lane named in ``lanes``."""
+    return review_panel.RunLimits(
+        lanes={lane: {**review_panel.DEFAULT_LIMITS,
+                      **({"verification": lanes[lane]} if lane in lanes else {})}
+               for lane in review_panel.LANES},
+        hard={lane: None for lane in review_panel.LANES})
+
+
+# Room for exactly two verdicts: a part is one file holding two candidates.
+_TWO_VERDICTS = review_panel.Limits(
+    input_bytes=400 * 1024,
+    reply_bytes=review_panel.VERIFICATION_REPLY_HEAD
+    + 2 * review_panel.VERIFICATION_REPLY_PRICES["verdict"])
+
+
+class VerificationIsSplitByFile(unittest.TestCase):
+    """A batch — one area, one finder, one question — over its lane's limits is split into
+    parts by file. Each verdict answers its own candidate, so a part asks exactly what the
+    whole batch asked, and every part goes to the lane that did not raise it."""
+
+    # In the order the packer takes them: folders by name, the root's "" first.
+    FILES = ("run.py", "engine/core.py", "engine/util.py")
+
+    def candidates(self, kind="reader"):
+        return [_split_candidate(n, file, kind=kind)
+                for n, file in enumerate((f for f in self.FILES for _ in range(2)), 1)]
+
+    def assert_three_parts(self, batches, suffix, asks):
+        self.assertEqual([b.id for b in batches],
+                         [f"verify-area-01-A-f{k}{suffix}" for k in (1, 2, 3)])
+        for batch, file in zip(batches, self.FILES):
+            with self.subTest(part=batch.id):
+                self.assertEqual((batch.area, batch.finder, batch.lane, batch.asks),
+                                 ("area-01", "A", "B", asks))
+                self.assertEqual(len(batch.candidates), 2)
+                self.assertTrue(batch.dispatch)
+                self.assertFalse(batch.oversize)
+                self.assertEqual(batch.limits, {"planning": _TWO_VERDICTS.record()})
+                self.assertIn("other lane, B", batch.routing)
+        placed = [cid for batch in batches for cid in batch.candidates]
+        self.assertEqual(placed, [c.id for c in self.candidates()])
+
+    def test_a_defect_batch_splits_three_ways_by_file(self):
+        batches = review_panel.route(self.candidates(),
+                                     limits=_verification_limits(B=_TWO_VERDICTS))
+        self.assert_three_parts(batches, "", review_panel.DEFECT_ASKS)
+
+    def test_a_coverage_batch_splits_three_ways_and_keeps_its_suffix_last(self):
+        batches = review_panel.route(self.candidates("auditor"),
+                                     limits=_verification_limits(B=_TWO_VERDICTS))
+        self.assert_three_parts(batches, review_panel.COVERAGE_BATCH_SUFFIX,
+                                review_panel.COVERAGE_ASKS)
+
+    def test_a_batch_within_its_limits_keeps_todays_id_and_order(self):
+        batches = review_panel.route(self.candidates())
+        self.assertEqual([b.id for b in batches], ["verify-area-01-A"])
+        self.assertEqual(list(batches[0].candidates), [c.id for c in self.candidates()])
+        self.assertEqual(batches[0].limits,
+                         {"planning": review_panel.DEFAULT_LIMITS["verification"].record()})
+
+    def test_a_part_is_packed_against_the_lane_it_goes_to(self):
+        # Lane A's limits are tiny and lane B's the defaults: A's findings go to B whole,
+        # and B's findings, which go to A, are split.
+        cands = self.candidates() + [_split_candidate(n, file, finder="B")
+                                     for n, file in enumerate(self.FILES, 10)]
+        tiny = review_panel.Limits(input_bytes=400 * 1024,
+                                   reply_bytes=review_panel.VERIFICATION_REPLY_HEAD
+                                   + review_panel.VERIFICATION_REPLY_PRICES["verdict"])
+        batches = review_panel.route(cands, limits=_verification_limits(A=tiny))
+        self.assertEqual([(b.id, b.lane) for b in batches],
+                         [("verify-area-01-A", "B"), ("verify-area-01-B-f1", "A"),
+                          ("verify-area-01-B-f2", "A"), ("verify-area-01-B-f3", "A")])
+
+    def test_the_payload_head_is_measured_into_every_part(self):
+        # A head this size leaves room for one file's candidates beside it, not two.
+        head = "x" * 1000
+        records = {c.id: "".join(review_panel._candidate_sections(
+            [review_panel.asdict(c)])) for c in self.candidates()}
+        per_file = max(sum(len(records[c.id].encode("utf-8")) for c in self.candidates()
+                           if c.file == file) for file in self.FILES)
+        limits = review_panel.Limits(input_bytes=1000 + per_file + 1, reply_bytes=128 * 1024)
+        batches = review_panel.route(self.candidates(), limits=_verification_limits(B=limits),
+                                     head_for=lambda asks, scope: head)
+        self.assertEqual(len(batches), 3)
+
+    def test_a_file_over_the_planning_ceiling_goes_alone_and_is_flagged(self):
+        cands = self.candidates()
+        batches = review_panel.route(
+            cands, limits=_verification_limits(
+                B=review_panel.Limits(input_bytes=400 * 1024,
+                                      reply_bytes=review_panel.VERIFICATION_REPLY_HEAD
+                                      + review_panel.VERIFICATION_REPLY_PRICES["verdict"])))
+        self.assertEqual(len(batches), 3)
+        for batch in batches:
+            with self.subTest(part=batch.id):
+                self.assertTrue(batch.oversize)
+                self.assertTrue(batch.dispatch)
+
+    def test_a_file_over_the_hard_ceiling_is_listed_and_not_dispatched(self):
+        one = review_panel.VERIFICATION_REPLY_HEAD + review_panel.VERIFICATION_REPLY_PRICES["verdict"]
+        limits = review_panel.RunLimits(
+            lanes={lane: dict(review_panel.DEFAULT_LIMITS) for lane in review_panel.LANES},
+            hard={"A": None, "B": review_panel.Limits(input_bytes=400 * 1024, reply_bytes=one)})
+        batches = review_panel.route(self.candidates(), limits=limits)
+        self.assertEqual(len(batches), 3)
+        self.assertEqual({b.dispatch for b in batches}, {False})
+        self.assertEqual(batches[0].limits["hard"],
+                         {"input_bytes": 400 * 1024, "reply_bytes": one})
+
+    def test_every_part_of_a_coverage_batch_is_given_the_whole_batchs_test_scope(self):
+        # Two raisers' areas: the gaps in run.py came from an auditor of area-02. Every part
+        # names both, so a part's verifier is shown the tests the whole batch would be.
+        cands = [_split_candidate(1, "engine/core.py", kind="auditor"),
+                 _split_candidate(2, "engine/util.py", kind="auditor"),
+                 _split_candidate(3, "run.py", kind="auditor", raiser_area="area-02")]
+        one = review_panel.Limits(input_bytes=400 * 1024,
+                                  reply_bytes=review_panel.VERIFICATION_REPLY_HEAD
+                                  + review_panel.VERIFICATION_REPLY_PRICES["verdict"])
+        seen = []
+        batches = review_panel.route(cands, limits=_verification_limits(B=one),
+                                     head_for=lambda asks, scope: seen.append(scope) or "")
+        self.assertEqual(len(batches), 3)
+        self.assertEqual({b.scope for b in batches}, {("area-01", "area-02")})
+        self.assertEqual(seen, [("area-01", "area-02")])
+
+
+class RoutingRefusesAPartSentToItsRaiser(unittest.TestCase):
+    """``check_routing`` keeps its rule — each candidate in exactly one verification unit —
+    and refuses a unit addressed to the lane that raised one of its candidates, which is
+    what splitting a batch must never produce. A unit listed and never dispatched is still
+    a routing, and is accepted."""
+
+    CANDIDATES = [{"id": "cand-001", "raised_by": [{"lane": "A"}]},
+                  {"id": "cand-002", "raised_by": [{"lane": "A"}]}]
+
+    def unit(self, uid, candidates, lane="B", **extra):
+        return {"id": uid, "lane": lane, "finder": "A", "candidates": candidates, **extra}
+
+    def test_parts_of_one_batch_are_accepted(self):
+        holder = review_panel.check_routing(self.CANDIDATES, [
+            self.unit("verify-area-01-A-f1", ["cand-001"]),
+            self.unit("verify-area-01-A-f2", ["cand-002"])])
+        self.assertEqual(holder["cand-002"]["id"], "verify-area-01-A-f2")
+
+    def test_a_part_sent_to_its_raiser_is_refused_by_name(self):
+        with self.assertRaises(review_panel.RunDirError) as ctx:
+            review_panel.check_routing(self.CANDIDATES, [
+                self.unit("verify-area-01-A-f1", ["cand-001"]),
+                self.unit("verify-area-01-A-f2", ["cand-002"], lane="A")])
+        message = str(ctx.exception)
+        for words in ("verify-area-01-A-f2", "cand-002", "lane A"):
+            self.assertIn(words, message)
+
+    def test_a_unit_listed_and_never_dispatched_is_accepted(self):
+        holder = review_panel.check_routing(self.CANDIDATES, [
+            self.unit("verify-area-01-A-f1", ["cand-001"], dispatch=False),
+            self.unit("verify-area-01-A-f2", ["cand-002"])])
+        self.assertEqual(holder["cand-001"]["id"], "verify-area-01-A-f1")
+
+    def test_a_unit_never_dispatched_reads_as_not_verified(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rundir = Path(tmp)
+            (rundir / "units" / "verify-area-01-A").mkdir(parents=True)
+            states = review_panel.read_verification_results(
+                rundir, [self.unit("verify-area-01-A", ["cand-001"], dispatch=False)],
+                {"cand-001": False})
+        self.assertEqual(states[0].state, review_panel.UNIT_MISSING)
+        self.assertEqual(states[0].reason, review_panel.NOT_DISPATCHED_REASON)
+        resolved = review_panel.resolve(
+            self.CANDIDATES[:1], {"cand-001": self.unit("verify-area-01-A", ["cand-001"])},
+            states)
+        self.assertIn("not verified", resolved["cand-001"].rationale)
+
+
+class TheVerifierRecordReadsWhatTheUnitAsks(unittest.TestCase):
+    """The per-unit record takes a unit's question from its listing, and from its id only
+    for a run whose listing does not record one."""
+
+    def records(self, batch):
+        record = {"verified_by": {"lane": "B", "unit": batch["id"]}, "status": "unresolved"}
+        state = review_panel.VerificationState(batch["id"], review_panel.UNIT_COMPLETE, None, ())
+        return review_panel._verification_records([record], [state], [batch])
+
+    def test_the_field_is_read(self):
+        row, = self.records({"id": "verify-area-01-A-f2", "finder": "A",
+                             "asks": review_panel.COVERAGE_ASKS})
+        self.assertEqual(row["asks"], review_panel.COVERAGE_ASKS)
+
+    def test_a_listing_without_the_field_falls_back_to_the_id(self):
+        row, = self.records({"id": "verify-area-01-A-coverage", "finder": "A"})
+        self.assertEqual(row["asks"], review_panel.COVERAGE_ASKS)
+        row, = self.records({"id": "verify-area-01-A", "finder": "A"})
+        self.assertEqual(row["asks"], review_panel.DEFECT_ASKS)
+
+
+class ASplitBatchIsWrittenPartByPart(_RouteCase):
+    """``route`` reads the run's limits and writes each part as its own unit: its own
+    payload, built from the inputs a whole batch's is, and a listing recording what it asks
+    and the limits it was planned under."""
+
+    def test_three_files_from_one_finder_become_three_units(self):
+        self.plan()
+        part = {"input_bytes": 400 * 1024,
+                "reply_bytes": review_panel.VERIFICATION_REPLY_HEAD
+                + 2 * review_panel.VERIFICATION_REPLY_PRICES["verdict"]}
+        (self.rundir / review_panel.LIMITS_FILE_NAME).write_text(json.dumps(
+            review_panel.limits_document({lane: {"verification": part}
+                                          for lane in review_panel.LANES})), encoding="utf-8")
+        self.land("area-01-A1", [{**FINDING, "file": file, "line_start": line,
+                                  "line_end": line}
+                                 for file in ("engine/core.py", "engine/util.py", "run.py")
+                                 for line in (1, 2)])
+        self.route()
+        units = self.verifiers()
+        self.assertEqual([u["id"] for u in units],
+                         ["verify-area-01-A-f1", "verify-area-01-A-f2", "verify-area-01-A-f3"])
+        cands = {c["id"]: c for c in self.candidates()["candidates"]}
+        brief = review_panel.load_brief("verifier")
+        probe = review_panel.read_probe_result(self.rundir, [{"id": "probe-A", "kind": "probe"}])
+        for unit in units:
+            with self.subTest(unit=unit["id"]):
+                self.assertEqual((unit["lane"], unit["finder"], unit["asks"]),
+                                 ("B", "A", review_panel.DEFECT_ASKS))
+                self.assertEqual(unit["limits"], {"planning": part})
+                self.assertIs(unit["dispatch"], True)
+                held = [cands[cid] for cid in unit["candidates"]]
+                self.assertEqual(len({c["file"] for c in held}), 1)
+                expected = review_panel.render_verifier_payload(
+                    brief, FILE_JOB["problem"], held, probe,
+                    schema=review_panel.load_schema(review_panel.VERIFIER_SCHEMA_NAME))
+                self.assertEqual((self.rundir / unit["payload"]).read_bytes(),
+                                 expected.encode("utf-8"))
+                self.assertLessEqual(unit["payload_bytes"], part["input_bytes"])
+
 
 class RouteWritesTheRunDirectory(_RouteCase):
     """What ``route`` leaves on disk, and what it refuses before writing anything."""
@@ -4287,7 +4536,8 @@ class RouteWritesTheRunDirectory(_RouteCase):
         for unit in self.verifiers():
             with self.subTest(unit=unit["id"]):
                 self.assertEqual(set(unit), {"id", "kind", "area", "lane", "lens", "finder", "candidates",
-                                             "routing", "asks", "payload", "schema", "payload_lines",
+                                             "routing", "asks", "limits", "oversize", "dispatch",
+                                             "payload", "schema", "payload_lines",
                                              "payload_bytes"})
                 self.assertEqual(sorted(p.name for p in self.unit_dir(unit["id"]).iterdir()),
                                  ["payload.md", "schema.json"])
@@ -4913,10 +5163,10 @@ CLUSTER_TABLE = {
 }
 
 
-# Synthesis round: ONE unit, handed every defect that needs a write-up — D1 and D2; D3 is
-# refuted at its only site and is left out. It names the run's tiers once and places every
-# defect it was handed under one of them, which is why a second unit would be a second
-# vocabulary. D1 and D3 are two sites of one story, so D1 cites D3.
+# Synthesis round over the standard run: one batch, handed every defect that needs a
+# write-up — D1 and D2; D3 is refuted at its only site and is left out. It names its own
+# tiers and places every defect it was handed under one of them. D1 and D3 are two sites of
+# one story, so D1 cites D3.
 SYNTH_TABLE = {
     "synth-A": {
         "tiers": ["A run stops instead of finishing", "The total comes out wrong"],
@@ -4934,7 +5184,6 @@ SYNTH_TABLE = {
              "fix": "Print the usage text when the argument list is empty.",
              "site_notes": [], "cross_references": []},
         ],
-        "summary": "Two tiers: the run stopping, and the arithmetic being wrong.",
     },
 }
 # D3's entry, for a run whose verification leaves D3 standing or open rather than refuted:
@@ -4945,6 +5194,25 @@ SYNTH_D3 = {"defect": "D3", "heading": "A missing value makes the total too larg
                                "total is quietly too large.",
             "fix": "Skip a missing value instead of arithmetic on it.",
             "site_notes": [], "cross_references": []}
+# The paragraph about the whole run a unit v2026.10.0 wrote also returned, and the standard
+# reply in that shape, for the runs that pin how such a generation is still read.
+LEGACY_OVERVIEW = "Two tiers: the run stopping, and the arithmetic being wrong."
+LEGACY_SYNTH_TABLE = {"synth-A": {**SYNTH_TABLE["synth-A"], "summary": LEGACY_OVERVIEW}}
+
+
+def _as_v2026_10_0(rundir):
+    """Make a run directory read as one v2026.10.0 planned and synthesized: no run format,
+    and synthesis rows recording no generation, writer, limits or index, as that engine's
+    did not."""
+    (rundir / review_panel.RUN_FORMAT_FILE_NAME).unlink()
+    doc = json.loads((rundir / "units.json").read_text(encoding="utf-8"))
+    for unit in doc["units"]:
+        if unit["kind"] == review_panel.SYNTHESIZER_KIND:
+            for key in ("generation", "writer", "limits", "oversize", "dispatch", "index_cut"):
+                unit.pop(key, None)
+    (rundir / "units.json").write_text(json.dumps(doc), encoding="utf-8")
+
+
 SYNTH_TABLE_ALL = {"synth-A": {**SYNTH_TABLE["synth-A"],
                                "defects": [*SYNTH_TABLE["synth-A"]["defects"], SYNTH_D3]}}
 
@@ -5392,7 +5660,7 @@ class _ReportCase(_RouteCase):
         units = self.clusterers(rundir)
         doc = json.loads((rundir / "candidates.json").read_text(encoding="utf-8"))
         review_panel.check_clustering(doc["candidates"], units)
-        states = review_panel.read_clustering_results(rundir, units)
+        states = review_panel.read_clustering_results(rundir, units, doc["candidates"])
         return review_panel.build_clusters(doc["candidates"], units, states)
 
     def members(self, clustering):
@@ -5463,7 +5731,8 @@ class _ReportCase(_RouteCase):
 
     def run_all(self, rundir=None, order="sequential", reading=READING_TABLE, verify=VERIFY_TABLE,
                 grouping=CLUSTER_TABLE, synthesis=None, dispatch=DISPATCH, data=FILE_JOB,
-                expect=0, after_plan=None, merge=None, check=None, **over):
+                expect=0, after_plan=None, merge=None, check=None, after_synthesize=None,
+                **over):
         """The whole pipeline. ``synthesis`` is opt-in and defaults to the round not being
         run at all: an absent round is a complete run, and the round renders nothing yet.
         ``{}`` runs the stage and lands no result, which is the round dispatched and never
@@ -5473,6 +5742,7 @@ class _ReportCase(_RouteCase):
         ``after_plan`` is called with the run directory once ``plan`` has committed, for the
         files the DRIVER puts there rather than the engine — ``job-notes.json`` is copied in
         after planning, because ``plan`` refuses a run directory holding anything but the job.
+        ``after_synthesize`` is called once ``synthesize`` has committed, before its units land.
         """
         rundir = rundir or self.rundir
         self.plan_into(rundir, data, **over)
@@ -5489,6 +5759,8 @@ class _ReportCase(_RouteCase):
         self.merge_checked(rundir, check, order)
         if synthesis is not None:
             self.synthesize(rundir)
+            if after_synthesize is not None:
+                after_synthesize(rundir)
             stub_dispatch(rundir, synthesis, None, order)
         return self.report(rundir, expect)
 
@@ -6041,7 +6313,8 @@ class TheClusteringRoundGroupsWhatVerificationSettled(_ReportCase):
         self.cluster()
         stub_dispatch(self.rundir, {self.UNIT: {"clusters": [], "summary": "s",
                                                 "bad \ud800 key": 1}})
-        states = review_panel.read_clustering_results(self.rundir, self.clusterers())
+        states = review_panel.read_clustering_results(self.rundir, self.clusterers(),
+                                                      self.candidates()["candidates"])
         self.assertEqual(states[0].state, "failed")
         self.assertIn("\\ud800", states[0].reason)
         self.report()
@@ -6434,6 +6707,262 @@ class TheOverMergeCasesThePartitionCheckCannotCatch(_ReportCase):
         self.assertEqual(len(merged["clusters"]), 1, "one line range, one cluster: the check is happy")
         self.assertIn("too weak and too strong at once", self.payload())
         self.assertIn("Split when you are unsure", self.payload())
+
+
+def _clustering_limits(hard=None, **lanes):
+    """A run's limits with the clustering limits of each lane named in ``lanes``, and
+    ``hard`` as every lane's hard ceiling."""
+    return review_panel.RunLimits(
+        lanes={lane: {**review_panel.DEFAULT_LIMITS,
+                      **({"clustering": lanes[lane]} if lane in lanes else {})}
+               for lane in review_panel.LANES},
+        hard={lane: hard for lane in review_panel.LANES})
+
+
+def _clusters_room(n):
+    """Clustering limits with reply room for exactly ``n`` candidates' clusters."""
+    return review_panel.Limits(
+        input_bytes=400 * 1024,
+        reply_bytes=review_panel.CLUSTERING_REPLY_HEAD
+        + n * review_panel.CLUSTERING_REPLY_PRICES["cluster"])
+
+
+class ClusteringIsSplitByFile(unittest.TestCase):
+    """An (area, question) batch over the clustering limits is split into parts by file.
+    Every candidate for one file and question, from both lanes, is in one part, so the
+    duplicates a clusterer exists to merge are always handed to it together."""
+
+    # In the order the packer takes them: folders by name, the root's "" first.
+    FILES = ("run.py", "engine/core.py", "engine/util.py")
+
+    def candidates(self, kind="reader"):
+        """Two candidates per file, one raised by each lane."""
+        out, n = [], 0
+        for file in self.FILES:
+            for finder in review_panel.LANES:
+                n += 1
+                out.append(review_panel.asdict(_split_candidate(n, file, finder=finder,
+                                                                kind=kind)))
+        return out
+
+    def assert_three_parts(self, units, suffix, asks, room):
+        self.assertEqual([u.id for u in units],
+                         [f"cluster-area-01-f{k}{suffix}" for k in (1, 2, 3)])
+        by_id = {c["id"]: c for c in self.candidates()}
+        for unit, file in zip(units, self.FILES):
+            with self.subTest(part=unit.id):
+                self.assertEqual((unit.area, unit.asks), ("area-01", asks))
+                held = [by_id[cid] for cid in unit.candidates]
+                self.assertEqual({c["file"] for c in held}, {file})
+                self.assertEqual({c["raised_by"][0]["lane"] for c in held}, {"A", "B"})
+                self.assertTrue(unit.dispatch)
+                self.assertFalse(unit.oversize)
+                self.assertEqual(unit.limits, {"planning": room.record()})
+        # The lanes take the parts in turn, as they take whole areas.
+        self.assertEqual([u.lane for u in units], ["A", "B", "A"])
+        self.assertEqual([cid for u in units for cid in u.candidates],
+                         [c["id"] for c in self.candidates()])
+
+    def test_a_defect_batch_splits_three_ways_by_file(self):
+        room = _clusters_room(2)
+        units = review_panel.plan_clusters(self.candidates(),
+                                           limits=_clustering_limits(A=room, B=room))
+        self.assert_three_parts(units, "", review_panel.DEFECT_ASKS, room)
+
+    def test_a_coverage_batch_keeps_its_question_and_its_suffix_last_in_every_part(self):
+        room = _clusters_room(2)
+        units = review_panel.plan_clusters(self.candidates("auditor"),
+                                           limits=_clustering_limits(A=room, B=room))
+        self.assert_three_parts(units, review_panel.COVERAGE_BATCH_SUFFIX,
+                                review_panel.COVERAGE_ASKS, room)
+
+    def test_a_batch_within_its_limits_keeps_todays_id(self):
+        units = review_panel.plan_clusters(self.candidates())
+        self.assertEqual([u.id for u in units], ["cluster-area-01"])
+        self.assertEqual(list(units[0].candidates), [c["id"] for c in self.candidates()])
+        self.assertEqual(units[0].limits,
+                         {"planning": review_panel.DEFAULT_LIMITS["clustering"].record()})
+
+    def test_parts_are_packed_against_the_smallest_limits_of_either_lane(self):
+        # Lane A keeps the defaults and lane B's are small: a part's lane is assigned after
+        # packing, so the part has to fit whichever lane it lands on.
+        units = review_panel.plan_clusters(self.candidates(),
+                                           limits=_clustering_limits(B=_clusters_room(2)))
+        self.assertEqual(len(units), 3)
+
+    def test_the_payload_head_is_measured_into_every_part(self):
+        head = "x" * 1000
+        records = {file: "".join(review_panel._clusterer_sections(
+            [c for c in self.candidates() if c["file"] == file],
+            {c["id"]: None for c in self.candidates()})) for file in self.FILES}
+        per_file = max(len(text.encode("utf-8")) for text in records.values())
+        room = review_panel.Limits(input_bytes=1000 + per_file + 1, reply_bytes=64 * 1024)
+        units = review_panel.plan_clusters(self.candidates(), head=head,
+                                           limits=_clustering_limits(A=room, B=room))
+        self.assertEqual(len(units), 3)
+
+    def test_a_file_over_the_planning_ceiling_goes_alone_and_is_flagged(self):
+        room = _clusters_room(1)
+        units = review_panel.plan_clusters(self.candidates(),
+                                           limits=_clustering_limits(A=room, B=room))
+        self.assertEqual(len(units), 3)
+        for unit in units:
+            with self.subTest(part=unit.id):
+                self.assertTrue(unit.oversize)
+                self.assertTrue(unit.dispatch)
+
+    def test_a_file_over_the_hard_ceiling_is_listed_and_not_dispatched(self):
+        one = _clusters_room(1)
+        units = review_panel.plan_clusters(self.candidates(),
+                                           limits=_clustering_limits(hard=one))
+        self.assertEqual(len(units), 3)
+        self.assertEqual({u.dispatch for u in units}, {False})
+        self.assertEqual(units[0].limits["hard"], one.record())
+
+    def test_a_file_over_one_lanes_hard_ceiling_goes_to_the_lane_that_takes_it(self):
+        # Each file's two candidates need more reply than lane A's hard ceiling allows and
+        # lane B states none: every part is sent, alone, to B, under B's own limits.
+        limits = review_panel.RunLimits(
+            lanes={lane: dict(review_panel.DEFAULT_LIMITS) for lane in review_panel.LANES},
+            hard={"A": _clusters_room(1), "B": None})
+        units = review_panel.plan_clusters(self.candidates(), limits=limits)
+        self.assertEqual(len(units), 3)
+        for unit in units:
+            with self.subTest(part=unit.id):
+                self.assertTrue(unit.dispatch)
+                self.assertTrue(unit.oversize)
+                self.assertEqual(unit.lane, "B")
+                self.assertEqual(unit.limits, {
+                    "planning": limits.planning("clustering", ("B",)).record()})
+
+    def test_a_file_over_every_lanes_hard_ceiling_is_still_not_dispatched(self):
+        one = _clusters_room(1)
+        limits = review_panel.RunLimits(
+            lanes={lane: dict(review_panel.DEFAULT_LIMITS) for lane in review_panel.LANES},
+            hard={"A": one, "B": review_panel.Limits(input_bytes=400 * 1024,
+                                                     reply_bytes=2047)})
+        units = review_panel.plan_clusters(self.candidates(), limits=limits)
+        self.assertEqual(len(units), 3)
+        self.assertEqual({u.dispatch for u in units}, {False})
+
+
+class AClusteringPartGroupsWithinOneFile(unittest.TestCase):
+    """A site cannot span parts, so in an area split by file a site never spans files. A
+    part can hold several files, so the parser refuses a cluster in a part whose members
+    come from two of them; a whole area's unit may still group across its files."""
+
+    HANDED = ("cand-001", "cand-002", "cand-003")
+    FILES = {"cand-001": "run.py", "cand-002": "run.py", "cand-003": "engine/core.py"}
+
+    def reply(self, *groups):
+        return {"clusters": [{"members": list(g), "consequence": "c", "split_reason": None}
+                             for g in groups], "summary": "s"}
+
+    def test_a_part_refuses_a_cluster_across_two_files(self):
+        with self.assertRaises(review_panel.ResultError) as caught:
+            review_panel.parse_clusterer_result(
+                self.reply(("cand-001", "cand-003"), ("cand-002",)), "cluster-area-01-f1",
+                self.HANDED, files=self.FILES)
+        message = str(caught.exception)
+        for words in ("cluster-area-01-f1", "run.py", "engine/core.py"):
+            self.assertIn(words, message)
+
+    def test_a_part_accepts_clusters_within_one_file(self):
+        parsed = review_panel.parse_clusterer_result(
+            self.reply(("cand-001", "cand-002"), ("cand-003",)), "cluster-area-01-f1",
+            self.HANDED, files=self.FILES)
+        self.assertEqual(len(parsed["clusters"]), 2)
+
+    def test_a_whole_area_may_group_across_files(self):
+        parsed = review_panel.parse_clusterer_result(
+            self.reply(("cand-001", "cand-003"), ("cand-002",)), "cluster-area-01",
+            self.HANDED)
+        self.assertEqual(len(parsed["clusters"]), 2)
+
+    def test_the_reader_applies_the_rule_to_a_part_and_not_to_a_whole_area(self):
+        cands = [{"id": cid, "area": "area-01", "file": file,
+                  "raised_by": [{"kind": "reader", "lane": "A"}]}
+                 for cid, file in {**self.FILES, "cand-004": "engine/util.py"}.items()]
+        across = self.reply(("cand-001", "cand-003"), ("cand-002",))
+        for units, expect in (
+            ([{"id": "cluster-area-01-f1", "area": "area-01", "candidates": list(self.HANDED)},
+              {"id": "cluster-area-01-f2", "area": "area-01", "candidates": ["cand-004"]}],
+             review_panel.UNIT_FAILED),
+            ([{"id": "cluster-area-01", "area": "area-01", "candidates": list(self.HANDED)}],
+             review_panel.UNIT_COMPLETE),
+        ):
+            with self.subTest(units=[u["id"] for u in units]), \
+                    tempfile.TemporaryDirectory() as tmp:
+                rundir = Path(tmp)
+                unit_dir = rundir / "units" / units[0]["id"]
+                unit_dir.mkdir(parents=True)
+                (unit_dir / "result.json").write_text(json.dumps(across), encoding="utf-8")
+                states = review_panel.read_clustering_results(rundir, units, cands)
+                self.assertEqual(states[0].state, expect)
+                if expect == review_panel.UNIT_FAILED:
+                    self.assertIn("engine/core.py", states[0].reason)
+
+
+class ClusteringPartsMustPartitionTheArea(unittest.TestCase):
+    """``check_clustering`` accepts parts that together hold exactly the area's candidates
+    for one question, a file's candidates all in one part, and a unit listed and never
+    dispatched. Anything else is a listing this engine did not write."""
+
+    CANDIDATES = [{"id": f"cand-00{n}", "area": "area-01", "file": file,
+                   "raised_by": [{"kind": "reader", "lane": lane}]}
+                  for n, (file, lane) in enumerate((("run.py", "A"), ("run.py", "B"),
+                                                    ("engine/core.py", "A"),
+                                                    ("engine/core.py", "B")), 1)]
+
+    def part(self, k, candidates, **extra):
+        return {"id": f"cluster-area-01-f{k}", "area": "area-01", "asks": "defect",
+                "candidates": candidates, **extra}
+
+    def refuse(self, units, *fragments):
+        with self.assertRaises(review_panel.RunDirError) as caught:
+            review_panel.check_clustering(self.CANDIDATES, units)
+        for fragment in (*fragments, "units.json"):
+            self.assertIn(fragment, str(caught.exception))
+
+    def test_parts_that_partition_the_area_are_accepted(self):
+        review_panel.check_clustering(self.CANDIDATES, [
+            self.part(1, ["cand-001", "cand-002"]), self.part(2, ["cand-003", "cand-004"])])
+
+    def test_a_part_listed_and_never_dispatched_is_accepted(self):
+        review_panel.check_clustering(self.CANDIDATES, [
+            self.part(1, ["cand-001", "cand-002"]),
+            self.part(2, ["cand-003", "cand-004"], dispatch=False)])
+
+    def test_parts_holding_one_candidate_twice_are_refused(self):
+        self.refuse([self.part(1, ["cand-001", "cand-002", "cand-003"]),
+                     self.part(2, ["cand-003", "cand-004"])],
+                    "cluster-area-01-f1", "cluster-area-01-f2", "cand-003")
+
+    def test_parts_short_of_the_area_are_refused(self):
+        self.refuse([self.part(1, ["cand-001", "cand-002"]), self.part(2, ["cand-003"])],
+                    "not area-01's", "cand-004")
+
+    def test_a_file_split_across_two_parts_is_refused(self):
+        self.refuse([self.part(1, ["cand-001", "cand-002", "cand-003"]),
+                     self.part(2, ["cand-004"])],
+                    "engine/core.py", "cluster-area-01-f1", "cluster-area-01-f2")
+
+    def test_two_units_sharing_one_id_are_refused_by_that_id(self):
+        # One result file would answer both rows, so one part's candidates would vanish
+        # and the other's would be counted twice.
+        with self.assertRaises(review_panel.RunDirError) as caught:
+            review_panel.check_clustering(self.CANDIDATES, [
+                self.part(1, ["cand-001", "cand-002"]), self.part(1, ["cand-003", "cand-004"])])
+        message = str(caught.exception)
+        for fragment in ("cluster-area-01-f1", "more than once", "units.json"):
+            self.assertIn(fragment, message)
+
+    def test_an_empty_unit_beside_a_whole_area_is_refused(self):
+        # Otherwise the empty row makes the whole-area unit read as a part, and the
+        # one-file-per-site rule lands on an area that was never split.
+        self.refuse([self.part(1, ["cand-001", "cand-002", "cand-003", "cand-004"]),
+                     self.part(2, [])],
+                    "cluster-area-01-f2", "no candidates")
 
 
 class TheStubDispatcherDrivesTheWholeEngine(_ReportCase):
@@ -14881,6 +15410,225 @@ class TheAppendixPricesTheOpenWorkAndShowsTheVerifierSpread(_FindingsCase):
         self.assertNotIn("The share left unresolved ranges from", table)
 
 
+class AFileOverItsHardCeilingIsReportedNotVerified(_FindingsCase):
+    """A verification unit over its lane's hard ceiling is listed and never dispatched; the
+    run still reaches its report, and the report says those findings were not verified."""
+
+    def write_limits(self, rundir):
+        # Lane B checks lane A's findings, and its hard ceiling holds no verdict at all.
+        (rundir / review_panel.LIMITS_FILE_NAME).write_text(json.dumps(
+            review_panel.limits_document({"B": {"hard": {"input_bytes": 400 * 1024,
+                                                         "reply_bytes": 64}}})),
+            encoding="utf-8")
+
+    def test_the_unit_is_listed_never_answered_and_reported_not_verified(self):
+        verify = {k: v for k, v in VERIFY_TABLE.items() if k != "verify-area-01-A"}
+        self.run_all(verify=verify, after_plan=self.write_limits)
+        listed = {u["id"]: u for u in self.verifiers()}
+        self.assertIs(listed["verify-area-01-A"]["dispatch"], False)
+        self.assertIs(listed["verify-area-01-B"]["dispatch"], True)
+        rows = {row["unit"]: row for row in self.findings()["verification"]}
+        self.assertEqual(rows["verify-area-01-A"]["reason"], review_panel.NOT_DISPATCHED_REASON)
+        for cid in listed["verify-area-01-A"]["candidates"]:
+            with self.subTest(candidate=cid):
+                record = self.records()[cid]
+                self.assertEqual(record["status"], "unresolved")
+                self.assertIn("not verified", record["rationale"])
+        table = self.text().partition(review_panel.SUBSECTION_VERIFIERS)[2].partition("\n### ")[0]
+        self.assertIn("verify-area-01-A — not dispatched", table)
+        self.assertIn("not verified", table)
+
+
+# The same mistakes in two more files: run.py has no test, engine/util.py gets one in the
+# class below, so its gaps can be raised there.
+FINDING_RUN = {**FINDING, "file": "run.py", "line_start": 1, "line_end": 1,
+               "failure": "main ignores its arguments and always exits 0.",
+               "quote": "def main():"}
+FINDING_UTIL = {**FINDING, "file": "engine/util.py", "line_start": 1, "line_end": 2,
+                "failure": "util returns a constant whatever it is asked.",
+                "quote": "def util():\n    return \"util\""}
+# At the lines FINDING cites, so a defect and a gap overlap at one place.
+GAP_AT_FINDING = {**GAP, "line_start": 2, "line_end": 3}
+GAP_UTIL = {**GAP, "file": "engine/util.py", "line_start": 1, "line_end": 2,
+            "failure": "util has one branch and no test checks what it returns.",
+            "quote": "def util():\n    return \"util\""}
+
+
+class AnAreaSplitByFileIsClusteredPartByPart(_CoverageCase):
+    """Clustering limits that hold two candidates' clusters split area-01 by file: its
+    defects into a part for run.py and one for engine/core.py, its gaps into one for
+    engine/core.py and one for engine/util.py. Both lanes raised every finding, so each
+    part holds a duplicate to merge — and every reader of clustering results reads every
+    part."""
+
+    ROOM = (review_panel.CLUSTERING_REPLY_HEAD
+            + 2 * review_panel.CLUSTERING_REPLY_PRICES["cluster"])
+    READING = {"area-01-A1": {"findings": [FINDING, FINDING_RUN], "summary": "A read"},
+               "area-01-B1": {"findings": [FINDING, FINDING_RUN], "summary": "B read"},
+               "audit-area-01-A": {"findings": [GAP_AT_FINDING, GAP_UTIL], "summary": "A"},
+               "audit-area-01-B": {"findings": [GAP_AT_FINDING, GAP_UTIL], "summary": "B"},
+               "probe-A": PROBE_RESULT}
+    DEFECT_PARTS = ["cluster-area-01-f1", "cluster-area-01-f2"]
+    COVERAGE_PARTS = ["cluster-area-01-f1-coverage", "cluster-area-01-f2-coverage"]
+
+    def setUp(self):
+        super().setUp()
+        (self.root / "tests" / "test_util.py").write_text(
+            "from engine.util import util\n\n\ndef test_util():\n    assert util()\n",
+            encoding="utf-8")
+
+    def split(self, reading=None, hard=None):
+        """Plan with the small clustering limits, route, verify every batch, cluster."""
+        self.plan_into(self.rundir)
+        lane = {"clustering": {"reply_bytes": self.ROOM}}
+        if hard is not None:
+            lane["hard"] = {"input_bytes": 400 * 1024, "reply_bytes": hard}
+        (self.rundir / review_panel.LIMITS_FILE_NAME).write_text(json.dumps(
+            review_panel.limits_document({name: lane for name in review_panel.LANES})),
+            encoding="utf-8")
+        self.routed(reading)
+        # A hard ceiling is a lane's, not a stage's, so one that turns a clustering part away
+        # turns verification parts away too; those are listed and never answered.
+        dispatched = {u["id"] for u in self.batches() if u["dispatch"]}
+        stub_dispatch(self.rundir, {uid: reply for uid, reply in self.verify_table().items()
+                                    if uid in dispatched})
+        self.cluster()
+        return {u["id"]: u for u in self.clusterers()}
+
+    def routed(self, reading=None):
+        stub_dispatch(self.rundir, reading or self.READING, DISPATCH)
+        proc = _run("route", str(self.rundir))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return proc
+
+    @staticmethod
+    def grouped(unit):
+        return {"clusters": [{"members": list(unit["candidates"]),
+                              "consequence": "One mistake, written up twice.",
+                              "split_reason": None}],
+                "summary": f"{unit['id']} merged its duplicate"}
+
+    def files_of(self, unit):
+        by_id = {c["id"]: c for c in self.candidates()["candidates"]}
+        return {by_id[cid]["file"] for cid in unit["candidates"]}
+
+    def test_the_area_is_split_by_file_and_every_part_records_its_limits(self):
+        parts = self.split()
+        self.assertEqual(list(parts), [*self.DEFECT_PARTS, *self.COVERAGE_PARTS])
+        self.assertEqual([self.files_of(parts[uid]) for uid in parts],
+                         [{"run.py"}, {"engine/core.py"}, {"engine/core.py"},
+                          {"engine/util.py"}])
+        self.assertEqual([parts[uid]["lane"] for uid in parts], ["A", "B", "A", "B"])
+        for unit in parts.values():
+            with self.subTest(part=unit["id"]):
+                self.assertEqual(unit["limits"]["planning"]["reply_bytes"], self.ROOM)
+                self.assertIs(unit["dispatch"], True)
+                self.assertIs(unit["oversize"], False)
+                self.assertLessEqual(unit["payload_bytes"],
+                                     unit["limits"]["planning"]["input_bytes"])
+                text = (self.rundir / unit["payload"]).read_text(encoding="utf-8")
+                for cand in self.candidates()["candidates"]:
+                    held = cand["id"] in unit["candidates"]
+                    self.assertEqual(f"### {cand['id']}\n" in text, held, cand["id"])
+
+    def test_both_kinds_at_overlapping_lines_merge_their_own_duplicates_and_stay_apart(self):
+        parts = self.split()
+        stub_dispatch(self.rundir, {uid: self.grouped(unit) for uid, unit in parts.items()})
+        clustering = self.clustering()
+        self.assertEqual(clustering.ungrouped, ())
+        self.assertEqual({(frozenset(c.members), c.asks) for c in clustering.clusters},
+                         {(frozenset(unit["candidates"]), unit["asks"])
+                          for unit in parts.values()})
+        # The defect and the gap at engine/core.py lines 2-3 are two sites, one of each kind.
+        at = [c for c in clustering.clusters
+              if any(self.files_of({"candidates": [m]}) == {"engine/core.py"}
+                     for m in c.members)]
+        self.assertEqual(sorted(c.asks for c in at), ["coverage", "defect"])
+        for cluster in clustering.clusters:
+            with self.subTest(site=cluster.id):
+                self.assertEqual(len(cluster.members), 2, "a duplicate went unmerged")
+
+    def test_one_part_failing_places_every_candidate_and_names_only_that_part(self):
+        parts = self.split()
+        landed = {uid: self.grouped(unit) for uid, unit in parts.items()
+                  if uid != "cluster-area-01-f2"}
+        landed["cluster-area-01-f2"] = "the reply was not a JSON object\n"
+        stub_dispatch(self.rundir, landed)
+        clustering = self.clustering()
+        placed = sorted(cid for c in clustering.clusters for cid in c.members)
+        self.assertEqual(placed, sorted(c["id"] for c in self.candidates()["candidates"]))
+        self.assertEqual([(u.unit, u.state) for u in clustering.ungrouped],
+                         [("cluster-area-01-f2", review_panel.UNIT_FAILED)])
+        # The part that landed kept its merge; only the failed part's candidates stand alone.
+        merged = {frozenset(c.members) for c in clustering.clusters if c.grouped}
+        self.assertIn(frozenset(parts["cluster-area-01-f1"]["candidates"]), merged)
+        self.report()
+        text = self.text()
+        self.assertIn("cluster-area-01-f2", text)
+        self.assertIn(review_panel.UNGROUPED_PART_NOTE, text)
+        self.assertNotIn(review_panel.UNGROUPED_NOTE, text)
+        rows = json.loads((self.rundir / "findings.json").read_text(encoding="utf-8"))
+        self.assertEqual([(row["unit"], row["state"]) for row in rows["clustering"]],
+                         [("cluster-area-01-f1", "complete"), ("cluster-area-01-f2", "failed"),
+                          ("cluster-area-01-f1-coverage", "complete"),
+                          ("cluster-area-01-f2-coverage", "complete")])
+
+    def test_a_split_coverage_batch_keeps_its_question_and_a_missing_part_is_named(self):
+        parts = self.split()
+        for uid in self.COVERAGE_PARTS:
+            self.assertEqual(parts[uid]["asks"], review_panel.COVERAGE_ASKS)
+        stub_dispatch(self.rundir, {uid: self.grouped(unit) for uid, unit in parts.items()
+                                    if uid != "cluster-area-01-f2-coverage"})
+        clustering = self.clustering()
+        self.assertEqual([(u.unit, u.state, u.asks) for u in clustering.ungrouped],
+                         [("cluster-area-01-f2-coverage", review_panel.UNIT_MISSING,
+                           review_panel.COVERAGE_ASKS)])
+        self.report()
+        self.assertIn("cluster-area-01-f2-coverage", self.text())
+
+    def test_a_file_over_the_hard_ceiling_is_listed_and_reported_not_clustered(self):
+        # Room for one cluster: run.py's one candidate fits, engine/core.py's two do not.
+        one = (review_panel.CLUSTERING_REPLY_HEAD
+               + review_panel.CLUSTERING_REPLY_PRICES["cluster"])
+        reading = {**self.READING,
+                   "area-01-B1": {"findings": [FINDING], "summary": "B read"},
+                   "audit-area-01-A": {"findings": [], "summary": "no gap"},
+                   "audit-area-01-B": {"findings": [], "summary": "no gap"}}
+        parts = self.split(reading, hard=one)
+        self.assertEqual({uid: unit["dispatch"] for uid, unit in parts.items()},
+                         {"cluster-area-01-f1": True, "cluster-area-01-f2": False})
+        stub_dispatch(self.rundir, {"cluster-area-01-f1": self.grouped(
+            parts["cluster-area-01-f1"])})
+        clustering = self.clustering()
+        self.assertEqual([(u.unit, u.reason) for u in clustering.ungrouped],
+                         [("cluster-area-01-f2", review_panel.NOT_DISPATCHED_REASON)])
+        self.report()
+        text = self.text()
+        self.assertIn("cluster-area-01-f2", text)
+        self.assertIn(review_panel.NOT_DISPATCHED_REASON, text)
+        self.assertIn("not clustered", text)
+
+    def test_check_refuses_a_cluster_across_two_files_of_a_part(self):
+        # Room for two: run.py's two candidates fill the first part, and engine/core.py and
+        # engine/util.py, one candidate each, share the second.
+        reading = {**self.READING,
+                   "area-01-A1": {"findings": [FINDING, FINDING_RUN], "summary": "A read"},
+                   "area-01-B1": {"findings": [FINDING_UTIL, FINDING_RUN], "summary": "B read"},
+                   "audit-area-01-A": {"findings": [], "summary": "no gap"},
+                   "audit-area-01-B": {"findings": [], "summary": "no gap"}}
+        parts = self.split(reading)
+        second = parts["cluster-area-01-f2"]
+        self.assertEqual(self.files_of(second), {"engine/core.py", "engine/util.py"})
+        self.land_reply(second["id"], self.grouped(second))
+        proc = self.check_unit(second["id"], expect=2)
+        for words in ("cluster-area-01-f2", "engine/core.py", "engine/util.py"):
+            self.assertIn(words, proc.stderr)
+        stub_dispatch(self.rundir, {second["id"]: self.grouped(second)})
+        states = {s.id: s for s in review_panel.read_clustering_results(
+            self.rundir, self.clusterers(), self.candidates()["candidates"])}
+        self.assertEqual(states[second["id"]].state, review_panel.UNIT_FAILED)
+
+
 class CoverageFindingsTravelTheirOwnPath(_CoverageCase):
     """The auditor asks what input no test constructs. A defect verifier is asked whether a
     claimed failure is real. Routed together, a coverage finding is liable to come back
@@ -15666,6 +16414,14 @@ class RouteRedoTakesEveryRoundAfterReadingBackOffTheRun(_ReportCase):
         self.assertEqual(after["area-01-B1"], before["area-01-B1"], "a reused unit moved")
         self.assertEqual(len(self.candidates()["candidates"]), 3)
 
+    def test_a_redo_takes_every_later_synthesis_round_and_its_record_with_it(self):
+        self.routed()
+        stub_dispatch(self.rundir, VERIFY_TABLE)
+        self.clustered()
+        later = _through_every_round(self)
+        self.redo()
+        _assert_every_round_taken_back(self, later)
+
     def test_a_redo_takes_verification_clustering_synthesis_and_the_report_with_it(self):
         """All of it, because every one of those rounds reads a candidate id and the ids
         move. A verification kept across a re-route answers about a finding that is no
@@ -15820,6 +16576,13 @@ class ClusterRedoTakesTheLastTwoRoundsBackOffTheRun(_ReportCase):
         self.assertEqual(self.units()["stage"], "clustered")
         for name in ("report.md", "report.html", "findings.json"):
             self.assertFalse((self.rundir / name).exists(), name)
+
+    def test_a_redo_takes_every_later_synthesis_round_and_its_record_with_it(self):
+        self.clustered_only()
+        later = _through_every_round(self)
+        self.redo()
+        _assert_every_round_taken_back(self, later)
+        self.assertEqual(self.units()["stage"], "clustered")
 
     def test_a_redo_clears_the_dispatch_directories_of_what_it_took_back(self):
         self.clustered_only()
@@ -16292,6 +17055,239 @@ class OverTheMergeCeilingTheSitesBatchByDirectory(unittest.TestCase):
                            149 * review_panel.MERGE_REPLY_BYTES_PER_SITE)
 
 
+class ThePlanRecordsTheRunFormat(_RouteCase):
+    """`plan` writes the run format before the listing that commits it; a directory without
+    one was planned by an earlier release, and a damaged one is never read as absent."""
+
+    def test_plan_writes_the_run_format(self):
+        self.plan()
+        doc = json.loads((self.rundir / review_panel.RUN_FORMAT_FILE_NAME)
+                         .read_text(encoding="utf-8"))
+        self.assertEqual(doc, {"format": review_panel.RUN_FORMAT})
+        self.assertEqual(review_panel.read_run_format(self.rundir), review_panel.RUN_FORMAT)
+
+    def test_a_directory_without_one_has_no_format(self):
+        self.plan()
+        (self.rundir / review_panel.RUN_FORMAT_FILE_NAME).unlink()
+        self.assertIsNone(review_panel.read_run_format(self.rundir))
+
+    def test_a_damaged_record_is_refused_not_read_as_absent(self):
+        self.plan()
+        for text in ("not json", "{}", '{"format": "1"}', '{"format": 0}'):
+            with self.subTest(text=text):
+                (self.rundir / review_panel.RUN_FORMAT_FILE_NAME).write_text(
+                    text, encoding="utf-8")
+                with self.assertRaises(review_panel.RunDirError):
+                    review_panel.read_run_format(self.rundir)
+
+    def test_a_failed_plan_takes_it_back(self):
+        """A refused re-plan would otherwise find a file of this plan's and refuse the
+        directory as a mixed run."""
+        with mock.patch.object(review_panel, "write_units", side_effect=OSError("disk")):
+            with self.assertRaises(OSError):
+                review_panel.main(["plan", str(self.write(dict(FILE_JOB))),
+                                   "--rundir", str(self.rundir)])
+        self.assertFalse((self.rundir / review_panel.RUN_FORMAT_FILE_NAME).exists())
+
+
+class LimitsAreReadFromTheRunDirectory(unittest.TestCase):
+    """`limits.json` is the one place a stage reads its limits from: the engine's defaults
+    under each lane's own, and a lane's hard ceiling where one is stated."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.rundir = Path(tmp.name)
+
+    def write(self, doc):
+        (self.rundir / review_panel.LIMITS_FILE_NAME).write_text(json.dumps(doc),
+                                                                 encoding="utf-8")
+
+    def test_no_limits_file_gives_the_defaults(self):
+        limits = review_panel.read_limits(self.rundir)
+        for stage in review_panel.LIMIT_STAGES:
+            for lane in review_panel.LANES:
+                self.assertEqual(limits.planning(stage, [lane]),
+                                 review_panel.DEFAULT_LIMITS[stage])
+        self.assertIsNone(limits.hard_ceiling(review_panel.LANES))
+
+    def test_a_lanes_values_merge_over_the_defaults_and_are_read_back(self):
+        doc = review_panel.limits_document({
+            "A": {"synthesis": {"input_bytes": 1000}, "hard": {"input_bytes": 5000,
+                                                               "reply_bytes": 900}},
+            "B": None})
+        self.write(doc)
+        limits = review_panel.read_limits(self.rundir)
+        default = review_panel.DEFAULT_LIMITS["synthesis"]
+        self.assertEqual(limits.planning("synthesis", ["A"]),
+                         review_panel.Limits(1000, 900, default.index_bytes),
+                         "the reply is clamped to A's hard ceiling")
+        self.assertEqual(limits.planning("synthesis", ["B"]), default)
+        self.assertEqual(limits.hard_ceiling(["A"]), review_panel.Limits(5000, 900))
+        self.assertIsNone(limits.hard_ceiling(["B"]))
+
+    def test_the_planning_ceiling_is_clamped_to_the_hard_one_measure_by_measure(self):
+        self.write(review_panel.limits_document({
+            "A": {"verification": {"input_bytes": 10_000},
+                  "hard": {"input_bytes": 5_000, "reply_bytes": 900_000}},
+            "B": None}))
+        limits = review_panel.read_limits(self.rundir)
+        default = review_panel.DEFAULT_LIMITS["verification"]
+        self.assertEqual(limits.planning("verification", ["A"]),
+                         review_panel.Limits(5_000, default.reply_bytes))
+        self.assertEqual(limits.planning("verification", review_panel.LANES),
+                         review_panel.Limits(5_000, default.reply_bytes),
+                         "a unit that may go to A is held to A's hard ceiling")
+        self.assertEqual(limits.planning("verification", ["B"]), default)
+
+    def test_a_unit_either_lane_may_take_is_held_to_the_smaller_of_each(self):
+        self.write(review_panel.limits_document({
+            "A": {"clustering": {"input_bytes": 1000, "reply_bytes": 9000}},
+            "B": {"clustering": {"input_bytes": 8000, "reply_bytes": 2000}}}))
+        limits = review_panel.read_limits(self.rundir)
+        self.assertEqual(limits.planning("clustering", review_panel.LANES),
+                         review_panel.Limits(1000, 2000))
+
+    def test_a_bad_lane_limit_is_refused_by_name(self):
+        for raw, words in (({"synthesis": {"input_bytes": 0}}, "lanes.A.limits.synthesis"),
+                           ({"verification": {"index_bytes": 9}}, "index_bytes"),
+                           ({"merge": {}}, "unknown key"),
+                           ({"hard": {"input_bytes": 9}}, "missing 'reply_bytes'"),
+                           ([], "must be a JSON object")):
+            with self.subTest(raw=raw):
+                with self.assertRaises(review_panel.LimitsError) as ctx:
+                    review_panel.limits_document({"A": raw})
+                self.assertIn(words, str(ctx.exception))
+
+    def test_an_index_too_small_for_its_cut_notice_is_refused_by_name(self):
+        floor = review_panel.INDEX_NOTICE_FLOOR
+        self.assertGreaterEqual(
+            floor, len(f"\n{review_panel.index_cut_line(9_999_999)}\n".encode("utf-8")))
+        for small in (1, floor - 1):
+            with self.subTest(index_bytes=small):
+                with self.assertRaises(review_panel.LimitsError) as ctx:
+                    review_panel.limits_document({"A": {"synthesis": {"index_bytes": small}}})
+                self.assertIn("lanes.A.limits.synthesis.index_bytes", str(ctx.exception))
+                self.assertIn(str(floor), str(ctx.exception))
+        doc = review_panel.limits_document({"A": {"synthesis": {"index_bytes": floor}}})
+        self.assertEqual(doc["lanes"]["A"]["synthesis"]["index_bytes"], floor)
+        # A limits file edited by hand below the floor is refused when it is read.
+        doc["lanes"]["B"]["synthesis"]["index_bytes"] = floor - 1
+        self.write(doc)
+        with self.assertRaises(review_panel.LimitsError) as ctx:
+            review_panel.read_limits(self.rundir)
+        self.assertIn("lanes.B.synthesis.index_bytes", str(ctx.exception))
+
+    def test_a_damaged_limits_file_is_refused_not_replaced_by_the_defaults(self):
+        good = review_panel.limits_document({})
+        broken = json.loads(json.dumps(good))
+        del broken["lanes"]["B"]["clustering"]
+        for doc in ({}, {"lanes": {"A": good["lanes"]["A"]}}, broken):
+            with self.subTest(doc=doc):
+                self.write(doc)
+                with self.assertRaises(review_panel.ReviewPanelError):
+                    review_panel.read_limits(self.rundir)
+
+
+def _pack_item(item_id, folder, nested, record_bytes=100, kind="verdict"):
+    return review_panel.PackItem(id=item_id, folder=folder, record="x" * record_bytes,
+                                 counts={kind: nested})
+
+
+class ThePackerSizesUnitsByWhatTheyHold(unittest.TestCase):
+    """The shared packer: measured input, a reply estimated from the nested entries it must
+    hold, folders kept whole while they fit, and an item never split."""
+
+    PER = {"verdict": 500, "note": 200}
+
+    def pack(self, items, limits, hard=None, head="h" * 50):
+        return review_panel.pack_items(items, head=head, reply_head=100,
+                                       per_entry=self.PER, limits=limits, hard=hard)
+
+    def test_equal_item_counts_split_by_what_the_reply_must_hold(self):
+        """Two batches of four items each: one item's reply needs one verdict, the other's
+        twenty. Only the second is too much for one reply."""
+        limits = review_panel.Limits(input_bytes=100_000, reply_bytes=15_000)
+        light = [_pack_item(f"l{n}", "a", 1) for n in range(4)]
+        heavy = [_pack_item(f"h{n}", "a", 20) for n in range(4)]
+        self.assertEqual([p.items for p in self.pack(light, limits)],
+                         [("l0", "l1", "l2", "l3")])
+        self.assertGreater(len(self.pack(heavy, limits)), 1)
+        self.assertEqual(sorted(i for p in self.pack(heavy, limits) for i in p.items),
+                         [f"h{n}" for n in range(4)], "an item was lost or repeated")
+
+    def test_the_input_is_measured_with_the_head_counted_once_per_unit(self):
+        items = [_pack_item(f"i{n}", "a", 0, record_bytes=1000) for n in range(3)]
+        limits = review_panel.Limits(input_bytes=50 + 2000, reply_bytes=10_000)
+        packs = self.pack(items, limits)
+        self.assertEqual([p.items for p in packs], [("i0", "i1"), ("i2",)])
+        self.assertEqual([p.input_bytes for p in packs], [2050, 1050])
+        self.assertEqual([p.reply_bytes for p in packs], [100, 100])
+
+    def test_folders_are_taken_in_order_and_kept_whole_while_they_fit(self):
+        items = [_pack_item("b1", "b", 1), _pack_item("a1", "a", 1),
+                 _pack_item("b2", "b", 1), _pack_item("c1", "c", 1)]
+        limits = review_panel.Limits(input_bytes=100_000, reply_bytes=100 + 2 * 500)
+        self.assertEqual([p.items for p in self.pack(items, limits)],
+                         [("a1",), ("b1", "b2"), ("c1",)])
+
+    def test_an_item_over_the_planning_ceiling_goes_alone_and_is_flagged(self):
+        limits = review_panel.Limits(input_bytes=100_000, reply_bytes=3000)
+        hard = review_panel.Limits(input_bytes=100_000, reply_bytes=20_000)
+        items = [_pack_item("s1", "a", 1), _pack_item("big", "a", 10),
+                 _pack_item("s2", "a", 1)]
+        packs = self.pack(items, limits, hard)
+        self.assertEqual([(p.items, p.oversize, p.dispatch) for p in packs],
+                         [(("s1",), False, True), (("big",), True, True),
+                          (("s2",), False, True)])
+
+    def test_an_item_over_the_hard_ceiling_is_listed_and_never_dispatched(self):
+        limits = review_panel.Limits(input_bytes=100_000, reply_bytes=3000)
+        hard = review_panel.Limits(input_bytes=100_000, reply_bytes=4000)
+        packs = self.pack([_pack_item("s1", "a", 1), _pack_item("huge", "a", 10)],
+                          limits, hard)
+        self.assertEqual([(p.items, p.oversize, p.dispatch) for p in packs],
+                         [(("s1",), False, True), (("huge",), True, False)])
+
+    def test_with_no_hard_ceiling_stated_an_oversize_item_is_still_dispatched(self):
+        limits = review_panel.Limits(input_bytes=100_000, reply_bytes=3000)
+        (pack,) = self.pack([_pack_item("huge", "a", 10)], limits)
+        self.assertEqual((pack.oversize, pack.dispatch), (True, True))
+
+    def test_every_unit_records_the_limits_it_was_planned_under(self):
+        limits = review_panel.Limits(input_bytes=100_000, reply_bytes=3000, index_bytes=700)
+        hard = review_panel.Limits(input_bytes=200_000, reply_bytes=9000)
+        (pack,) = self.pack([_pack_item("s1", "a", 1)], limits, hard)
+        self.assertEqual(pack.limits_record(), {
+            "planning": {"input_bytes": 100_000, "reply_bytes": 3000, "index_bytes": 700},
+            "hard": {"input_bytes": 200_000, "reply_bytes": 9000}})
+        (pack,) = self.pack([_pack_item("s1", "a", 1)], limits)
+        self.assertNotIn("hard", pack.limits_record())
+
+    def test_a_hard_ceiling_below_the_planning_one_bounds_every_dispatched_unit(self):
+        """An operator who states only a hard ceiling keeps the planning defaults, which
+        can be larger: each measure is packed against the smaller of the two."""
+        limits = review_panel.Limits(input_bytes=10_000, reply_bytes=100_000)
+        hard = review_panel.Limits(input_bytes=5_000, reply_bytes=100_000)
+        (big,) = self.pack([_pack_item("big", "a", 0, record_bytes=6_000)], limits, hard)
+        self.assertEqual((big.oversize, big.dispatch), (True, False))
+        small = [_pack_item(f"s{n}", "a", 0, record_bytes=1_500) for n in range(4)]
+        packs = self.pack(small, limits, hard)
+        self.assertGreater(len(packs), 1)
+        self.assertEqual(sorted(i for p in packs for i in p.items),
+                         [f"s{n}" for n in range(4)])
+        for pack in packs:
+            self.assertTrue(pack.dispatch)
+            self.assertLessEqual(pack.input_bytes, hard.input_bytes)
+            self.assertEqual(pack.limits, review_panel.Limits(5_000, 100_000),
+                             "the unit records the clamped limits it was planned under")
+
+    def test_a_reply_entry_nobody_priced_is_refused(self):
+        with self.assertRaises(review_panel.LimitsError):
+            self.pack([_pack_item("s1", "a", 1, kind="cross_reference")],
+                      review_panel.Limits(100_000, 100_000))
+
+
 class ABatchedMergeSaysWhatItDidNotAttempt(_ReportCase):
     """Over the ceiling the report states that merges across batches were not attempted: a
     mistake copied into two batches is shown once per batch, and a reader has to know that
@@ -16350,13 +17346,14 @@ class ARedoFromTheMergedStageTakesTheMergeBack(_ReportCase):
 
 
 class TheSynthesisRoundIsOneUnitWithOneVocabulary(_ReportCase):
-    """The fifth round: one unit, handed every defect in the run, asked to name the tiers
-    once and place every defect under one of them.
+    """The fifth round over a run small enough for one batch: one unit, `synth-A`, handed
+    every defect that needs a write-up, asked to name its tiers once and place every defect
+    under one of them.
 
-    ONE unit is how "exactly one unit names the tiers" is kept — a second unit naming its
-    own would give one run two vocabularies, which is the failure the round exists to
-    avoid. The payload still separates the whole defect INDEX from the defects this unit
-    must judge, because that separation is the contract a split round would inherit.
+    The payload separates the batch's INDEX — the outside defects sharing a file with its
+    own, none here — from the defects this unit must judge, because that separation is what
+    lets the bytes be rebuilt from declared inputs. ``SynthesisIsPlannedInBatchesByFolder``
+    and ``SynthesisIsWrittenInBatchesThatStandAlone`` cover several batches.
     """
 
     UNIT = "synth-A"
@@ -16421,11 +17418,8 @@ class TheSynthesisRoundIsOneUnitWithOneVocabulary(_ReportCase):
             [d for d in review_panel.group_sites(clustering) if d.id in self.WRITTEN], {})
 
     def index(self, clustering):
-        """Every handed defect's id and heading: one defect per site, headed by that
-        site's."""
-        site_of = {c.id: c for c in clustering.clusters}
-        return [{"id": d.id, "consequence": site_of[d.sites[0]].consequence}
-                for d in review_panel.group_sites(clustering) if d.id in self.WRITTEN]
+        """The batch's index: one batch holds every defect, so none is outside it."""
+        return []
 
     def test_one_unit_carries_every_defect_needing_a_write_up_and_the_stage_moves(self):
         self.clustered_only()
@@ -16453,13 +17447,14 @@ class TheSynthesisRoundIsOneUnitWithOneVocabulary(_ReportCase):
         self.assertEqual(self.units()["stage"], "synthesized")
         self.report()
 
-    def test_the_payload_carries_the_whole_index_and_the_detail_for_its_own_defects(self):
+    def test_the_payload_carries_the_detail_for_its_own_defects_and_no_outside_index(self):
         self.clustered_only()
         self.synthesize()
         text = (self.rundir / self.synthesizers()[0]["payload"]).read_text(encoding="utf-8")
         index = text.split(review_panel.TO_JUDGE_HEADING)[0]
+        self.assertIn(review_panel.NO_OUTSIDE_LINE, index)
         for defect in self.WRITTEN:
-            self.assertIn(f"- {defect}: ", index, "every handed defect can be cited")
+            self.assertNotIn(f"- {defect}: ", index, "a batch's own defect is not outside it")
             self.assertIn(f"\n### {defect}\n", text)
         self.assertIn(FINDING["failure"], text)
         self.assertIn(FINDING["direction"], text)
@@ -16637,12 +17632,14 @@ class TheSynthesisRoundIsOneUnitWithOneVocabulary(_ReportCase):
         self.assertEqual(unit["payload_lines"], raw.count(b"\n"))
         self.assertGreater(unit["payload_bytes"], 0)
 
-    def test_synthesize_runs_once_and_a_refusal_writes_nothing(self):
+    def test_synthesize_while_its_round_is_in_flight_is_refused_and_writes_nothing(self):
+        # A later call plans the next round, and only once every unit of this one landed.
         self.clustered_only()
         self.synthesize()
         before = _tree_bytes(self.rundir)
         proc = self.synthesize(expect=2)
-        self.assertIn("synthesize runs once", proc.stderr)
+        self.assertIn(f"{self.UNIT} of the latest synthesis round has no result yet",
+                      proc.stderr)
         self.assertEqual(_tree_bytes(self.rundir), before)
 
     def test_a_unit_directory_an_interrupted_synthesize_left_is_reclaimed(self):
@@ -16718,7 +17715,8 @@ class TheSynthesisRoundIsOneUnitWithOneVocabulary(_ReportCase):
         for name, edit, fragment in (
             ("short", [{**row, "defects": ["D1"]}], "not this run's defects"),
             ("foreign", [{**row, "defects": ["D1", "D2", "D9"]}], "not this run's defects"),
-            ("twice", [row, {**row, "id": "synth-B"}], "both name the synthesis round"),
+            ("twice", [row, {**row, "id": "synth-B"}], "both hold D1"),
+            ("one id twice", [row, row], "listed twice"),
             ("null list", [{**row, "defects": None}], "no list of defect ids"),
             ("id not a string", [{**row, "defects": ["D1", "D2", 7]}], "no list of defect ids"),
         ):
@@ -16880,7 +17878,7 @@ class TheSynthesisRoundIsHandedOnlyWhatNeedsAWriteUp(_CoverageCase):
         self.run_all(reading=self.CLEAN, synthesis=self.SENT)
         text, doc = self.text(), self.doc()
         record = doc["synthesis"]
-        self.assertEqual(record["state"], review_panel.UNIT_COMPLETE, record["reason"])
+        self.assertEqual(record["state"], review_panel.UNIT_COMPLETE, record)
         self.assertEqual(record["rejected"], [])
         self.assertEqual(record["defects"], ["D1", "D2"])
         defects = {d["id"]: d for d in doc["defects"]}
@@ -16943,11 +17941,11 @@ class ASynthesisResultMustBeAPartition(_ReportCase):
                 "what_goes_wrong": what, "fix": fix, "site_notes": [],
                 "cross_references": list(refs)}
 
-    def parse(self, defects, tiers=None, handed=None, summary="s"):
+    def parse(self, defects, tiers=None, handed=None):
         handed = handed or self.HANDED
         return review_panel.parse_synthesizer_result(
-            {"tiers": self.TIERS if tiers is None else tiers, "defects": defects,
-             "summary": summary}, "synth-A", handed, [[f"S{did[1:]}"] for did in handed])
+            {"tiers": self.TIERS if tiers is None else tiers, "defects": defects},
+            "synth-A", handed, [[f"S{did[1:]}"] for did in handed])
 
     def refuse(self, defects, *fragments, tiers=None, handed=None):
         with self.assertRaises(review_panel.ResultError) as caught:
@@ -16967,7 +17965,7 @@ class ASynthesisResultMustBeAPartition(_ReportCase):
         self.assertEqual(parsed["assignments"]["D1"]["cross_references"], ["D2"])
         self.assertEqual(parsed["assignments"]["D2"]["cross_references"], [])
         self.assertEqual(parsed["rejected"], [])
-        self.assertEqual(parsed["summary"], "s")
+        self.assertIsNone(parsed["summary"], "a batch writes no paragraph about the run")
 
     def test_a_dropped_id_fails_the_unit(self):
         self.refuse([self.one("D1"), self.one("D2")], "D3", "every defect")
@@ -16993,7 +17991,7 @@ class ASynthesisResultMustBeAPartition(_ReportCase):
                     tiers=[self.TIERS[0], self.TIERS[0]])
         with self.assertRaises(review_panel.ResultError):
             review_panel.parse_synthesizer_result(
-                {"tiers": self.TIERS, "defects": "all one", "summary": "s"},
+                {"tiers": self.TIERS, "defects": "all one"},
                 "synth-A", self.HANDED, [["S1"], ["S2"], ["S3"]])
         with self.assertRaises(review_panel.ResultError):
             review_panel.parse_synthesizer_result(
@@ -17028,7 +18026,7 @@ class AnEntryTheEngineCannotReadCostsItsOwnDefect(_ReportCase):
 
     def parse(self, defects):
         return review_panel.parse_synthesizer_result(
-            {"tiers": self.TIERS, "defects": defects, "summary": "s"}, "synth-A", self.HANDED,
+            {"tiers": self.TIERS, "defects": defects}, "synth-A", self.HANDED,
             [["S1"], ["S2"], ["S3"]])
 
     def test_the_defect_is_rejected_by_name_and_the_rest_stand(self):
@@ -17116,7 +18114,7 @@ class AnEntryTheEngineCannotReadCostsItsOwnDefect(_ReportCase):
             "tiers": SYNTH_TABLE["synth-A"]["tiers"],
             "defects": [{**e, "tier": "A tier nobody declared"} if e["defect"] == "D2" else e
                         for e in SYNTH_TABLE["synth-A"]["defects"]],
-            "summary": "one went wrong"}})
+            }})
         doc = json.loads((self.rundir / "findings.json").read_text(encoding="utf-8"))
         record = doc["synthesis"]
         self.assertEqual(record["state"], "complete")
@@ -17151,7 +18149,7 @@ class ASynthesisEntryIsHeldToItsLengthLimits(unittest.TestCase):
 
     def parse(self, defects):
         return review_panel.parse_synthesizer_result(
-            {"tiers": self.TIERS, "defects": defects, "summary": "s"}, "synth-A",
+            {"tiers": self.TIERS, "defects": defects}, "synth-A",
             self.HANDED, self.SITES)
 
     def assert_refused_alone(self, broken, *fragments):
@@ -17251,9 +18249,10 @@ class ASynthesisFromBeforeSitesIsReadInTheShapeItWasAskedFor(unittest.TestCase):
            "cross_references": []}
 
     def parse(self, entry, sites):
+        # Both listings are an earlier engine's, whose replies carry a summary.
         return review_panel.parse_synthesizer_result(
             {"tiers": self.TIERS, "defects": [entry], "summary": "s"}, "synth-A", ("D1",),
-            sites)
+            sites, legacy=True)
 
     def test_the_old_shape_is_read_from_a_listing_with_no_sites(self):
         parsed = self.parse(self.OLD, None)
@@ -17301,7 +18300,6 @@ SYNTH_MERGED = {
              "what_goes_wrong": "A missing value is doubled rather than skipped.",
              "fix": "Skip a missing value.", "site_notes": [], "cross_references": []},
         ],
-        "summary": "Two tiers; one mistake made at two sites.",
     },
 }
 
@@ -17422,8 +18420,9 @@ class ASynthesisRoundThatDidNotComeBackLeavesTheStatusGrouping(_ReportCase):
 
     def assert_nothing_judged(self, doc, state):
         record = doc["synthesis"]
-        self.assertEqual(record["unit"], self.UNIT)
+        self.assertEqual([batch["unit"] for batch in record["units"]], [self.UNIT])
         self.assertEqual(record["state"], state)
+        self.assertEqual(record["units"][0]["state"], state)
         self.assertEqual(record["tiers"], [])
         for cluster in doc["defects"]:
             self.assertIsNone(cluster["heading"], cluster["id"])
@@ -17444,19 +18443,511 @@ class ASynthesisRoundThatDidNotComeBackLeavesTheStatusGrouping(_ReportCase):
     def test_a_unit_that_failed_degrades_the_same_way(self):
         doc = self.degraded("the reply was not a JSON object\n")
         self.assert_nothing_judged(doc, "failed")
-        self.assertIn("not a JSON object", doc["synthesis"]["reason"])
+        self.assertIn("not a JSON object", doc["synthesis"]["units"][0]["reason"])
 
     def test_a_result_that_is_not_a_partition_degrades_the_same_way(self):
         landed = {**SYNTH_TABLE[self.UNIT],
                   "defects": SYNTH_TABLE[self.UNIT]["defects"][:1]}
         doc = self.degraded(landed)
         self.assert_nothing_judged(doc, "failed")
-        self.assertIn("D2", doc["synthesis"]["reason"])
+        self.assertIn("D2", doc["synthesis"]["units"][0]["reason"])
 
     def test_a_reason_quoting_a_lone_surrogate_is_escaped_where_it_is_recorded(self):
         doc = self.degraded({**SYNTH_TABLE[self.UNIT], "bad \ud800 key": 1})
         self.assert_nothing_judged(doc, "failed")
-        self.assertIn("\\ud800", doc["synthesis"]["reason"])
+        self.assertIn("\\ud800", doc["synthesis"]["units"][0]["reason"])
+
+
+def _synthesis_defect(did, files, failure="It fails.", consequence=None):
+    """One defect's payload material, by hand: a site of one report per file."""
+    return {"id": did, "sites": [f"S{did[1:]}"],
+            "consequence": consequence or f"{did} goes wrong.", "mechanism": None,
+            "site_material": [{
+                "id": f"S{did[1:]}", "consequence": consequence or f"{did} goes wrong.",
+                "instance": None, "split_reason": None,
+                "members": [{"file": path, "line_start": 1, "line_end": 1,
+                             "failure": failure, "directions": ["Fix it."],
+                             "fix_sizes": ["1 line"], "rationale": None}
+                            for path in files]}]}
+
+
+def _synthesis_limits(input_bytes=200 * 1024, reply_bytes=60 * 1024, index_bytes=32 * 1024,
+                      hard=None):
+    """Run limits with the same synthesis limits on both lanes, and ``hard`` on both."""
+    stage = review_panel.Limits(input_bytes=input_bytes, reply_bytes=reply_bytes,
+                                index_bytes=index_bytes)
+    return review_panel.RunLimits(
+        lanes={lane: {**review_panel.DEFAULT_LIMITS, "synthesis": stage}
+               for lane in review_panel.LANES},
+        hard={lane: hard for lane in review_panel.LANES})
+
+
+class SynthesisIsPlannedInBatchesByFolder(unittest.TestCase):
+    """One unit holding every defect grows with the run past what a worker can read, and
+    its one failure costs every write-up. So the round is planned in batches: each defect
+    packed beside the defects nearest it in the tree, under the synthesis limits, the lanes
+    alternating."""
+
+    # One defect per batch: the reply head and one defect's entry fit 3000 bytes, two do not.
+    ONE_EACH = 3000
+
+    def test_a_defects_folder_is_the_lowest_one_its_sites_share(self):
+        folder = review_panel.defect_folder
+        self.assertEqual(folder(["pkg/a/x.py", "pkg/a/y.py"]), "pkg/a")
+        self.assertEqual(folder(["pkg/a/q.py", "pkg/b/r.py"]), "pkg")
+        self.assertEqual(folder(["top.py"]), "")
+        # Component by component, never by characters.
+        self.assertEqual(folder(["pkg/a.py", "pkga/b.py"]), "")
+
+    def test_batches_follow_folder_order_and_alternate_lanes(self):
+        material = [_synthesis_defect("D1", ["pkg/b/x.py"]),
+                    _synthesis_defect("D2", ["pkg/a/y.py"]),
+                    _synthesis_defect("D3", ["pkg/a/z.py"]),
+                    _synthesis_defect("D4", ["top.py"])]
+        units = review_panel.plan_synthesis(
+            material, limits=_synthesis_limits(reply_bytes=self.ONE_EACH))
+        self.assertEqual([(u.id, u.lane, u.defects) for u in units],
+                         [("synth-A-b1", "A", ("D4",)), ("synth-B-b2", "B", ("D2",)),
+                          ("synth-A-b3", "A", ("D3",)), ("synth-B-b4", "B", ("D1",))])
+        for unit in units:
+            self.assertEqual(unit.limits["planning"]["reply_bytes"], self.ONE_EACH)
+            self.assertTrue(unit.dispatch)
+            self.assertFalse(unit.oversize)
+
+    def test_one_batch_keeps_the_id_the_single_unit_always_had(self):
+        material = [_synthesis_defect(f"D{k}", [f"pkg/{k}.py"]) for k in range(1, 6)]
+        units = review_panel.plan_synthesis(material, limits=_synthesis_limits())
+        self.assertEqual([(u.id, u.lane) for u in units], [("synth-A", "A")])
+        self.assertEqual(units[0].defects, ("D1", "D2", "D3", "D4", "D5"))
+        self.assertEqual(review_panel.plan_synthesis([], limits=_synthesis_limits()), ())
+
+    def test_a_defect_sharing_files_is_priced_for_the_references_it_may_make(self):
+        # Two runs of five defects with the same entry counts: in one every defect shares a
+        # file with every other, so each may cite four. Only that one splits.
+        apart = [_synthesis_defect(f"D{k}", [f"pkg/{k}.py"]) for k in range(1, 6)]
+        shared = [_synthesis_defect(f"D{k}", ["pkg/one.py"]) for k in range(1, 6)]
+        reply = (review_panel.SYNTHESIS_REPLY_HEAD
+                 + 5 * review_panel.SYNTHESIS_REPLY_PRICES["defect"])
+        limits = _synthesis_limits(reply_bytes=reply)
+        self.assertEqual(len(review_panel.plan_synthesis(apart, limits=limits)), 1)
+        self.assertGreater(len(review_panel.plan_synthesis(shared, limits=limits)), 1)
+
+    def test_over_the_planning_ceiling_alone_and_over_the_hard_one_never_dispatched(self):
+        material = [_synthesis_defect("D1", ["a.py"]),
+                    _synthesis_defect("D2", ["b.py"], failure="x" * 4000),
+                    _synthesis_defect("D3", ["c.py"], failure="y" * 10000)]
+        hard = review_panel.Limits(input_bytes=8000, reply_bytes=60 * 1024)
+        units = review_panel.plan_synthesis(
+            material, limits=_synthesis_limits(input_bytes=2000, index_bytes=100, hard=hard))
+        by_defect = {unit.defects: unit for unit in units}
+        self.assertEqual(sorted(by_defect), [("D1",), ("D2",), ("D3",)])
+        self.assertFalse(by_defect[("D1",)].oversize)
+        self.assertTrue(by_defect[("D2",)].oversize)
+        self.assertTrue(by_defect[("D2",)].dispatch)
+        self.assertFalse(by_defect[("D3",)].dispatch)
+        self.assertEqual(by_defect[("D3",)].limits["hard"]["input_bytes"], 8000)
+
+    def test_a_defect_over_one_lanes_hard_ceiling_goes_to_the_lane_that_takes_it(self):
+        # One defect's reply is estimated over lane A's hard reply ceiling, and lane B
+        # states none: each goes alone to B and records B's limits.
+        one = review_panel.SYNTHESIS_REPLY_HEAD + review_panel.SYNTHESIS_REPLY_PRICES["defect"]
+        self.assertGreater(one, 2048)
+        stage = _synthesis_limits().lanes["A"]
+        limits = review_panel.RunLimits(
+            lanes={lane: stage for lane in review_panel.LANES},
+            hard={"A": review_panel.Limits(input_bytes=200 * 1024, reply_bytes=2048),
+                  "B": None})
+        material = [_synthesis_defect("D1", ["a.py"]), _synthesis_defect("D2", ["b.py"])]
+        units = review_panel.plan_synthesis(material, limits=limits)
+        self.assertEqual([(u.defects, u.lane) for u in units], [(("D1",), "B"), (("D2",), "B")])
+        for unit in units:
+            with self.subTest(unit=unit.id):
+                self.assertTrue(unit.dispatch)
+                self.assertTrue(unit.oversize)
+                self.assertEqual(unit.limits, {
+                    "planning": limits.planning("synthesis", ("B",)).record()})
+
+    def test_only_a_unit_that_went_alone_may_record_other_limits_than_its_round(self):
+        shared = {"planning": {"input_bytes": 1, "reply_bytes": 2}}
+        own = {"planning": {"input_bytes": 3, "reply_bytes": 4}}
+        units = [{"id": "synth-A-b1", "limits": shared, "oversize": False},
+                 {"id": "synth-B-b2", "limits": own, "oversize": True}]
+        record = review_panel.batches_round_record(
+            [{**u, "kind": review_panel.SYNTHESIZER_KIND, "defects": []} for u in units])
+        records = {(1, 1): record}
+        inp = {"input": True}
+        record["input_digest"] = review_panel._digest_of(inp)
+        review_panel._check_round(records, 1, 1, units, inp)
+        units[1]["oversize"] = False
+        with self.assertRaisesRegex(review_panel.RunDirError, "records other limits"):
+            review_panel._check_round(records, 1, 1, units, inp)
+
+    def test_a_defect_over_every_lanes_hard_ceiling_is_still_not_dispatched(self):
+        stage = _synthesis_limits().lanes["A"]
+        limits = review_panel.RunLimits(
+            lanes={lane: stage for lane in review_panel.LANES},
+            hard={"A": review_panel.Limits(input_bytes=200 * 1024, reply_bytes=2048),
+                  "B": review_panel.Limits(input_bytes=200 * 1024, reply_bytes=2500)})
+        material = [_synthesis_defect("D1", ["a.py"]), _synthesis_defect("D2", ["b.py"])]
+        units = review_panel.plan_synthesis(material, limits=limits)
+        self.assertEqual(len(units), 2)
+        self.assertEqual({u.dispatch for u in units}, {False})
+
+    def test_a_payload_with_the_cut_notice_stays_under_the_limit_it_was_packed_to(self):
+        # Two defects sharing a file, one per batch, each consequence too long for any
+        # index this cap allows: every index renders the cut notice alone, which is longer
+        # than the empty-index line the head was measured with. Swept across input limits
+        # around the exact fit, every unit is held to what it records.
+        long = "It goes wrong at length. " * 20
+        material = [_synthesis_defect("D1", ["pkg/a.py"], consequence=long),
+                    _synthesis_defect("D2", ["pkg/a.py"], consequence=long)]
+        files_of = review_panel.synthesis_files(material)
+        head = review_panel.render_synthesizer_payload("Brief.", "Problem.", (), ())
+        prices = review_panel.SYNTHESIS_REPLY_PRICES
+        reply = (review_panel.SYNTHESIS_REPLY_HEAD + prices["defect"]
+                 + prices["cross_reference"])
+        record = max(review_panel.measure_payload(
+            review_panel.render_synthesis_defect(d))[1] for d in material)
+        fit = review_panel.measure_payload(head)[1] + record
+        notices = 0
+        for index_bytes in (1, review_panel.INDEX_NOTICE_FLOOR):
+            for input_bytes in range(fit, fit + 2 * review_panel.INDEX_NOTICE_FLOOR + 1):
+                hard = review_panel.Limits(input_bytes=input_bytes, reply_bytes=reply)
+                limits = _synthesis_limits(input_bytes=input_bytes, reply_bytes=reply,
+                                           index_bytes=index_bytes, hard=hard)
+                cap = limits.planning("synthesis", review_panel.LANES).index_bytes
+                for unit in review_panel.plan_synthesis(material, head, limits):
+                    with self.subTest(index_bytes=index_bytes, input_bytes=input_bytes,
+                                      unit=unit.id):
+                        index, cut = review_panel.synthesis_index(
+                            unit.defects, material, files_of, cap)
+                        text = review_panel.render_synthesizer_payload(
+                            "Brief.", "Problem.", index,
+                            [d for d in material if d["id"] in unit.defects], cut=cut)
+                        size = review_panel.measure_payload(text)[1]
+                        notices += bool(cut)
+                        if unit.dispatch:
+                            self.assertLessEqual(size, unit.limits["hard"]["input_bytes"])
+                        if not unit.oversize:
+                            self.assertLessEqual(
+                                size, unit.limits["planning"]["input_bytes"])
+        self.assertGreater(notices, 0, "the sweep never rendered the cut notice")
+
+    def test_the_index_holds_only_outside_defects_sharing_a_file_and_says_what_it_cut(self):
+        material = [_synthesis_defect("D1", ["a.py"]),
+                    _synthesis_defect("D2", ["a.py", "b.py"]),
+                    _synthesis_defect("D3", ["b.py"]),
+                    _synthesis_defect("D4", ["c.py"])]
+        files_of = review_panel.synthesis_files(material)
+        index, cut = review_panel.synthesis_index(["D1"], material, files_of, 10_000)
+        self.assertEqual([e["id"] for e in index], ["D2"])
+        self.assertEqual(cut, 0)
+        index, cut = review_panel.synthesis_index(["D2"], material, files_of, 10_000)
+        self.assertEqual([e["id"] for e in index], ["D1", "D3"])
+        # A cap that fits one line and the line saying what was cut keeps the first and
+        # counts the rest; the whole index stays inside the cap.
+        long = "It goes wrong at length. " * 10
+        material = [_synthesis_defect("D1", ["a.py"], consequence=long),
+                    *material[1:2],
+                    _synthesis_defect("D3", ["b.py"], consequence=long), material[3]]
+        line = len(f"- D1: {long}\n".encode("utf-8"))
+        said = len(f"\n{review_panel.index_cut_line(2)}\n".encode("utf-8"))
+        self.assertEqual(review_panel.synthesis_index(["D2"], material, files_of,
+                                                      line + said - 1), ([], 2))
+        index, cut = review_panel.synthesis_index(["D2"], material, files_of, line + said)
+        self.assertEqual(([e["id"] for e in index], cut), (["D1"], 1))
+        text = review_panel.render_synthesizer_payload("Brief.", "Problem.", index,
+                                                       [material[1]], cut=cut)
+        head = text.split(review_panel.TO_JUDGE_HEADING)[0]
+        self.assertIn("- D1: ", head)
+        self.assertNotIn("- D3: ", head)
+        self.assertIn(review_panel.index_cut_line(1), head)
+        self.assertIn("1 more defect", review_panel.index_cut_line(1))
+        self.assertNotIn("### D4", text)
+        self.assertNotIn("D4", text, "a defect sharing no file reaches no other payload")
+
+
+class SynthesisIsWrittenInBatchesThatStandAlone(_FindingsCase):
+    """Over the standard run, limits that fit one defect's entry per reply: D1 and D2 each
+    get a batch of their own, on alternating lanes. Each batch is checked on its own — every
+    defect it was handed answered exactly once, each tier one it declared — and a batch that fails costs its own defects their write-ups and nothing else.
+    """
+
+    TIER = "A run stops instead of finishing"
+    FIRST, SECOND = "synth-A-b1", "synth-B-b2"
+
+    def split(self, rundir):
+        doc = review_panel.limits_document(
+            {lane: {"synthesis": {"reply_bytes": 3000}} for lane in review_panel.LANES})
+        (rundir / "limits.json").write_text(json.dumps(doc), encoding="utf-8")
+
+    def entry(self, did, tier=None, refs=()):
+        return {"defect": did, "heading": f"{did} stops the run.",
+                "tier": tier or self.TIER,
+                "what_goes_wrong": f"{did}: the call dies on an empty input.",
+                "fix": "Guard the empty case.", "site_notes": [],
+                "cross_references": list(refs)}
+
+    def batch(self, *entries, tiers=None):
+        return {"tiers": list(tiers or [self.TIER]), "defects": list(entries)}
+
+    def both(self, first=None, second=None):
+        return {self.FIRST: first or self.batch(self.entry("D1")),
+                self.SECOND: second or self.batch(self.entry("D2"))}
+
+    def run_split(self, table, rundir=None):
+        return self.run_all(rundir, synthesis=table, after_plan=self.split)
+
+    def test_each_defect_is_a_batch_of_its_own_on_alternating_lanes(self):
+        self.run_split(self.both())
+        units = self.synthesizers()
+        self.assertEqual([(u["id"], u["lane"], u["defects"]) for u in units],
+                         [(self.FIRST, "A", ["D1"]), (self.SECOND, "B", ["D2"])])
+        for unit in units:
+            self.assertEqual(unit["generation"], 1)
+            self.assertEqual(unit["writer"], review_panel.SYNTHESIS_WRITER)
+            self.assertEqual(unit["limits"]["planning"]["reply_bytes"], 3000)
+            self.assertTrue(unit["dispatch"])
+        first = (self.rundir / units[0]["payload"]).read_text(encoding="utf-8")
+        index, own = first.split(review_panel.TO_JUDGE_HEADING)
+        # D2 shares engine/core.py with D1, so the first batch may cite it.
+        self.assertIn("- D2: ", index)
+        self.assertIn("\n### D1\n", own)
+        self.assertNotIn("\n### D2\n", own)
+        self.assertNotIn("D3", first, "D3 is refuted, needs no write-up and is in no index")
+
+    def test_one_batch_failing_leaves_the_others_standing(self):
+        self.run_split(self.both(second="the reply was not a JSON object\n"))
+        doc = self.findings()
+        defects = {d["id"]: d for d in doc["defects"]}
+        self.assertEqual(defects["D1"]["heading"], "D1 stops the run.")
+        self.assertEqual(defects["D1"]["tier"], self.TIER)
+        self.assertIsNone(defects["D2"]["heading"])
+        self.assertIsNone(defects["D2"]["tier"])
+        record = doc["synthesis"]
+        self.assertEqual(record["state"], review_panel.SYNTHESIS_PARTIAL)
+        self.assertEqual([(u["unit"], u["state"]) for u in record["units"]],
+                         [(self.FIRST, "complete"), (self.SECOND, "failed")])
+        text = self.text()
+        self.assertIn(f"The synthesis batch {self.SECOND} did not come back usable, so "
+                      f"[D2](#D2) is not written up", text)
+        self.assertNotIn(review_panel.GROUPING_NO_SYNTHESIS, text)
+        self.assertNotIn(review_panel.EVERY_UNIT_RETURNED, text)
+        # Nothing is dropped.
+        self.assertEqual(sorted(defects), ["D1", "D2", "D3"])
+
+    def test_a_tier_two_batches_spelled_alike_is_one_section(self):
+        self.run_split(self.both())
+        self.assertEqual(self.findings()["synthesis"]["tiers"], [self.TIER])
+        established = self.body(self.text(), "Established defects")
+        self.assertEqual(re.findall(rf"(?m)^### {re.escape(self.TIER)}\b", established),
+                         [f"### {self.TIER}"])
+
+    def test_sections_follow_batch_order_each_batchs_tiers_in_its_own(self):
+        other = "The total comes out wrong"
+        self.run_split(self.both(
+            first=self.batch(self.entry("D1", other), tiers=[other, self.TIER]),
+            second=self.batch(self.entry("D2"), tiers=[self.TIER])))
+        self.assertEqual(self.findings()["synthesis"]["tiers"], [other, self.TIER])
+
+    def test_an_undeclared_tier_costs_its_own_defect_alone(self):
+        self.run_split(self.both(first=self.batch(self.entry("D1", "Nobody declared this"))))
+        doc = self.findings()
+        defects = {d["id"]: d for d in doc["defects"]}
+        self.assertIsNone(defects["D1"]["tier"])
+        self.assertEqual(defects["D2"]["tier"], self.TIER)
+        self.assertEqual(doc["synthesis"]["state"], "complete")
+        self.assertEqual(len(doc["synthesis"]["rejected"]), 1)
+        self.assertIn("Nobody declared this", doc["synthesis"]["rejected"][0])
+
+    def test_a_reply_carrying_the_old_summary_is_refused(self):
+        self.run_split(self.both(first={**self.batch(self.entry("D1")), "summary": "s"}))
+        record = self.findings()["synthesis"]
+        self.assertEqual(record["units"][0]["state"], "failed")
+        self.assertIn("summary", record["units"][0]["reason"])
+
+    def test_the_record_is_the_batches_and_says_there_is_no_overview(self):
+        self.run_split(self.both())
+        record = self.findings()["synthesis"]
+        self.assertEqual(record["generation"], 1)
+        self.assertEqual(record["writer"], review_panel.SYNTHESIS_WRITER)
+        self.assertEqual(record["state"], "complete")
+        self.assertEqual(record["defects"], ["D1", "D2"])
+        self.assertIsNone(record["overview"])
+        self.assertNotIn("summary", record)
+        self.assertIn(review_panel.SYNTHESIS_NO_OVERVIEW, self.text())
+
+    def test_a_defect_over_the_hard_ceiling_is_listed_and_never_written_up(self):
+        self.plan_into(self.rundir)
+        stub_dispatch(self.rundir, READING_TABLE, DISPATCH)
+        self.assertEqual(_run("route", str(self.rundir)).returncode, 0)
+        stub_dispatch(self.rundir, VERIFY_TABLE)
+        self.clustered()
+        self.merged()
+        self.merge_checked()
+        # D1 holds two reports and D2 one: a hard ceiling between their sizes keeps D2 and
+        # leaves D1 out.
+        clustering = self.clustering()
+        rationales = {"cand-001": "Lines 2-3 index without a guard.",
+                      "cand-002": "Lines 2-3 index without a guard.",
+                      "cand-003": "The run raised as claimed."}
+        material = review_panel.synthesis_material(
+            clustering, self.candidates()["candidates"], rationales,
+            [d for d in review_panel.group_sites(clustering) if d.id in ("D1", "D2")], {})
+        companions = review_panel.load_synthesis_companions()
+        index_cap = review_panel.INDEX_NOTICE_FLOOR
+        fixed = review_panel.measure_payload(
+            review_panel.synthesis_head(companions, FILE_JOB["problem"]))[1] + index_cap
+        size = {d["id"]: review_panel.measure_payload(
+            review_panel.render_synthesis_defect(d))[1] for d in material}
+        self.assertGreater(size["D1"], size["D2"])
+        ceiling = fixed + (size["D1"] + size["D2"]) // 2
+        doc = review_panel.limits_document({lane: {
+            "synthesis": {"input_bytes": ceiling, "index_bytes": index_cap},
+            "hard": {"input_bytes": ceiling, "reply_bytes": 60 * 1024}}
+            for lane in review_panel.LANES})
+        (self.rundir / "limits.json").write_text(json.dumps(doc), encoding="utf-8")
+        self.synthesize()
+        units = {tuple(u["defects"]): u for u in self.synthesizers()}
+        self.assertFalse(units[("D1",)]["dispatch"])
+        self.assertTrue(units[("D2",)]["dispatch"])
+        stub_dispatch(self.rundir, {units[("D2",)]["id"]: self.batch(self.entry("D2"))})
+        self.report()
+        defects = {d["id"]: d for d in self.findings()["defects"]}
+        self.assertIsNone(defects["D1"]["heading"])
+        self.assertEqual(defects["D2"]["heading"], "D2 stops the run.")
+        text = self.text()
+        self.assertIn(f"The synthesis batch {units[('D1',)]['id']} was over every lane's "
+                      f"hard ceiling and never dispatched, so [D1](#D1) is not written up", text)
+        self.assertIn(review_panel.NOT_DISPATCHED_REASON, " ".join(text.split()))
+
+    def test_a_defect_over_one_lanes_hard_ceiling_is_written_up_by_the_other(self):
+        self.plan_into(self.rundir)
+        stub_dispatch(self.rundir, READING_TABLE, DISPATCH)
+        self.assertEqual(_run("route", str(self.rundir)).returncode, 0)
+        stub_dispatch(self.rundir, VERIFY_TABLE)
+        self.clustered()
+        self.merged()
+        self.merge_checked()
+        # Lane A's hard ceiling sits between the two defects' sizes and lane B states none:
+        # D2 is packed as usual, and D1, over A's ceiling alone, goes to B.
+        clustering = self.clustering()
+        rationales = {"cand-001": "Lines 2-3 index without a guard.",
+                      "cand-002": "Lines 2-3 index without a guard.",
+                      "cand-003": "The run raised as claimed."}
+        material = review_panel.synthesis_material(
+            clustering, self.candidates()["candidates"], rationales,
+            [d for d in review_panel.group_sites(clustering) if d.id in ("D1", "D2")], {})
+        companions = review_panel.load_synthesis_companions()
+        index_cap = review_panel.INDEX_NOTICE_FLOOR
+        fixed = review_panel.measure_payload(
+            review_panel.synthesis_head(companions, FILE_JOB["problem"]))[1] + index_cap
+        size = {d["id"]: review_panel.measure_payload(
+            review_panel.render_synthesis_defect(d))[1] for d in material}
+        self.assertGreater(size["D1"], size["D2"])
+        ceiling = fixed + (size["D1"] + size["D2"]) // 2
+        doc = review_panel.limits_document({
+            "A": {"synthesis": {"input_bytes": ceiling, "index_bytes": index_cap},
+                  "hard": {"input_bytes": ceiling, "reply_bytes": 60 * 1024}},
+            "B": {"synthesis": {"input_bytes": ceiling, "index_bytes": index_cap}}})
+        (self.rundir / "limits.json").write_text(json.dumps(doc), encoding="utf-8")
+        self.synthesize()
+        units = {tuple(u["defects"]): u for u in self.synthesizers()}
+        self.assertTrue(units[("D1",)]["dispatch"])
+        self.assertEqual(units[("D1",)]["lane"], "B")
+        self.assertNotIn("hard", units[("D1",)]["limits"])
+        self.assertTrue(units[("D2",)]["dispatch"])
+        self.assertIn("hard", units[("D2",)]["limits"])
+        stub_dispatch(self.rundir, {units[("D1",)]["id"]: self.batch(self.entry("D1")),
+                                    units[("D2",)]["id"]: self.batch(self.entry("D2"))})
+        self.report()
+        defects = {d["id"]: d for d in self.findings()["defects"]}
+        self.assertEqual(defects["D1"]["heading"], "D1 stops the run.")
+        self.assertEqual(defects["D2"]["heading"], "D2 stops the run.")
+        self.assertEqual(self.findings()["synthesis"]["state"], "complete")
+
+
+class TheSynthesisRecordFollowsItsWriter(unittest.TestCase):
+    """The discriminator is the engine that wrote a generation, never whether the run has a
+    run format: a run v2026.10.0 planned has none, yet a later generation this engine
+    writes on it is read this engine's way."""
+
+    def state(self, unit, tiers=("A run stops",), summary=None):
+        assignments = {did: {"defect": did, "heading": "h", "tier": tiers[0],
+                             "what_goes_wrong": "w", "fix": "f", "site_notes": {},
+                             "cross_references": []} for did in unit["defects"]}
+        return review_panel.SynthesisState(unit["id"], "complete", None, tuple(tiers),
+                                           assignments, (), summary)
+
+    def test_the_writer_is_recorded_or_defaulted_from_the_run_format(self):
+        writer = review_panel.synthesis_writer
+        self.assertEqual(writer({"id": "synth-A"}, None), review_panel.LEGACY_SYNTHESIS_WRITER)
+        self.assertEqual(writer({"id": "synth-A"}, review_panel.RUN_FORMAT),
+                         review_panel.SYNTHESIS_WRITER)
+        self.assertEqual(writer({"id": "synth-g2-A", "writer": review_panel.SYNTHESIS_WRITER},
+                                None), review_panel.SYNTHESIS_WRITER)
+
+    def test_an_old_generation_one_and_a_new_generation_two_each_get_their_shape(self):
+        old = {"id": "synth-A", "kind": "synthesizer", "lane": "A", "defects": ["D1", "D2"]}
+        new = {"id": "synth-g2-A", "kind": "synthesizer", "lane": "A",
+               "defects": ["D1", "D2"], "generation": 2,
+               "writer": review_panel.SYNTHESIS_WRITER}
+        generations = review_panel.synthesis_generations([old, new])
+        self.assertEqual(generations, {1: [old], 2: [new]})
+        first = review_panel.build_synthesis([old], [self.state(old, summary="all of it")],
+                                             None)
+        self.assertEqual(set(first.record),
+                         {"unit", "defects", "state", "reason", "tiers", "rejected",
+                          "summary"})
+        self.assertEqual(first.record["summary"], "all of it")
+        second = review_panel.build_synthesis([new], [self.state(new)], None)
+        self.assertEqual(second.record["generation"], 2)
+        self.assertEqual([u["unit"] for u in second.record["units"]], ["synth-g2-A"])
+        self.assertNotIn("summary", second.record)
+        self.assertEqual(second.batch_of, {"D1": "synth-g2-A", "D2": "synth-g2-A"})
+
+
+class ACrossReferenceFollowsTheSynthesisThatWroteIt(unittest.TestCase):
+    """For a generation this engine wrote, a reference survives on a shared file or a
+    shared batch; a shared tier is no longer enough, because tiers are named per batch and a
+    shared heading says nothing about two defects' code. A generation v2026.10.0 wrote keeps
+    the tier rule, so an old report re-renders with the references it had."""
+
+    FILES = {"D1": frozenset({"a.py"}), "D2": frozenset({"b.py"}),
+             "D3": frozenset({"c.py"})}
+    TIERS = {"D1": "Money moves twice", "D2": "Money moves twice", "D3": "Money moves twice"}
+    BATCHES = {"D1": "synth-A-b1", "D2": "synth-B-b2", "D3": "synth-A-b1"}
+
+    def test_every_defect_in_one_tier_a_cross_file_reference_between_batches_is_dropped(self):
+        kept, dropped = review_panel.resolve_cross_references(
+            "D1", ["D2"], self.FILES, self.BATCHES)
+        self.assertEqual(kept, [])
+        self.assertEqual(dropped, [{"defect": "D2", "reason": review_panel.CROSS_REF_APART}])
+
+    def test_one_within_a_batch_survives(self):
+        kept, dropped = review_panel.resolve_cross_references(
+            "D1", ["D3"], self.FILES, self.BATCHES)
+        self.assertEqual((kept, dropped), (["D3"], []))
+
+    def test_a_v2026_10_0_generation_keeps_the_tier_rule(self):
+        kept, dropped = review_panel.resolve_cross_references(
+            "D1", ["D2"], self.FILES, self.TIERS, review_panel.LEGACY_CROSS_REF_RULE)
+        self.assertEqual((kept, dropped), (["D2"], []))
+        self.assertIn("tier", review_panel.LEGACY_CROSS_REF_APART)
+        self.assertIn("batch", review_panel.CROSS_REF_APART)
+        self.assertNotIn("tier", review_panel.CROSS_REF_APART)
+
+
+class TheSynthesizerSchemaIsTheEnginesVocabulary(unittest.TestCase):
+    """The engine's pin on the shipped schema: the keys it parses are the keys the schema
+    declares, and a batch's reply carries no ``summary``."""
+
+    def test_the_result_keys_are_the_schemas(self):
+        schema = review_panel.load_schema(review_panel.SYNTHESIZER_SCHEMA_NAME)
+        self.assertEqual(set(review_panel.SYNTHESIZER_RESULT_KEYS), set(schema["properties"]))
+        self.assertEqual(set(schema["required"]), {"tiers", "defects"})
+        self.assertEqual(set(review_panel.SYNTHESIS_KEYS),
+                         set(schema["properties"]["defects"]["items"]["properties"]))
 
 
 class TheSynthesisLandsInTheStructureAndInBothDocuments(_FindingsCase):
@@ -17478,7 +18969,9 @@ class TheSynthesisLandsInTheStructureAndInBothDocuments(_FindingsCase):
         landed = SYNTH_TABLE[self.UNIT]
         self.assertEqual(doc["synthesis"]["tiers"], landed["tiers"])
         self.assertEqual(doc["synthesis"]["state"], "complete")
-        self.assertEqual(doc["synthesis"]["summary"], landed["summary"])
+        # A batch writes no paragraph about the run, so the record holds none yet.
+        self.assertIsNone(doc["synthesis"]["overview"])
+        self.assertNotIn("summary", doc["synthesis"])
         self.assertEqual(doc["synthesis"]["rejected"], [])
         defects = {c["id"]: c for c in doc["defects"]}
         for entry in landed["defects"]:
@@ -17545,12 +19038,8 @@ class TheSynthesisLandsInTheStructureAndInBothDocuments(_FindingsCase):
         prose = self.reads_as()
         page = (self.rundir / "report.html").read_text(encoding="utf-8")
         landed = SYNTH_TWO_TIERS[self.UNIT]
-        # The summary is the one field that is not about a defect. It renders once, under
-        # its own heading near the top, and nowhere in a defect's entry.
-        overview = " ".join(review_panel._unescape(
-            _section(self.text(), review_panel.SUBSECTION_OVERVIEW)).split())
-        self.assertIn(" ".join(landed["summary"].split()), overview)
-        self.assertEqual(prose.count(" ".join(landed["summary"].split())), 1)
+        # A batch writes no paragraph about the run, so no overview heads the report.
+        self.assertNotIn(f"### {review_panel.SUBSECTION_OVERVIEW}", self.text())
         # A refuted defect is one line in the appendix and renders no prose at all, so its
         # judgment is not among what the body carries.
         work = {c["id"] for c in self.findings()["defects"] if c["status"] != "refuted"}
@@ -17887,15 +19376,26 @@ class ACrossReferenceIsCheckedAsFarAsItCanBe(_FindingsCase):
     unchecked claim in the voice of a checked one, one level up.
 
     What is checkable is narrow. The id must name a defect in this run, and the two defects
-    must touch a file in common. Whether they are connected in the way the prose SAYS needs
-    a stage that read both, which the pipeline does not have — so a surviving reference is
-    checked and not verified, and this class is careful not to claim otherwise.
+    must touch a file in common or have been written up in one batch. Whether they are
+    connected in the way the prose SAYS needs a stage that read both, which the pipeline
+    does not have — so a surviving reference is checked and not verified, and this class is
+    careful not to claim otherwise.
 
     The run below raises a fifth candidate in a second file, so a defect exists that shares
-    no file with the one citing it. Everything else is the standard fixture.
+    no file with the one citing it, and its limits put that defect in a batch of its own.
+    Everything else is the standard fixture.
     """
 
     UNIT = "synth-A"
+    # D1 and D2 are written up in the first batch and D4 alone in the second: the reply
+    # limit fits the head and two defects' entries, not three.
+    FIRST, SECOND = "synth-A-b1", "synth-B-b2"
+
+    @staticmethod
+    def split(rundir):
+        doc = review_panel.limits_document(
+            {lane: {"synthesis": {"reply_bytes": 5000}} for lane in review_panel.LANES})
+        (rundir / "limits.json").write_text(json.dumps(doc), encoding="utf-8")
     OTHER_FILE = {**FINDING, "file": "engine/util.py", "line_start": 1, "line_end": 2,
                   "severity": "minor",
                   "consequence": "The helper returns a constant nobody checks.",
@@ -17923,24 +19423,32 @@ class ACrossReferenceIsCheckedAsFarAsItCanBe(_FindingsCase):
         entries = [{**entry, "cross_references": list(references)}
                    if entry["defect"] == "D1" else entry
                    for entry in SYNTH_TABLE[self.UNIT]["defects"]]
-        synthesis = {self.UNIT: {
-            "tiers": SYNTH_TABLE[self.UNIT]["tiers"],
-            "defects": [*entries,
-                        {"defect": "D4", "heading": "A caller reads a stale value.",
-                         "tier": SYNTH_TABLE[self.UNIT]["tiers"][1],
-                         "what_goes_wrong": "The helper answers the same thing whatever it "
-                                            "is asked, so a caller reads a stale value.",
-                         "fix": "Return the argument the caller passed.",
-                         "site_notes": [], "cross_references": []}],
-            "summary": "Two tiers over four defects."}}
+        synthesis = {
+            ACrossReferenceIsCheckedAsFarAsItCanBe.FIRST: {
+                "tiers": SYNTH_TABLE[self.UNIT]["tiers"], "defects": entries},
+            ACrossReferenceIsCheckedAsFarAsItCanBe.SECOND: {
+                "tiers": [SYNTH_TABLE[self.UNIT]["tiers"][1]],
+                "defects": [{"defect": "D4", "heading": "A caller reads a stale value.",
+                             "tier": SYNTH_TABLE[self.UNIT]["tiers"][1],
+                             "what_goes_wrong": "The helper answers the same thing whatever "
+                                                "it is asked, so a caller reads a stale "
+                                                "value.",
+                             "fix": "Return the argument the caller passed.",
+                             "site_notes": [], "cross_references": []}]}}
         return reading, verify, grouping, synthesis
 
     def judged(self, references, rundir=None, synthesis=True):
         reading, verify, grouping, table = self.tables(references)
         rundir = rundir or self.rundir
         self.run_all(rundir, reading=reading, verify=verify, grouping=grouping,
-                     synthesis=table if synthesis else None)
+                     synthesis=table if synthesis else None, after_plan=self.split)
         return self.defects(rundir)
+
+    def test_d4_is_written_up_in_a_batch_of_its_own(self):
+        # Anti-vacuity for the refusals below: in one batch with D1 the reference would
+        # survive on the batch alone.
+        self.judged([])
+        self.assertEqual([u["defects"] for u in self.synthesizers()], [["D1", "D2"], ["D4"]])
 
     def test_the_fixture_really_holds_two_files_and_four_defects(self):
         # Anti-vacuity for every case below: a run whose defects all sat in one file could
@@ -18070,6 +19578,17 @@ class ACrossReferenceIsCheckedAsFarAsItCanBe(_FindingsCase):
                 self.assertIn(condition, brief)
                 self.assertIn(condition, described)
                 self.assertIn(condition, review_panel.CROSS_REF_APART)
+        # The rule a generation v2026.10.0 wrote is checked by is not this engine's, and the
+        # writer is never told its condition: a batch's tiers are its own until reconciled.
+        legacy_only = [name for name, _ in review_panel.LEGACY_CROSS_REF_RULE
+                       if name not in conditions]
+        self.assertTrue(legacy_only)
+        for condition in legacy_only:
+            with self.subTest(legacy=condition):
+                self.assertNotIn(condition, brief)
+                self.assertNotIn(condition, described)
+                self.assertNotIn(condition, review_panel.CROSS_REF_APART)
+                self.assertIn(condition, review_panel.LEGACY_CROSS_REF_APART)
         self.assertIn("drops any reference that fails the check", brief)
         # The reporting half landed with the rendering, so the brief may now state it —
         # and must, since it is the one thing telling the writer a refusal is visible.
@@ -18604,7 +20123,6 @@ SYNTH_EIGHT_REPORTS = {
                      "what_goes_wrong": SYNTH_TABLE["synth-A"]["defects"][0]["what_goes_wrong"],
                      "fix": SYNTH_TABLE["synth-A"]["defects"][0]["fix"],
                      "site_notes": [], "cross_references": []}],
-        "summary": "One tier.",
     },
 }
 
@@ -19000,27 +20518,33 @@ class ACrossReferenceSurvivesOnASharedTier(unittest.TestCase):
     calls it, say, or a chain of calls across three files. Those are exactly the connections
     a reader wants and exactly the ones a same-file rule cannot see.
 
-    A shared TIER is evidence of the same kind. The synthesis round assigns tiers to group
-    chains like these, so two defects the round put under one theme are connected by the
-    round's own judgment -- which is the thing the file test was standing in for.
+    A shared TIER is evidence of the same kind for a generation v2026.10.0 wrote: its one
+    unit named the run's one vocabulary, so two defects it put under one theme are connected
+    by that unit's own judgment. That rule is kept for such a generation, and this class
+    pins it; ``ACrossReferenceFollowsTheSynthesisThatWroteIt`` covers the batch rule.
     """
+
+    RULE = review_panel.LEGACY_CROSS_REF_RULE
 
     FILES = {"D1": frozenset({"a.py"}), "D2": frozenset({"b.py"}), "D3": frozenset({"a.py"})}
 
     def test_a_shared_file_still_keeps_a_link(self):
-        kept, dropped = review_panel.resolve_cross_references("D1", ["D3"], self.FILES)
+        kept, dropped = review_panel.resolve_cross_references("D1", ["D3"], self.FILES,
+                                                                rule=self.RULE)
         self.assertEqual((kept, dropped), (["D3"], []))
 
     def test_a_shared_tier_keeps_a_link_with_no_file_in_common(self):
         tiers = {"D1": "Money moves twice", "D2": "Money moves twice"}
-        kept, dropped = review_panel.resolve_cross_references("D1", ["D2"], self.FILES, tiers)
+        kept, dropped = review_panel.resolve_cross_references("D1", ["D2"], self.FILES, tiers,
+                                                                self.RULE)
         self.assertEqual((kept, dropped), (["D2"], []))
 
     def test_neither_a_file_nor_a_tier_in_common_still_drops_it(self):
         tiers = {"D1": "Money moves twice", "D2": "A run stops"}
-        kept, dropped = review_panel.resolve_cross_references("D1", ["D2"], self.FILES, tiers)
+        kept, dropped = review_panel.resolve_cross_references("D1", ["D2"], self.FILES, tiers,
+                                                                self.RULE)
         self.assertEqual(kept, [])
-        self.assertEqual(dropped[0]["reason"], review_panel.CROSS_REF_APART)
+        self.assertEqual(dropped[0]["reason"], review_panel.LEGACY_CROSS_REF_APART)
 
     def test_a_run_without_tiers_is_not_a_run_where_every_link_survives(self):
         """The rule must not become "keep everything" where the synthesis round did not
@@ -19028,9 +20552,9 @@ class ACrossReferenceSurvivesOnASharedTier(unittest.TestCase):
         for tiers in ({}, {"D1": None, "D2": None}):
             with self.subTest(tiers=tiers):
                 kept, dropped = review_panel.resolve_cross_references(
-                    "D1", ["D2"], self.FILES, tiers)
+                    "D1", ["D2"], self.FILES, tiers, self.RULE)
                 self.assertEqual(kept, [])
-                self.assertEqual(dropped[0]["reason"], review_panel.CROSS_REF_APART)
+                self.assertEqual(dropped[0]["reason"], review_panel.LEGACY_CROSS_REF_APART)
 
     def test_a_reference_is_kept_exactly_when_a_named_condition_holds(self):
         """Every combination of the two conditions, so the resolver cannot accept a pair on
@@ -19045,21 +20569,22 @@ class ACrossReferenceSurvivesOnASharedTier(unittest.TestCase):
                     tiers = {"D1": "Money moves twice",
                              "D2": "Money moves twice" if share_tier else None}
                     kept, dropped = review_panel.resolve_cross_references(
-                        "D1", ["D2"], files_of, tiers)
+                        "D1", ["D2"], files_of, tiers, self.RULE)
                     if share_file or share_tier:
                         self.assertEqual((kept, dropped), (["D2"], []))
                     else:
                         self.assertEqual(kept, [])
-                        self.assertEqual(dropped, [{"defect": "D2",
-                                                    "reason": review_panel.CROSS_REF_APART}])
+                        self.assertEqual(dropped, [{
+                            "defect": "D2", "reason": review_panel.LEGACY_CROSS_REF_APART}])
 
     def test_the_dropped_reason_names_both_conditions(self):
-        self.assertIn("file in common", review_panel.CROSS_REF_APART)
-        self.assertIn("tier", review_panel.CROSS_REF_APART)
+        self.assertIn("file in common", review_panel.LEGACY_CROSS_REF_APART)
+        self.assertIn("tier", review_panel.LEGACY_CROSS_REF_APART)
 
     def test_an_id_naming_no_defect_is_still_refused_first(self):
         tiers = {"D1": "Money moves twice", "D9": "Money moves twice"}
-        kept, dropped = review_panel.resolve_cross_references("D1", ["D9"], self.FILES, tiers)
+        kept, dropped = review_panel.resolve_cross_references("D1", ["D9"], self.FILES, tiers,
+                                                                self.RULE)
         self.assertEqual(kept, [])
         self.assertEqual(dropped[0]["reason"], review_panel.CROSS_REF_ABSENT)
 
@@ -19085,7 +20610,7 @@ class ACrossReferenceIsRenderedOrNamedAsDropped(_FindingsCase):
             ACrossReferenceIsCheckedAsFarAsItCanBe.tables(self, references))
         rundir = rundir or self.rundir
         self.run_all(rundir, reading=reading, verify=verify, grouping=grouping,
-                     synthesis=table)
+                     synthesis=table, after_plan=ACrossReferenceIsCheckedAsFarAsItCanBe.split)
         return rundir
 
     def test_a_surviving_reference_renders_as_a_link_that_resolves_in_the_page(self):
@@ -19139,6 +20664,10 @@ class ACrossReferenceIsRenderedOrNamedAsDropped(_FindingsCase):
                 unit["defects"] = ["D1", "D2", "D3"]
                 unit["defect_sites"] = [["S1"], ["S2"], ["S3"]]
         (self.rundir / "units.json").write_text(json.dumps(doc), encoding="utf-8")
+        # The round's record beside it, as the engine writes the two together.
+        (self.rundir / review_panel.ROUNDS_DIR / "synthesis-g1-1.json").write_text(
+            json.dumps(review_panel.batches_round_record(
+                [u for u in doc["units"] if u["kind"] == "synthesizer"])), encoding="utf-8")
         stub_dispatch(self.rundir, table)
         self.report()
 
@@ -19489,8 +21018,13 @@ class TheMarkerIsTheOnlyCommitRecord(_ReportCase):
         self.synthesize()
         self.assertEqual(self.synthesizers(), [])
         self.assertEqual(self.units()["stage"], "synthesized")
-        proc = self.synthesize(expect=2)
-        self.assertIn("'synthesized'", proc.stderr)
+        # At `synthesized` the stage plans a later round or nothing; a round of no units
+        # has nothing after it, so it plans nothing and is never asked for again.
+        self.assertFalse(review_panel.synthesis_needs_round(self.rundir))
+        proc = self.synthesize()
+        self.assertIn("nothing to plan", proc.stdout)
+        self.assertEqual(self.synthesizers(), [])
+        self.assertEqual(self.units()["stage"], "synthesized")
 
     def fails_on_the_page(self, lost):
         """``report`` stopped between ``report.md`` and ``report.html``, with the prose it
@@ -19784,8 +21318,8 @@ class TheClaimIsWhatExcludes(_ReportCase):
         other = {}
         real = review_panel.route
 
-        def let_another_in(found):
-            batches = real(found)
+        def let_another_in(*args, **kwargs):
+            batches = real(*args, **kwargs)
             other["proc"] = _run("route", str(self.rundir))
             return batches
 
@@ -20296,7 +21830,12 @@ class TheReportPrintsTheSummariesTheRunSaved(_FindingsCase):
     prints them."""
 
     UNIT = "synth-A"
-    OVERVIEW = SYNTH_TABLE["synth-A"]["summary"]
+    OVERVIEW = LEGACY_OVERVIEW
+
+    def run_old(self, rundir=None, synthesis=LEGACY_SYNTH_TABLE):
+        """The paragraph is what a generation v2026.10.0 wrote carries; a batch writes
+        none."""
+        return self.run_all(rundir, synthesis=synthesis, after_synthesize=_as_v2026_10_0)
 
     def overview(self, text=None):
         text = self.text() if text is None else text
@@ -20304,7 +21843,7 @@ class TheReportPrintsTheSummariesTheRunSaved(_FindingsCase):
         return _section(text, review_panel.SUBSECTION_OVERVIEW) if heading in text else None
 
     def test_a_completed_round_prints_its_paragraph_labeled_as_a_reading(self):
-        self.run_all(synthesis=SYNTH_TABLE)
+        self.run_old()
         text = self.text()
         section = self.overview(text)
         self.assertIsNotNone(section)
@@ -20320,23 +21859,26 @@ class TheReportPrintsTheSummariesTheRunSaved(_FindingsCase):
     def test_no_paragraph_is_printed_where_there_is_none_to_print(self):
         for name, synthesis in (("none", None), ("missing", {}),
                                 ("failed", {self.UNIT: "no object\n"}),
-                                ("empty", {self.UNIT: {**SYNTH_TABLE[self.UNIT],
+                                ("empty", {self.UNIT: {**LEGACY_SYNTH_TABLE[self.UNIT],
                                                        "summary": "  "}})):
             with self.subTest(round=name):
                 rundir = self.tmp / f"run-{name}"
-                self.run_all(rundir, synthesis=synthesis)
+                if synthesis is None:
+                    self.run_all(rundir)
+                else:
+                    self.run_old(rundir, synthesis)
                 self.assertIsNone(self.overview(self.text(rundir)))
                 self.assertNotIn(review_panel.SUBSECTION_OVERVIEW,
                                  (rundir / "report.html").read_text(encoding="utf-8"))
 
     def test_a_record_with_no_summary_field_renders_without_one(self):
-        self.run_all(synthesis=SYNTH_TABLE)
+        self.run_old()
         text = self.rerender(lambda doc: doc["synthesis"].pop("summary"))
         self.assertIsNone(self.overview(text))
 
     def test_the_paragraph_cannot_open_a_block_of_its_own(self):
         forged = "# 9. Forged section\n- D9 invented <b>bold</b>"
-        self.run_all(synthesis={self.UNIT: {**SYNTH_TABLE[self.UNIT], "summary": forged}})
+        self.run_old(synthesis={self.UNIT: {**SYNTH_TABLE[self.UNIT], "summary": forged}})
         section = self.overview()
         self.assertNotIn("\n# 9.", section)
         self.assertNotIn("\n- D9", section)
@@ -20363,7 +21905,7 @@ class TheReportPrintsTheSummariesTheRunSaved(_FindingsCase):
         self.assertNotIn("What the probe reported", text)
 
     def test_a_rerender_of_an_existing_run_picks_both_up(self):
-        self.run_all(synthesis=SYNTH_TABLE)
+        self.run_old()
         (self.rundir / "report.md").write_text("an older report\n", encoding="utf-8")
         proc = _run("report", str(self.rundir), "--rerender")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -20574,7 +22116,8 @@ class _SitesCase(_FindingsCase):
         states = review_panel.read_verification_results(rundir, batches, reproducible)
         resolved = review_panel.resolve(routed["candidates"], holder, states)
         cluster_units = [u for u in units_doc["units"] if u["kind"] == "clusterer"]
-        cluster_states = review_panel.read_clustering_results(rundir, cluster_units)
+        cluster_states = review_panel.read_clustering_results(rundir, cluster_units,
+                                                              routed["candidates"])
         clustering = review_panel.build_clusters(routed["candidates"], cluster_units,
                                                  cluster_states)
         snippets = {c["id"]: None for c in routed["candidates"]}
@@ -20932,8 +22475,7 @@ class _FiveSiteCase(_FindingsCase):
                                    if several else []),
                     "cross_references": []})
             stub_dispatch(rundir, {unit["id"]: {"tiers": ["A total is wrong"],
-                                                "defects": entries,
-                                                "summary": "One mistake at five sites."}})
+                                                "defects": entries}})
         self.report(rundir)
         self.doc = self.findings()
         self.md = self.text()
@@ -21996,6 +23538,58 @@ class ARunFromBeforeSitesStillRenders(unittest.TestCase):
                                      "half of this proves nothing")
 
 
+_TAG_RUN = Path(__file__).resolve().parent / "fixtures" / "review-panel" / "v2026.10.0-run"
+_OLD_RUN_RERENDERED = (Path(__file__).resolve().parent / "fixtures" / "review-panel"
+                       / "old-run-rerendered")
+# The one line of a report that names where the run directory is, which a copy moves.
+_RUNDIR_LINE = re.compile(r"(Run directory, holding every payload[^:\n]*: ).*")
+_REPORT_OUTPUTS = ("report.md", "report.html", "findings.json", "fix-brief.md",
+                   "fix-brief.json")
+
+
+class OldRunsReRenderUnchanged(unittest.TestCase):
+    """A run directory an earlier release wrote re-renders exactly as that release
+    re-rendered it. Compared as text, so a checkout that turned line endings into CRLF
+    compares equal, and with the line naming the run directory aside, since the copy is
+    somewhere else."""
+
+    def rerender(self, fixture):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        rundir = Path(tmp.name).resolve() / "run"
+        shutil.copytree(fixture, rundir)
+        proc = _run("report", str(rundir), "--rerender")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        return rundir
+
+    def assert_same_outputs(self, baseline, rundir):
+        names = [*_REPORT_OUTPUTS, *(f"fix-brief/{p.name}"
+                                    for p in sorted((baseline / "fix-brief").iterdir()))]
+        self.assertEqual(sorted(p.name for p in (rundir / "fix-brief").iterdir()),
+                         sorted(p.name for p in (baseline / "fix-brief").iterdir()))
+        for name in names:
+            with self.subTest(file=name):
+                want = (baseline / name).read_text(encoding="utf-8")
+                got = (rundir / name).read_text(encoding="utf-8")
+                self.assertEqual(_RUNDIR_LINE.sub(r"\1", got), _RUNDIR_LINE.sub(r"\1", want))
+
+    def test_the_tag_built_run_rerenders_as_it_was_published(self):
+        rundir = self.rerender(_TAG_RUN)
+        units = json.loads((_TAG_RUN / "units.json").read_text(encoding="utf-8"))["units"]
+        kinds = [u["kind"] for u in units]
+        # Anti-vacuity: the shapes this fixture exists to carry.
+        self.assertEqual(kinds.count("merger"), 2)
+        self.assertEqual(kinds.count("merge-checker"), 1)
+        self.assertEqual([u["id"] for u in units if u["kind"] == "synthesizer"], ["synth-A"])
+        self.assertIsNone(review_panel.read_run_format(_TAG_RUN))
+        self.assert_same_outputs(_TAG_RUN, rundir)
+
+    def test_the_old_run_rerenders_as_the_tag_rerendered_it(self):
+        rundir = self.rerender(_OLD_RUN)
+        self.assert_same_outputs(_OLD_RUN_RERENDERED, rundir)
+
+
 class TwoBlocksAreOneOnlyWhereTheyAreTheSameText(unittest.TestCase):
     """An identical block another site printed becomes a pointer. Identical means the same
     text; only the indentation the Markdown nests the block under is not part of it."""
@@ -23028,7 +24622,7 @@ class AMergeCheckedGroupIsOneDefect(_FindingsCase):
         synthesis = {"synth-A": {"tiers": ["A run stops"], "defects": [
             {"defect": "D1", "heading": "It indexes first.", "tier": "A run stops",
              "what_goes_wrong": "It indexes first.", "fix": "Check first.", "site_notes": [],
-             "cross_references": []}], "summary": "one"}}
+             "cross_references": []}]}}
         self.merged_run(synthesis=synthesis)
         self.assertEqual(self.units()["stage"], review_panel.REPORTED_STAGE)
         # The merge's groups move under the check planned over them.
@@ -23176,8 +24770,1308 @@ class EverySiteOfAMergedGapRendersInTheCoverageSections(_CoverageCase):
                              .splitlines() if re.match(r'^\| (?:<a id="[^"]+"></a>)?S\d', line)), 1)
 
 
+# --------------------------------------------------------------------------- #
+# synthesis rounds: tier names reconciled, tier summaries and the overview
+# --------------------------------------------------------------------------- #
+# Short briefs, so a payload's fixed part is small and a test can choose limits that split
+# a round without hundreds of defects.
+ROUND_COMPANIONS = review_panel.RoundCompanions(
+    tier_names_brief="Merge the names.", tier_names_schema=None,
+    overview_brief="Summarize.", overview_schema=None)
+
+
+def _round_limits(input_bytes=200 * 1024, reply_bytes=60 * 1024):
+    """Run limits whose synthesis input and reply are these, on both lanes."""
+    return _synthesis_limits(input_bytes=input_bytes, reply_bytes=reply_bytes,
+                             index_bytes=review_panel.INDEX_NOTICE_FLOOR)
+
+
+def _batch_row(unit_id, lane, defects):
+    return {"id": unit_id, "kind": review_panel.SYNTHESIZER_KIND, "lane": lane,
+            "defects": list(defects), "defect_sites": [[f"S{d[1:]}"] for d in defects],
+            "generation": 1, "writer": review_panel.SYNTHESIS_WRITER, "round": 1,
+            "limits": {"planning": {"input_bytes": 1, "reply_bytes": 1}}}
+
+
+def _batch_state(row, tiers, heading=lambda did: f"{did} goes wrong in its own way."):
+    """A landed batch: ``tiers`` maps each defect to the tier its batch named for it."""
+    names = list(dict.fromkeys(tiers[did] for did in row["defects"]))
+    assignments = {did: {"defect": did, "heading": heading(did), "tier": tiers[did],
+                         "what_goes_wrong": "w", "fix": "f", "site_notes": {},
+                         "cross_references": []} for did in row["defects"]}
+    return review_panel.SynthesisState(row["id"], review_panel.UNIT_COMPLETE, None,
+                                       tuple(names), assignments, (), None)
+
+
+class _InMemoryRounds:
+    """A generation held in memory: its batches landed, each later round planned by the
+    engine, listed and recorded as ``synthesize`` lists and records it, and answered by
+    ``answer(row, unit)`` — an object, which is parsed as the engine parses a landed
+    result; a string, which is a failed unit; or ``None``, which leaves it unlanded."""
+
+    def __init__(self, batches, limits=None, problem="Find what breaks."):
+        self.units = [row for row, _state in batches]
+        self.states = [state for _row, state in batches]
+        self.limits = limits or _round_limits()
+        self.problem = problem
+        self.landed = {}
+        self.records = {(1, 1): review_panel.batches_round_record(self.units)}
+        self.planned = []
+        self.texts = {}
+
+    def name_of(self, unit_id, entry):
+        """The name a tier-name unit's payload gives ``entry``."""
+        block = self.texts[unit_id].split(f"\n### {entry}\n", 1)[1]
+        return next(line[len("Name: "):] for line in block.splitlines()
+                    if line.startswith("Name: "))
+
+    def read(self, row):
+        if row["id"] not in self.landed:
+            return review_panel.round_state(row, review_panel.UNIT_MISSING, "not landed")
+        state, payload = self.landed[row["id"]]
+        return review_panel.round_state(row, state, payload)
+
+    def replay(self):
+        return review_panel.replay_synthesis(self.units, self.states, self.read,
+                                             self.records, ROUND_COMPANIONS, self.problem,
+                                             self.limits)
+
+    def run(self, answer, rounds=30):
+        for _ in range(rounds):
+            replayed = self.replay()
+            if replayed.next_round is None:
+                return replayed
+            planned = replayed.next_round
+            self.planned.append(planned)
+            rows = review_panel.round_unit_rows(planned)
+            self.units += rows
+            self.records[(planned.generation, planned.round)] = \
+                review_panel.round_record_of(planned)
+            for row, unit in zip(rows, planned.units):
+                self.texts[row["id"]] = unit.text
+                reply = answer(row, unit)
+                if reply is None:
+                    continue
+                self.landed[row["id"]] = ((review_panel.UNIT_FAILED, reply)
+                                          if isinstance(reply, str)
+                                          else (review_panel.UNIT_COMPLETE, reply))
+        raise AssertionError(f"the rounds did not end within {rounds}")
+
+    def ids(self, phase):
+        return [unit.id for planned in self.planned if planned.phase == phase
+                for unit in planned.units]
+
+
+def _map_all_to(name):
+    """A tier-name reply mapping every entry it was handed to one final name."""
+    def reply(row):
+        return {"tiers": [name], "map": [{"entry": eid, "tier": 1} for eid in row["entries"]]}
+    return reply
+
+
+def _short_summary(row, unit):
+    return {"summary": f"What {row['id']} covers, briefly."}
+
+
+def _answering(names=None, summary=_short_summary):
+    def answer(row, unit):
+        if row["kind"] == review_panel.TIER_NAMER_KIND:
+            return names(row) if names is not None else _map_all_to("One theme")(row)
+        return summary(row, unit)
+    return answer
+
+
+def _names_never_called(answer):
+    """``answer``, for a generation that must plan no tier-name round."""
+    def guarded(row, unit):
+        if row["kind"] == review_panel.TIER_NAMER_KIND:
+            raise AssertionError(f"{row['id']} was planned")
+        return answer(row, unit)
+    return guarded
+
+
+class TierNamesAreReconciledAcrossBatches(unittest.TestCase):
+    """Batches name tiers independently, so two may name one theme in two phrasings. One
+    round reads every name the landed batches used and returns the run's final list."""
+
+    STOPS, DIES = "A run stops instead of finishing", "The tool dies on bad input"
+
+    def two_batches(self):
+        first = _batch_row("synth-A-b1", "A", ["D1"])
+        second = _batch_row("synth-B-b2", "B", ["D2"])
+        return [(first, _batch_state(first, {"D1": self.STOPS})),
+                (second, _batch_state(second, {"D2": self.DIES}))]
+
+    def test_two_batches_naming_one_theme_differently_end_under_one_tier(self):
+        rounds = _InMemoryRounds(self.two_batches())
+        planned = rounds.replay().next_round
+        self.assertEqual((planned.phase, planned.level, planned.round),
+                         (review_panel.PHASE_TIER_NAMES, 1, 2))
+        self.assertEqual([(u.id, u.kind, u.entries) for u in planned.units],
+                         [("synth-tiers-l1-c1", review_panel.TIER_NAMER_KIND, ("N1", "N2"))])
+        text = planned.units[0].text
+        self.assertIn(f"Name: {self.STOPS}", text)
+        self.assertIn(f"Name: {self.DIES}", text)
+        self.assertIn("Defects: 1", text)
+        self.assertIn("D1 goes wrong in its own way.", text)
+        self.assertEqual(review_panel.round_unit_rows(planned)[0]["lane"],
+                         review_panel.LANES[0])
+        done = rounds.run(_answering(_map_all_to(self.STOPS)))
+        self.assertEqual(done.tier_names["state"], review_panel.NAMES_RECONCILED)
+        self.assertEqual(done.tiers, (self.STOPS,))
+        self.assertEqual(done.final_of, {self.STOPS: self.STOPS, self.DIES: self.STOPS})
+
+    def test_identical_names_are_one_entry_and_one_batch_needs_no_round(self):
+        first = _batch_row("synth-A-b1", "A", ["D1"])
+        second = _batch_row("synth-B-b2", "B", ["D2"])
+        same = _InMemoryRounds([(first, _batch_state(first, {"D1": self.STOPS})),
+                                (second, _batch_state(second, {"D2": self.STOPS}))])
+        done = same.run(_answering())
+        self.assertEqual(same.ids(review_panel.PHASE_TIER_NAMES), [])
+        self.assertEqual(done.tier_names["state"], review_panel.ROUND_NOT_NEEDED)
+        alone = _batch_row("synth-A", "A", ["D1", "D2"])
+        one = _InMemoryRounds([(alone, _batch_state(alone, {"D1": self.STOPS,
+                                                            "D2": self.DIES}))])
+        one.run(_answering())
+        self.assertEqual(one.ids(review_panel.PHASE_TIER_NAMES), [])
+
+    def test_a_mapping_that_misses_or_repeats_or_invents_an_entry_fails_the_unit(self):
+        parse = review_panel.parse_tier_names_result
+        handed = ("N1", "N2")
+        tiers, final = parse({"tiers": ["One", "Two"],
+                              "map": [{"entry": "N1", "tier": 2}, {"entry": "N2", "tier": 2}]},
+                             "synth-tiers-l1-c1", handed)
+        self.assertEqual((tiers, final), (("Two",), {"N1": "Two", "N2": "Two"}))
+        for reply, said in (
+                ({"tiers": ["One"], "map": [{"entry": "N1", "tier": 1}]}, "N2"),
+                ({"tiers": ["One"], "map": [{"entry": "N1", "tier": 1},
+                                            {"entry": "N1", "tier": 1},
+                                            {"entry": "N2", "tier": 1}]}, "twice"),
+                ({"tiers": ["One"], "map": [{"entry": "N1", "tier": 1},
+                                            {"entry": "N2", "tier": 1},
+                                            {"entry": "N9", "tier": 1}]}, "N9"),
+                ({"tiers": ["One"], "map": [{"entry": "N1", "tier": 1},
+                                            {"entry": "N2", "tier": 2}]}, "tier"),
+                ({"tiers": [], "map": []}, "empty")):
+            with self.subTest(said=said):
+                with self.assertRaises(review_panel.ResultError) as ctx:
+                    parse(reply, "synth-tiers-l1-c1", handed)
+                self.assertIn("synth-tiers-l1-c1", str(ctx.exception))
+                self.assertIn(said, str(ctx.exception))
+
+    def test_a_reply_naming_more_final_tiers_than_entries_fails_the_unit(self):
+        # The reply limit prices one final name per entry handed, so a reply listing more
+        # names than that could run past the limit the unit was packed under.
+        parse = review_panel.parse_tier_names_result
+        handed = ("N1", "N2")
+        mapping = [{"entry": "N1", "tier": 1}, {"entry": "N2", "tier": 2}]
+        self.assertEqual(parse({"tiers": ["One", "Two"], "map": mapping},
+                               "synth-tiers-l1-c1", handed)[0], ("One", "Two"))
+        with self.assertRaises(review_panel.ResultError) as ctx:
+            parse({"tiers": ["One", "Two", "Three"], "map": mapping},
+                  "synth-tiers-l1-c1", handed)
+        self.assertIn("synth-tiers-l1-c1", str(ctx.exception))
+        self.assertIn("3 tiers", str(ctx.exception))
+
+    def test_a_final_name_over_the_length_cap_fails_the_unit(self):
+        cap = review_panel.TIER_NAME_CHARS
+        parse = review_panel.parse_tier_names_result
+        for name, ok in (("x" * cap, True), ("x" * (cap + 1), False)):
+            reply = {"tiers": [name], "map": [{"entry": "N1", "tier": 1}]}
+            with self.subTest(chars=len(name)):
+                if ok:
+                    self.assertEqual(parse(reply, "synth-tiers-l1-c1", ("N1",))[0], (name,))
+                    continue
+                with self.assertRaises(review_panel.ResultError) as ctx:
+                    parse(reply, "synth-tiers-l1-c1", ("N1",))
+                self.assertIn("synth-tiers-l1-c1", str(ctx.exception))
+                self.assertIn(f"{cap + 1} characters", str(ctx.exception))
+
+    def test_a_final_name_changed_under_a_summary_round_is_refused(self):
+        # The summary payload carries the tier's name, so a name changed with the mapping
+        # left alone is other input than the summary round was planned from.
+        rounds = _InMemoryRounds(self.two_batches())
+        done = rounds.run(_answering(summary=lambda row, unit: None))
+        self.assertEqual(rounds.ids(review_panel.PHASE_TIER_SUMMARIES),
+                         ["synth-tier-1-l1-c1"])
+        self.assertIsNone(done.next_round)
+        row = next(u for u in rounds.units if u["id"] == "synth-tiers-l1-c1")
+        rounds.landed[row["id"]] = (review_panel.UNIT_COMPLETE,
+                                    _map_all_to("Another name for it")(row))
+        with self.assertRaises(review_panel.RunDirError) as ctx:
+            rounds.replay()
+        self.assertIn("round 3", str(ctx.exception))
+
+    def test_a_failed_round_leaves_the_batches_names_and_the_overview_is_still_complete(self):
+        rounds = _InMemoryRounds(self.two_batches())
+        done = rounds.run(_answering(names=lambda row: "the reply was not JSON\n"))
+        self.assertEqual(done.tier_names["state"], review_panel.NAMES_NOT_RECONCILED)
+        self.assertIn("synth-tiers-l1-c1", done.tier_names["reason"])
+        self.assertEqual(done.tiers, (self.STOPS, self.DIES))
+        self.assertEqual(done.final_of, {self.STOPS: self.STOPS, self.DIES: self.DIES})
+        # Both of the batches' names get a summary, and the overview is written over them.
+        self.assertEqual([t["tier"] for t in done.tier_summaries], [self.STOPS, self.DIES])
+        self.assertEqual(done.overview["state"], review_panel.UNIT_COMPLETE)
+        self.assertIsNotNone(done.overview_text)
+        self.assertFalse(done.limits_too_small)
+
+
+class TierNamesThatDoNotFitOneUnitAreReconciledInLevels(unittest.TestCase):
+    """Names that do not fit one unit are reconciled in chunks, and the chunks' final tiers
+    reconciled in turn. Identical names out of two chunks meet as one entry at the next
+    level, and a level that would not reduce the count stops the round."""
+
+    def many(self, count=8):
+        """``count`` batches, each naming a tier of its own and a shared one."""
+        out = []
+        for k in range(1, count + 1):
+            row = _batch_row(f"synth-{'AB'[(k - 1) % 2]}-b{k}", "AB"[(k - 1) % 2],
+                             [f"D{2 * k - 1}", f"D{2 * k}"])
+            out.append((row, _batch_state(row, {
+                f"D{2 * k - 1}": f"Theme number {k} as batch {k} phrased it, at length",
+                f"D{2 * k}": "Shared"})))
+        return out
+
+    def tight(self):
+        """Input limits that fit a few entries per tier-name chunk."""
+        head = review_panel.render_tier_names_payload(
+            ROUND_COMPANIONS.tier_names_brief, "Find what breaks.", (), None)
+        return _round_limits(input_bytes=review_panel.measure_payload(head)[1] + 400,
+                             reply_bytes=8000)
+
+    def test_names_that_do_not_fit_are_reconciled_in_two_levels(self):
+        rounds = _InMemoryRounds(self.many(), self.tight())
+
+        def names(row):
+            # Every chunk merges its themes into one name and keeps `Shared`.
+            return {"tiers": ["Everything else", "Shared"],
+                    "map": [{"entry": eid,
+                             "tier": 2 if rounds.name_of(row["id"], eid) == "Shared" else 1}
+                            for eid in row["entries"]]}
+        done = rounds.run(_answering(names))
+        levels = [p.level for p in rounds.planned if p.phase == review_panel.PHASE_TIER_NAMES]
+        self.assertEqual(levels[:1], [1])
+        self.assertGreater(len(rounds.planned[0].units), 1, "level 1 fit one unit")
+        self.assertIn(2, levels)
+        self.assertEqual(done.tier_names["state"], review_panel.NAMES_RECONCILED)
+        self.assertEqual(set(done.tiers), {"Everything else", "Shared"})
+        self.assertEqual(done.final_of["Shared"], "Shared")
+        self.assertEqual(done.final_of["Theme number 3 as batch 3 phrased it, at length"],
+                         "Everything else")
+        # Identical names out of every chunk met as ONE entry at the next level, its count
+        # the sum of theirs.
+        second = next(p for p in rounds.planned
+                      if p.phase == review_panel.PHASE_TIER_NAMES and p.level == 2)
+        text = "".join(unit.text for unit in second.units)
+        self.assertEqual(text.count("Name: Shared\n"), 1)
+        self.assertEqual(text.count("Name: Everything else\n"), 1)
+        self.assertIn("Defects: 8\n", text)
+
+    def test_a_level_that_would_not_reduce_stops_the_round(self):
+        rounds = _InMemoryRounds(self.many(), self.tight())
+
+        def keep(row):
+            # Limits that fit every summary from here on: what is asserted is the tier
+            # names alone, not the summaries planned after them.
+            rounds.limits = _round_limits()
+            return {"tiers": [f"Kept {eid} of {row['id']}" for eid in row["entries"]],
+                    "map": [{"entry": eid, "tier": k}
+                            for k, eid in enumerate(row["entries"], 1)]}
+        done = rounds.run(_answering(keep))
+        self.assertEqual([p.level for p in rounds.planned
+                          if p.phase == review_panel.PHASE_TIER_NAMES], [1])
+        self.assertEqual(done.tier_names["state"], review_panel.NAMES_NOT_RECONCILED)
+        self.assertIn("would not reduce", done.tier_names["reason"])
+        # The batches' own names stand, and the overview over them is not incomplete.
+        self.assertIn("Shared", done.tiers)
+        self.assertFalse(done.limits_too_small)
+
+    def test_a_chunk_merging_every_name_it_holds_stays_within_its_reply_limit(self):
+        rounds = _InMemoryRounds(self.many(), self.tight())
+        planned = rounds.replay().next_round
+        self.assertGreater(len(planned.units), 1)
+        for unit in planned.units:
+            limit = unit.limits["planning"]["reply_bytes"]
+            names = [line.split("Name: ", 1)[1] for line in unit.text.splitlines()
+                     if line.startswith("Name: ")]
+            merged = {"tiers": ["One name for all of them"],
+                      "map": [{"entry": eid, "tier": 1} for eid in unit.entries]}
+            apart = {"tiers": names,
+                     "map": [{"entry": eid, "tier": k}
+                             for k, eid in enumerate(unit.entries, 1)]}
+            for reply in (merged, apart):
+                with self.subTest(unit=unit.id, tiers=len(reply["tiers"])):
+                    self.assertLessEqual(len(json.dumps(reply, indent=2).encode("utf-8")),
+                                         limit)
+
+
+    def test_a_chunk_estimate_covers_its_largest_legal_reply(self):
+        # The largest reply a chunk may legally return names every entry apart, each under
+        # a name at the length cap written in the characters that encode longest in JSON.
+        cap = review_panel.TIER_NAME_CHARS
+        rounds = _InMemoryRounds(self.many(), _round_limits(reply_bytes=2000))
+        planned = rounds.replay().next_round
+        for unit in planned.units:
+            reply = {"tiers": ["\x00" * (cap - len(str(k))) + str(k)
+                               for k in range(1, len(unit.entries) + 1)],
+                     "map": [{"entry": eid, "tier": k}
+                             for k, eid in enumerate(unit.entries, 1)]}
+            review_panel.parse_tier_names_result(reply, unit.id, unit.entries)
+            with self.subTest(unit=unit.id):
+                self.assertLessEqual(
+                    len(json.dumps(reply, indent=2, ensure_ascii=False).encode("utf-8")),
+                    unit.limits["planning"]["reply_bytes"])
+        self.assertGreater(len(planned.units), 1, "the reply limit did not split the chunks")
+
+
+class TierSummariesReduceToAnOverviewThatAlwaysEnds(unittest.TestCase):
+    """Tier summaries are written from bounded chunks of a tier's headings, the chunk
+    summaries summarized level by level, and the overview from the tier summaries. A
+    summary's reply is capped at a third of the input limit, so a level always has fewer
+    units than the one before, and limits too small for two summaries stop the reduction."""
+
+    TIER = "The run stops"
+
+    def one_tier(self, count=30):
+        row = _batch_row("synth-A", "A", [f"D{k}" for k in range(1, count + 1)])
+        long = lambda did: f"{did}: " + "the call stops with a traceback on bad input " * 2
+        return [(row, _batch_state(row, {f"D{k}": self.TIER for k in range(1, count + 1)},
+                                   heading=long))]
+
+    def head(self, what="x" * 60):
+        return review_panel.measure_payload(review_panel.render_summary_payload(
+            ROUND_COMPANIONS.overview_brief, "Find what breaks.", what, 100, (), None))[1]
+
+    def test_every_defect_in_one_tier_is_summarized_in_two_levels_and_reaches_an_overview(self):
+        rounds = _InMemoryRounds(self.one_tier(), _round_limits(input_bytes=1500))
+        done = rounds.run(_answering())
+        summaries = [p for p in rounds.planned
+                     if p.phase == review_panel.PHASE_TIER_SUMMARIES]
+        self.assertEqual([p.level for p in summaries], [1, 2])
+        self.assertGreater(len(summaries[0].units), 1)
+        self.assertEqual(len(summaries[1].units), 1)
+        self.assertTrue(all(u.id.startswith("synth-tier-1-l") for p in summaries
+                            for u in p.units))
+        self.assertEqual(rounds.ids(review_panel.PHASE_OVERVIEW), ["synth-overview"])
+        self.assertEqual(done.tier_summaries[0]["state"], review_panel.UNIT_COMPLETE)
+        self.assertEqual(done.tier_summaries[0]["summary"],
+                         f"What {summaries[1].units[0].id} covers, briefly.")
+        self.assertEqual(done.overview_text, "What synth-overview covers, briefly.")
+        self.assertFalse(done.limits_too_small)
+        # Every summarizer unit runs on the first lane and states its cap.
+        for planned in summaries:
+            for unit, row in zip(planned.units, review_panel.round_unit_rows(planned)):
+                self.assertEqual(row["lane"], review_panel.LANES[0])
+                self.assertEqual(row["kind"], review_panel.SUMMARIZER_KIND)
+                self.assertLessEqual(3 * unit.summary_bytes, 1500)
+                self.assertIn(f"at most {unit.summary_bytes} bytes", unit.text)
+
+    def test_limits_that_fit_one_summary_per_chunk_stop_and_do_not_loop(self):
+        # Room for a heading or two beside the fixed part, never for two capped summaries.
+        rounds = _InMemoryRounds(self.one_tier(), _round_limits(input_bytes=self.head() + 260,
+                                                                reply_bytes=400))
+        done = rounds.run(_answering(), rounds=5)
+        self.assertEqual(rounds.ids(review_panel.PHASE_TIER_SUMMARIES), [])
+        self.assertTrue(done.limits_too_small)
+        self.assertEqual(done.tier_summaries[0]["state"], review_panel.SUMMARY_STOPPED)
+        self.assertIsNone(done.overview_text)
+        self.assertIsNone(rounds.replay().next_round, "a stopped reduction planned again")
+
+    def test_a_failed_chunk_is_named_and_the_overview_is_written_from_what_landed(self):
+        rounds = _InMemoryRounds(self.one_tier(), _round_limits(input_bytes=1500))
+
+        def summary(row, unit):
+            if row["id"] == "synth-tier-1-l1-c1":
+                return "the worker returned nothing\n"
+            return _short_summary(row, unit)
+        done = rounds.run(_answering(summary=summary))
+        tier = done.tier_summaries[0]
+        self.assertEqual(tier["state"], review_panel.SUMMARY_PARTIAL)
+        failed = [u for u in tier["units"] if u["state"] != review_panel.UNIT_COMPLETE]
+        self.assertEqual([u["unit"] for u in failed], ["synth-tier-1-l1-c1"])
+        self.assertIsNotNone(tier["summary"])
+        self.assertEqual(done.overview["state"], review_panel.UNIT_COMPLETE)
+        self.assertIsNotNone(done.overview_text)
+
+    def test_limits_raised_after_a_stop_do_not_reopen_it_under_a_later_round(self):
+        # One tier fits one unit, the other needs a second level; the limits are lowered
+        # before that level, so it stops and the overview is written from the first tier
+        # alone. Raising them again afterwards must not plan the stopped level under the
+        # overview that was planned on its stopping.
+        row = _batch_row("synth-A", "A", ["D99", *(f"D{k}" for k in range(1, 31))])
+        tiers = {"D99": "Small", **{f"D{k}": self.TIER for k in range(1, 31)}}
+        long = lambda did: f"{did}: " + "the call stops with a traceback on bad input " * 2
+        rounds = _InMemoryRounds([(row, _batch_state(row, tiers, heading=long))],
+                                 _round_limits(input_bytes=1500))
+        tiny = _round_limits(input_bytes=self.head() + 260, reply_bytes=400)
+
+        def answer(row, unit):
+            if row.get("phase") == review_panel.PHASE_TIER_SUMMARIES and row["level"] == 1:
+                rounds.limits = tiny
+                if row["tier"] == 2:
+                    # Long enough that the big tier's parts no longer fit one unit.
+                    return {"summary": "x" * 400}
+            return _short_summary(row, unit)
+        done = rounds.run(_names_never_called(answer))
+        self.assertEqual(rounds.ids(review_panel.PHASE_OVERVIEW), ["synth-overview"])
+        self.assertTrue(done.limits_too_small)
+        rounds.limits = _round_limits(input_bytes=1500)
+        again = rounds.replay()
+        self.assertIsNone(again.next_round)
+        self.assertEqual([t["state"] for t in again.tier_summaries],
+                         [review_panel.UNIT_COMPLETE, review_panel.SUMMARY_STOPPED])
+
+    def test_a_summary_over_its_cap_fails_the_unit(self):
+        with self.assertRaises(review_panel.ResultError) as ctx:
+            review_panel.parse_summary_result({"summary": "x" * 101}, "synth-overview", 100)
+        self.assertIn("101 bytes", str(ctx.exception))
+        self.assertEqual(review_panel.parse_summary_result({"summary": "x" * 100},
+                                                           "synth-overview", 100), "x" * 100)
+
+    def test_the_cap_is_measured_on_the_summary_as_json_writes_it(self):
+        # A quote or backslash is two bytes inside the reply, so a summary within its cap
+        # as text can still be over it as written.
+        parse = review_panel.parse_summary_result
+        with self.assertRaises(review_panel.ResultError) as ctx:
+            parse({"summary": '"' * 100}, "synth-overview", 100)
+        self.assertIn("200 bytes", str(ctx.exception))
+        self.assertEqual(parse({"summary": '\\' * 50}, "synth-overview", 100), '\\' * 50)
+        for text in ('"' * 51, "\n" * 51, "\x01" * 17):
+            with self.subTest(text=text[:1]):
+                with self.assertRaises(review_panel.ResultError):
+                    parse({"summary": text}, "synth-overview", 100)
+
+    def test_a_tier_with_no_landed_summary_gets_none_and_so_may_the_generation(self):
+        rounds = _InMemoryRounds(self.one_tier(count=3))
+        done = rounds.run(_answering(summary=lambda row, unit: "nothing came back\n"))
+        self.assertEqual(done.tier_summaries[0]["state"], review_panel.SUMMARY_NONE)
+        self.assertEqual(done.overview["state"], review_panel.SUMMARY_NONE)
+        self.assertIsNone(done.overview_text)
+
+
+class TheRoundSchemasAreTheEnginesVocabulary(unittest.TestCase):
+    """The engine's pin on the two shipped schemas the later rounds answer in."""
+
+    def test_the_tier_name_keys_are_the_schemas(self):
+        schema = review_panel.load_schema(review_panel.TIER_NAMES_SCHEMA_NAME)
+        self.assertEqual(set(review_panel.TIER_NAMES_RESULT_KEYS), set(schema["properties"]))
+        self.assertEqual(set(review_panel.TIER_MAP_KEYS),
+                         set(schema["properties"]["map"]["items"]["properties"]))
+
+    def test_the_tier_name_length_cap_is_the_schemas(self):
+        schema = review_panel.load_schema(review_panel.TIER_NAMES_SCHEMA_NAME)
+        self.assertEqual(schema["properties"]["tiers"]["items"]["maxLength"],
+                         review_panel.TIER_NAME_CHARS)
+
+    def test_the_summary_keys_are_the_schemas(self):
+        schema = review_panel.load_schema(review_panel.OVERVIEW_SCHEMA_NAME)
+        self.assertEqual(set(review_panel.SUMMARY_RESULT_KEYS), set(schema["properties"]))
+
+
+class SynthesisRunsAsRecordedRounds(_FindingsCase):
+    """Synthesis runs as rounds while the marker stays `synthesized`. Each round is recorded
+    after its units and before `units.json`, which is the commit; a record nothing lists is
+    taken back on the next call, and a round planned from results that have since changed
+    is refused."""
+
+    def rounds_dir(self):
+        return self.rundir / review_panel.ROUNDS_DIR
+
+    def record(self, number):
+        return json.loads((self.rounds_dir() / f"synthesis-g1-{number}.json")
+                          .read_text(encoding="utf-8"))
+
+    def later(self):
+        doc = json.loads((self.rundir / "units.json").read_text(encoding="utf-8"))
+        return [u for u in doc["units"]
+                if u["kind"] in (review_panel.TIER_NAMER_KIND, review_panel.SUMMARIZER_KIND)]
+
+    def answer_later(self):
+        stub_dispatch(self.rundir, {
+            u["id"]: {"summary": f"What {u['id']} covers."} for u in self.later()
+            if u["kind"] == review_panel.SUMMARIZER_KIND})
+
+    def through_batches(self, synthesis=SYNTH_TABLE, after_plan=None, reading=READING_TABLE):
+        """The run up to its synthesis batches landed, and no report yet."""
+        self.plan_into(self.rundir)
+        if after_plan is not None:
+            after_plan(self.rundir)
+        stub_dispatch(self.rundir, reading, DISPATCH)
+        self.assertEqual(_run("route", str(self.rundir)).returncode, 0)
+        stub_dispatch(self.rundir, VERIFY_TABLE)
+        self.clustered()
+        self.synthesize()
+        stub_dispatch(self.rundir, synthesis)
+
+    def batches_landed(self):
+        self.through_batches()
+
+    def test_the_batches_are_round_one_and_the_next_call_plans_round_two(self):
+        self.batches_landed()
+        first = self.record(1)
+        self.assertEqual(first["units"], ["synth-A"])
+        self.assertEqual(first["writer"], review_panel.SYNTHESIS_WRITER)
+        self.assertEqual(first["phase"], review_panel.PHASE_BATCHES)
+        for key in ("input_digest", "limits_digest"):
+            self.assertRegex(first[key], r"\A[0-9a-f]{64}\Z")
+        self.assertTrue(review_panel.synthesis_needs_round(self.rundir))
+        self.synthesize()
+        self.assertEqual(self.units()["stage"], review_panel.SYNTHESIZED_STAGE)
+        second = self.record(2)
+        # One batch: no names to reconcile, so the next round is the tier summaries.
+        self.assertEqual(second["phase"], review_panel.PHASE_TIER_SUMMARIES)
+        self.assertEqual(second["units"], ["synth-tier-1-l1-c1"])
+        self.assertEqual([(u["id"], u["round"], u["lane"]) for u in self.later()],
+                         [("synth-tier-1-l1-c1", 2, review_panel.LANES[0])])
+        self.assertFalse(review_panel.synthesis_needs_round(self.rundir),
+                         "a round was asked for while the last one had not landed")
+
+    def test_a_round_still_in_flight_is_refused_and_a_complete_one_plans_nothing(self):
+        self.batches_landed()
+        self.synthesize()
+        proc = self.synthesize(expect=2)
+        self.assertIn("synth-tier-1-l1-c1", proc.stderr)
+        self.answer_later()
+        self.synthesize()
+        self.assertEqual([u["id"] for u in self.later()],
+                         ["synth-tier-1-l1-c1", "synth-overview"])
+        self.answer_later()
+        self.assertFalse(review_panel.synthesis_needs_round(self.rundir))
+        proc = self.synthesize()
+        self.assertIn("nothing to plan", proc.stdout)
+        self.assertEqual(len(self.later()), 2)
+
+    def test_an_uncommitted_round_is_reclaimed_on_the_next_call(self):
+        self.batches_landed()
+        ghost = self.rundir / "units" / "synth-ghost"
+        ghost.mkdir()
+        (ghost / review_panel.PAYLOAD_NAME).write_text("x", encoding="utf-8")
+        (self.rounds_dir() / "synthesis-g1-2.json").write_text(json.dumps({
+            "generation": 1, "round": 2, "units": ["synth-ghost"]}), encoding="utf-8")
+        self.synthesize()
+        self.assertFalse(ghost.exists())
+        self.assertEqual(self.record(2)["units"], ["synth-tier-1-l1-c1"])
+
+    def test_a_round_planned_from_results_that_changed_is_refused(self):
+        self.batches_landed()
+        self.synthesize()
+        result = self.rundir / "units" / "synth-A" / "result.json"
+        doc = json.loads(result.read_text(encoding="utf-8"))
+        doc["defects"][0]["heading"] = "A heading the round was not planned from."
+        result.write_text(json.dumps(doc), encoding="utf-8")
+        self.answer_later()
+        for proc in (self.synthesize(expect=2), self.report(expect=2)):
+            self.assertIn("round 2", proc.stderr)
+
+    def test_the_report_prints_the_overview_and_findings_keeps_the_tier_summaries(self):
+        self.batches_landed()
+        while review_panel.synthesis_needs_round(self.rundir):
+            self.synthesize()
+            self.answer_later()
+        self.report()
+        record = self.findings()["synthesis"]
+        self.assertEqual(record["overview"], "What synth-overview covers.")
+        self.assertEqual([(t["tier"], t["summary"]) for t in record["tier_summaries"]],
+                         [("A run stops instead of finishing", "What synth-tier-1-l1-c1 covers.")])
+        overview = _section(self.text(), review_panel.SUBSECTION_OVERVIEW)
+        self.assertIn("What synth-overview covers.", overview)
+        self.assertNotIn("What synth-tier-1-l1-c1 covers.", self.text())
+        self.assertNotIn(review_panel.SYNTHESIS_NO_OVERVIEW, self.text())
+
+    def test_limits_too_small_for_two_summaries_stop_and_the_report_says_so(self):
+        self.batches_landed()
+        head = review_panel.measure_payload(review_panel.render_summary_payload(
+            review_panel.load_round_companions().overview_brief, FILE_JOB["problem"],
+            review_panel.tier_summary_what("A run stops instead of finishing", 1), 136, (),
+            review_panel.load_round_companions().overview_schema))[1]
+        doc = review_panel.limits_document({lane: {"synthesis": {
+            "input_bytes": head + 80, "reply_bytes": 200}} for lane in review_panel.LANES})
+        (self.rundir / "limits.json").write_text(json.dumps(doc), encoding="utf-8")
+        self.assertFalse(review_panel.synthesis_needs_round(self.rundir))
+        proc = self.synthesize()
+        self.assertIn("nothing to plan", proc.stdout)
+        self.assertEqual(self.later(), [])
+        self.report()
+        self.assertIn(review_panel.OVERVIEW_INCOMPLETE_LIMITS, " ".join(self.text().split()))
+
+    def test_a_stopped_tier_name_round_is_named_and_the_overview_is_not_incomplete(self):
+        split = {lane: {"synthesis": {"reply_bytes": 3000}} for lane in review_panel.LANES}
+
+        def after_plan(rundir):
+            (rundir / "limits.json").write_text(
+                json.dumps(review_panel.limits_document(split)), encoding="utf-8")
+        entry = SYNTH_TABLE["synth-A"]["defects"]
+        self.through_batches(after_plan=after_plan, synthesis={
+            "synth-A-b1": {"tiers": ["A run stops"], "defects": [
+                {**entry[0], "tier": "A run stops", "cross_references": []}]},
+            "synth-B-b2": {"tiers": ["The tool dies"], "defects": [
+                {**entry[1], "tier": "The tool dies"}]}})
+        self.synthesize()
+        self.assertEqual([u["id"] for u in self.later()], ["synth-tiers-l1-c1"])
+        stub_dispatch(self.rundir, {"synth-tiers-l1-c1": "the reply was not JSON\n"})
+        while review_panel.synthesis_needs_round(self.rundir):
+            self.synthesize()
+            self.answer_later()
+        self.report()
+        text = " ".join(self.text().split())
+        self.assertIn(review_panel.TIER_NAMES_NOT_RECONCILED, text)
+        self.assertIn("synth-tiers-l1-c1", text)
+        self.assertNotIn(review_panel.OVERVIEW_INCOMPLETE_LIMITS, text)
+        self.assertIn("What synth-overview covers.",
+                      _section(self.text(), review_panel.SUBSECTION_OVERVIEW))
+        tiers = {d["id"]: d["tier"] for d in self.findings()["defects"]}
+        self.assertEqual((tiers["D1"], tiers["D2"]), ("A run stops", "The tool dies"))
+
+    def test_a_later_unit_that_failed_withholds_the_every_unit_line(self):
+        reading = {**READING_TABLE, "audit-area-01-B": {"findings": [], "summary": "no gap"}}
+        for fails in (None, "synth-tier-1-l1-c1"):
+            with self.subTest(fails=fails):
+                self.rundir = self.tmp / f"run-{fails or 'clean'}"
+                self.through_batches(reading=reading)
+                while review_panel.synthesis_needs_round(self.rundir):
+                    self.synthesize()
+                    if fails is not None:
+                        stub_dispatch(self.rundir, {fails: "the reply was not JSON\n"})
+                    self.answer_later()
+                self.report()
+                coverage = _section(self.text(), "Coverage")
+                if fails is None:
+                    self.assertIn(review_panel.EVERY_UNIT_RETURNED, coverage)
+                    continue
+                self.assertNotIn(review_panel.EVERY_UNIT_RETURNED, coverage)
+                self.assertIn(fails, self.text())
+
+    def test_a_reconciled_tier_is_each_defects_tier_in_the_report_and_findings(self):
+        split = {lane: {"synthesis": {"reply_bytes": 3000}} for lane in review_panel.LANES}
+
+        def after_plan(rundir):
+            (rundir / "limits.json").write_text(
+                json.dumps(review_panel.limits_document(split)), encoding="utf-8")
+        entry = SYNTH_TABLE["synth-A"]["defects"]
+        self.through_batches(after_plan=after_plan, synthesis={
+            "synth-A-b1": {"tiers": ["A run stops"], "defects": [
+                {**entry[0], "tier": "A run stops", "cross_references": []}]},
+            "synth-B-b2": {"tiers": ["The tool dies"], "defects": [
+                {**entry[1], "tier": "The tool dies"}]}})
+        self.synthesize()
+        stub_dispatch(self.rundir, {"synth-tiers-l1-c1": {
+            "tiers": ["Runs stop instead of finishing"],
+            "map": [{"entry": "N1", "tier": 1}, {"entry": "N2", "tier": 1}]}})
+        while review_panel.synthesis_needs_round(self.rundir):
+            self.synthesize()
+            self.answer_later()
+        self.report()
+        doc = self.findings()
+        self.assertEqual(doc["synthesis"]["tiers"], ["Runs stop instead of finishing"])
+        self.assertEqual({d["id"]: d["tier"] for d in doc["defects"] if d["id"] != "D3"},
+                         {"D1": "Runs stop instead of finishing",
+                          "D2": "Runs stop instead of finishing"})
+        self.assertEqual(doc["synthesis"]["tier_names"]["state"],
+                         review_panel.NAMES_RECONCILED)
+        self.assertIn("### Runs stop instead of finishing", self.text())
+        self.assertNotIn(review_panel.TIER_NAMES_NOT_RECONCILED, " ".join(self.text().split()))
+
+
+def _through_every_round(case):
+    """Synthesis on a clustered run, through every kind of round: two batches naming their
+    tiers differently, the round reconciling the names, a tier summary and the overview.
+    Each round is planned by `synthesize` and landed as the dispatcher lands it."""
+    split = {lane: {"synthesis": {"reply_bytes": 3000}} for lane in review_panel.LANES}
+    (case.rundir / "limits.json").write_text(
+        json.dumps(review_panel.limits_document(split)), encoding="utf-8")
+    case.synthesize()
+    entry = SYNTH_TABLE["synth-A"]["defects"]
+    stub_dispatch(case.rundir, {
+        "synth-A-b1": {"tiers": ["A run stops"], "defects": [
+            {**entry[0], "tier": "A run stops", "cross_references": []}]},
+        "synth-B-b2": {"tiers": ["The tool dies"], "defects": [
+            {**entry[1], "tier": "The tool dies"}]}})
+    while review_panel.synthesis_needs_round(case.rundir):
+        case.synthesize()
+        doc = json.loads((case.rundir / "units.json").read_text(encoding="utf-8"))
+        stub_dispatch(case.rundir, {
+            u["id"]: ({"tiers": ["Runs stop"], "map": [{"entry": e, "tier": 1}
+                                                       for e in u["entries"]]}
+                      if u["kind"] == review_panel.TIER_NAMER_KIND
+                      else {"summary": f"What {u['id']} covers."})
+            for u in doc["units"]
+            if u["kind"] in (review_panel.TIER_NAMER_KIND, review_panel.SUMMARIZER_KIND)})
+    doc = json.loads((case.rundir / "units.json").read_text(encoding="utf-8"))
+    later = [u["id"] for u in doc["units"]
+             if u["kind"] in (review_panel.TIER_NAMER_KIND, review_panel.SUMMARIZER_KIND)]
+    case.assertEqual(later, ["synth-tiers-l1-c1", "synth-tier-1-l1-c1", "synth-overview"])
+    rounds = case.rundir / review_panel.ROUNDS_DIR
+    case.assertEqual(sorted(p.name for p in rounds.iterdir()),
+                     [f"synthesis-g1-{n}.json" for n in range(1, 5)])
+    return later
+
+
+def _assert_every_round_taken_back(case, later):
+    doc = json.loads((case.rundir / "units.json").read_text(encoding="utf-8"))
+    case.assertFalse({u["kind"] for u in doc["units"]} & set(review_panel.SYNTHESIS_KINDS))
+    for unit in later:
+        case.assertFalse((case.rundir / "units" / unit).exists(), unit)
+    rounds = case.rundir / review_panel.ROUNDS_DIR
+    case.assertEqual(sorted(rounds.iterdir()) if rounds.exists() else [], [])
+
+
 def _short_failure(gap):
     return review_panel._short(gap["failure"])
+
+
+# A second synthesis of the run SYNTH_TABLE writes up: the same two defects under other
+# headings and one tier, so a report shows which generation it was rendered from.
+GEN2_TABLE = {"tiers": ["Runs halt"], "defects": [
+    {**SYNTH_TABLE["synth-A"]["defects"][0], "heading": "An empty input halts the run.",
+     "tier": "Runs halt"},
+    {**SYNTH_TABLE["synth-A"]["defects"][1], "heading": "No arguments halts the tool.",
+     "tier": "Runs halt"}]}
+GEN2_DISPATCH = {"generation": 2, "lanes": {
+    "A": {"adapter": "runtime-three sub-agent", "permission": "read-only resynthesis"}}}
+_STAMP_KEYS_LATER = {"generated", "generation", "resynthesized"}
+
+
+class _Killed(BaseException):
+    """A kill, as far as the code under test can tell: nothing it catches."""
+
+
+class _GenerationCase(_FindingsCase):
+    """A reported run, and later synthesis generations planned, landed and published on
+    it."""
+
+    def listing(self, rundir=None):
+        return json.loads(((rundir or self.rundir) / "units.json").read_text(encoding="utf-8"))
+
+    def synthesis_rows(self, generation=None, rundir=None):
+        return [u for u in self.listing(rundir)["units"]
+                if u["kind"] in review_panel.SYNTHESIS_KINDS
+                and (generation is None or u.get("generation", 1) == generation)]
+
+    def answer_rounds(self, rundir=None):
+        rundir = rundir or self.rundir
+        stub_dispatch(rundir, {
+            u["id"]: ({"tiers": ["Runs stop"], "map": [{"entry": e, "tier": 1}
+                                                       for e in u["entries"]]}
+                      if u["kind"] == review_panel.TIER_NAMER_KIND
+                      else {"summary": f"What {u['id']} covers."})
+            for u in self.synthesis_rows(rundir=rundir)
+            if u["kind"] in (review_panel.TIER_NAMER_KIND, review_panel.SUMMARIZER_KIND)})
+
+    def finish_rounds(self, rundir=None):
+        rundir = rundir or self.rundir
+        while review_panel.synthesis_needs_round(rundir):
+            self.synthesize(rundir)
+            self.answer_rounds(rundir)
+
+    def reported_run(self):
+        """Generation 1 synthesized through every round and published by `report`."""
+        self.plan_into(self.rundir)
+        stub_dispatch(self.rundir, READING_TABLE, DISPATCH)
+        self.assertEqual(_run("route", str(self.rundir)).returncode, 0)
+        stub_dispatch(self.rundir, VERIFY_TABLE)
+        self.clustered()
+        self.synthesize()
+        stub_dispatch(self.rundir, SYNTH_TABLE)
+        self.finish_rounds()
+        self.report()
+        self.assertEqual(self.listing()["stage"], review_panel.REPORTED_STAGE)
+
+    def new_generation(self, rundir=None, expect=0):
+        proc = _run("synthesize", str(rundir or self.rundir), "--new-generation")
+        self.assertEqual(proc.returncode, expect, proc.stdout + proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        return proc
+
+    def write_dispatch(self, generation, record, rundir=None):
+        ((rundir or self.rundir) / f"dispatch-g{generation}.json").write_text(
+            json.dumps(record), encoding="utf-8")
+
+    def built_generation(self, generation=2, table=None, dispatch=GEN2_DISPATCH, rundir=None):
+        """Generation ``generation`` planned, its batch landed and every round after it,
+        and its dispatch record written; not published."""
+        rundir = rundir or self.rundir
+        self.new_generation(rundir)
+        stub_dispatch(rundir, {f"synth-g{generation}-A": table or GEN2_TABLE})
+        self.finish_rounds(rundir)
+        if dispatch is not None:
+            self.write_dispatch(generation, {**dispatch, "generation": generation}, rundir)
+
+    def stamp(self, rundir=None):
+        return json.loads(((rundir or self.rundir) / review_panel.REPORT_STAMP_NAME)
+                          .read_text(encoding="utf-8"))
+
+    def outputs(self, rundir=None):
+        """Every file a publication writes, by its path under the run directory."""
+        rundir = rundir or self.rundir
+        out = {name: (rundir / name).read_bytes() for name in _REPORT_OUTPUTS}
+        out.update({f"fix-brief/{p.name}": p.read_bytes()
+                    for p in sorted((rundir / "fix-brief").iterdir())})
+        return out
+
+
+class ANewGenerationIsPlannedBesideThePublishedOne(_GenerationCase):
+    """`synthesize --new-generation` plans generation n of a reported run beside the one
+    it published, under its own ids, and leaves the marker at `reported`; plain
+    `synthesize` then carries that generation's rounds. Each reader takes the generation
+    its question is about."""
+
+    def test_it_is_refused_before_the_run_is_reported(self):
+        self.plan_into(self.rundir)
+        stub_dispatch(self.rundir, READING_TABLE, DISPATCH)
+        self.assertEqual(_run("route", str(self.rundir)).returncode, 0)
+        stub_dispatch(self.rundir, VERIFY_TABLE)
+        self.clustered()
+        self.synthesize()
+        proc = self.new_generation(expect=2)
+        self.assertIn("reported", proc.stderr)
+
+    def test_it_plans_generation_two_under_its_own_ids_and_the_marker_stays_reported(self):
+        self.reported_run()
+        self.new_generation()
+        rows = self.synthesis_rows(2)
+        self.assertEqual([(u["id"], u["round"], u["writer"]) for u in rows],
+                         [("synth-g2-A", 1, review_panel.SYNTHESIS_WRITER)])
+        record = json.loads((self.rundir / review_panel.ROUNDS_DIR / "synthesis-g2-1.json")
+                            .read_text(encoding="utf-8"))
+        self.assertEqual(record["units"], ["synth-g2-A"])
+        self.assertEqual(self.listing()["stage"], review_panel.REPORTED_STAGE)
+        listing = self.listing()["units"]
+        self.assertEqual(review_panel.published_generation(self.rundir, listing), 1)
+        self.assertEqual(review_panel.building_generation(self.rundir, listing), 2)
+
+    def test_a_second_new_generation_is_refused_while_one_is_unpublished(self):
+        self.reported_run()
+        self.new_generation()
+        proc = self.new_generation(expect=2)
+        self.assertIn("generation 2", proc.stderr)
+        self.assertEqual([u["id"] for u in self.synthesis_rows(3)], [])
+
+    def test_plain_synthesize_carries_the_building_generations_rounds(self):
+        self.reported_run()
+        self.new_generation()
+        stub_dispatch(self.rundir, {"synth-g2-A": GEN2_TABLE})
+        self.assertTrue(review_panel.synthesis_needs_round(self.rundir))
+        self.synthesize()
+        self.assertEqual([(u["id"], u["round"]) for u in self.synthesis_rows(2)
+                          if u["kind"] == review_panel.SUMMARIZER_KIND],
+                         [("synth-g2-tier-1-l1-c1", 2)])
+        self.assertTrue((self.rundir / review_panel.ROUNDS_DIR / "synthesis-g2-2.json").exists())
+        self.assertEqual(self.listing()["stage"], review_panel.REPORTED_STAGE)
+        self.answer_rounds()
+        self.finish_rounds()
+        self.assertFalse(review_panel.synthesis_needs_round(self.rundir))
+        self.assertIn("nothing to plan", self.synthesize().stdout)
+
+    def test_plain_synthesize_with_no_generation_building_is_refused(self):
+        self.reported_run()
+        proc = self.synthesize(expect=2)
+        self.assertIn("--new-generation", proc.stderr)
+
+    def test_each_reader_takes_its_generation(self):
+        self.reported_run()
+        first = self.findings()
+        self.built_generation()
+        listing = self.listing()["units"]
+        self.assertEqual(review_panel.published_generation(self.rundir, listing), 1)
+        self.assertEqual(review_panel.building_generation(self.rundir, listing), 2)
+        # The published report re-renders from the generation it published.
+        proc = _run("report", str(self.rundir), "--rerender")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.findings(), first)
+        # The staged render takes the building generation, and publishing it makes it the
+        # published one.
+        self.report()
+        doc = self.findings()
+        self.assertEqual(doc["synthesis"]["generation"], 2)
+        self.assertEqual(self.defects()["D1"]["heading"], "An empty input halts the run.")
+        listing = self.listing()["units"]
+        self.assertEqual(review_panel.published_generation(self.rundir, listing), 2)
+        self.assertIsNone(review_panel.building_generation(self.rundir, listing))
+        self.assertEqual(self.listing()["stage"], review_panel.REPORTED_STAGE)
+
+    def test_check_synthesis_holds_each_generation_to_its_own_units(self):
+        self.reported_run()
+        self.new_generation()
+        doc = self.listing()
+        for unit in doc["units"]:
+            if unit["id"] == "synth-g2-A":
+                unit["defects"], unit["defect_sites"] = unit["defects"][:1], unit["defect_sites"][:1]
+        (self.rundir / "units.json").write_text(json.dumps(doc), encoding="utf-8")
+        proc = self.synthesize(expect=2)
+        self.assertIn("synth-g2-A", proc.stderr)
+        self.assertNotIn("synth-A ", proc.stderr)
+
+    def test_a_run_with_nothing_to_write_up_is_left_as_it_is(self):
+        self.plan_into(self.rundir)
+        stub_dispatch(self.rundir, {"area-01-A1": {"findings": [], "summary": "clean"},
+                                    "area-01-B1": {"findings": [], "summary": "clean"},
+                                    "audit-area-01-A": {"findings": [], "summary": "no gap"},
+                                    "audit-area-01-B": {"findings": [], "summary": "no gap"},
+                                    "probe-A": PROBE_RESULT}, DISPATCH)
+        self.assertEqual(_run("route", str(self.rundir)).returncode, 0)
+        self.cluster()
+        self.synthesize()
+        self.report()
+        self.assertEqual(self.listing()["stage"], review_panel.REPORTED_STAGE)
+        self.assertEqual(review_panel.defects_needing_a_write_up(self.rundir), 0)
+        path = self.rundir / "units.json"
+        # Dated far in the past first, so a rewrite shows on a filesystem whose timestamps
+        # are too coarse to tell a write a moment ago from one now.
+        os.utime(path, (1_000_000_000, 1_000_000_000))
+        listing, written = path.read_bytes(), path.stat().st_mtime_ns
+        self.assertIn("nothing to resynthesize", self.new_generation().stdout)
+        # Not written at all: the same bytes written again would still be a write.
+        self.assertEqual(path.read_bytes(), listing)
+        self.assertEqual(path.stat().st_mtime_ns, written)
+
+    def test_the_count_of_defects_needing_a_write_up_is_the_runs(self):
+        self.reported_run()
+        handed = {did for u in self.synthesis_rows(1)
+                  if u["kind"] == review_panel.SYNTHESIZER_KIND for did in u["defects"]}
+        self.assertTrue(handed)
+        self.assertEqual(review_panel.defects_needing_a_write_up(self.rundir), len(handed))
+
+    def test_a_v2026_10_0_run_gets_a_second_generation(self):
+        rundir = self.tmp / "tag-run"
+        shutil.copytree(_TAG_RUN, rundir)
+        self.new_generation(rundir)
+        rows = self.synthesis_rows(2, rundir)
+        self.assertTrue(rows and all(u["id"].startswith("synth-g2-") for u in rows), rows)
+        listing = self.listing(rundir)["units"]
+        self.assertEqual(review_panel.published_generation(rundir, listing), 1)
+        self.assertEqual(review_panel.building_generation(rundir, listing), 2)
+
+
+class ALaterGenerationIsAttributedToItsOwnLanes(_GenerationCase):
+    """A generation's synthesis is attributed to the lanes `dispatch-g<n>.json` records,
+    and the original stages to `dispatch.json`, whose rung the run keeps."""
+
+    def test_the_report_names_the_generations_lanes_beside_the_runs(self):
+        self.reported_run()
+        self.built_generation()
+        self.report()
+        how = " ".join(_section(self.text(), review_panel.SUBSECTION_HOW_IT_RAN).split())
+        for adapter in ("runtime-one sub-agent", "runtime-two command line",
+                        "runtime-three sub-agent"):
+            self.assertIn(adapter, how)
+        self.assertIn("generation 2", how)
+        doc = self.findings()
+        self.assertEqual(doc["rung"], DISPATCH["rung"])
+        self.assertEqual(doc["synthesis"]["dispatch"], GEN2_DISPATCH["lanes"])
+
+    def test_publishing_without_its_dispatch_record_is_refused(self):
+        self.reported_run()
+        before = self.outputs()
+        self.built_generation(dispatch=None)
+        proc = self.report(expect=2)
+        self.assertIn("dispatch-g2.json", proc.stderr)
+        self.assertEqual(self.outputs(), before)
+        self.assertFalse((self.rundir / "publish-g2.json").exists())
+        self.assertFalse((self.rundir / "staging-g2").exists())
+
+    def test_a_dispatch_record_for_another_generation_is_refused(self):
+        self.reported_run()
+        self.built_generation(dispatch=None)
+        self.write_dispatch(2, {**GEN2_DISPATCH, "generation": 3})
+        self.assertIn("dispatch-g2.json", self.report(expect=2).stderr)
+
+
+class APublicationIsOneRecoverableTransaction(_GenerationCase):
+    """A later generation is rendered into a staging directory and published by the steps
+    `publish-g<n>.json` records. A kill after any step resumes to the publication an
+    uninterrupted one makes, and until the last step every reader says the run is
+    publishing."""
+
+    def setUp(self):
+        super().setUp()
+        self.reported_run()
+        self.built_generation()
+        self.base = self.rundir
+
+    def copy(self, name):
+        rundir = self.tmp / name
+        shutil.copytree(self.base, rundir)
+        return rundir
+
+    def publish_killed_after(self, rundir, steps):
+        """`report` in process, killed once ``steps`` publication steps have run."""
+        real = review_panel._publication_step
+        ran = []
+
+        def step(*args, **kwargs):
+            if len(ran) == steps:
+                raise _Killed()
+            ran.append(1)
+            return real(*args, **kwargs)
+
+        with mock.patch.object(review_panel, "_publication_step", step):
+            with self.assertRaises(_Killed):
+                review_panel._run_report(types.SimpleNamespace(rundir=str(rundir),
+                                                               rerender=False))
+
+    def staged(self, rundir):
+        staging = rundir / "staging-g2"
+        out = {name: (staging / name).read_bytes() for name in _REPORT_OUTPUTS}
+        out.update({f"fix-brief/{p.name}": p.read_bytes()
+                    for p in sorted((staging / "fix-brief").iterdir())})
+        return out
+
+    def assert_publishing(self, rundir):
+        listing = self.listing(rundir)["units"]
+        self.assertEqual(review_panel.publishing_generation(rundir), 2)
+        self.assertEqual(review_panel.published_generation(rundir, listing), 1)
+        with self.assertRaisesRegex(review_panel.RunDirError, "publish"):
+            review_panel.published_report(
+                rundir, [rundir / name for name in ("report.md", "findings.json",
+                                                    "report.html")])
+        self.assertFalse(review_panel.synthesis_needs_round(rundir))
+        proc = _run("report", str(rundir), "--rerender")
+        self.assertEqual(proc.returncode, 2, proc.stdout)
+        self.assertIn("publish-g2.json", proc.stderr)
+        self.assertIn("publish-g2.json", self.new_generation(rundir, expect=2).stderr)
+
+    def assert_published(self, rundir, staged, record):
+        self.assertEqual(self.outputs(rundir), staged)
+        self.assertFalse((rundir / "staging-g2").exists())
+        self.assertEqual(self.stamp(rundir), {
+            "generated": record["generated"], "generation": 2,
+            "resynthesized": record["resynthesized"]})
+        listing = self.listing(rundir)["units"]
+        self.assertIsNone(review_panel.publishing_generation(rundir))
+        self.assertEqual(review_panel.published_generation(rundir, listing), 2)
+        self.assertEqual(self.listing(rundir)["stage"], review_panel.REPORTED_STAGE)
+
+    def test_a_kill_after_each_step_resumes_to_the_same_publication(self):
+        probe = self.copy("probe")
+        self.publish_killed_after(probe, 0)
+        steps = json.loads((probe / "publish-g2.json").read_text(encoding="utf-8"))["steps"]
+        kinds = [step["step"] for step in steps]
+        # Anti-vacuity: the directory moves are steps of their own.
+        for kind in ("aside", "move-in", "delete-previous", "remove-staging", "stamp"):
+            self.assertIn(kind, kinds)
+        self.assertEqual(kinds[-1], "stamp")
+        for after in range(len(steps)):
+            with self.subTest(after=after):
+                rundir = self.copy(f"killed-{after}")
+                self.publish_killed_after(rundir, 0)
+                record = json.loads((rundir / "publish-g2.json").read_text(encoding="utf-8"))
+                staged = self.staged(rundir)
+                if after:
+                    self.publish_killed_after(rundir, after)
+                self.assert_publishing(rundir)
+                self.report(rundir)
+                self.assert_published(rundir, staged, record)
+                self.assertIn("An empty input halts the run.",
+                              (rundir / "report.md").read_text(encoding="utf-8"))
+
+    def test_a_staging_directory_left_without_its_record_is_taken_back(self):
+        rundir = self.copy("unrecorded")
+        staging = rundir / "staging-g2"
+        (staging / "fix-brief").mkdir(parents=True)
+        (staging / "report.md").write_text("half a report\n", encoding="utf-8")
+        (staging / "fix-brief" / "D1.md").write_text("half\n", encoding="utf-8")
+        self.report(rundir)
+        self.assertFalse(staging.exists())
+        self.assertEqual(self.stamp(rundir)["generation"], 2)
+        self.assertIn("An empty input halts the run.",
+                      (rundir / "report.md").read_text(encoding="utf-8"))
+
+    def test_a_staging_directory_holding_something_else_is_refused(self):
+        rundir = self.copy("foreign")
+        (rundir / "staging-g2").mkdir()
+        (rundir / "staging-g2" / "notes.txt").write_text("mine\n", encoding="utf-8")
+        before = self.outputs(rundir)
+        proc = self.report(rundir, expect=2)
+        self.assertIn("notes.txt", proc.stderr)
+        self.assertEqual(self.outputs(rundir), before)
+
+    def test_a_published_generation_is_not_published_twice(self):
+        self.report()
+        self.assertIn("published report", self.report(expect=2).stderr)
+
+    def interrupted(self, name):
+        """A copy whose publication wrote its record and staging and took no step."""
+        rundir = self.copy(name)
+        self.publish_killed_after(rundir, 0)
+        return rundir
+
+    def assert_resume_refused(self, rundir, *fragments):
+        """`report` refuses the resume and the run's publication is as the kill left it."""
+        before = self.outputs(rundir)
+        stamp = self.stamp(rundir)
+        proc = self.report(rundir, expect=2)
+        for fragment in fragments:
+            self.assertIn(fragment, proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertEqual(self.outputs(rundir), before)
+        self.assertEqual(self.stamp(rundir), stamp)
+        return proc
+
+    def test_a_resume_through_a_linked_staging_directory_is_refused(self):
+        rundir = self.interrupted("linked")
+        outside = self.tmp / "outside-staging"
+        (rundir / "staging-g2").rename(outside)
+        try:
+            os.symlink(outside, rundir / "staging-g2", target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"cannot create a symlink here: {exc}")
+        held = {p.relative_to(outside): p.read_bytes()
+                for p in sorted(outside.rglob("*")) if p.is_file()}
+        self.assert_resume_refused(rundir, "staging-g2")
+        self.assertEqual({p.relative_to(outside): p.read_bytes()
+                          for p in sorted(outside.rglob("*")) if p.is_file()}, held)
+
+    def test_a_resume_through_a_staging_junction_is_refused(self):
+        # The stand-in answers "junction" for the staging directory on every host.
+        rundir = self.interrupted("junction-stand-in")
+        staging = rundir / "staging-g2"
+        before, stamp, staged = self.outputs(rundir), self.stamp(rundir), self.staged(rundir)
+        real = review_panel._is_junction
+        with mock.patch.object(review_panel, "_is_junction",
+                               lambda path: Path(path) == staging or real(path)):
+            code = review_panel.main(["report", str(rundir)])
+        self.assertEqual(code, 2)
+        self.assertEqual((self.outputs(rundir), self.stamp(rundir), self.staged(rundir)),
+                         (before, stamp, staged))
+
+    def test_a_resume_through_a_real_staging_junction_is_refused(self):
+        if sys.platform != "win32":
+            self.skipTest("directory junctions exist only on Windows")
+        rundir = self.interrupted("junction")
+        outside = self.tmp / "outside-junction"
+        (rundir / "staging-g2").rename(outside)
+        try:
+            import _winapi
+            _winapi.CreateJunction(str(outside), str(rundir / "staging-g2"))
+        except (ImportError, AttributeError, OSError) as exc:
+            self.skipTest(f"cannot create a junction here: {exc}")
+        held = {p.relative_to(outside): p.read_bytes()
+                for p in sorted(outside.rglob("*")) if p.is_file()}
+        self.assert_resume_refused(rundir, "staging-g2")
+        self.assertEqual({p.relative_to(outside): p.read_bytes()
+                          for p in sorted(outside.rglob("*")) if p.is_file()}, held)
+
+    def report_in_process(self, rundir):
+        """`report` in this process, so a scratch name can carry this process's pid."""
+        with open(os.devnull, "w", encoding="utf-8") as sink, contextlib.redirect_stdout(sink):
+            return review_panel.main(["report", str(rundir)])
+
+    def rewrite_steps(self, rundir, steps):
+        path = rundir / "publish-g2.json"
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record["steps"] = steps
+        path.write_text(json.dumps(record), encoding="utf-8")
+
+    def test_a_record_with_steps_missing_is_refused(self):
+        rundir = self.interrupted("truncated")
+        self.rewrite_steps(rundir, [{"step": "stamp"}])
+        self.assert_resume_refused(rundir, "publish-g2.json")
+
+    def test_a_record_with_steps_out_of_order_is_refused(self):
+        rundir = self.interrupted("reordered")
+        steps = review_panel.publication_steps()
+        replaces = [s for s in steps if s["step"] == "replace"]
+        self.rewrite_steps(rundir, [*reversed(replaces),
+                                    *(s for s in steps if s["step"] != "replace")])
+        self.assert_resume_refused(rundir, "publish-g2.json")
+
+    def test_scratch_a_killed_write_left_is_reclaimed_before_publishing(self):
+        # A kill inside `write_json` strands `<name>.<pid>.tmp`; under a pid that comes
+        # round again it would refuse the write, so a publication takes it back first.
+        pid = os.getpid()
+        first = self.copy("record-scratch")
+        for name in (f"publish-g2.json.{pid}.tmp", "publish-g2.json.4242.tmp"):
+            (first / name).write_text("{", encoding="utf-8")
+        self.assertEqual(self.report_in_process(first), 0)
+        self.assertEqual(self.stamp(first)["generation"], 2)
+        resumed = self.interrupted("stamp-scratch")
+        for name in (f"report-stamp.json.{pid}.tmp", "report-stamp.json.4242.tmp"):
+            (resumed / name).write_text("{", encoding="utf-8")
+        self.assertEqual(self.report_in_process(resumed), 0)
+        self.assertEqual(self.stamp(resumed)["generation"], 2)
+        for rundir in (first, resumed):
+            self.assertEqual([p.name for p in rundir.iterdir() if p.name.endswith(".tmp")],
+                             [])
+
+
+class RedoTakesBackEveryGeneration(_GenerationCase):
+    """A redo takes back every synthesis generation, the unpublished included, with its
+    rounds, its publication record, its staging directory and the driver's records of
+    it."""
+
+    def test_two_generations_and_a_pending_third_all_go_back(self):
+        self.reported_run()
+        self.built_generation()
+        self.report()
+        self.built_generation(3, table=GEN2_TABLE)
+        real = review_panel._publication_step
+        ran = []
+
+        def step(*args, **kwargs):
+            if len(ran) == 2:
+                raise _Killed()
+            ran.append(1)
+            return real(*args, **kwargs)
+
+        with mock.patch.object(review_panel, "_publication_step", step):
+            with self.assertRaises(_Killed):
+                review_panel._run_report(types.SimpleNamespace(rundir=str(self.rundir),
+                                                               rerender=False))
+        self.assertTrue((self.rundir / "staging-g3").is_dir())
+        for name in ("budget-g3.json", "adapter-pin-g3.json"):
+            (self.rundir / name).write_text("{}", encoding="utf-8")
+        # What a kill inside a write of any per-generation record, or of the stamp, leaves.
+        for name in ("publish-g3.json.4242.tmp", "dispatch-g2.json.4242.tmp",
+                     "budget-g3.json.4242.tmp", "report-stamp.json.4242.tmp"):
+            (self.rundir / name).write_text("{", encoding="utf-8")
+        later = [u["id"] for u in self.synthesis_rows()]
+        self.assertTrue(any(u.startswith("synth-g3-") for u in later), later)
+        proc = _run("cluster", str(self.rundir), "--redo")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        _assert_every_round_taken_back(self, later)
+        left = sorted(p.name for p in self.rundir.iterdir()
+                      if re.match(r"(publish|dispatch|budget|adapter-pin)-g\d+\.json\Z|"
+                                  r"staging-g\d+\Z", p.name))
+        self.assertEqual(left, [])
+        self.assertEqual([p.name for p in self.rundir.iterdir() if p.name.endswith(".tmp")],
+                         [])
+        for name in (*_REPORT_OUTPUTS, "fix-brief", review_panel.REPORT_STAMP_NAME):
+            self.assertFalse((self.rundir / name).exists(), name)
+
+    def test_a_staging_directory_holding_something_else_refuses_the_redo(self):
+        self.reported_run()
+        (self.rundir / "staging-g2").mkdir()
+        (self.rundir / "staging-g2" / "notes.txt").write_text("mine\n", encoding="utf-8")
+        proc = _run("cluster", str(self.rundir), "--redo")
+        self.assertEqual(proc.returncode, 2, proc.stdout)
+        self.assertIn("notes.txt", proc.stderr)
+        self.assertTrue((self.rundir / "report.md").exists())
+
+
+class TheStampSaysWhenItWasResynthesized(_GenerationCase):
+    """Generation 1's stamp records when it was generated; a later one also records its
+    generation and when it was resynthesized, and its report says both."""
+
+    def test_generation_one_keeps_todays_stamp(self):
+        self.reported_run()
+        self.assertEqual(set(self.stamp()), {"generated"})
+
+    def test_a_later_generation_states_both_clocks_and_rerenders_unchanged(self):
+        self.reported_run()
+        generated = self.stamp()["generated"]
+        self.built_generation()
+        self.report()
+        stamp = self.stamp()
+        self.assertEqual(set(stamp), _STAMP_KEYS_LATER)
+        self.assertEqual((stamp["generated"], stamp["generation"]), (generated, 2))
+        self.assertRegex(stamp["resynthesized"], rf"\A{review_panel.CLOCK_PATTERN}\Z")
+        self.assertIn(f"Generated {generated} · Resynthesized {stamp['resynthesized']}",
+                      self.text())
+        before = self.outputs()
+        proc = _run("report", str(self.rundir), "--rerender")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.outputs(), before)
+        self.assertEqual(self.stamp(), stamp)
 
 
 if __name__ == "__main__":

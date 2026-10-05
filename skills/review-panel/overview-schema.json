@@ -1,0 +1,14 @@
+{
+  "title": "review-panel summary result",
+  "description": "One summary: of one report section's defects, of part of them, of the sections' own summaries, or of the whole run, as the payload says. Written for a person deciding where to start, from the headings or summaries the payload lists and nothing else. It settles nothing about any defect and cannot remove one. The engine measures it in bytes against the limit the payload states, and a longer summary fails the reply.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary"],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "description": "One paragraph in plain language: what the defects listed have in common, which matter most and why, in this project's own terms. No defect ids, no list, no heading. Within the byte limit the payload states."
+    }
+  }
+}

@@ -1,15 +1,15 @@
 {
   "title": "review-panel synthesis result",
-  "description": "One reading of the whole defect list: the words this run groups its defects by, and for each defect — one mistake, at one or more sites — a heading, what goes wrong in plain language, what to do about it, what is particular to any site that differs, and which other defects it belongs beside. Nothing here settles whether a defect or a site is real — another stage did that, and this one cannot reopen it, revise a severity or remove a defect from the run. Every defect the payload lists appears here exactly once; a reply that drops one, repeats one, or names one the payload never listed is refused whole, and the report is then grouped by status as it was before this round existed.",
+  "description": "One reading of a batch of the run's defects: the words this batch groups its defects by, and for each defect — one mistake, at one or more sites — a heading, what goes wrong in plain language, what to do about it, what is particular to any site that differs, and which other defects it belongs beside. Nothing here settles whether a defect or a site is real — another stage did that, and this one cannot reopen it, revise a severity or remove a defect from the run. Every defect the payload lists appears here exactly once; a reply that drops one, repeats one, or names one the payload never listed is refused whole, and the report then groups that batch's defects by status alone, with no tier or write-up.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["tiers", "defects", "summary"],
+  "required": ["tiers", "defects"],
   "properties": {
     "tiers": {
       "type": "array",
       "minItems": 1,
       "items": {"type": "string", "minLength": 1},
-      "description": "The run's whole vocabulary, in the order a reader should work through it: each entry a short plain-language name for what a group of these defects breaks, e.g. `Money can be taken twice`. Name as few as the list really has — a reader who has to hold fourteen headings in mind has no grouping at all. Every defect below names one of these and nothing else; an assignment naming a tier absent from this list is refused on its own and that defect falls back to being grouped by its status."
+      "description": "This batch's tiers, in the order a reader should work through them: each entry a short plain-language name, in this project's own terms, for what a group of these defects breaks, e.g. `Money can be taken twice`. Name as few as your defects really need — a reader who has to hold fourteen headings in mind has no grouping at all. Other batches name their own, and a later round merges names that mean the same thing. Every defect below names one of these and nothing else; an assignment naming a tier absent from this list is refused on its own and that defect falls back to being grouped by its status."
     },
     "defects": {
       "type": "array",
@@ -72,14 +72,10 @@
           "cross_references": {
             "type": "array",
             "items": {"type": "string", "minLength": 1},
-            "description": "The ids of other defects this one should be read beside, as the payload spells them, or an empty list. Name one only where the two are genuinely connected — the same mechanism, the same call path, one causing or masking the other — never because they sit in the same file. The engine drops any reference whose id is not a defect in this run, and keeps one only where the two defects touch a file in common or sit under one tier."
+            "description": "The ids of other defects this one should be read beside, as the payload spells them, or an empty list. Name one only where the two are genuinely connected — the same mechanism, the same call path, one causing or masking the other — never because they sit in the same file. The engine drops any reference whose id is not a defect in this run, and keeps one only where the two defects touch a file in common or were written up in one batch."
           }
         }
       }
-    },
-    "summary": {
-      "type": "string",
-      "description": "One paragraph for a person reading the report: what the tiers came out as and why, which defects were hardest to place, and where your reading of a mechanism is a guess rather than something the payload told you."
     }
   }
 }
