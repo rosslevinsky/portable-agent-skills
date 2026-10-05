@@ -21,6 +21,7 @@ import errno
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import stat
@@ -43,6 +44,12 @@ _DRIVER = _SKILL_DIR / "review_panel_run.py"
 _SUPERVISOR = _SKILL_DIR.parent / "diff-review" / "review_runner.py"
 _FIXTURE_TREE = Path(__file__).resolve().parent / "fixtures" / "review-panel" / "tree"
 
+# The stub worker's own capacity: a unit whose payload, or whose reply, is larger than this
+# is refused. Several times what any unit of these tests holds under the limits they plan
+# to, and well short of what one synthesis unit for every defect of a run of hundreds needs.
+STUB_CAPACITY_PAYLOAD_BYTES = 256 * 1024
+STUB_CAPACITY_REPLY_BYTES = 96 * 1024
+
 # The stub worker. Written into each case's temporary directory rather than tracked as a
 # fixture, so it sits beside the tests that drive it and no run can pick up a stale copy.
 STUB = r'''#!/usr/bin/env python3
@@ -54,6 +61,11 @@ import pathlib
 import re
 import sys
 import time
+
+# Fixed here, never read from the run: a stub that sized itself from `limits.json` could not
+# show a unit planned too large for the worker that runs it.
+CAPACITY_PAYLOAD_BYTES = ⟪payload capacity⟫
+CAPACITY_REPLY_BYTES = ⟪reply capacity⟫
 
 args = dict(zip(sys.argv[1::2], sys.argv[2::2]))
 payload = pathlib.Path(args["--payload"]).read_text(encoding="utf-8")
@@ -129,15 +141,20 @@ elif props >= {"findings"}:
     listed = files_in_payload()
     findings = []
     if listed and "Test inventory" not in payload and not control.get("no_findings"):
-        target = listed[0]
-        first = pathlib.Path(target).read_text(encoding="utf-8").splitlines()[0]
-        findings.append({
-            "file": target, "line_start": 1, "line_end": 1, "severity": "major",
-            "consequence": "A caller reading this line is misled about what it does.",
-            "failure": "The first line does not describe what the file actually does.",
-            "direction": "Say what the file does.", "fix_size": "small",
-            "quote": first, "reproduction": None,
-        })
+        # One finding on the first listed file, or on every one with `every_file`; on its
+        # first line, or on every line with `every_line`.
+        for target in (listed if control.get("every_file") else listed[:1]):
+            lines = pathlib.Path(target).read_text(encoding="utf-8").splitlines()
+            for number, quote in enumerate(lines if control.get("every_line") else lines[:1],
+                                           start=1):
+                findings.append({
+                    "file": target, "line_start": number, "line_end": number,
+                    "severity": "major",
+                    "consequence": "A caller reading this line is misled about what it does.",
+                    "failure": "The line does not describe what the file actually does.",
+                    "direction": "Say what the file does.", "fix_size": "small",
+                    "quote": quote, "reproduction": None,
+                })
     answer = {"findings": findings, "summary": "read the area"}
 elif props >= {"verdicts"}:
     answer = {"verdicts": [{
@@ -180,14 +197,25 @@ elif props >= {"clusters"}:
         "split_reason": None,
     } for cid in ids(r"cand-\d+", "\n## Candidates to group\n")],
         "summary": "one defect per candidate"}
+elif props >= {"map"}:
+    # The tier-name round: every name it is handed is one theme.
+    answer = {"tiers": ["A reader is misled"], "map": [
+        {"entry": entry, "tier": 1}
+        for entry in re.findall(r"\n### (N\d+)\n", section("\n## The names\n"))]}
+elif props == {"summary"}:
+    answer = {"summary": "A short summary."}
 else:
-    tier = "A reader is misled"
+    mine = ids(r"\bD\d+\b", "\n## Your defects\n")
+    # Each batch may name its tier in its own words, as batches that never see each other
+    # do, which is what the tier-name round exists to reconcile.
+    tier = ("A reader is misled" if not control.get("tier_per_batch")
+            else f"A reader of {mine[0]} is misled")
     answer = {"tiers": [tier], "defects": [{
         "defect": did, "heading": "The opening line misdescribes its file.", "tier": tier,
         "what_goes_wrong": "The opening line of the file describes something else.",
         "fix": "Rewrite the opening line to say what the file does.",
         "site_notes": [], "cross_references": [],
-    } for did in ids(r"\bD\d+\b", "\n## Your defects\n")], "summary": "one tier"}
+    } for did in mine]}
 
 # Refusing by KIND rather than by count, so which units come back unusable does not depend
 # on the order two lanes happened to be launched in. The schema is what says which kind this
@@ -197,6 +225,20 @@ if set(schema.get("properties", {})) & set(control.get("refuse_for", ())):
     mode = "refused"
 
 text = json.dumps(answer, indent=2)
+answered = "Working on it.\n\n" + text + "\n"
+# The worker's own capacity, which neither `limits.json` nor the engine's estimates know:
+# what it was really handed, or what it would really return, over it, and it answers
+# nothing usable, as a model whose context is exceeded does. The reply is measured as it
+# would be written, wrapper included. Recorded beside the control file so a test can name
+# the unit it refused.
+payload_bytes = len(payload.encode("utf-8"))
+reply_bytes = len(answered.encode("utf-8"))
+if payload_bytes > CAPACITY_PAYLOAD_BYTES or reply_bytes > CAPACITY_REPLY_BYTES:
+    with open(control_path.with_name("over-capacity.jsonl"), "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+            "payload_bytes": payload_bytes, "reply_bytes": reply_bytes}) + "\n")
+    mode = "refused"
 if mode == "no-object":
     body = "I could not answer this one.\n"
 elif mode == "trailing":
@@ -204,13 +246,14 @@ elif mode == "trailing":
 elif mode == "refused":
     body = json.dumps({"findings": "not a list", "summary": "x"}, indent=2)
 else:
-    body = "Working on it.\n\n" + text + "\n"
+    body = answered
 transcript.write_text(body, encoding="utf-8")
 # Replace a file once this worker has answered: how a test edits something the run reads
 # while the run is in progress.
 if control.get("rewrite"):
     pathlib.Path(control["rewrite"][0]).write_text(control["rewrite"][1], encoding="utf-8")
-'''
+'''.replace("⟪payload capacity⟫", str(STUB_CAPACITY_PAYLOAD_BYTES)).replace(
+    "⟪reply capacity⟫", str(STUB_CAPACITY_REPLY_BYTES))
 
 
 def _stub_mode(stub: Path, control: Path, deadline: float = 60.0,
@@ -416,15 +459,20 @@ class _Case(unittest.TestCase):
             json.dumps({"files": entries}), encoding="utf-8")
         return snapshot
 
-    def fake_units(self, *units, stage="reading"):
+    def fake_units(self, *units, stage="reading", run_format=True):
         """A run directory with a listing, and each unit's two inputs beside it.
 
         Enough for every question about eligibility, allowances and landing, none of which
         reads a payload — but a spawn copies the brief and the schema into the worker's
         opaque input directory and refuses to launch a worker without them, so a listing
         with no files under `units/` would be a run directory no plan can produce.
+
+        With the run format `plan` records, as every run this driver plans has; without
+        it the directory is one an earlier release planned.
         """
         self.rundir.mkdir(parents=True, exist_ok=True)
+        if run_format:
+            review_panel.write_run_format(self.rundir)
         (self.rundir / "units.json").write_text(json.dumps({
             "stage": stage, "lanes": list(review_panel.LANES),
             "units": [{"id": uid, "kind": "reader", "lane": lane, "area": "area-01",
@@ -721,6 +769,225 @@ class BootstrapNeverDeletesWhatItDidNotExamine(_Case):
 # --------------------------------------------------------------------------- #
 # the adapter config
 # --------------------------------------------------------------------------- #
+class TheRunCarriesItsFormatAndLimits(_Case):
+    """`limits.json` lands after `plan` and before the run directory is published, follows
+    the adapter's limits on a resume without touching the pin, and a run an earlier release
+    planned is refused before it reached `reported`."""
+
+    def limits(self):
+        return json.loads((self.rundir / review_panel.LIMITS_FILE_NAME)
+                          .read_text(encoding="utf-8"))
+
+    def test_limits_are_absent_at_the_rundir_check_and_present_before_publication(self):
+        partial = self.rundir.with_name(self.rundir.name + driver.PARTIAL_SUFFIX)
+        seen = {}
+        real_check, real_replace = review_panel.check_rundir, driver.os.replace
+
+        def check(rundir, job):
+            seen.setdefault("at check", (Path(rundir) / review_panel.LIMITS_FILE_NAME)
+                            .exists())
+            return real_check(rundir, job)
+
+        def replace(src, dst):
+            if Path(src) == partial:
+                seen["at publication"] = (partial / review_panel.LIMITS_FILE_NAME).exists()
+            return real_replace(src, dst)
+
+        document = driver.limits_document(driver.load_adapter_config(self.adapter_path))
+        with mock.patch.object(review_panel, "check_rundir", check), \
+                mock.patch.object(driver.os, "replace", replace):
+            driver.bootstrap(self.rundir, self.job_path, limits=document)
+        self.assertEqual(seen, {"at check": False, "at publication": True})
+        self.assertEqual(self.limits(), document)
+        self.assertEqual(review_panel.read_run_format(self.rundir), review_panel.RUN_FORMAT)
+
+    def test_a_resume_rewrites_the_limits_and_a_limits_change_is_not_a_new_adapter(self):
+        self.plan_only()
+        self.assertEqual(self.limits(), review_panel.limits_document({}))
+        self.write_adapter(A={"limits": {"verification": {"input_bytes": 1234},
+                                         "hard": {"input_bytes": 9999,
+                                                  "reply_bytes": 999}}})
+        self.drive()
+        lane = self.limits()["lanes"]["A"]
+        self.assertEqual(lane["verification"]["input_bytes"], 1234)
+        self.assertEqual(lane["hard"], {"input_bytes": 9999, "reply_bytes": 999})
+        self.assertEqual(self.limits()["lanes"]["B"],
+                         review_panel.limits_document({})["lanes"]["B"])
+        lanes = driver.load_adapter_config(self.adapter_path)
+        self.assertFalse(driver.sync_limits(self.rundir, driver.limits_document(lanes)),
+                         "unchanged limits were written again")
+
+    def test_a_limit_the_engine_cannot_use_is_refused_with_the_config(self):
+        self.write_adapter(B={"limits": {"synthesis": {"reply_bytes": -1}}})
+        with self.assertRaises(driver.DriverError) as ctx:
+            driver.load_adapter_config(self.adapter_path)
+        self.assertIn("lanes.B.limits.synthesis.reply_bytes", str(ctx.exception))
+
+    def test_a_run_planned_by_an_earlier_release_is_refused_by_name_before_reported(self):
+        self.fake_units(("area-01-A1", "A"), run_format=False)
+        self.fake_snapshot()
+        proc = self.drive(expect=driver.EXIT_REFUSED)
+        for words in (review_panel.RUN_FORMAT_FILE_NAME, "v2026.10.0", "'reading'",
+                      "resynthesize"):
+            self.assertIn(words, proc.stderr)
+        self.assertFalse((self.rundir / "adapter-pin.json").exists(),
+                         "the refusal came after the run was pinned")
+
+    def test_a_finished_run_from_an_earlier_release_is_not_refused_for_it(self):
+        self.fake_units(("area-01-A1", "A"), stage=review_panel.REPORTED_STAGE,
+                        run_format=False)
+        driver.refuse_an_old_run_before_reported(self.rundir)
+        self.fake_units(("area-01-A1", "A"), stage=review_panel.READING_STAGE,
+                        run_format=False)
+        with self.assertRaises(driver.DriverError):
+            driver.refuse_an_old_run_before_reported(self.rundir)
+
+
+class AUnitOverItsHardCeilingIsNeverDispatched(_Case):
+    """A unit the engine listed with `dispatch` false is never sent to a model, counts as
+    finished, and its round still ends."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake_units(("area-01-A1", "A"), ("area-01-B1", "B"))
+        doc = json.loads((self.rundir / "units.json").read_text(encoding="utf-8"))
+        doc["units"][1]["dispatch"] = False
+        (self.rundir / "units.json").write_text(json.dumps(doc), encoding="utf-8")
+        self.fake_snapshot()
+
+    def test_the_round_spawns_only_the_others_and_finishes(self):
+        run = self.run_object(poll=0.01)
+        spawned = []
+        real_terminal = run.terminal
+
+        def spawn(unit, probe=False):
+            spawned.append(unit["id"])
+            return True
+
+        run.spawn = spawn
+        run.terminal = lambda uid: uid in spawned or real_terminal(uid)
+        run.dispatch_round((review_panel.READER_KIND,))
+        self.assertEqual(spawned, ["area-01-A1"])
+        self.assertEqual(run.unfinished((review_panel.READER_KIND,)), [])
+        self.assertIn("1 over its lane's hard ceiling, not dispatched", run.out.getvalue())
+
+    def test_it_is_finished_and_never_eligible(self):
+        run = self.run_object()
+        self.assertTrue(run.terminal("area-01-B1"))
+        self.assertFalse(run.eligible("area-01-B1"))
+        self.assertFalse(run.terminal("area-01-A1"))
+        self.assertTrue((self.rundir / "units" / "area-01-B1").is_dir(),
+                        "its unit directory was taken away")
+
+    def test_status_shows_it_as_not_dispatched_rather_than_open(self):
+        lines = {line.split(" [")[0].strip(): line
+                 for line in status_text(self.run_object()).splitlines()
+                 if line.startswith("  area-")}
+        self.assertIn("not dispatched, over its lane's hard ceiling", lines["area-01-B1"])
+        self.assertNotIn("open", lines["area-01-B1"])
+        self.assertTrue(lines["area-01-A1"].endswith(" open"), lines["area-01-A1"])
+
+    def test_status_counts_it_apart_from_the_units_that_run(self):
+        self.assertIn("  reader: 2 unit(s), 1 of them over its lane's hard ceiling and "
+                      "never dispatched\n", status_text(self.run_object()))
+
+    def test_the_preview_counts_it_apart_from_the_reading_rounds_work(self):
+        text = driver._preview(self.rundir, driver.load_adapter_config(self.adapter_path))
+        self.assertIn("reading round: 1 unit(s) to dispatch; 1 more over its lane's hard "
+                      "ceiling, listed and never dispatched\n", text)
+        self.assertIn("lane A: 2 slot(s); 1 unit(s) run up to 2 at a time", text)
+        self.assertIn("lane B: 2 slot(s); 0 unit(s) run up to 2 at a time, in about 0 "
+                      "wave(s)", text)
+
+
+class ALoweredLimitReplansVerification(_Case):
+    """Limits lowered in the adapter reach a run on its next resume, and a redo from
+    routing then plans verification against them: the same findings, in more units, each
+    still addressed to the lane that did not raise it."""
+
+    def verifiers(self):
+        doc = json.loads((self.rundir / "units.json").read_text(encoding="utf-8"))
+        return [u for u in doc["units"] if u["kind"] == review_panel.VERIFIER_KIND]
+
+    def test_a_redo_from_routing_after_a_lowered_limit_plans_more_units(self):
+        self.write_control(every_file=True)
+        self.drive("--go")
+        before = self.verifiers()
+        self.assertTrue(before)
+        self.assertTrue(any(len(u["candidates"]) > 1 for u in before),
+                        "no batch held two files, so nothing below could split")
+        # Room for one verdict a unit: every file's findings go alone.
+        one = {"verification": {"reply_bytes": review_panel.VERIFICATION_REPLY_HEAD
+                                + review_panel.VERIFICATION_REPLY_PRICES["verdict"]}}
+        self.write_adapter(A={"limits": one}, B={"limits": one})
+        self.drive()
+        proc = subprocess.run([sys.executable, str(_SKILL_DIR / "review_panel.py"), "route",
+                               str(self.rundir), "--redo"], capture_output=True,
+                              encoding="utf-8", errors="replace", timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        after = self.verifiers()
+        self.assertGreater(len(after), len(before))
+        self.assertEqual(sorted(c for u in after for c in u["candidates"]),
+                         sorted(c for u in before for c in u["candidates"]))
+        candidates = {c["id"]: c for c in json.loads(
+            (self.rundir / review_panel.CANDIDATES_FILE_NAME).read_text(encoding="utf-8"))
+            ["candidates"]}
+        for unit in after:
+            with self.subTest(unit=unit["id"]):
+                self.assertEqual(unit["limits"]["planning"]["reply_bytes"],
+                                 one["verification"]["reply_bytes"])
+                for cid in unit["candidates"]:
+                    self.assertNotIn(unit["lane"],
+                                     {r["lane"] for r in candidates[cid]["raised_by"]})
+        self.drive("--go")
+        doc = json.loads((self.rundir / "units.json").read_text(encoding="utf-8"))
+        self.assertEqual(doc["stage"], review_panel.REPORTED_STAGE)
+
+
+class ThePreviewOfAResumedRunCountsOnlyWhatIsLeft(_Case):
+    """A unit that has landed is finished work: the preview of a resumed run plans waves
+    for what is left to dispatch, and says how many have already landed."""
+
+    def landed_all_but(self, kept):
+        """Every listed unit landed except ``kept``; the units, as listed."""
+        self.plan_only()
+        units = json.loads((self.rundir / "units.json").read_text(encoding="utf-8"))["units"]
+        for unit in units:
+            if unit["id"] != kept:
+                (self.rundir / review_panel.DISPATCH_DIR / unit["id"]).mkdir(parents=True,
+                                                                           exist_ok=True)
+                driver.publish(self.rundir, unit["id"], None, "error", "stopped\n")
+        return units
+
+    def preview(self):
+        return driver._preview(self.rundir, driver.load_adapter_config(self.adapter_path))
+
+    def test_a_run_resumed_during_reading_dispatches_only_the_unlanded(self):
+        units = self.landed_all_but("area-01-A1")
+        text = self.preview()
+        self.assertIn(f"reading round: 1 unit(s) to dispatch; {len(units) - 1} already "
+                      f"landed\n", text)
+        self.assertIn("lane A: 2 slot(s); 1 unit(s) run up to 2 at a time, in about 1 "
+                      "wave(s)\n", text)
+        self.assertIn("lane B: 2 slot(s); 0 unit(s) run up to 2 at a time, in about 0 "
+                      "wave(s)\n", text)
+
+    def test_a_run_resumed_past_reading_lists_only_the_unlanded(self):
+        units = self.landed_all_but("area-01-A1")
+        path = self.rundir / "units.json"
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        doc["stage"] = review_panel.ROUTED_STAGE
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        self.assertIn(f"units listed: 1; {len(units) - 1} already landed\n", self.preview())
+
+    def test_a_run_with_nothing_landed_reads_as_it_always_did(self):
+        self.plan_only()
+        units = json.loads((self.rundir / "units.json").read_text(encoding="utf-8"))["units"]
+        text = self.preview()
+        self.assertIn(f"reading round: {len(units)} unit(s) to dispatch\n", text)
+        self.assertNotIn("already landed", text)
+
+
 class TheAdapterConfigIsData(_Case):
     """Every spawn's argv arrives as data. The driver names no product anywhere, so the
     only thing it can do about a command line is refuse one it could not run."""
@@ -1743,6 +2010,32 @@ class AFullRun(_Case):
         text = (self.rundir / "dispatch" / "progress.log").read_text(encoding="utf-8")
         self.assertIn("spawning", text)
         self.assertIn("landed", text)
+
+    def test_each_stage_after_reading_says_how_many_units_it_planned(self):
+        """Only the reading round is known before the run starts, so every later stage
+        says what it planned when it plans it."""
+        text = (self.rundir / "dispatch" / "progress.log").read_text(encoding="utf-8")
+        said: dict[str, int] = {}
+        for stage, count in re.findall(r"\n\S+ (\S+) planned (\d+) unit\(s\)", text):
+            said[stage] = said.get(stage, 0) + int(count)
+        units = self.units_doc()["units"]
+        # Synthesis plans in rounds, each saying what it added.
+        self.assertGreater(len(re.findall(r"\n\S+ synthesize planned ", text)), 1)
+        self.assertEqual(said, {
+            stage: sum(1 for unit in units if unit["kind"] in kinds)
+            for stage, kinds in (("route", (review_panel.VERIFIER_KIND,)),
+                                 ("cluster", (review_panel.CLUSTERER_KIND,)),
+                                 ("merge", (review_panel.MERGER_KIND,)),
+                                 ("merge-check", (review_panel.MERGE_CHECKER_KIND,)),
+                                 ("synthesize", review_panel.SYNTHESIS_KINDS))})
+
+    def test_status_shows_how_many_units_each_kind_has(self):
+        text = status_text(self.run_object())
+        units = self.units_doc()["units"]
+        for kind in {unit["kind"] for unit in units}:
+            count = sum(1 for unit in units if unit["kind"] == kind)
+            with self.subTest(kind=kind):
+                self.assertIn(f"  {kind}: {count} unit(s)\n", text)
 
     def test_status_is_read_only_and_answers_while_a_run_is_owned(self):
         """It writes nothing and takes no lock. The moment an operator most wants it is
@@ -4602,7 +4895,7 @@ class TheRoundThatPublishesIsVerifiedToo(_Case):
         for unit in doc["units"]:
             unit["kind"] = kinds[unit["id"]]
         (self.rundir / "units.json").write_text(json.dumps(doc), encoding="utf-8")
-        for unit, result in (("s1", '{"tiers": [], "defects": [], "summary": "x"}'),
+        for unit, result in (("s1", '{"tiers": [], "defects": []}'),
                              ("v1", '{"verdicts": [], "summary": "x"}')):
             self.attempt(unit, 0, status='{"status": "ok"}',
                          disposition={"attempt": "a0", "unit": unit,
@@ -4661,6 +4954,771 @@ class TheRoundThatPublishesIsVerifiedToo(_Case):
         with self.reporting_stage() as staged:
             self.assertEqual(run.loop(), driver.EXIT_OK)
         self.assertEqual([call.args[0] for call in staged.call_args_list], ["report"])
+
+
+# --------------------------------------------------------------------------- #
+# synthesis rounds — batches, tier names, tier summaries and the overview
+# --------------------------------------------------------------------------- #
+class SynthesisRunsInRoundsToAnOverview(_Case):
+    """A run of several defects under synthesis limits small enough to need every kind of
+    round: one batch per defect, each naming its tier in its own words, a tier-name round,
+    two levels of tier summary and the overview, all under the one `synthesized` marker."""
+
+    TIER = "A reader is misled"
+    # The stub's summary is 16 bytes; a cap of 36 leaves room for two summaries in a unit
+    # holding room for only two headings.
+    CAP = 36
+
+    def setUp(self):
+        super().setUp()
+        job = json.loads(self.job_path.read_text(encoding="utf-8"))
+        job.update(partition="subject", exclude=["tests/", "docs/", "README.md"], areas=[
+            {"name": name, "paths": [path]} for name, path in (
+                ("cli", "run.py"), ("core", "engine/core.py"), ("util", "engine/util.py"),
+                ("deep", "engine/sub/deep.py"), ("vendor", "vendor/lib.py"))]
+            + [{"name": "rest", "paths": [], "remainder": True}])
+        self.job_path.write_text(json.dumps(job), encoding="utf-8")
+        companions = review_panel.load_round_companions()
+        head = review_panel.measure_payload(review_panel.render_summary_payload(
+            companions.overview_brief, job["problem"],
+            review_panel.tier_summary_what(self.TIER, 1), self.CAP, (),
+            companions.overview_schema))[1]
+        limits = {"synthesis": {"input_bytes": head + 110, "reply_bytes": self.CAP + 64}}
+        self.write_adapter(**{lane: {"limits": limits} for lane in review_panel.LANES})
+        self.write_control(tier_per_batch=True)
+
+    def assert_every_round_ran(self):
+        doc = json.loads((self.rundir / "units.json").read_text(encoding="utf-8"))
+        self.assertEqual(doc["stage"], review_panel.REPORTED_STAGE)
+        rows = [u for u in doc["units"] if u["kind"] in review_panel.SYNTHESIS_KINDS]
+        batches = [u for u in rows if u["kind"] == review_panel.SYNTHESIZER_KIND]
+        self.assertGreater(len(batches), 1)
+        self.assertEqual({u["lane"] for u in batches}, set(review_panel.LANES))
+        self.assertTrue([u for u in rows if u["kind"] == review_panel.TIER_NAMER_KIND])
+        summaries = [u for u in rows if u.get("phase") == review_panel.PHASE_TIER_SUMMARIES]
+        self.assertGreater(sum(1 for u in summaries if u["level"] == 1), 1)
+        self.assertEqual([u["id"] for u in summaries if u["level"] == 2],
+                         ["synth-tier-1-l2-c1"])
+        self.assertEqual([u["id"] for u in rows if u.get("phase") == review_panel.PHASE_OVERVIEW],
+                         ["synth-overview"])
+        for unit in rows:
+            if unit["kind"] != review_panel.SYNTHESIZER_KIND:
+                self.assertEqual(unit["lane"], review_panel.LANES[0], unit["id"])
+            here = self.rundir / "units" / unit["id"]
+            self.assertTrue((here / "result.json").is_file(), unit["id"])
+        findings = json.loads((self.rundir / "findings.json").read_text(encoding="utf-8"))
+        self.assertEqual({d["tier"] for d in findings["defects"]}, {self.TIER})
+        self.assertEqual(findings["synthesis"]["tier_names"]["state"],
+                         review_panel.NAMES_RECONCILED)
+        self.assertEqual(findings["synthesis"]["overview"], "A short summary.")
+        self.assertIn("A short summary.", (self.rundir / "report.md").read_text(encoding="utf-8"))
+        records = sorted(p.name for p in (self.rundir / review_panel.ROUNDS_DIR).iterdir())
+        self.assertEqual(len(records), len({u.get("round", 1) for u in rows}))
+
+    def test_a_run_needing_every_kind_of_round_finishes(self):
+        proc = self.drive("--go", timeout=600)
+        self.assertIn("round ", proc.stdout)
+        self.assert_every_round_ran()
+
+    def landed_replies(self):
+        return {path.parent.name: path.read_bytes()
+                for path in self.rundir.glob("units/*/result.json")}
+
+    def run_until(self, pattern):
+        """Run the driver, resuming it past any attempt a kill orphaned, until ``pattern``
+        matches under the run directory; then kill it there."""
+        for _ in range(6):
+            proc = self.launch("--go", "--grace", "60")
+            deadline = time.time() + 240
+            while time.time() < deadline and proc.poll() is None:
+                if list(self.rundir.glob(pattern)):
+                    break
+                time.sleep(0.05)
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=30)
+                return
+            proc.wait(timeout=30)
+            if list(self.rundir.glob(pattern)):
+                return
+            self.resolve_stranded()
+        self.fail(f"{pattern} never appeared")
+
+    def resolve_stranded(self):
+        for unit_id, attempt in self.unaccountable(grace=60.0):
+            driver.resolve_attempt(
+                self.rundir, unit_id, attempt, action="fail",
+                reason="the driver was killed between this attempt's record and its launch, "
+                       "so nothing ever started", stopped_confirmed=True, grace=60.0)
+
+    def test_kill_and_resume_between_and_during_rounds_keeps_every_landed_reply(self):
+        self.write_adapter(deadline=5.0, **{
+            lane: {"limits": json.loads(self.adapter_path.read_text(encoding="utf-8"))
+                   ["lanes"][lane]["limits"]} for lane in review_panel.LANES})
+        self.write_control(tier_per_batch=True, sleep=0.3)
+        seen: dict[str, bytes] = {}
+        # Between rounds: the tier-name round has just been committed. During one: a tier
+        # summary has landed and the rest of its round is still out.
+        for pattern in ("units/synth-tiers-l1-c1/payload.md",
+                        "units/synth-tier-1-l1-c1/result.json"):
+            self.run_until(pattern)
+            now = self.landed_replies()
+            for unit, raw in seen.items():
+                self.assertEqual(now.get(unit), raw, f"{unit}'s landed reply changed")
+            seen.update(now)
+        self.assertTrue([u for u in seen if u.startswith("synth-tier-1-l1-")])
+        self.write_control(tier_per_batch=True)
+        finished = self.drive("--go", "--grace", "60", expect=None, timeout=600)
+        if finished.returncode == driver.EXIT_STOPPED:
+            self.resolve_stranded()
+            finished = self.drive("--go", "--grace", "60", expect=None, timeout=600)
+        self.assertEqual(finished.returncode, driver.EXIT_OK,
+                         finished.stdout + finished.stderr)
+        now = self.landed_replies()
+        for unit, raw in seen.items():
+            self.assertEqual(now.get(unit), raw, f"{unit}'s landed reply changed")
+        doc = json.loads((self.rundir / "units.json").read_text(encoding="utf-8"))
+        for unit in doc["units"]:
+            accepted = [a for a in driver.read_attempts(self.rundir, unit["id"], grace=120.0)
+                        if (a.disposition or {}).get("outcome") == driver.ACCEPTED]
+            self.assertLessEqual(len(accepted), 1, f"{unit['id']} was answered twice")
+        self.assertEqual(doc["stage"], review_panel.REPORTED_STAGE)
+        self.assertTrue((self.rundir / "units" / "synth-overview" / "result.json").is_file())
+
+
+class ALaterSynthesisRoundIsProgress(_Case):
+    """At `synthesized` the stage after a round is `synthesize` while the engine says a
+    round is still to plan. A later round moves no marker, so what counts as progress is a
+    round the listing newly commits; a `synthesize` that commits nothing is refused rather
+    than called again forever."""
+
+    def setUp(self):
+        super().setUp()
+        self.fake_units(("s1", "A"), ("v1", "B"), stage=review_panel.SYNTHESIZED_STAGE)
+        doc = json.loads((self.rundir / "units.json").read_text(encoding="utf-8"))
+        kinds = {"s1": review_panel.SYNTHESIZER_KIND, "v1": review_panel.VERIFIER_KIND}
+        for unit in doc["units"]:
+            unit["kind"] = kinds[unit["id"]]
+        (self.rundir / "units.json").write_text(json.dumps(doc), encoding="utf-8")
+        self.land("s1", '{"tiers": [], "defects": []}')
+        self.land("v1", '{"verdicts": [], "summary": "x"}')
+        self.fake_snapshot()
+
+    def land(self, unit, result):
+        (self.rundir / "units" / unit).mkdir(parents=True, exist_ok=True)
+        self.attempt(unit, 0, status='{"status": "ok"}',
+                     disposition={"attempt": "a0", "unit": unit, "outcome": driver.ACCEPTED,
+                                  "intended_publication": "result"})
+        (self.rundir / "units" / unit / review_panel.RESULT_NAME).write_text(
+            result, encoding="utf-8")
+        (self.rundir / "dispatch" / unit / "landed.json").write_text(
+            json.dumps({"publication": "result", "attempt": "a0"}), encoding="utf-8")
+
+    def test_the_round_dispatches_every_synthesis_kind(self):
+        self.assertEqual(driver.ROUNDS[review_panel.SYNTHESIZED_STAGE],
+                         (review_panel.SYNTHESIS_KINDS, "report"))
+        for kind in (review_panel.TIER_NAMER_KIND, review_panel.SUMMARIZER_KIND):
+            self.assertIn(kind, review_panel.REDO_KINDS)
+            self.assertIn(kind, review_panel.ROUTE_REDO_KINDS)
+            self.assertNotIn(kind, driver.WRITE_CAPABLE_KINDS)
+
+    def test_a_committed_round_is_progress_and_the_report_follows_once_none_is_needed(self):
+        asked = []
+
+        def staged(stage, rundir):
+            asked.append(stage)
+            doc = json.loads((Path(rundir) / "units.json").read_text(encoding="utf-8"))
+            if stage == "synthesize":
+                doc["units"].append({"id": "o1", "kind": review_panel.SUMMARIZER_KIND,
+                                     "lane": "A"})
+                (Path(rundir) / "units.json").write_text(json.dumps(doc), encoding="utf-8")
+                self.land("o1", '{"summary": "s"}')
+            else:
+                doc["stage"] = driver.REPORTED_STAGE
+                (Path(rundir) / "units.json").write_text(json.dumps(doc), encoding="utf-8")
+            return 0, "", ""
+
+        needs = iter([True, False])
+        with mock.patch.object(driver, "_engine_stage", side_effect=staged), \
+                mock.patch.object(review_panel, "synthesis_needs_round",
+                                  side_effect=lambda rundir: next(needs)):
+            self.assertEqual(self.run_object(poll=0.05).loop(), driver.EXIT_OK)
+        self.assertEqual(asked, ["synthesize", "report"])
+
+    def test_a_synthesize_that_commits_nothing_is_refused(self):
+        with mock.patch.object(driver, "_engine_stage", return_value=(0, "", "")), \
+                mock.patch.object(review_panel, "synthesis_needs_round", return_value=True):
+            with self.assertRaises(driver.DriverError) as ctx:
+                self.run_object(poll=0.05).loop()
+        self.assertIn("synthesize returned success without advancing", str(ctx.exception))
+
+
+class OnlyTheBuildingGenerationIsDispatched(_Case):
+    """A round of synthesis kinds takes only the generation being built: a published
+    generation's units, landed or not, are never dispatched again and never hold a round
+    open."""
+
+    def listed(self, stage, rows):
+        self.fake_units(*((uid, lane) for uid, lane, _generation in rows), stage=stage)
+        doc = json.loads((self.rundir / "units.json").read_text(encoding="utf-8"))
+        generations = {uid: generation for uid, _lane, generation in rows}
+        for unit in doc["units"]:
+            unit["kind"] = review_panel.SYNTHESIZER_KIND
+            unit["generation"] = generations[unit["id"]]
+        (self.rundir / "units.json").write_text(json.dumps(doc), encoding="utf-8")
+        self.fake_snapshot()
+
+    def test_a_reported_run_dispatches_the_later_generation_alone(self):
+        self.listed(driver.REPORTED_STAGE, [("synth-A", "A", 1), ("synth-g2-A-b1", "A", 2),
+                                            ("synth-g2-B-b2", "B", 2)])
+        run = self.run_object(poll=0.01)
+        self.assertEqual([uid for uid, _why in run.unfinished(review_panel.SYNTHESIS_KINDS)],
+                         ["synth-g2-A-b1", "synth-g2-B-b2"])
+        spawned = []
+
+        def spawn(unit, probe=False):
+            spawned.append(unit["id"])
+            return True
+
+        run.spawn = spawn
+        real_terminal = run.terminal
+        run.terminal = lambda uid: uid in spawned or real_terminal(uid)
+        run.dispatch_round(review_panel.SYNTHESIS_KINDS)
+        self.assertEqual(spawned, ["synth-g2-A-b1", "synth-g2-B-b2"])
+
+    def test_before_the_report_generation_one_is_the_one_building(self):
+        self.listed(review_panel.SYNTHESIZED_STAGE, [("synth-A", "A", 1)])
+        self.assertEqual([uid for uid, _why in
+                          self.run_object().unfinished(review_panel.SYNTHESIS_KINDS)],
+                         ["synth-A"])
+
+
+_V2026_10_0_RUN = Path(__file__).resolve().parent / "fixtures" / "review-panel" / "v2026.10.0-run"
+_RECORD_OF_A_GENERATION = re.compile(r"(?:budget|adapter-pin|dispatch|publish)-g\d+\.json\Z")
+
+
+class _Resynthesis(_Case):
+    """A run the driver carried to `reported`, and `resynthesize` run on it."""
+
+    def several_defects(self):
+        """A job of five subject areas, so the run has a defect in each."""
+        job = json.loads(self.job_path.read_text(encoding="utf-8"))
+        job.update(partition="subject", exclude=["tests/", "docs/", "README.md"], areas=[
+            {"name": name, "paths": [path]} for name, path in (
+                ("cli", "run.py"), ("core", "engine/core.py"), ("util", "engine/util.py"),
+                ("deep", "engine/sub/deep.py"), ("vendor", "vendor/lib.py"))]
+            + [{"name": "rest", "paths": [], "remainder": True}])
+        self.job_path.write_text(json.dumps(job), encoding="utf-8")
+
+    def low_synthesis_limits(self, **adapter):
+        """Synthesis limits small enough that every defect is a batch of its own, and still
+        large enough for two summaries in one unit: `SynthesisRunsInRoundsToAnOverview`'s."""
+        cap = SynthesisRunsInRoundsToAnOverview.CAP
+        companions = review_panel.load_round_companions()
+        head = review_panel.measure_payload(review_panel.render_summary_payload(
+            companions.overview_brief,
+            json.loads(self.job_path.read_text(encoding="utf-8"))["problem"],
+            review_panel.tier_summary_what(SynthesisRunsInRoundsToAnOverview.TIER, 1), cap,
+            (), companions.overview_schema))[1]
+        limits = {"synthesis": {"input_bytes": head + 110, "reply_bytes": cap + 64}}
+        deadline = adapter.pop("deadline", 60.0)
+        self.write_adapter(deadline, **{lane: {**adapter.get(lane, {}), "limits": limits}
+                                        for lane in review_panel.LANES})
+
+    def reported_run(self):
+        self.drive("--go", timeout=600)
+        self.assertEqual(self.listing()["stage"], review_panel.REPORTED_STAGE)
+
+    def listing(self):
+        return json.loads((self.rundir / "units.json").read_text(encoding="utf-8"))
+
+    def batches(self, generation):
+        return [u["id"] for u in self.listing()["units"]
+                if u["kind"] == review_panel.SYNTHESIZER_KIND
+                and review_panel.synthesis_generation(u) == generation]
+
+    def findings(self):
+        return json.loads((self.rundir / "findings.json").read_text(encoding="utf-8"))
+
+    def stamp(self):
+        return json.loads((self.rundir / review_panel.REPORT_STAMP_NAME)
+                          .read_text(encoding="utf-8"))
+
+    def resynth_argv(self, *extra):
+        return [sys.executable, str(_DRIVER), "resynthesize", str(self.rundir),
+                "--adapter", str(self.adapter_path), "--poll", "0.1", *extra]
+
+    def resynth(self, *extra, expect=0, timeout=600):
+        proc = subprocess.run(self.resynth_argv(*extra), capture_output=True,
+                              encoding="utf-8", errors="replace", timeout=timeout)
+        if expect is not None:
+            self.assertEqual(proc.returncode, expect, proc.stdout + proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        return proc
+
+    def assert_written_up(self, generation):
+        """Every defect handed to the generation has a tier and an account, and the run has
+        an overview."""
+        doc = self.findings()
+        self.assertEqual(doc["synthesis"]["generation"], generation)
+        handed = {did for unit in doc["synthesis"]["units"] for did in unit["defects"]}
+        self.assertTrue(handed)
+        for defect in doc["defects"]:
+            if defect["id"] in handed:
+                self.assertTrue(defect["tier"], defect["id"])
+                self.assertTrue(defect["what_goes_wrong"], defect["id"])
+        self.assertEqual(doc["synthesis"]["overview"], "A short summary.")
+        self.assertEqual(self.stamp()["generation"], generation)
+
+    def records(self):
+        return sorted(p.name for p in self.rundir.iterdir()
+                      if _RECORD_OF_A_GENERATION.match(p.name))
+
+    def run_files(self):
+        """Every file under the run directory, as its bytes."""
+        return {p.relative_to(self.rundir).as_posix(): p.read_bytes()
+                for p in sorted(self.rundir.rglob("*")) if p.is_file()}
+
+
+class ResynthesizeIsACommandOfItsOwn(_Resynthesis):
+    """`resynthesize` writes a finished run's synthesis again, as a later generation: under
+    its own time budget, past a stale drain request, with limits from the adapter it is
+    given, and published over the report the run has, which a plain `run` still finds
+    finished."""
+
+    def test_a_lowered_limit_writes_it_in_more_batches(self):
+        self.several_defects()
+        self.reported_run()
+        first = self.batches(1)
+        self.assertEqual(len(first), 1, first)
+        self.low_synthesis_limits()
+        self.write_control(tier_per_batch=True)
+        self.resynth()
+        second = self.batches(2)
+        self.assertGreater(len(second), len(first), second)
+        self.assertTrue(all(uid.startswith("synth-g2-") for uid in second), second)
+        self.assert_written_up(2)
+        limits = json.loads((self.rundir / review_panel.LIMITS_FILE_NAME)
+                            .read_text(encoding="utf-8"))
+        self.assertEqual(limits, driver.limits_document(
+            driver.load_adapter_config(self.adapter_path)))
+        # A plain run on the directory still finds it finished, and plans nothing.
+        before = self.listing()
+        proc = self.drive("--go")
+        self.assertIn("reported:", proc.stdout)
+        self.assertEqual(self.listing(), before)
+
+    def test_it_keeps_a_budget_of_its_own_and_clears_a_stale_drain_request(self):
+        self.reported_run()
+        spent = {"seconds": 7200.0, "extended": 0.0}
+        (self.rundir / "budget.json").write_text(json.dumps(spent), encoding="utf-8")
+        flag = self.rundir.with_name(self.rundir.name + driver.DRAIN_SUFFIX)
+        flag.write_text("", encoding="utf-8")
+        self.resynth("--max-hours", "1")
+        self.assertFalse(flag.exists(), "a stale drain request survived the start")
+        self.assertEqual(json.loads((self.rundir / "budget.json").read_text(encoding="utf-8")),
+                         spent, "the run's own budget was charged for the resynthesis")
+        own = json.loads((self.rundir / "budget-g2.json").read_text(encoding="utf-8"))
+        self.assertLess(own["seconds"], 3600.0)
+        self.assert_written_up(2)
+
+    def test_a_spent_budget_leaves_a_generation_status_names_as_being_built(self):
+        self.reported_run()
+        proc = self.resynth("--max-hours", "0", expect=driver.EXIT_STOPPED)
+        self.assertIn("time budget", proc.stdout)
+        self.assertTrue((self.rundir / "budget-g2.json").is_file())
+        self.assertEqual(review_panel.building_generation(
+            self.rundir, self.listing()["units"]), 2)
+        status = subprocess.run([sys.executable, str(_DRIVER), "status", str(self.rundir)],
+                                capture_output=True, encoding="utf-8", errors="replace",
+                                timeout=60)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        text = " ".join(status.stdout.split())
+        self.assertIn("published synthesis generation: 1", text)
+        self.assertIn("building synthesis generation 2: 0 of 1 unit(s) finished", text)
+        self.assertIn("generation 2 budget spent:", text)
+
+    def test_a_run_with_no_defect_needing_a_write_up_has_nothing_to_resynthesize(self):
+        self.write_control(no_findings=True)
+        self.reported_run()
+        report = (self.rundir / "report.md").read_bytes()
+        before = self.run_files()
+        # Limits other than the run's, so a resynthesize that wrote them would show it.
+        self.low_synthesis_limits()
+        for _ in range(2):
+            proc = self.resynth()
+            self.assertIn("nothing to resynthesize", proc.stdout)
+        self.assertEqual(self.batches(2), [])
+        self.assertEqual(self.records(), [])
+        self.assertEqual((self.rundir / "report.md").read_bytes(), report)
+        # Nothing to do writes nothing: not the limits, the listing, the log or a pin.
+        after = self.run_files()
+        self.assertEqual([name for name in sorted(set(before) | set(after))
+                          if before.get(name) != after.get(name)], [])
+
+    def test_a_run_that_is_not_reported_is_refused(self):
+        self.plan_only()
+        proc = self.resynth(expect=driver.EXIT_REFUSED)
+        self.assertIn("reported", proc.stderr)
+        self.assertFalse((self.rundir / "budget-g2.json").exists())
+
+
+class AResynthesisIsAttributedToItsOwnAdapter(_Resynthesis):
+    """A generation may run on another adapter than the run was planned with. Its write-ups
+    are attributed to the lanes it ran on, and every other stage to the run's lanes and
+    rung; the run's own pin is not consulted."""
+
+    def test_a_single_batch_recovery_on_another_adapter_publishes(self):
+        self.reported_run()
+        rung = self.findings()["rung"]
+        pin = (self.rundir / "adapter-pin.json").read_bytes()
+        self.write_adapter(A={"adapter": "recovery lane A", "runtime": "stub-C",
+                              "model": "stub-model-C"})
+        self.resynth()
+        self.assertEqual(self.batches(2), ["synth-g2-A"])
+        doc = self.findings()
+        self.assertEqual(doc["rung"], rung)
+        lanes = doc["synthesis"]["dispatch"]
+        self.assertEqual(set(lanes), {"A"})
+        self.assertIn("recovery lane A (stub-C, stub-model-C)", lanes["A"]["adapter"])
+        self.assertEqual((self.rundir / "adapter-pin.json").read_bytes(), pin)
+        pinned = json.loads((self.rundir / "adapter-pin-g2.json").read_text(encoding="utf-8"))
+        self.assertEqual(pinned["A"]["runtime"], "stub-C")
+        how = " ".join(_report_section(self.rundir,
+                                       review_panel.SUBSECTION_HOW_IT_RAN).split())
+        self.assertIn("stub lane A (stub-A, stub-model-A)", how)
+        self.assertIn("stub lane B (stub-B, stub-model-B)", how)
+        self.assertIn("lane A of synthesis generation 2", how)
+        self.assertIn("recovery lane A (stub-C, stub-model-C)", how)
+        self.assert_written_up(2)
+
+
+def _report_section(rundir, heading):
+    text = (rundir / "report.md").read_text(encoding="utf-8")
+    start = text.index(f"### {heading}")
+    end = text.find("\n### ", start + 1)
+    return text[start:] if end < 0 else text[start:end]
+
+
+class AResynthesisResumes(_Resynthesis):
+    """Run again on a run with an unpublished generation, `resynthesize` carries that
+    generation on, keeping every unit that landed; on another adapter it is refused by
+    name."""
+
+    def landed(self):
+        return {path.parent.name: path.read_bytes()
+                for path in self.rundir.glob("units/synth-g2-*/result.json")}
+
+    def resolve_stranded(self):
+        for unit_id, attempt in self.unaccountable(grace=60.0):
+            driver.resolve_attempt(
+                self.rundir, unit_id, attempt, action="fail",
+                reason="the driver was killed between this attempt's record and its launch, "
+                       "so nothing ever started", stopped_confirmed=True, grace=60.0)
+
+    def test_a_kill_during_dispatch_resumes_and_another_adapter_is_refused(self):
+        self.several_defects()
+        self.reported_run()
+        self.low_synthesis_limits(deadline=5.0)
+        self.write_control(tier_per_batch=True, sleep=0.3)
+        proc = subprocess.Popen(self.resynth_argv("--grace", "60"),
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                encoding="utf-8", errors="replace")
+        self.addCleanup(self._reap, proc)
+        deadline = time.time() + 240
+        while time.time() < deadline and proc.poll() is None and not self.landed():
+            time.sleep(0.05)
+        self.assertIsNone(proc.poll(), "the resynthesis finished before it could be killed")
+        proc.kill()
+        proc.wait(timeout=30)
+        seen = self.landed()
+        self.assertTrue(seen)
+        self.assertEqual(review_panel.building_generation(
+            self.rundir, self.listing()["units"]), 2)
+        adapter = self.adapter_path.read_text(encoding="utf-8")
+        self.low_synthesis_limits(deadline=5.0, A={"model": "stub-model-other"})
+        refused = self.resynth("--grace", "60", expect=driver.EXIT_REFUSED)
+        self.assertIn("adapter-pin-g2.json", refused.stderr)
+        self.adapter_path.write_text(adapter, encoding="utf-8")
+        self.write_control(tier_per_batch=True)
+        finished = self.resynth("--grace", "60", expect=None)
+        if finished.returncode == driver.EXIT_STOPPED:
+            self.resolve_stranded()
+            finished = self.resynth("--grace", "60", expect=None)
+        self.assertEqual(finished.returncode, driver.EXIT_OK, finished.stdout + finished.stderr)
+        now = self.landed()
+        for unit, raw in seen.items():
+            self.assertEqual(now.get(unit), raw, f"{unit}'s landed reply changed")
+        for unit in self.listing()["units"]:
+            accepted = [a for a in driver.read_attempts(self.rundir, unit["id"], grace=120.0)
+                        if (a.disposition or {}).get("outcome") == driver.ACCEPTED]
+            self.assertLessEqual(len(accepted), 1, f"{unit['id']} was answered twice")
+        self.assertEqual(self.batches(3), [])
+        self.assert_written_up(2)
+
+
+class TheTaggedRunIsRecoveredByResynthesize(_Resynthesis):
+    """The run directory the v2026.10.0 release wrote, its one synthesis unit failed, and
+    recovered to a complete report — so `resynthesize` needs nothing such a directory
+    lacks: no `asks`, recorded limits, round records or run format."""
+
+    def setUp(self):
+        super().setUp()
+        shutil.copytree(_V2026_10_0_RUN, self.rundir)
+        unit = self.rundir / "units" / "synth-A"
+        (unit / review_panel.RESULT_NAME).unlink()
+        (unit / review_panel.ERROR_NAME).write_text(
+            "the worker returned nothing\n", encoding="utf-8")
+        proc = subprocess.run([sys.executable, str(_SKILL_DIR / "review_panel.py"), "report",
+                               str(self.rundir), "--rerender"], capture_output=True,
+                              encoding="utf-8", errors="replace", timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_it_lacks_what_this_engine_records(self):
+        for name in (review_panel.RUN_FORMAT_FILE_NAME, review_panel.LIMITS_FILE_NAME,
+                     review_panel.ROUNDS_DIR):
+            self.assertFalse((self.rundir / name).exists(), name)
+        for unit in self.listing()["units"]:
+            if unit["kind"] == review_panel.SYNTHESIZER_KIND:
+                self.assertNotIn("generation", unit)
+
+    def test_the_failed_report_names_resynthesize(self):
+        appendix = " ".join(_report_section(self.rundir, review_panel.SUBSECTION_SYNTHESIS)
+                            .split())
+        self.assertIn("resynthesize", appendix)
+
+    def test_it_is_recovered_to_a_complete_report(self):
+        rung = self.findings()["rung"]
+        self.resynth()
+        self.assert_written_up(2)
+        doc = self.findings()
+        self.assertEqual(doc["rung"], rung)
+        self.assertEqual(set(doc["synthesis"]["dispatch"]), {"A"})
+        self.assertIn("stub lane A", doc["synthesis"]["dispatch"]["A"]["adapter"])
+        report = " ".join((self.rundir / "report.md").read_text(encoding="utf-8").split())
+        self.assertIn("A short summary.", report)
+        self.assertNotIn(" ".join(review_panel.GROUPING_NO_SYNTHESIS.split()), report)
+        self.assertIn("runtime-one sub-agent", report)
+        # Still a run of the tag's format: its generation 1 is read as the tag wrote it.
+        self.assertFalse((self.rundir / review_panel.RUN_FORMAT_FILE_NAME).exists())
+
+
+class RedoTakesBackEveryResynthesis(_Resynthesis):
+    """A redo takes back every generation `resynthesize` added, the one still being built
+    included, and every record the driver kept of each."""
+
+    def test_two_generations_and_a_pending_third_leave_no_record(self):
+        self.reported_run()
+        self.resynth()
+        self.resynth()
+        self.resynth("--max-hours", "0", expect=driver.EXIT_STOPPED)
+        self.assertEqual(self.records(), [
+            "adapter-pin-g2.json", "adapter-pin-g3.json", "adapter-pin-g4.json",
+            "budget-g2.json", "budget-g3.json", "budget-g4.json",
+            "dispatch-g2.json", "dispatch-g3.json", "publish-g2.json", "publish-g3.json"])
+        proc = subprocess.run([sys.executable, str(_SKILL_DIR / "review_panel.py"), "cluster",
+                               str(self.rundir), "--redo"], capture_output=True,
+                              encoding="utf-8", errors="replace", timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.records(), [])
+        self.assertFalse([u for u in self.listing()["units"]
+                          if u["kind"] in review_panel.SYNTHESIS_KINDS])
+
+
+_PART_ID = re.compile(rf"{re.escape(review_panel.VERIFICATION_PART_MARK)}\d+(?:-coverage)?\Z")
+
+
+class ARunOfHundredsOfDefects(_Resynthesis):
+    """About five hundred defects, against a stub that refuses any unit larger than its own
+    capacity. Under limits below that capacity every defect needing a write-up is written
+    up; the same run as v2026.10.0 wrote it, its one synthesis unit refused, is recovered by
+    `resynthesize`; and limits above the capacity get units refused, which is what shows the
+    stub would have caught a unit planned too large.
+
+    The stages up to the merge check are run once for the class and the run directory put
+    back before each case, at the same path, because they are the expensive part and every
+    case starts from the same place."""
+
+    AREAS, FILES, LINES = 10, 5, 5
+    # Below the stub's capacity, and large enough to split nothing before synthesis in this
+    # run, as v2026.10.0 split nothing: an area's 25 findings a lane are one batch.
+    BELOW = {"verification": {"input_bytes": 240 * 1024, "reply_bytes": 90 * 1024},
+             "clustering": {"input_bytes": 240 * 1024, "reply_bytes": 60 * 1024},
+             "synthesis": {"input_bytes": 200 * 1024, "reply_bytes": 60 * 1024,
+                           "index_bytes": 32 * 1024}}
+
+    @classmethod
+    def setUpClass(cls):
+        cls._layout = _lay_out(Path(tempfile.mkdtemp(prefix="rp-driver-large-")))
+        try:
+            case = cls("to_the_merge_check")
+            case.__dict__.update(cls._layout)
+            case.to_the_merge_check()
+            shutil.copytree(case.rundir, cls._layout["tmp"] / "merge-checked", symlinks=True)
+        except BaseException:
+            _discard(cls._layout["tmp"])
+            raise
+
+    @classmethod
+    def tearDownClass(cls):
+        _discard(cls._layout["tmp"])
+
+    def setUp(self):   # deliberately NOT _Case.setUp: the run up to the merge check is the class's
+        self.__dict__.update(self._layout)
+        driver.remove_tree(self.rundir, self.tmp)
+        shutil.copytree(self.tmp / "merge-checked", self.rundir, symlinks=True)
+        for name in ("over-capacity.jsonl", "stub-count.txt"):
+            with contextlib.suppress(FileNotFoundError):
+                (self.tmp / name).unlink()
+        self.write_adapter(**{lane: {"limits": self.BELOW} for lane in review_panel.LANES})
+        self.write_control(every_file=True, every_line=True, tier_per_batch=True)
+
+    def to_the_merge_check(self):
+        """Plan a tree of `AREAS` areas with one finding a line, and run every stage before
+        synthesis."""
+        shutil.rmtree(self.root)
+        areas = []
+        for a in range(self.AREAS):
+            for f in range(self.FILES):
+                path = self.root / f"pkg{a:02d}" / f"mod{f:02d}.py"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("".join(f"value_{a}_{f}_{n} = {n}\n" for n in range(self.LINES)),
+                                encoding="utf-8")
+            areas.append({"name": f"pkg{a:02d}", "paths": [f"pkg{a:02d}/"]})
+        job = json.loads(self.job_path.read_text(encoding="utf-8"))
+        job.update(partition="subject", areas=areas)
+        self.job_path.write_text(json.dumps(job), encoding="utf-8")
+        self.write_adapter(**{lane: {"limits": self.BELOW} for lane in review_panel.LANES})
+        self.write_control(every_file=True, every_line=True)
+        self.drive(timeout=600)
+        run = self.run_object(poll=0.05)
+        run_stage = run._run_stage
+        run._run_stage = lambda stage: (driver.EXIT_STOPPED if stage == "synthesize"
+                                        else run_stage(stage))
+        self.assertEqual(run.loop(), driver.EXIT_STOPPED)
+        self.assertEqual(self.listing()["stage"], review_panel.MERGE_CHECKED_STAGE)
+        self.assertFalse((self.tmp / "over-capacity.jsonl").exists())
+
+    def over_capacity(self):
+        path = self.tmp / "over-capacity.jsonl"
+        return ([json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+                if path.exists() else [])
+
+    def refused_units(self):
+        """The units whose payload the stub refused, by id."""
+        digests = {record["sha256"] for record in self.over_capacity()}
+        return {unit["id"] for unit in self.listing()["units"]
+                if hashlib.sha256((self.rundir / unit["payload"]).read_text(encoding="utf-8")
+                                  .encode("utf-8")).hexdigest() in digests}
+
+    def defects_in(self, unit_ids):
+        return {did for unit in self.listing()["units"] if unit["id"] in unit_ids
+                for did in unit["defects"]}
+
+    def assert_every_defect_written_up(self, generation, needing):
+        """Every one of ``needing`` written up by ``generation``, under a tier from the
+        reconciled list, and the run with an overview."""
+        doc = self.findings()
+        synthesis = doc["synthesis"]
+        self.assertEqual(synthesis["generation"], generation)
+        self.assertGreater(len(synthesis["units"]), 1)
+        self.assertEqual({did for unit in synthesis["units"] for did in unit["defects"]},
+                         needing)
+        self.assertEqual(synthesis["tier_names"]["state"], review_panel.NAMES_RECONCILED)
+        tiers = synthesis["tiers"]
+        self.assertTrue(tiers)
+        written = {d["id"] for d in doc["defects"] if d.get("what_goes_wrong")}
+        self.assertEqual(written, needing)
+        for defect in doc["defects"]:
+            if defect["id"] in needing:
+                self.assertIn(defect["tier"], tiers, defect["id"])
+        self.assertEqual(synthesis["overview"], "A short summary.")
+
+    def test_under_limits_below_the_stubs_capacity_every_defect_is_written_up(self):
+        for lane in json.loads((self.rundir / review_panel.LIMITS_FILE_NAME)
+                               .read_text(encoding="utf-8"))["lanes"].values():
+            for stage in ("verification", "clustering", "synthesis"):
+                self.assertLess(lane[stage]["input_bytes"], STUB_CAPACITY_PAYLOAD_BYTES)
+                self.assertLess(lane[stage]["reply_bytes"], STUB_CAPACITY_REPLY_BYTES)
+        self.drive("--go", timeout=900)
+        self.assertEqual(self.listing()["stage"], review_panel.REPORTED_STAGE)
+        self.assertEqual(self.over_capacity(), [])
+        needing = self.defects_in({u["id"] for u in self.listing()["units"]
+                                   if u["kind"] == review_panel.SYNTHESIZER_KIND})
+        self.assertGreater(len(needing), 450)
+        self.assertEqual(needing, {d["id"] for d in self.findings()["defects"]})
+        self.assert_every_defect_written_up(1, needing)
+
+    def test_the_same_run_as_v2026_10_0_wrote_it_is_recovered_by_resynthesize(self):
+        self.assertFalse([u["id"] for u in self.listing()["units"] if _PART_ID.search(u["id"])],
+                         "the stages before synthesis split something v2026.10.0 would not")
+        self.list_one_old_synthesis_unit()
+        old = [u for u in self.listing()["units"] if u["kind"] == review_panel.SYNTHESIZER_KIND]
+        self.assertEqual([u["id"] for u in old], ["synth-A"])
+        needing = set(old[0]["defects"])
+        self.assertGreater(len(needing), 450)
+        # Dispatched to the same stub, which refuses it as over its capacity: the failure
+        # resynthesize has to recover from.
+        run = self.run_object(poll=0.05)
+        run.dispatch_round(review_panel.SYNTHESIS_KINDS)
+        self.assertTrue((self.rundir / "units" / "synth-A" / review_panel.ERROR_NAME).is_file())
+        self.assertEqual(self.refused_units(), {"synth-A"})
+        # The engine's own report, since this driver refuses a v2026.10.0 run before it.
+        _write_json = driver._write_json
+        _write_json(self.rundir / review_panel.DISPATCH_FILE_NAME,
+                    driver.dispatch_record(run.lanes, driver.executed_provenance(run)))
+        proc = subprocess.run([sys.executable, str(_SKILL_DIR / "review_panel.py"), "report",
+                               str(self.rundir)], capture_output=True, encoding="utf-8",
+                              errors="replace", timeout=300)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.listing()["stage"], review_panel.REPORTED_STAGE)
+        self.assertFalse([d for d in self.findings()["defects"] if d.get("what_goes_wrong")])
+        self.resynth(timeout=900)
+        self.assert_every_defect_written_up(2, needing)
+        self.assertEqual(self.refused_units(), {"synth-A"},
+                         "the recovery planned a unit too large for the worker")
+        self.assertFalse((self.rundir / review_panel.RUN_FORMAT_FILE_NAME).exists())
+
+    def list_one_old_synthesis_unit(self):
+        """The run as v2026.10.0 left it at synthesis: no run format, no limits, no round
+        record, and one synthesis unit for every defect, listed with the keys that release
+        wrote. The engine plans it, under synthesis limits that cannot split, and the
+        listing is then put back to that shape."""
+        doc = json.loads((self.rundir / review_panel.LIMITS_FILE_NAME).read_text(encoding="utf-8"))
+        for lane in doc["lanes"].values():
+            lane["synthesis"] = {"input_bytes": 64 << 20, "reply_bytes": 64 << 20,
+                                 "index_bytes": 32 * 1024}
+        (self.rundir / review_panel.LIMITS_FILE_NAME).write_text(json.dumps(doc),
+                                                                 encoding="utf-8")
+        proc = subprocess.run([sys.executable, str(_SKILL_DIR / "review_panel.py"),
+                               "synthesize", str(self.rundir)], capture_output=True,
+                              encoding="utf-8", errors="replace", timeout=300)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        listing = self.listing()
+        old_keys = ("area", "defect_sites", "defects", "id", "kind", "lane", "lens", "payload",
+                    "payload_bytes", "payload_lines", "schema")
+        listing["units"] = [unit if unit["kind"] != review_panel.SYNTHESIZER_KIND
+                            else {key: unit[key] for key in old_keys}
+                            for unit in listing["units"]]
+        (self.rundir / "units.json").write_text(json.dumps(listing), encoding="utf-8")
+        shutil.rmtree(self.rundir / review_panel.ROUNDS_DIR)
+        for name in (review_panel.RUN_FORMAT_FILE_NAME, review_panel.LIMITS_FILE_NAME):
+            (self.rundir / name).unlink()
+
+    def test_limits_above_the_stubs_capacity_get_units_refused(self):
+        above = {**self.BELOW, "synthesis": {"input_bytes": 4 << 20, "reply_bytes": 4 << 20,
+                                             "index_bytes": 32 * 1024}}
+        self.write_adapter(**{lane: {"limits": above} for lane in review_panel.LANES})
+        self.drive("--go", timeout=900)
+        batches = [u["id"] for u in self.listing()["units"]
+                   if u["kind"] == review_panel.SYNTHESIZER_KIND]
+        self.assertEqual(batches, ["synth-A"])
+        self.assertEqual(self.refused_units(), {"synth-A"})
+        for record in self.over_capacity():
+            self.assertTrue(record["payload_bytes"] > STUB_CAPACITY_PAYLOAD_BYTES
+                            or record["reply_bytes"] > STUB_CAPACITY_REPLY_BYTES, record)
+        self.assertTrue((self.rundir / "units" / "synth-A" / review_panel.ERROR_NAME).is_file())
+        self.assertFalse([d for d in self.findings()["defects"] if d.get("what_goes_wrong")])
 
 
 # --------------------------------------------------------------------------- #
@@ -5049,7 +6107,7 @@ class TheSynthesizerGetsACopyLikeEveryOtherWriter(_Case):
                                   "lane": "A"}, **over)
         (path / "reply.json").write_text(reply, encoding="utf-8")
         (self.rundir / "units" / unit / review_panel.RESULT_NAME).write_text(
-            '{"tiers": [], "defects": [], "summary": "x"}', encoding="utf-8")
+            '{"tiers": [], "defects": []}', encoding="utf-8")
         (self.rundir / "dispatch" / unit / "landed.json").write_text(
             json.dumps({"publication": "result", "attempt": "a0"}), encoding="utf-8")
         return path

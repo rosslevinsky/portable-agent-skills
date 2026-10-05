@@ -2839,7 +2839,7 @@ class TheMaintainersGuideNamesNothingThatWasRenamed(unittest.TestCase):
         self.assertTrue(tokens, f"no quoted names in the span matched by {pattern!r}")
         return tokens
 
-    NUMBER_WORDS = {4: "four", 6: "six", 7: "seven", 8: "Eight"}
+    NUMBER_WORDS = {4: "four", 5: "five", 6: "six", 7: "seven", 8: "Eight"}
 
     def test_the_stage_table_lists_stages_and_only_stages(self):
         """Every marker in the table's first column is one `units.json` can hold.

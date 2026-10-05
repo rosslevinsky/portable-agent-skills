@@ -11,9 +11,11 @@ about how much the run trusts it. **Write from what each defect actually gives y
 a defect carries no checker's account, say what goes wrong from the report and the code, and
 do not write as though someone had confirmed it. What the run has now is a list of defects and no account of them: a
 reader gets an ordered list of separate problems and has to work out for themselves what these
-defects have in common and what each one actually does. Your job is to write that account,
-**once per defect**: the report lists each defect's sites under your account, each with its own
-location, source, outcome and test, so do not write a separate account per site.
+defects have in common and what each one actually does. Your job is to write that account
+for the defects in your batch — the run's defects are split into batches by folder, and other
+agents write up the rest — **once per defect**: the report lists each defect's sites under
+your account, each with its own location, source, outcome and test, so do not write a
+separate account per site.
 
 You are given a disposable copy of the snapshot as your working directory; every path below is
 relative to it. Read any file you need. **It is the only place you may write** — nothing reads
@@ -38,11 +40,12 @@ taxonomy and not a severity — the words somebody would use at a desk: what sto
 what a person using this software loses, when the defects under that heading go wrong. A good
 tier heading tells a reader whether the section is worth their afternoon.
 
-**You name every tier this run has, and you name them once.** The list you return is the whole
-vocabulary: every defect then names one entry from it, spelled exactly as you spelled it there.
-Two headings for one theme, in two phrasings, is the failure this round exists to avoid — a
-reader with fourteen headings has no grouping at all, only a longer list. Prefer few, and put
-them in the order a reader should work through them.
+**You name the tiers your batch's defects need, in this project's own terms, once each.** The
+list you return is your vocabulary: every defect then names one entry from it, spelled exactly
+as you spelled it there. Two headings for one theme, in two phrasings, gives a reader a longer
+list rather than a grouping. Prefer few, and put them in the order a reader should work
+through them. Other batches name tiers for their own defects; a later round merges names that
+mean the same thing, so name what your defects break rather than guessing at the others.
 
 Every defect in the payload gets a tier, including the ones nothing could settle. A defect
 whose theme is that nobody could check it is not a tier — say what it would break if it is
@@ -88,8 +91,9 @@ one causing or masking the other, or one fix that has to account for both. **Sit
 same file is not a connection**, and neither is sharing a word in their descriptions.
 
 The engine checks what it can — that the id names a defect in this run, and that the two
-defects touch a file in common or sit under one tier, the tiers being the ones you assign —
-and **drops any reference that fails the check, naming it in the report** so a reader can see
+defects touch a file in common or were written up in one batch, which for a defect of yours
+means one under `Your defects` — and **drops any reference that fails the check, naming it in
+the report** so a reader can see
 which connection you claimed and why it was refused. It cannot check that the two are related
 in the way you say, so a loose reference is not caught; it is simply printed, and it costs the
 reader the trust the checked material earned.
@@ -98,12 +102,14 @@ reader the trust the checked material earned.
 
 Every defect the payload lists under `Your defects` appears in your reply exactly once. A reply
 that drops one, repeats one, or names one the payload does not list is refused whole, and the
-report then groups defects by status as though this round had not run — so an approximate
-answer buys nothing over no answer, and a careful one is the only kind worth returning.
+report then shows every defect of your batch with no write-up, grouped by status — so an
+approximate answer buys nothing over no answer, and a careful one is the only kind worth
+returning.
 
-The defect index above that section lists **every** defect in the run, including any outside
-your own list. It is there so you can cite one in a cross-reference. Do not write an entry for
-a defect that is not in `Your defects`.
+The index above that section lists the defects outside your batch that share a file with one
+of yours — the only outside defects a reference from yours can survive to — by id and
+consequence. It is capped, and says how many it left out. It is there so you can cite one in
+a cross-reference. Do not write an entry for a defect that is not in `Your defects`.
 
 ## How to answer
 

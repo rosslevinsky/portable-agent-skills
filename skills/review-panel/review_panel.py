@@ -6,7 +6,7 @@ Five subcommands, each a stage of a blind multi-agent correctness sweep:
     plan       <job> --rundir <dir>  -> areas, closure proof, reading payloads
     route      <rundir>              -> candidate findings, verification payloads
     cluster    <rundir>              -> one clustering payload per area, after the verdicts
-    synthesize <rundir>              -> one payload judging every defect, after the grouping
+    synthesize <rundir>              -> batched payloads writing up the defects, after the grouping
     report     <rundir>              -> the report
 
 ``synthesize`` is OPTIONAL: ``report`` runs whether or not it happened, and reads its result
@@ -575,6 +575,11 @@ JOB_FILE_NAME = "job.json"
 # in ready-made has none, and so does one the interview wrote before this file existed. The
 # report says that rather than concluding which, because the absence cannot tell them apart.
 JOB_NOTES_FILE_NAME = "job-notes.json"
+# What `plan` records about the shape of the run directory it wrote. A directory without
+# the file was planned by v2026.10.0 or earlier, whose units carry no limits, no `asks` and
+# no round records; the driver refuses to resume one before it reached `reported`.
+RUN_FORMAT_FILE_NAME = "run-format.json"
+RUN_FORMAT = 1
 # One per field the notes may carry, and one of these three per field. Only ``defaulted``
 # renders a mark: a reader wants to know which values nobody chose, and marking the two that
 # were chosen would put a parenthesis on nearly every line to say "as asked".
@@ -1925,8 +1930,10 @@ def _claim_stage(rundir: Path, stage: str) -> Path:
 
 
 # What ``plan`` writes into a run directory, and so all a failed ``plan`` may take back.
-_PLAN_OUTPUTS = frozenset({"snapshot", "inventory.json", "areas.json", "units", "units.json", JOB_FILE_NAME})
-_PLAN_FILES = ("inventory.json", "areas.json", "units.json", JOB_FILE_NAME)
+_PLAN_OUTPUTS = frozenset({"snapshot", "inventory.json", "areas.json", "units", "units.json",
+                           JOB_FILE_NAME, RUN_FORMAT_FILE_NAME})
+_PLAN_FILES = ("inventory.json", "areas.json", "units.json", JOB_FILE_NAME,
+               RUN_FORMAT_FILE_NAME)
 
 
 def _remove_what_was_written(rundir: Path, *, keep_job: bool, made_rundir: bool) -> None:
@@ -2174,6 +2181,368 @@ LANES = ("A", "B")
 # are differs by partition mode and is settled in :func:`partition`; see
 # :func:`auditor_areas`.
 AUDITORS = len(LANES)
+
+
+# --------------------------------------------------------------------------- #
+# run format and limits
+# --------------------------------------------------------------------------- #
+def write_run_format(rundir: Path) -> None:
+    write_json(rundir / RUN_FORMAT_FILE_NAME, {"format": RUN_FORMAT})
+
+
+def read_run_format(rundir: Path) -> int | None:
+    """The format `plan` recorded, or ``None`` for a directory planned before one was.
+
+    **A file that is there and cannot be read is refused, never read as absent**: absent
+    is what marks an old run, and a damaged record read that way would send a current run
+    down the old run's path."""
+    path = rundir / RUN_FORMAT_FILE_NAME
+    if _lstat_or_absent(path, RUN_FORMAT_FILE_NAME, RunDirError) is None:
+        return None
+    doc = _read_run_json(rundir, RUN_FORMAT_FILE_NAME)
+    value = doc.get("format") if isinstance(doc, dict) else None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise RunDirError(f"{path} records no run format; it should hold "
+                          f'{{"format": {RUN_FORMAT}}}')
+    return value
+
+
+class LimitsError(ReviewPanelError):
+    """A limits record, or the per-lane limits it is built from, that cannot be used."""
+
+
+# The stages a run sizes its units for when it plans them. The reading round is bounded by
+# the partition's ceiling and the merge and merge-check rounds by their own constants above;
+# none of those reads these.
+LIMIT_STAGES = ("verification", "clustering", "synthesis")
+LIMITS_FILE_NAME = "limits.json"
+INPUT_BYTES, REPLY_BYTES, INDEX_BYTES = "input_bytes", "reply_bytes", "index_bytes"
+# The key of a lane's hard ceiling: the size its model is known to take, stated by the
+# operator and unset by default. An item over it is listed and never dispatched.
+HARD_LIMITS = "hard"
+
+
+@dataclass(frozen=True)
+class Limits:
+    """What one unit of a stage is packed to stay under: its measured payload bytes and its
+    estimated reply bytes, and for synthesis the bytes of the index of outside defects."""
+
+    input_bytes: int
+    reply_bytes: int
+    index_bytes: int | None = None
+
+    def record(self) -> dict:
+        out = {INPUT_BYTES: self.input_bytes, REPLY_BYTES: self.reply_bytes}
+        if self.index_bytes is not None:
+            out[INDEX_BYTES] = self.index_bytes
+        return out
+
+    def within(self, hard: "Limits | None") -> "Limits":
+        """These limits with each measure no larger than ``hard``'s, so a unit packed under
+        them can never be over the hard ceiling: an operator may state a hard ceiling below
+        the planning defaults and nothing else."""
+        if hard is None:
+            return self
+        return Limits(input_bytes=min(self.input_bytes, hard.input_bytes),
+                      reply_bytes=min(self.reply_bytes, hard.reply_bytes),
+                      index_bytes=self.index_bytes)
+
+
+# Planning ceilings: batching targets with headroom, not measured model limits. Synthesis
+# starts at the reader's 200 KB input and about forty defects' write-ups (1.5 KB each) per
+# reply, with the index well inside the input. They are defaults to lower, per lane, when a
+# worker cannot take the units they plan.
+DEFAULT_LIMITS = {
+    "verification": Limits(input_bytes=400 * 1024, reply_bytes=128 * 1024),
+    "clustering": Limits(input_bytes=400 * 1024, reply_bytes=64 * 1024),
+    "synthesis": Limits(input_bytes=200 * 1024, reply_bytes=60 * 1024,
+                        index_bytes=32 * 1024),
+}
+
+
+def _limit_fields(stage: str) -> tuple[str, ...]:
+    return ((INPUT_BYTES, REPLY_BYTES, INDEX_BYTES) if stage == "synthesis"
+            else (INPUT_BYTES, REPLY_BYTES))
+
+
+def _positive_bytes(value: object, where: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise LimitsError(f"{where} must be a whole number of bytes, at least 1")
+    return value
+
+
+def _parse_limit_group(raw: object, where: str, fields: Sequence[str],
+                       base: Limits | None) -> Limits:
+    """One stage's limits, or a hard ceiling: an object of the named byte fields. A field
+    left out keeps ``base``'s value; with no ``base`` every field is required."""
+    if not isinstance(raw, dict):
+        raise LimitsError(f"{where} must be a JSON object of byte limits")
+    unknown = sorted(set(raw) - set(fields))
+    if unknown:
+        raise LimitsError(f"{where} has unknown key(s): {', '.join(unknown)}; "
+                          f"it takes: {', '.join(fields)}")
+    values = {}
+    for field in fields:
+        if field in raw:
+            values[field] = _positive_bytes(raw[field], f"{where}.{field}")
+        elif base is not None:
+            values[field] = getattr(base, field)
+        else:
+            raise LimitsError(f"{where} is missing {field!r}")
+    return Limits(**values)
+
+
+def _index_holds_its_notice(limits: Limits, where: str) -> Limits:
+    """``limits``, refused by name where its index cap cannot hold the line saying how many
+    outside defects it left out: that line is rendered whatever the cap, so a smaller cap
+    would put a payload over the bytes the packer reserved for its index."""
+    if limits.index_bytes is not None and limits.index_bytes < INDEX_NOTICE_FLOOR:
+        raise LimitsError(f"{where}.{INDEX_BYTES} must be at least {INDEX_NOTICE_FLOOR} "
+                          f"bytes, the size of the line an index says it was cut with")
+    return limits
+
+
+def lane_limits(raw: object, where: str) -> dict:
+    """One lane's limits record: the engine's planning ceilings with ``raw``'s values over
+    them, and its hard ceiling when ``raw`` states one. ``raw`` is the lane's ``limits``
+    from the adapter config, or ``None`` for a lane that states none."""
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise LimitsError(f"{where} must be a JSON object")
+    unknown = sorted(set(raw) - {*LIMIT_STAGES, HARD_LIMITS})
+    if unknown:
+        raise LimitsError(f"{where} has unknown key(s): {', '.join(unknown)}; it takes: "
+                          f"{', '.join((*LIMIT_STAGES, HARD_LIMITS))}")
+    out = {stage: _index_holds_its_notice(
+               _parse_limit_group(raw.get(stage, {}), f"{where}.{stage}",
+                                  _limit_fields(stage), DEFAULT_LIMITS[stage]),
+               f"{where}.{stage}").record()
+           for stage in LIMIT_STAGES}
+    if HARD_LIMITS in raw:
+        out[HARD_LIMITS] = _parse_limit_group(raw[HARD_LIMITS], f"{where}.{HARD_LIMITS}",
+                                              (INPUT_BYTES, REPLY_BYTES), None).record()
+    return out
+
+
+def limits_document(per_lane: Mapping[str, object]) -> dict:
+    """What the driver writes as ``limits.json``: every lane's limits record, from the
+    ``limits`` each lane states (``None`` where it states none)."""
+    return {"lanes": {lane: lane_limits(per_lane.get(lane), f"lanes.{lane}.limits")
+                      for lane in LANES}}
+
+
+@dataclass(frozen=True)
+class RunLimits:
+    """The limits a run plans its units against, per lane."""
+
+    lanes: Mapping[str, Mapping[str, Limits]]
+    hard: Mapping[str, Limits | None]
+
+    def planning(self, stage: str, lanes: Sequence[str]) -> Limits:
+        """The smallest of each limit across ``lanes``: one lane's own when a unit's lane is
+        fixed before packing, every lane it could go to when it is assigned afterwards.
+        Each measure is clamped to the smallest hard ceiling across the same lanes."""
+        chosen = [self.lanes[lane][stage] for lane in lanes]
+        index = [limits.index_bytes for limits in chosen if limits.index_bytes is not None]
+        return Limits(input_bytes=min(limits.input_bytes for limits in chosen),
+                      reply_bytes=min(limits.reply_bytes for limits in chosen),
+                      index_bytes=min(index) if index else None,
+                      ).within(self.hard_ceiling(lanes))
+
+    def hard_ceiling(self, lanes: Sequence[str]) -> Limits | None:
+        """The smallest hard ceiling stated across ``lanes``, or ``None`` where none is."""
+        stated = [self.hard[lane] for lane in lanes if self.hard.get(lane) is not None]
+        if not stated:
+            return None
+        return Limits(input_bytes=min(limits.input_bytes for limits in stated),
+                      reply_bytes=min(limits.reply_bytes for limits in stated))
+
+
+def default_limits() -> RunLimits:
+    return RunLimits(lanes={lane: dict(DEFAULT_LIMITS) for lane in LANES},
+                     hard={lane: None for lane in LANES})
+
+
+def read_limits(rundir: Path) -> RunLimits:
+    """The limits ``limits.json`` records, or the engine's defaults where there is none — a
+    stage run by hand, or a run planned before the file existed. The only place limits are
+    read from: the adapter config is the driver's, and reaches the engine through this file.
+
+    A file that is there and cannot be used is refused by name rather than replaced by the
+    defaults, which would plan a run against limits nobody chose."""
+    path = rundir / LIMITS_FILE_NAME
+    if _lstat_or_absent(path, LIMITS_FILE_NAME, RunDirError) is None:
+        return default_limits()
+    doc = _read_run_json(rundir, LIMITS_FILE_NAME)
+    lanes = doc.get("lanes") if isinstance(doc, dict) else None
+    if not isinstance(lanes, dict) or sorted(lanes) != sorted(LANES):
+        raise LimitsError(f"{path} must hold a 'lanes' object with one entry for each of "
+                          f"{', '.join(LANES)}")
+    planning: dict[str, dict[str, Limits]] = {}
+    hard: dict[str, Limits | None] = {}
+    for lane in LANES:
+        where = f"{path} lanes.{lane}"
+        raw = lanes[lane]
+        if not isinstance(raw, dict):
+            raise LimitsError(f"{where} must be a JSON object")
+        missing = [stage for stage in LIMIT_STAGES if stage not in raw]
+        if missing:
+            raise LimitsError(f"{where} is missing {', '.join(missing)}")
+        unknown = sorted(set(raw) - {*LIMIT_STAGES, HARD_LIMITS})
+        if unknown:
+            raise LimitsError(f"{where} has unknown key(s): {', '.join(unknown)}")
+        planning[lane] = {stage: _index_holds_its_notice(
+                              _parse_limit_group(raw[stage], f"{where}.{stage}",
+                                                 _limit_fields(stage), None),
+                              f"{where}.{stage}")
+                          for stage in LIMIT_STAGES}
+        hard[lane] = (_parse_limit_group(raw[HARD_LIMITS], f"{where}.{HARD_LIMITS}",
+                                         (INPUT_BYTES, REPLY_BYTES), None)
+                      if HARD_LIMITS in raw else None)
+    return RunLimits(lanes=planning, hard=hard)
+
+
+@dataclass(frozen=True)
+class PackItem:
+    """One thing a stage never splits, as the packer sees it: its id, the folder it is
+    ordered and grouped by, its record as the payload renders it, and how many of each kind
+    of nested entry the reply must hold for it (verdicts, site notes, cross-references)."""
+
+    id: str
+    folder: str
+    record: str
+    counts: Mapping[str, int]
+
+
+@dataclass(frozen=True)
+class Pack:
+    """One planned unit's items and what it was planned under.
+
+    ``oversize`` marks an item over the planning ceiling that went alone; ``dispatch`` is
+    ``False`` for one over the hard ceiling of every lane it could go to, which is listed
+    and never sent to a model. ``lanes`` names the only lanes whose hard ceiling takes an
+    item over ``hard``; it is empty where any lane may take the unit."""
+
+    items: tuple[str, ...]
+    input_bytes: int
+    reply_bytes: int
+    limits: Limits
+    hard: Limits | None
+    oversize: bool = False
+    dispatch: bool = True
+    lanes: tuple[str, ...] = ()
+
+    def limits_record(self) -> dict:
+        """What the unit's listing records as the limits it was planned under."""
+        out = {"planning": self.limits.record()}
+        if self.hard is not None:
+            out[HARD_LIMITS] = self.hard.record()
+        return out
+
+
+def assign_lane(pack: Pack, turn: str, stage: str,
+                run_limits: RunLimits) -> tuple[str, dict]:
+    """The lane a unit packed against every lane's limits goes to, and the limits record
+    it carries: ``turn`` and the pack's own record, except for an item only some lanes'
+    hard ceilings take, which goes to ``turn`` where that lane takes it and to the first
+    lane that does otherwise, and records that lane's own limits."""
+    if not pack.lanes:
+        return turn, pack.limits_record()
+    lane = turn if turn in pack.lanes else pack.lanes[0]
+    own = replace(pack, limits=run_limits.planning(stage, (lane,)),
+                  hard=run_limits.hard_ceiling((lane,)))
+    return lane, own.limits_record()
+
+
+def estimate_reply(counts: Mapping[str, int], per_entry: Mapping[str, int]) -> int:
+    """A reply's bytes, estimated before it exists from what it must hold: each kind of
+    nested entry times its bytes. A kind ``per_entry`` does not price is refused, so an
+    estimate can never quietly count something as free."""
+    unpriced = sorted(set(counts) - set(per_entry))
+    if unpriced:
+        raise LimitsError(f"no reply size is stated for: {', '.join(unpriced)}")
+    return sum(count * per_entry[kind] for kind, count in counts.items())
+
+
+def pack_items(items: Sequence[PackItem], *, head: str, reply_head: int,
+               per_entry: Mapping[str, int], limits: Limits,
+               hard: Limits | None = None, reserve: int = 0,
+               lane_hard: Mapping[str, Limits | None] | None = None) -> tuple[Pack, ...]:
+    """Pack ``items`` into units under ``limits``, in folder order, as :func:`plan_merge`
+    batches sites: folders in name order and whole while they fit beside the unit being
+    filled; one that does not starts the next unit, and one over the limits on its own is
+    filled item by item. An item is never split.
+
+    ``head`` is what every unit's payload carries once — the brief, the schema and the
+    index — and is measured, not estimated; each item adds its record's bytes. A reply is
+    ``reply_head`` plus :func:`estimate_reply` over the items' nested counts, never a count
+    of items alone. An item over the limits on its own goes in a unit by itself, flagged
+    ``oversize``, or, over ``hard`` as well, listed with ``dispatch`` false.
+
+    ``lane_hard`` is each lane's own hard ceiling, given where a unit's lane is assigned
+    after packing and ``hard`` is the smallest of them. An item over ``hard`` then goes
+    alone with ``lanes`` naming the lanes whose ceiling takes it (a lane with none takes
+    anything), and is listed with ``dispatch`` false only where no lane takes it.
+
+    ``reserve`` is bytes every unit's payload may carry beyond ``head`` that are only known
+    once the unit's items are chosen — synthesis's index of outside defects — counted at the
+    cap the caller holds them to, so the measured payload can never outgrow its plan.
+
+    ``limits`` is clamped to ``hard`` measure by measure before packing, and the clamped
+    limits are what each unit records, so no dispatched unit is ever over ``hard``."""
+    limits = limits.within(hard)
+    fixed = measure_payload(head)[1] + reserve
+    size = {item.id: measure_payload(item.record)[1] for item in items}
+    reply = {item.id: estimate_reply(item.counts, per_entry) for item in items}
+
+    def totals(chosen: Sequence[PackItem]) -> tuple[int, int]:
+        return (fixed + sum(size[item.id] for item in chosen),
+                reply_head + sum(reply[item.id] for item in chosen))
+
+    def under(chosen: Sequence[PackItem], bound: Limits) -> bool:
+        in_bytes, out_bytes = totals(chosen)
+        return in_bytes <= bound.input_bytes and out_bytes <= bound.reply_bytes
+
+    packs: list[Pack] = []
+
+    def close(chosen: Sequence[PackItem], **flags) -> None:
+        in_bytes, out_bytes = totals(chosen)
+        packs.append(Pack(items=tuple(item.id for item in chosen), input_bytes=in_bytes,
+                          reply_bytes=out_bytes, limits=limits, hard=hard, **flags))
+
+    by_folder: dict[str, list[PackItem]] = {}
+    for item in items:
+        by_folder.setdefault(item.folder, []).append(item)
+    current: list[PackItem] = []
+    for folder in sorted(by_folder):
+        group = by_folder[folder]
+        if under(current + group, limits):
+            current += group
+            continue
+        if current and under(group, limits):
+            close(current)
+            current = list(group)
+            continue
+        for item in group:
+            if not under([item], limits):
+                if current:
+                    close(current)
+                    current = []
+                if hard is not None and not under([item], hard):
+                    takers = tuple(lane for lane, ceiling in (lane_hard or {}).items()
+                                   if ceiling is None or under([item], ceiling))
+                    close([item], oversize=True, dispatch=bool(takers), lanes=takers)
+                else:
+                    close([item], oversize=True)
+                continue
+            if current and not under(current + [item], limits):
+                close(current)
+                current = []
+            current.append(item)
+    if current:
+        close(current)
+    return tuple(packs)
 
 
 @dataclass(frozen=True)
@@ -4047,6 +4416,15 @@ class Batch:
     candidates: tuple[str, ...]
     routing: str
     asks: str = DEFECT_ASKS
+    # The limits the unit was planned under, as :meth:`Pack.limits_record` writes them;
+    # ``oversize`` and ``dispatch`` as on a :class:`Pack`.
+    limits: dict | None = None
+    oversize: bool = False
+    dispatch: bool = True
+    # The areas whose tests a coverage unit is shown: the batch's own, then every area an
+    # auditor of the WHOLE batch read from, so each part of a split batch is shown the same
+    # tests the batch would have been. Empty on a defect unit.
+    scope: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -4720,7 +5098,27 @@ def asks_of(cand: dict) -> str:
     return asks_of_kind(cand["raised_by"][0]["kind"])
 
 
-def route(candidates: Sequence[Candidate]) -> tuple[Batch, ...]:
+# A verification reply, priced before it exists: the summary, then one verdict per
+# candidate. A verdict is a status, a rationale of a few sentences, the test to make red and
+# at most four kilobytes of evidence, which most verdicts by reading do not carry; the price
+# is what a verdict usually costs, and the reply limit holds the headroom.
+VERIFICATION_REPLY_HEAD = 1024
+VERIFICATION_REPLY_PRICES = {"verdict": 2048}
+# What a part of a split verification batch carries in its id before any coverage suffix.
+VERIFICATION_PART_MARK = "-f"
+
+
+def coverage_scope(area: str, held: Sequence[Candidate]) -> tuple[str, ...]:
+    """The areas whose tests a coverage batch is shown: its own first, then every area its
+    auditors read from, sorted. A coverage finding is usually raised from a tests area that
+    reached the source through ``also_read``, so the area it is filed under and the area
+    holding the test that settles it differ by design."""
+    raisers = sorted({cand.raised_by[0].area for cand in held} - {area, None})
+    return (area, *raisers)
+
+
+def route(candidates: Sequence[Candidate], limits: RunLimits | None = None,
+          head_for: Callable[[str, tuple[str, ...]], str] | None = None) -> tuple[Batch, ...]:
     """One batch per (area, finder, question), the finder being the lane that raised its
     candidates, addressed to the other lane. Every candidate has exactly one raiser, so
     every batch is addressed to a lane that raised none of it, and each candidate is in
@@ -4733,7 +5131,23 @@ def route(candidates: Sequence[Candidate]) -> tuple[Batch, ...]:
     Reader batches are unchanged, down to their ids; a coverage batch is the same key with
     the kind on the end of its name, so which question a unit was asked is visible in the
     run directory without opening anything.
+
+    **A batch over its lane's limits is split into parts by file**, packed by
+    :func:`pack_items` against the verification limits of the lane it goes to. Splitting
+    keeps the question: each verdict answers its own candidate and none is weighed against
+    another, so a part asks of each candidate exactly what the whole batch would. A file's
+    candidates are never split, and every part goes to the batch's lane, so a finding is
+    still checked by the lane that did not raise it. A batch that fits is
+    ``verify-<area>-<finder>``, with ``-coverage`` for a coverage batch; a part inserts
+    ``-f<k>`` before that suffix. A file over the lane's hard ceiling on
+    its own is listed with ``dispatch`` false and reported not verified.
+
+    ``head_for(asks, scope)`` is what every payload of a batch carries besides its
+    candidates — brief, problem, probe, test inventory and schema — measured into each part;
+    ``scope`` is :func:`coverage_scope` for a coverage batch and empty for a defect one.
     """
+    run_limits = limits if limits is not None else default_limits()
+    by_id = {cand.id: cand for cand in candidates}
     keyed: dict[tuple[str, str, str], list[str]] = {}
     for cand in candidates:
         raiser = cand.raised_by[0]
@@ -4750,10 +5164,34 @@ def route(candidates: Sequence[Candidate]) -> tuple[Batch, ...]:
             + ("; asked whether any test in scope constructs the input, not whether the "
                "code is wrong" if coverage else "")
         )
-        batches.append(Batch(
-            id=f"verify-{area}-{finder}{COVERAGE_BATCH_SUFFIX if coverage else ''}",
-            area=area, finder=finder, lane=lane, asks=question,
-            candidates=tuple(keyed[(area, finder, question)]), routing=routing))
+        ids = keyed[(area, finder, question)]
+        held = [by_id[cid] for cid in ids]
+        scope = coverage_scope(area, held) if coverage else ()
+        by_file: dict[str, list[Candidate]] = {}
+        for cand in held:
+            by_file.setdefault(cand.file, []).append(cand)
+        items = [PackItem(id=file, folder=posixpath.dirname(file),
+                          record="".join(_candidate_sections([asdict(c) for c in mine])),
+                          counts={"verdict": len(mine)})
+                 for file, mine in sorted(by_file.items())]
+        packs = pack_items(items, head=head_for(question, scope) if head_for else "",
+                           reply_head=VERIFICATION_REPLY_HEAD,
+                           per_entry=VERIFICATION_REPLY_PRICES,
+                           limits=run_limits.planning("verification", (lane,)),
+                           hard=run_limits.hard_ceiling((lane,)))
+        suffix = COVERAGE_BATCH_SUFFIX if coverage else ""
+        for k, pack in enumerate(packs, 1):
+            files = frozenset(pack.items)
+            split = len(packs) > 1
+            batches.append(Batch(
+                id=(f"verify-{area}-{finder}"
+                    f"{f'{VERIFICATION_PART_MARK}{k}' if split else ''}{suffix}"),
+                area=area, finder=finder, lane=lane, asks=question,
+                candidates=tuple(c.id for c in held if c.file in files),
+                routing=routing + (f"; part {k} of {len(packs)}, split by file"
+                                   if split else ""),
+                limits=pack.limits_record(), oversize=pack.oversize,
+                dispatch=pack.dispatch, scope=scope))
     return tuple(batches)
 
 
@@ -5757,6 +6195,42 @@ def _claim_candidates(path: Path) -> None:
         raise InventoryError(f"cannot write {path}: {exc}") from exc
 
 
+def tests_in_scope(scope: Sequence[str],
+                   tests_of: dict[str, tuple[str, ...]] | None) -> tuple[str, ...]:
+    """The tests a coverage verifier is shown: those of each area in ``scope``, in its
+    order, a test named twice listed once.
+
+    The tests the AUDITORS saw, not only the tests of the area the batch was filed under.
+    Keyed on the batch's area alone, the verifier would be handed only the source owner's
+    tests — often none — while being told to check the supplied tests, and a gap a test in
+    another area already covers would come back confirmed."""
+    return tuple(dict.fromkeys(t for area in scope for t in (tests_of or {}).get(area, ())))
+
+
+def _scope_of(batch: Batch, held: Sequence[dict]) -> tuple[str, ...]:
+    """``batch``'s test scope: the one :func:`route` recorded, else — for a batch built by
+    hand — its own area and its candidates' raisers' areas."""
+    if batch.scope:
+        return batch.scope
+    raisers = sorted({r["area"] for cand in held for r in cand["raised_by"]} - {batch.area})
+    return (batch.area, *raisers)
+
+
+def render_verification_payload(companions: "RouteCompanions", problem: str, probe: Probe,
+                                tests_of: dict[str, tuple[str, ...]] | None, asks: str,
+                                scope: Sequence[str], held: Sequence[dict]) -> str:
+    """One verification unit's payload: the coverage form, with the tests of ``scope``, for
+    a coverage unit, the defect form otherwise. With no candidates it is the part every
+    unit of a batch carries, which is what :func:`route` measures each part against."""
+    schema = companions.schema_for(asks)
+    if asks == COVERAGE_ASKS:
+        return render_coverage_verifier_payload(
+            companions.coverage_brief, problem, held, probe, tests_in_scope(scope, tests_of),
+            schema=schema)
+    return render_verifier_payload(companions.verifier_brief, problem, held, probe,
+                                   schema=schema)
+
+
 def write_route(rundir: Path, units_doc: dict, states: Sequence[UnitState],
                 candidates: Sequence[Candidate], batches: Sequence[Batch],
                 companions: RouteCompanions, problem: str, probe: Probe,
@@ -5797,25 +6271,8 @@ def write_route(rundir: Path, units_doc: dict, states: Sequence[UnitState],
             created.append(unit_dir)
             held = [by_id[cid] for cid in batch.candidates]
             schema = companions.schema_for(batch.asks)
-            if batch.asks == COVERAGE_ASKS:
-                # The tests the AUDITORS saw, not only the tests of the area the batch was
-                # filed under. Routing files a finding under the area that owns the source
-                # it names; a coverage finding is usually raised from a tests area that
-                # reached that source through `also_read`, so the two differ by design. Keyed
-                # on the batch's area alone, the verifier was handed the source owner's tests
-                # -- often none -- while being told to check the supplied tests, and a gap a
-                # test already covered came back confirmed. The batch's own area stays first;
-                # every raiser's area follows, sorted, and a test named twice appears once.
-                raisers = sorted({r["area"] for cand in held for r in cand["raised_by"]}
-                                 - {batch.area})
-                in_scope = tuple(dict.fromkeys(
-                    t for area in (batch.area, *raisers)
-                    for t in (tests_of or {}).get(area, ())))
-                text = render_coverage_verifier_payload(
-                    companions.coverage_brief, problem, held, probe, in_scope, schema=schema)
-            else:
-                text = render_verifier_payload(companions.verifier_brief, problem, held,
-                                               probe, schema=schema)
+            text = render_verification_payload(companions, problem, probe, tests_of,
+                                               batch.asks, _scope_of(batch, held), held)
             write_text(unit_dir / PAYLOAD_NAME, text)
             write_json(unit_dir / SCHEMA_NAME, schema)
             lines, size = measure_payload(text)
@@ -5823,6 +6280,8 @@ def write_route(rundir: Path, units_doc: dict, states: Sequence[UnitState],
                 "id": batch.id, "kind": VERIFIER_KIND, "area": batch.area, "lane": batch.lane,
                 "lens": None, "finder": batch.finder, "candidates": list(batch.candidates),
                 "routing": batch.routing, "asks": batch.asks,
+                "limits": batch.limits, "oversize": batch.oversize,
+                "dispatch": batch.dispatch,
                 "payload": f"{UNITS_DIR}/{batch.id}/{PAYLOAD_NAME}",
                 "schema": f"{UNITS_DIR}/{batch.id}/{SCHEMA_NAME}",
                 "payload_lines": lines,
@@ -5886,7 +6345,10 @@ def route_summary(states: Sequence[UnitState], candidates: Sequence[Candidate],
     for batch in batches:
         out.append(f"  {batch.id}  {_plural(len(batch.candidates), 'candidate')}  "
                    f"finder {batch.finder} -> lane {batch.lane}"
-                   + ("  (coverage gaps)" if batch.asks == COVERAGE_ASKS else ""))
+                   + ("  (coverage gaps)" if batch.asks == COVERAGE_ASKS else "")
+                   + ("  (over its lane's hard ceiling: not dispatched)" if not batch.dispatch
+                      else "  (one file over the planning ceiling)" if batch.oversize
+                      else ""))
     return "\n".join(out) + "\n"
 
 
@@ -6065,6 +6527,18 @@ NO_CHECK_LINE = "What the check found: it did not come back; judge this one from
 UNGROUPED_NOTE = ("The area was not clustered: every candidate in it is reported on its own, "
                   "one candidate per cluster, so a defect that two readers both found is "
                   "shown twice rather than merged.")
+UNGROUPED_PART_NOTE = ("This part of the area was not clustered: every candidate in it is "
+                       "reported on its own, one candidate per cluster, so a defect that two "
+                       "readers both found is shown twice rather than merged. The area's other "
+                       "parts are clustered or not on their own.")
+# A clustering reply, priced before it exists: the summary, then at worst one cluster per
+# candidate, each its member ids, a heading of at most 120 characters and a sentence on why
+# it was kept apart.
+CLUSTERING_REPLY_HEAD = 1024
+CLUSTERING_REPLY_PRICES = {"cluster": 512}
+# What a part of a split clustering batch carries in its id before any coverage suffix: the
+# mark a verification part carries.
+CLUSTERING_PART_MARK = VERIFICATION_PART_MARK
 
 
 @dataclass(frozen=True)
@@ -6081,6 +6555,9 @@ class ClusterUnit:
     lane: str
     candidates: tuple[str, ...]
     asks: str = DEFECT_ASKS
+    limits: dict | None = None
+    oversize: bool = False
+    dispatch: bool = True
 
 
 @dataclass(frozen=True)
@@ -6150,7 +6627,9 @@ def load_cluster_companions() -> ClusterCompanions:
     )
 
 
-def plan_clusters(candidates: Sequence[dict]) -> tuple[ClusterUnit, ...]:
+def plan_clusters(candidates: Sequence[dict], limits: RunLimits | None = None,
+                  rationales: Mapping[str, str | None] | None = None,
+                  head: str = "") -> tuple[ClusterUnit, ...]:
     """One unit per (area, kind) that raised something, areas in name order.
 
     A candidate's area owns its file and a file belongs to exactly one area, so two
@@ -6163,22 +6642,89 @@ def plan_clusters(candidates: Sequence[dict]) -> tuple[ClusterUnit, ...]:
     same lines would be one entry that is both a test to write and code to fix, and the
     report has to put it in exactly one place.
 
-    The lanes take the areas in turn. Neither lane is a stranger to an area's candidates —
+    The lanes take the units in turn. Neither lane is a stranger to an area's candidates —
     both lanes read every area — so the routing rule that keeps a finder away from its own
     finding has nothing to bite on here, and the reason to spread the work is that no one
     model's sense of what counts as the same defect then shapes the whole report.
+
+    **An (area, kind) over the clustering limits is split into parts by file**, packed by
+    :func:`pack_items` against the smallest limits of every lane, since a part's lane is
+    assigned after packing. Every candidate for one file and kind, from both lanes, is in
+    one part, so the duplicates this round exists to merge are handed to one clusterer
+    together. A site cannot span parts, so in a split area a site never spans files, and
+    :func:`parse_clusterer_result` holds a part to that. A batch that fits is
+    ``cluster-<area>``, with ``-coverage`` for a coverage batch; a part inserts ``-f<k>``
+    before that suffix. A file over the smallest hard ceiling
+    on its own goes alone to a lane whose hard ceiling takes it, under that lane's limits;
+    one over every lane's is listed with ``dispatch`` false and reported not clustered.
+
+    ``head`` is what every payload carries besides its candidates — brief, problem and
+    schema — measured into each part; ``rationales`` are the checks' rationales the payload
+    renders under each candidate.
     """
-    keyed: dict[tuple[str, str], list[str]] = {}
+    run_limits = limits if limits is not None else default_limits()
+    said = (rationales if rationales is not None
+            else {cand["id"]: None for cand in candidates})
+    keyed: dict[tuple[str, str], list[dict]] = {}
     for cand in candidates:
-        keyed.setdefault((cand["area"], asks_of(cand)), []).append(cand["id"])
+        keyed.setdefault((cand["area"], asks_of(cand)), []).append(cand)
     asked = {question: i for i, question in enumerate(ASKS)}
-    return tuple(
-        ClusterUnit(id=f"{CLUSTER_UNIT_PREFIX}{area}"
-                       f"{COVERAGE_BATCH_SUFFIX if question == COVERAGE_ASKS else ''}",
-                    area=area, lane=LANES[n % len(LANES)], asks=question,
-                    candidates=tuple(keyed[(area, question)]))
-        for n, (area, question) in enumerate(sorted(keyed, key=lambda k: (k[0], asked[k[1]])))
-    )
+    planning = run_limits.planning("clustering", LANES)
+    hard = run_limits.hard_ceiling(LANES)
+    units: list[ClusterUnit] = []
+    for area, question in sorted(keyed, key=lambda k: (k[0], asked[k[1]])):
+        held = keyed[(area, question)]
+        by_file: dict[str, list[dict]] = {}
+        for cand in held:
+            by_file.setdefault(cand["file"], []).append(cand)
+        items = [PackItem(id=file, folder=posixpath.dirname(file),
+                          record="".join(_clusterer_sections(mine, said)),
+                          counts={"cluster": len(mine)})
+                 for file, mine in sorted(by_file.items())]
+        packs = pack_items(items, head=head, reply_head=CLUSTERING_REPLY_HEAD,
+                           per_entry=CLUSTERING_REPLY_PRICES, limits=planning, hard=hard,
+                           lane_hard=run_limits.hard)
+        suffix = COVERAGE_BATCH_SUFFIX if question == COVERAGE_ASKS else ""
+        for k, pack in enumerate(packs, 1):
+            files = frozenset(pack.items)
+            mark = f"{CLUSTERING_PART_MARK}{k}" if len(packs) > 1 else ""
+            lane, record = assign_lane(pack, LANES[len(units) % len(LANES)], "clustering",
+                                       run_limits)
+            units.append(ClusterUnit(
+                id=f"{CLUSTER_UNIT_PREFIX}{area}{mark}{suffix}", area=area,
+                lane=lane, asks=question,
+                candidates=tuple(c["id"] for c in held if c["file"] in files),
+                limits=record, oversize=pack.oversize, dispatch=pack.dispatch))
+    return tuple(units)
+
+
+def clustering_parts(units: Sequence[dict]) -> frozenset[str]:
+    """The ids of the clustering units that are parts of a split (area, kind): those whose
+    area and question more than one listed unit shares. Derived from the listing rather
+    than recorded in it, so a v2026.10.0 listing, which never splits, reads as it did."""
+    count: dict[tuple[object, object], int] = {}
+    for unit in units:
+        key = (unit.get("area"), unit.get("asks", DEFECT_ASKS))
+        count[key] = count.get(key, 0) + 1
+    return frozenset(unit.get("id") for unit in units
+                     if count[(unit.get("area"), unit.get("asks", DEFECT_ASKS))] > 1)
+
+
+def part_files(unit: dict, parts: frozenset[str],
+               candidates: Sequence[dict]) -> dict[str, str] | None:
+    """Each of a part's candidates to its file, for :func:`parse_clusterer_result`'s rule
+    that a site in a part never spans files; ``None`` for a unit that is a whole area."""
+    if unit["id"] not in parts:
+        return None
+    file_of = {cand["id"]: cand.get("file") for cand in candidates}
+    unknown = [cid for cid in unit["candidates"] if file_of.get(cid) is None]
+    if unknown:
+        raise RunDirError(
+            f"clustering unit {unit['id']} lists candidate {unknown[0]}, which "
+            f"{CANDIDATES_FILE_NAME} does not place in a file; {UNITS_FILE_NAME} is not the "
+            f"engine's"
+        )
+    return {cid: file_of[cid] for cid in unit["candidates"]}
 
 
 def verified_rationales(candidates: Sequence[dict], holder: dict[str, dict],
@@ -6226,7 +6772,17 @@ def render_clusterer_payload(brief: str, problem: str, candidates: Sequence[dict
     is one in the verification payload: an input that may be omitted is an input the byte
     reconstruction can silently miss.
     """
-    out = [brief.rstrip("\n"), "\n", PROBLEM_HEADING, "\n", problem, "\n", TO_GROUP_HEADING]
+    out = [brief.rstrip("\n"), "\n", PROBLEM_HEADING, "\n", problem, "\n", TO_GROUP_HEADING,
+           *_clusterer_sections(candidates, rationales)]
+    out += _schema_section(schema)
+    return "".join(out)
+
+
+def _clusterer_sections(candidates: Sequence[dict],
+                        rationales: Mapping[str, str | None]) -> list[str]:
+    """Every candidate's block in a clustering payload, in order: what each one adds to a
+    payload's bytes, so the packer measures a part by the text it will carry."""
+    out: list[str] = []
     for cand in candidates:
         raised = cand["raised_by"]
         where = (f"line {cand['line_start']}" if cand["line_start"] == cand["line_end"]
@@ -6240,12 +6796,11 @@ def render_clusterer_payload(brief: str, problem: str, candidates: Sequence[dict
         out.append(f"Proposed severity: {'; '.join(_distinct(r['severity'] for r in raised))}\n")
         rationale = rationales[cand["id"]]
         out += [f"{NO_CHECK_LINE}\n"] if rationale is None else _payload_field("What the check found: ", rationale)
-    out += _schema_section(schema)
-    return "".join(out)
+    return out
 
 
 def _parse_cluster(raw: object, field: str, handed: frozenset[str],
-                   placed: dict[str, str]) -> dict:
+                   placed: dict[str, str], files: Mapping[str, str] | None = None) -> dict:
     """One cluster, with the two partition rules that can be decided from it alone: an id
     this unit was never handed, and an id already placed in another cluster.
 
@@ -6281,6 +6836,13 @@ def _parse_cluster(raw: object, field: str, handed: frozenset[str],
             )
         placed[name] = field
         members.append(name)
+    spanned = sorted({files[name] for name in members}) if files is not None else []
+    if len(spanned) > 1:
+        raise ResultError(
+            f"field '{field}' groups candidates from {spanned[0]} and {spanned[1]}; this unit "
+            f"is one part of an area split by file, and within a part a site never spans "
+            f"two files"
+        )
     return {
         "members": members,
         "consequence": _text(raw["consequence"], f"{field}.consequence"),
@@ -6288,7 +6850,8 @@ def _parse_cluster(raw: object, field: str, handed: frozenset[str],
     }
 
 
-def parse_clusterer_result(obj: object, unit_id: str, handed: Sequence[str]) -> dict:
+def parse_clusterer_result(obj: object, unit_id: str, handed: Sequence[str],
+                           files: Mapping[str, str] | None = None) -> dict:
     """Strictly parse a clustering result against the clusterer schema's vocabulary, and
     prove it is a partition of exactly the candidates the unit was handed.
 
@@ -6297,6 +6860,10 @@ def parse_clusterer_result(obj: object, unit_id: str, handed: Sequence[str]) -> 
     quietly leaving the rest of the candidates loose would give the report a grouping
     nobody produced. The engine's answer to a failed unit is no merging at all, which is
     the direction that keeps every finding visible.
+
+    ``files`` maps each handed id to its file when the unit is a part of an area split by
+    file (:func:`part_files`), and a cluster whose members come from two files then fails
+    the unit too: a site cannot span parts, and a part can hold several files.
     """
     try:
         if not isinstance(obj, dict):
@@ -6306,7 +6873,7 @@ def parse_clusterer_result(obj: object, unit_id: str, handed: Sequence[str]) -> 
             raise ResultError(f"field 'clusters' must be a list (found {type(obj['clusters']).__name__})")
         wanted = frozenset(handed)
         placed: dict[str, str] = {}
-        clusters = [_parse_cluster(raw, f"clusters[{index}]", wanted, placed)
+        clusters = [_parse_cluster(raw, f"clusters[{index}]", wanted, placed, files)
                     for index, raw in enumerate(obj["clusters"])]
         missing = sorted(wanted - set(placed))
         if missing:
@@ -6319,23 +6886,34 @@ def parse_clusterer_result(obj: object, unit_id: str, handed: Sequence[str]) -> 
         raise ResultError(f"{unit_id}: {exc}") from None
 
 
-def read_clustering_results(rundir: Path, units: Sequence[dict]) -> tuple[ClusterState, ...]:
+def read_clustering_results(rundir: Path, units: Sequence[dict],
+                            candidates: Sequence[dict]) -> tuple[ClusterState, ...]:
     """Classify every clustering unit as exactly one of complete, failed or missing, by the
     same landing rule every other kind is read by. A unit holding both ``result.json`` and
     ``error.txt`` refuses the run here, as it does for a reader and a verifier: the probe is
     the one kind that survives it, because its answer is folded into payloads mid-pipeline
     and a stop there would strand a whole reading round.
+
+    ``candidates`` places each candidate in its file, which a part's reply is held to; a
+    unit listed with ``dispatch`` false and no result is missing for the reason it was
+    never sent.
     """
+    parts = clustering_parts(units)
     states: list[ClusterState] = []
     for unit in units:
         asks = unit.get("asks", DEFECT_ASKS)
         state, payload = _read_unit_file(rundir, unit["id"])
+        if state == UNIT_MISSING and unit.get("dispatch") is False:
+            states.append(ClusterState(unit["id"], unit["area"], state, NOT_DISPATCHED_REASON,
+                                       (), None, asks))
+            continue
         if state != UNIT_COMPLETE:
             states.append(ClusterState(unit["id"], unit["area"], state,
                                        _writable(str(payload)), (), None, asks))
             continue
         try:
-            parsed = parse_clusterer_result(payload, unit["id"], unit["candidates"])
+            parsed = parse_clusterer_result(payload, unit["id"], unit["candidates"],
+                                            part_files(unit, parts, candidates))
         except ResultError as exc:
             states.append(ClusterState(unit["id"], unit["area"], UNIT_FAILED,
                                        _writable(str(exc)), (), None, asks))
@@ -6346,9 +6924,11 @@ def read_clustering_results(rundir: Path, units: Sequence[dict]) -> tuple[Cluste
 
 
 def check_clustering(candidates: Sequence[dict], units: Sequence[dict]) -> None:
-    """Every clustering unit against the area it names: at most one per area, and exactly
-    that area's candidates in it. Refused by name before any result is read, as
-    :func:`check_routing` refuses the same shape one stage earlier.
+    """Every clustering unit against the area it names: the units naming one area and
+    question hold exactly its candidates between them, each in one unit — a single unit,
+    or the parts of an area split by file, with each file's candidates in one part. Refused
+    by name before any result is read, as :func:`check_routing` refuses the same shape one
+    stage earlier. A unit listed with ``dispatch`` false is a clustering like any other.
 
     This is what makes the report's arithmetic true rather than merely stated. The
     partition check proves a reply against the ids its own unit was HANDED, so a listing
@@ -6364,42 +6944,87 @@ def check_clustering(candidates: Sequence[dict], units: Sequence[dict]) -> None:
     by_area: dict[tuple[str, str], list[str]] = {}
     for cand in candidates:
         by_area.setdefault((cand["area"], asks_of(cand)), []).append(cand["id"])
-    seen: dict[tuple[str, str], str] = {}
+    file_of = {cand["id"]: cand.get("file") for cand in candidates}
+    holder: dict[str, str] = {}
+    listed: dict[tuple[str, str], list[dict]] = {}
+    seen_ids: set[str] = set()
     for unit in units:
         # The row's own shape first. A listing this engine did not write can carry a null
         # candidate list or no area at all, and reaching the comparison below with either
         # raises out of the run as a traceback instead of the refusal this promises.
-        if (not isinstance(unit.get("area"), str) or not isinstance(unit.get("candidates"), list)
+        if (not isinstance(unit.get("id"), str) or not isinstance(unit.get("area"), str)
+                or not isinstance(unit.get("candidates"), list)
                 or not all(isinstance(cid, str) for cid in unit["candidates"])):
             raise RunDirError(
-                f"clustering unit {unit.get('id', '(unnamed)')!s} has no area or no list of "
-                f"candidate ids; {UNITS_FILE_NAME} is not the engine's"
+                f"clustering unit {unit.get('id', '(unnamed)')!s} has no id, no area or no "
+                f"list of candidate ids; {UNITS_FILE_NAME} is not the engine's"
             )
+        # One id names one result file, so a repeated id has one reply answer two rows: one
+        # row's candidates vanish from the report and another's are counted twice.
+        if unit["id"] in seen_ids:
+            raise RunDirError(
+                f"clustering unit {unit['id']} is listed more than once; each unit "
+                f"has its own result file, so {UNITS_FILE_NAME} is not the engine's"
+            )
+        seen_ids.add(unit["id"])
         # The pair, not the area. Coverage gaps and defects from one area are grouped by
         # two units on purpose, so "one unit per area" would refuse the shape this stage
         # writes; what must still hold is one unit per area per question.
         lane = (unit["area"], unit.get("asks", DEFECT_ASKS))
         area, question = lane
         named = area + (f" ({question})" if question != DEFECT_ASKS else "")
-        if lane in seen:
-            raise RunDirError(
-                f"clustering units {seen[lane]} and {unit['id']} both name area {named}; "
-                f"cluster writes one per area per kind, so {UNITS_FILE_NAME} is not the "
-                f"engine's"
-            )
-        seen[lane] = unit["id"]
         if lane not in by_area:
             raise RunDirError(
                 f"clustering unit {unit['id']} names area {named}, which raised no candidate; "
                 f"{UNITS_FILE_NAME} is not the engine's"
             )
-        if sorted(unit["candidates"]) != sorted(by_area[lane]):
+        # Parts are derived by counting the units that share an area and question, so an
+        # empty row would turn a whole area into a "part" and put it under the rule that a
+        # site never spans files. Cluster never lists a unit with nothing to group.
+        if not unit["candidates"]:
             raise RunDirError(
-                f"clustering unit {unit['id']} is listed with candidates that are not "
-                f"{named}'s ({len(unit['candidates'])} listed, {len(by_area[lane])} in it); "
-                f"every candidate belongs to exactly one cluster of its own area, so "
-                f"{UNITS_FILE_NAME} is not the engine's"
+                f"clustering unit {unit['id']} is listed with no candidates; cluster "
+                f"never lists one, so {UNITS_FILE_NAME} is not the engine's"
             )
+        own = set(by_area[lane])
+        for cid in unit["candidates"]:
+            if cid not in own:
+                raise RunDirError(
+                    f"clustering unit {unit['id']} is listed with candidates that are not "
+                    f"{named}'s ({cid} is not); every candidate belongs to exactly one "
+                    f"cluster of its own area, so {UNITS_FILE_NAME} is not the engine's"
+                )
+            if cid in holder:
+                raise RunDirError(
+                    f"clustering units {holder[cid]} and {unit['id']} both name area {named} "
+                    f"and both hold {cid}; cluster puts each candidate in one unit, so "
+                    f"{UNITS_FILE_NAME} is not the engine's"
+                )
+            holder[cid] = unit["id"]
+        listed.setdefault(lane, []).append(unit)
+    for lane, held in listed.items():
+        area, question = lane
+        named = area + (f" ({question})" if question != DEFECT_ASKS else "")
+        short = [cid for cid in by_area[lane] if cid not in holder]
+        if short:
+            raise RunDirError(
+                f"clustering units {', '.join(u['id'] for u in held)} are listed with "
+                f"candidates that are not {named}'s whole set: {short[0]}, one of its "
+                f"{len(by_area[lane])}, is in none; every candidate belongs to exactly one "
+                f"cluster of its own area, so {UNITS_FILE_NAME} is not the engine's"
+            )
+        # Parts split an area by file, so one file's candidates in two parts would hand two
+        # descriptions of one site to two clusterers, which could never merge them.
+        part_of: dict[str, str] = {}
+        for unit in held if len(held) > 1 else ():
+            for cid in unit["candidates"]:
+                file = file_of[cid]
+                if part_of.setdefault(file, unit["id"]) != unit["id"]:
+                    raise RunDirError(
+                        f"clustering units {part_of[file]} and {unit['id']} both hold "
+                        f"candidates in {file}; an area is split by file, so "
+                        f"{UNITS_FILE_NAME} is not the engine's"
+                    )
 
 
 def build_clusters(candidates: Sequence[dict], units: Sequence[dict],
@@ -6418,39 +7043,51 @@ def build_clusters(candidates: Sequence[dict], units: Sequence[dict],
     reorders the index, and an id assigned from the ranking would then name a different
     defect in the re-rendered document than it named in the one somebody cited.
 
-    ``units`` has been through :func:`check_clustering`, so each listed unit holds exactly
-    its own area's candidates and no area has two: that is what makes every candidate land
-    in exactly one cluster here, whichever branch it takes.
+    ``units`` has been through :func:`check_clustering`, so the units naming an area and
+    question hold exactly its candidates between them, each in one: that is what makes
+    every candidate land in exactly one cluster here, whichever branch it takes. Each part
+    of a split area stands or degrades on its own, and an entry left unmerged names the
+    part, not the area.
     """
     by_area: dict[tuple[str, str], list[dict]] = {}
     for cand in candidates:
         by_area.setdefault((cand["area"], asks_of(cand)), []).append(cand)
     consequence_of = {cand["id"]: cand["raised_by"][0]["consequence"] for cand in candidates}
-    by_unit_area = {(unit["area"], unit.get("asks", DEFECT_ASKS)): unit for unit in units}
-    state_of = {(state.area, state.asks): state for state in states}
+    units_of: dict[tuple[str, str], list[dict]] = {}
+    for unit in units:
+        units_of.setdefault((unit["area"], unit.get("asks", DEFECT_ASKS)), []).append(unit)
+    state_of = {state.id: state for state in states}
     asked = {question: i for i, question in enumerate(ASKS)}
     rows: list[tuple[str, tuple[str, ...], str, str | None, bool, str]] = []
     ungrouped: list[Ungrouped] = []
     for lane in sorted(by_area, key=lambda k: (k[0], asked[k[1]])):
         area, question = lane
-        state = state_of.get(lane)
-        if state is not None and state.state == UNIT_COMPLETE:
-            for cluster in state.clusters:
-                rows.append((area, tuple(sorted(cluster["members"])), cluster["consequence"],
-                             cluster["split_reason"], True, question))
-            continue
-        unit = by_unit_area.get(lane)
         suffix = COVERAGE_BATCH_SUFFIX if question == COVERAGE_ASKS else ""
-        ungrouped.append(Ungrouped(
-            area=area,
-            unit=unit["id"] if unit else f"{CLUSTER_UNIT_PREFIX}{area}{suffix}",
-            state=state.state if state else UNIT_MISSING,
-            reason=(state.reason if state and state.reason
-                    else f"{UNITS_FILE_NAME} lists no clustering unit for {area}{suffix}"),
-            asks=question,
-        ))
-        rows += [(area, (cand["id"],), consequence_of[cand["id"]], None, False, question)
-                 for cand in by_area[lane]]
+        listed = units_of.get(lane)
+        if not listed:
+            ungrouped.append(Ungrouped(
+                area=area, unit=f"{CLUSTER_UNIT_PREFIX}{area}{suffix}", state=UNIT_MISSING,
+                reason=f"{UNITS_FILE_NAME} lists no clustering unit for {area}{suffix}",
+                asks=question))
+            rows += [(area, (cand["id"],), consequence_of[cand["id"]], None, False, question)
+                     for cand in by_area[lane]]
+            continue
+        for unit in listed:
+            state = state_of.get(unit["id"])
+            if state is not None and state.state == UNIT_COMPLETE:
+                for cluster in state.clusters:
+                    rows.append((area, tuple(sorted(cluster["members"])),
+                                 cluster["consequence"], cluster["split_reason"], True,
+                                 question))
+                continue
+            ungrouped.append(Ungrouped(
+                area=area, unit=unit["id"], state=state.state if state else UNIT_MISSING,
+                reason=(state.reason if state and state.reason
+                        else f"no result was read for clustering unit {unit['id']}"),
+                asks=question))
+            held = frozenset(unit["candidates"])
+            rows += [(area, (cand["id"],), consequence_of[cand["id"]], None, False, question)
+                     for cand in by_area[lane] if cand["id"] in held]
     # Ordered by area then lowest member, as before, with the question last: a defect and a
     # gap in one area keep their own formation order, and neither renumbers the other.
     rows.sort(key=lambda row: (row[0], asked[row[5]], row[1]))
@@ -6561,6 +7198,7 @@ def write_clusters(rundir: Path, units_doc: dict, candidates: Sequence[dict],
             listing.append({
                 "id": unit.id, "kind": CLUSTERER_KIND, "area": unit.area, "lane": unit.lane,
                 "lens": None, "candidates": list(unit.candidates), "asks": unit.asks,
+                "limits": unit.limits, "oversize": unit.oversize, "dispatch": unit.dispatch,
                 "payload": f"{UNITS_DIR}/{unit.id}/{PAYLOAD_NAME}",
                 "schema": f"{UNITS_DIR}/{unit.id}/{SCHEMA_NAME}",
                 "payload_lines": lines,
@@ -6584,7 +7222,10 @@ def cluster_summary(units: Sequence[ClusterUnit], states: Sequence[VerificationS
            f"{sum(1 for s in states if s.state == UNIT_MISSING)} missing"]
     out.append(f"{_plural(len(units), 'clustering unit')}")
     for unit in units:
-        out.append(f"  {unit.id}  {_plural(len(unit.candidates), 'candidate')}  lane {unit.lane}")
+        out.append(f"  {unit.id}  {_plural(len(unit.candidates), 'candidate')}  lane {unit.lane}"
+                   + ("  (over the hard ceiling: not dispatched)" if not unit.dispatch
+                      else "  (one file over the planning ceiling)" if unit.oversize
+                      else ""))
     return "\n".join(out) + "\n"
 
 
@@ -7603,17 +8244,35 @@ SYNTHESIZER_KIND = "synthesizer"
 SYNTHESIZER_SCHEMA_NAME = "synthesizer-schema.json"
 SYNTHESIZED_STAGE = "synthesized"
 SYNTHESIS_UNIT_PREFIX = "synth-"
-# ONE unit for the whole round, which is how "exactly one unit names the tiers" is kept.
-# The alternative — a unit per batch of defects, each naming its own vocabulary and the
-# results merged — is the obvious design and the wrong one: two batches describing one
-# theme in two phrasings give a reader fourteen headings where the run has seven themes,
-# which is a longer list rather than a grouping. Splitting the round is the thing to do when
-# a payload outgrows what a model can read, and it costs each unit a second copy of the whole
-# index rather than costing any cross-reference: the payload separates that index from the
-# defects this unit judges precisely so a split round can still cite a defect it was not
-# handed.
+# The round is planned in batches, packed in folder order under the synthesis limits, and
+# each batch names its own tiers. Batched because a run of hundreds of defects makes a
+# payload near a megabyte, more than a model reads in one piece, and a unit that returns
+# nothing costs every defect it holds its write-up. A batch names its tiers in the project's
+# own terms for the defects it holds, and a later round reconciles the names across batches;
+# until it has, two batches' identically spelled names are one section and differently
+# spelled ones are two.
+#
+# A run with one batch names it `synth-<lane>`; several are numbered in packing order, each
+# with the lane it goes to.
 SYNTHESIS_UNIT_ID = f"{SYNTHESIS_UNIT_PREFIX}{LANES[0]}"
-SYNTHESIZER_RESULT_KEYS = ("tiers", "defects", "summary")
+SYNTHESIZER_RESULT_KEYS = ("tiers", "defects")
+# What a unit written by v2026.10.0 asked for: the one unit also wrote a paragraph about the
+# whole run. Read from such a unit only, so an old run re-renders with its paragraph.
+LEGACY_SYNTHESIZER_RESULT_KEYS = ("tiers", "defects", "summary")
+# Which engine wrote a synthesis unit, recorded in its listing as the run format that engine
+# writes. A unit with no record was written by v2026.10.0 — unless the run has a run format,
+# which v2026.10.0 never wrote: then it is this engine's generation 1. The writer, never the
+# presence of a run format, decides how a generation is read, because a run v2026.10.0
+# planned can carry a later generation this engine wrote.
+SYNTHESIS_WRITER = RUN_FORMAT
+LEGACY_SYNTHESIS_WRITER = 0
+# What a batch's reply is estimated at before it exists: the tier list and the object's own
+# keys once, then each defect's entry at its length limits (heading, account, fix, the tier
+# it names, the keys around them), each site note at its limit, and each cross-reference as
+# an id. A defect is priced one cross-reference per other defect sharing a file with it,
+# the only ones a reference can survive to outside its batch.
+SYNTHESIS_REPLY_HEAD = 1024
+SYNTHESIS_REPLY_PRICES = {"defect": 1536, "site_note": 256, "cross_reference": 16}
 SYNTHESIS_KEYS = ("defect", "heading", "tier", "what_goes_wrong", "fix", "site_notes",
                   "cross_references")
 # The shape a listing written before a defect could have several sites asked for: no
@@ -7635,18 +8294,24 @@ SYNTHESIS_FIX_WORDS = 60
 SYNTHESIS_FIX_CHARS = 600
 SYNTHESIS_NOTE_WORDS = 20
 SYNTHESIS_NOTE_CHARS = 200
-DEFECT_INDEX_HEADING = "\n## The defect index\n"
+DEFECT_INDEX_HEADING = "\n## Defects outside your batch\n"
 TO_JUDGE_HEADING = "\n## Your defects\n"
+NO_OUTSIDE_LINE = "No defect outside your batch shares a file with yours."
 
 
 @dataclass(frozen=True)
 class SynthesisUnit:
-    """The synthesis round's one unit: every defect that needs a write-up, addressed to one
-    lane."""
+    """One batch of the synthesis round: the defects it writes up, the lane it goes to, and
+    what it was planned under. ``dispatch`` is false for a defect over the hard ceiling,
+    which is listed and never sent to a model; ``oversize`` marks one over the planning
+    ceiling that went alone."""
 
     id: str
     lane: str
     defects: tuple[str, ...]
+    limits: dict | None = None
+    oversize: bool = False
+    dispatch: bool = True
 
 
 @dataclass(frozen=True)
@@ -7671,11 +8336,15 @@ class SynthesisState:
 
 @dataclass(frozen=True)
 class Synthesis:
-    """The round as the report reads it: every defect id to its judgment or ``None``, and
-    the record of the round itself that ``findings.json`` carries."""
+    """One generation of the round as the report reads it: every defect id to its judgment
+    or ``None``, the record of the generation that ``findings.json`` carries, the engine
+    that wrote it, and the batch each defect was written up in (empty for v2026.10.0's one
+    unit), which is what a cross-reference is checked against."""
 
     assignments: dict[str, dict | None]
     record: dict
+    writer: int
+    batch_of: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -7714,18 +8383,112 @@ def needs_a_write_up(defects: Sequence[Defect],
                  and any(statuses[sid] != DEFECT_REFUTED for sid in defect.sites))
 
 
-def plan_synthesis(defects: Sequence[Defect]) -> tuple[SynthesisUnit, ...]:
-    """One unit holding every defect it is given, or none at all where there is none.
+def defect_folder(files: Iterable[str]) -> str:
+    """The lowest folder every one of ``files`` sits in, compared component by component
+    (``pkg/a.py`` and ``pkga/b.py`` share only the root, which is ``""``)."""
+    folders = [[part for part in posixpath.dirname(path).split("/") if part]
+               for path in files]
+    if not folders:
+        return ""
+    shared: list[str] = []
+    for parts in zip(*folders):
+        if any(part != parts[0] for part in parts):
+            break
+        shared.append(parts[0])
+    return "/".join(shared)
 
-    ``defects`` is :func:`needs_a_write_up`'s answer. A run with nothing to write up gets no
-    unit for the reason an area that raised nothing gets no clustering unit: a payload with
-    an empty list asks a worker nothing, and the answer it would have to return is the
-    empty one.
+
+def synthesis_files(material: Sequence[dict]) -> dict[str, frozenset[str]]:
+    """Every file each defect's sites touch, by defect id, from the payload material."""
+    return {defect["id"]: frozenset(member["file"] for site in defect["site_material"]
+                                    for member in site["members"])
+            for defect in material}
+
+
+def plan_synthesis(material: Sequence[dict], head: str = "",
+                   limits: RunLimits | None = None,
+                   generation: int = 1) -> tuple[SynthesisUnit, ...]:
+    """The round's batches: every defect ``material`` holds, packed in folder order under
+    the synthesis limits, the lanes alternating batch by batch. None where there is none.
+
+    ``material`` is :func:`synthesis_material` over :func:`needs_a_write_up`'s answer. A run
+    with nothing to write up gets no unit for the reason an area that raised nothing gets no
+    clustering unit: a payload with an empty list asks a worker nothing.
+
+    A defect's folder is the lowest folder its sites share, so a defect is packed beside the
+    defects nearest it in the tree. Its record is measured as the payload renders it; its
+    reply is priced by :data:`SYNTHESIS_REPLY_PRICES`. ``head`` is what every payload of the
+    round carries once, and the index is reserved at its cap or its cut line, whichever is
+    longer. Batches alternate lanes after packing, so they are packed against the smallest
+    limits across the lanes; a defect over the smallest hard ceiling on its own goes alone
+    to a lane whose hard ceiling takes it, under that lane's limits, and one over every
+    lane's is listed with ``dispatch`` false. A generation after the first carries
+    ``-g<n>`` after ``synth`` in every id.
     """
-    if not defects:
+    if not material:
         return ()
-    return (SynthesisUnit(id=SYNTHESIS_UNIT_ID, lane=LANES[0],
-                          defects=tuple(defect.id for defect in defects)),)
+    run_limits = limits if limits is not None else default_limits()
+    planning = run_limits.planning("synthesis", LANES)
+    files_of = synthesis_files(material)
+    items = []
+    for defect in material:
+        mine = files_of[defect["id"]]
+        neighbors = sum(1 for other, theirs in files_of.items()
+                        if other != defect["id"] and mine & theirs)
+        sites = len(defect["sites"])
+        items.append(PackItem(
+            id=defect["id"], folder=defect_folder(mine),
+            record=render_synthesis_defect(defect),
+            counts={"defect": 1, "site_note": sites if sites > 1 else 0,
+                    "cross_reference": neighbors}))
+    # The index is reserved at its cap, or at the line saying what it cut where that is
+    # longer: the line is rendered whatever the cap, in place of the empty-index line the
+    # head was measured with.
+    reserve = (0 if planning.index_bytes is None
+               else max(planning.index_bytes, index_notice_bytes(len(material))))
+    packs = pack_items(items, head=head, reply_head=SYNTHESIS_REPLY_HEAD,
+                       per_entry=SYNTHESIS_REPLY_PRICES, limits=planning,
+                       hard=run_limits.hard_ceiling(LANES), reserve=reserve,
+                       lane_hard=run_limits.hard)
+    units = []
+    for k, pack in enumerate(packs, 1):
+        lane, record = assign_lane(pack, LANES[(k - 1) % len(LANES)], "synthesis", run_limits)
+        units.append(SynthesisUnit(
+            id=synthesis_unit_id(generation, lane if len(packs) == 1 else f"{lane}-b{k}"),
+            lane=lane, defects=pack.items, limits=record,
+            oversize=pack.oversize, dispatch=pack.dispatch))
+    return tuple(units)
+
+
+def synthesis_index(own: Sequence[str], material: Sequence[dict],
+                    files_of: Mapping[str, frozenset[str]],
+                    cap: int | None) -> tuple[list[dict], int]:
+    """A batch's index: one line for each defect outside it that shares a file with one of
+    its own — the only outside defects a cross-reference from it can survive to — in id
+    order, as many as fit ``cap`` bytes, and how many did not fit.
+
+    Bounded so no payload carries the whole run: the batch writes up its own defects in
+    full and needs of the rest only what it may cite. Where they do not all fit, the line
+    saying how many were cut is counted inside the cap too, so the index is never larger
+    than the bytes the packer reserved for it."""
+    mine = frozenset(own)
+    touched = frozenset().union(*(files_of[did] for did in own)) if own else frozenset()
+    outside = sorted((defect for defect in material
+                      if defect["id"] not in mine and files_of[defect["id"]] & touched),
+                     key=lambda defect: _id_rank(defect["id"]))
+    sizes = [len("".join(_payload_field(f"- {d['id']}: ", d["consequence"])).encode("utf-8"))
+             for d in outside]
+    room = None
+    if cap is not None and sum(sizes) > cap:
+        room = cap - index_notice_bytes(len(outside))
+    entries: list[dict] = []
+    used = 0
+    for defect, size in zip(outside, sizes):
+        if room is not None and used + size > room:
+            break
+        entries.append({"id": defect["id"], "consequence": defect["consequence"]})
+        used += size
+    return entries, len(outside) - len(entries)
 
 
 def synthesis_material(clustering: Clustering, candidates: Sequence[dict],
@@ -7797,65 +8560,93 @@ def synthesis_material(clustering: Clustering, candidates: Sequence[dict],
     return tuple(out)
 
 
-def render_synthesizer_payload(brief: str, problem: str, index: Sequence[dict],
-                               defects: Sequence[dict], schema: dict | None = None) -> str:
-    """The whole of a synthesis payload from exactly these inputs: the brief, the problem
-    statement verbatim, the whole defect index — every id and consequence, so any defect
-    can be cited — and the full material for the defects this unit judges.
+def render_synthesis_defect(defect: dict) -> str:
+    """One defect's full material as a payload states it, under its own heading."""
+    out = [f"\n### {defect['id']}\n"]
+    if defect["mechanism"] is not None:
+        out += ["\n", f"Sites: {', '.join(defect['sites'])}\n",
+                *_payload_field("The mechanism the merge check upheld: ",
+                                defect["mechanism"])]
+    for site in defect["site_material"]:
+        out += [f"\n#### {site['id']}\n", "\n",
+                *_payload_field("Consequence: ", site["consequence"])]
+        if site["instance"] is not None:
+            out += _payload_field("This site's instance of the mechanism: ",
+                                  site["instance"])
+        if site["split_reason"] is not None:
+            out += _payload_field("Kept apart from a defect at the same site because: ",
+                                  site["split_reason"])
+        for member in site["members"]:
+            where = (f"line {member['line_start']}"
+                     if member["line_start"] == member["line_end"]
+                     else f"lines {member['line_start']}-{member['line_end']}")
+            out.append(f"\nAt {member['file']}, {where}:\n")
+            out += _payload_field("- Failure: ", member["failure"])
+            for direction in member["directions"]:
+                out += _payload_field("- Direction: ", direction)
+            out.append(f"- Proposed fix size: {'; '.join(member['fix_sizes'])}\n")
+            out += ([f"- {NO_CHECK_LINE}\n"] if member["rationale"] is None
+                    else _payload_field("- What the check found: ", member["rationale"]))
+    return "".join(out)
 
-    ``index`` and ``defects`` are separate declared inputs even where one unit holds every
-    defect and they cover the same list. What a payload may never carry is another unit's
-    SYNTHESIS: a defect's id and consequence are settled facts this round is built on, as
-    the clustering payload is built on the verifiers' rationales, while a tier, a narrative
-    or a fix is the judgment this round exists to produce and no unit may be shown
-    another's. Keeping the two inputs apart is what makes that property checkable by
-    rebuilding the bytes.
+
+def index_cut_line(cut: int) -> str:
+    """What a batch's index says about the outside defects its cap left out."""
+    return (f"{_plural(cut, 'more defect')} outside your batch "
+            f"{'shares' if cut == 1 else 'share'} a file with yours and "
+            f"{'is' if cut == 1 else 'are'} not listed here: this index is capped.")
+
+
+def index_notice_bytes(cut: int) -> int:
+    """The bytes :func:`index_cut_line` takes in an index, with the blank line before it."""
+    return len(f"\n{index_cut_line(cut)}\n".encode("utf-8"))
+
+
+# The smallest index cap a limit may state: the cut line for a count of seven digits, more
+# defects than any run is planned for. The line is rendered whatever the cap, so a cap
+# below it cannot hold even an index that lists nothing.
+INDEX_NOTICE_FLOOR = index_notice_bytes(9_999_999)
+
+
+def render_synthesizer_payload(brief: str, problem: str, index: Sequence[dict],
+                               defects: Sequence[dict], schema: dict | None = None,
+                               cut: int = 0) -> str:
+    """The whole of a synthesis payload from exactly these inputs: the brief, the problem
+    statement verbatim, the batch's index — each outside defect sharing a file with one of
+    its own, by id and consequence, and how many the cap left out — and the full material
+    for the defects this unit writes up.
+
+    What a payload may never carry is another unit's SYNTHESIS: a defect's id and
+    consequence are settled facts this round is built on, as the clustering payload is built
+    on the verifiers' rationales, while a tier, a narrative or a fix is the judgment this
+    round exists to produce and no unit may be shown another's. Keeping the index and the
+    defects apart as declared inputs is what makes that property checkable by rebuilding the
+    bytes.
     """
     out = [brief.rstrip("\n"), "\n", PROBLEM_HEADING, "\n", problem, "\n",
            DEFECT_INDEX_HEADING, "\n"]
     for entry in index:
         out += _payload_field(f"- {entry['id']}: ", entry["consequence"])
+    if cut:
+        out += ["\n" if index else "", f"{index_cut_line(cut)}\n"]
+    elif not index:
+        out.append(f"{NO_OUTSIDE_LINE}\n")
     out.append(TO_JUDGE_HEADING)
-    for defect in defects:
-        out.append(f"\n### {defect['id']}\n")
-        if defect["mechanism"] is not None:
-            out += ["\n", f"Sites: {', '.join(defect['sites'])}\n",
-                    *_payload_field("The mechanism the merge check upheld: ",
-                                    defect["mechanism"])]
-        for site in defect["site_material"]:
-            out += [f"\n#### {site['id']}\n", "\n",
-                    *_payload_field("Consequence: ", site["consequence"])]
-            if site["instance"] is not None:
-                out += _payload_field("This site's instance of the mechanism: ",
-                                      site["instance"])
-            if site["split_reason"] is not None:
-                out += _payload_field("Kept apart from a defect at the same site because: ",
-                                      site["split_reason"])
-            for member in site["members"]:
-                where = (f"line {member['line_start']}"
-                         if member["line_start"] == member["line_end"]
-                         else f"lines {member['line_start']}-{member['line_end']}")
-                out.append(f"\nAt {member['file']}, {where}:\n")
-                out += _payload_field("- Failure: ", member["failure"])
-                for direction in member["directions"]:
-                    out += _payload_field("- Direction: ", direction)
-                out.append(f"- Proposed fix size: {'; '.join(member['fix_sizes'])}\n")
-                out += ([f"- {NO_CHECK_LINE}\n"] if member["rationale"] is None
-                        else _payload_field("- What the check found: ", member["rationale"]))
+    out += [render_synthesis_defect(defect) for defect in defects]
     out += _schema_section(schema)
     return "".join(out)
 
 
 def _parse_tiers(raw: object) -> tuple[str, ...]:
-    """The run's whole vocabulary, named once. Empty is refused and so is a repeat: a reply
-    with no tiers placed every defect under a name it never declared, and one naming a tier
-    twice has already produced the two-phrasings-of-one-theme the round exists to prevent.
-    Both fail the unit rather than one defect, because neither is about a defect."""
+    """The batch's own tier names, each named once. Empty is refused and so is a repeat: a
+    reply with no tiers placed every defect under a name it never declared, and one naming a
+    tier twice has produced two phrasings of one theme inside one reply. Both fail the unit
+    rather than one defect, because neither is about a defect."""
     if not isinstance(raw, list):
         raise ResultError(f"field 'tiers' must be a list (found {type(raw).__name__})")
     if not raw:
         raise ResultError(
-            "field 'tiers' is empty; the run's tier names are what every assignment below "
+            "field 'tiers' is empty; the batch's tier names are what every assignment below "
             "chooses from, so an empty list assigns nothing"
         )
     tiers: list[str] = []
@@ -7863,8 +8654,8 @@ def _parse_tiers(raw: object) -> tuple[str, ...]:
         name = _text(tier, f"tiers[{index}]")
         if name in tiers:
             raise ResultError(
-                f"field 'tiers[{index}]' names {name!r} twice; one theme spelled two ways is "
-                f"the grouping this round exists to prevent"
+                f"field 'tiers[{index}]' names {name!r} twice; a reply names each of its "
+                f"tiers once"
             )
         tiers.append(name)
     return tuple(tiers)
@@ -7910,16 +8701,16 @@ def _parse_site_notes(raw: object, field: str, sites: Sequence[str]) -> dict[str
 
 def _parse_synthesis(raw: object, field: str, tiers: Sequence[str],
                      sites: Sequence[str] | None) -> dict:
-    """One defect's judgment, checked against the run's own vocabulary.
+    """One defect's judgment, checked against the tiers its own reply declared.
 
     ``sites`` are the defect's sites as its listing recorded them, and ``None`` where the
     listing predates sites: that reply was asked for no heading, no site notes and no
     length, so it is read in the shape it was asked for, with ``heading`` ``None`` and the
     renderer falling back to the site's consequence.
 
-    A tier outside ``tiers`` is refused here rather than accepted and rendered: one
-    vocabulary per run is the property, and a name the unit invented after declaring its
-    list is a name no other defect can be filed beside. A cross-reference to the defect
+    A tier outside ``tiers`` is refused here rather than accepted and rendered: a name the
+    unit invented after declaring its list is one the engine cannot place among the batch's
+    tiers, and no later round can reconcile it. A cross-reference to the defect
     itself is refused too — the engine's later check asks whether the two defects share a
     file or a line range, which a defect trivially does with itself, so nothing downstream
     would catch it and the page would carry a defect pointing at its own heading.
@@ -7932,7 +8723,7 @@ def _parse_synthesis(raw: object, field: str, tiers: Sequence[str],
     tier = _text(raw["tier"], f"{field}.tier")
     if tier not in tiers:
         raise ResultError(
-            f"field '{field}.tier' names {tier!r}, which is not one of this run's tiers "
+            f"field '{field}.tier' names {tier!r}, which is not one of this reply's tiers "
             f"({', '.join(repr(name) for name in tiers)}); every defect is filed under a "
             f"name the reply declared"
         )
@@ -7979,13 +8770,16 @@ def _defect_of(raw: object) -> str | None:
 
 
 def parse_synthesizer_result(obj: object, unit_id: str, handed: Sequence[str],
-                             sites: Sequence[Sequence[str]] | None) -> dict:
-    """Strictly parse the synthesis result, and prove it answers for exactly the defects the
+                             sites: Sequence[Sequence[str]] | None,
+                             legacy: bool = False) -> dict:
+    """Strictly parse one batch's result, and prove it answers for exactly the defects the
     unit was handed.
 
     ``sites`` is the listing's ``defect_sites``, beside ``handed``: each defect's sites, which
     its site notes may name and no others. ``None`` is a listing written before sites, whose
     reply is read in the shape that listing asked for (see :func:`_parse_synthesis`).
+    ``legacy`` is a unit v2026.10.0 wrote, whose reply also carries a ``summary``; a unit
+    this engine writes asks for none, and a reply carrying one is refused.
 
     **The partition is proved before the judgment is believed**, exactly as the clustering
     round is: a dropped id, a repeated id or one the payload never listed fails the WHOLE
@@ -8010,8 +8804,8 @@ def parse_synthesizer_result(obj: object, unit_id: str, handed: Sequence[str],
     try:
         if not isinstance(obj, dict):
             raise ResultError(f"result must be a JSON object (found {type(obj).__name__})")
-        _check_keys(obj, "result", frozenset(SYNTHESIZER_RESULT_KEYS),
-                    SYNTHESIZER_RESULT_KEYS, ResultError)
+        keys = LEGACY_SYNTHESIZER_RESULT_KEYS if legacy else SYNTHESIZER_RESULT_KEYS
+        _check_keys(obj, "result", frozenset(keys), keys, ResultError)
         tiers = _parse_tiers(obj["tiers"])
         if not isinstance(obj["defects"], list):
             raise ResultError(f"field 'defects' must be a list (found {type(obj['defects']).__name__})")
@@ -8054,38 +8848,84 @@ def parse_synthesizer_result(obj: object, unit_id: str, handed: Sequence[str],
                 f"{len(missing)} of {len(wanted)} have none: {', '.join(missing)}"
             )
         return {"tiers": list(tiers), "assignments": assignments, "rejected": rejected,
-                "summary": _text(obj["summary"], "summary", empty_ok=True)}
+                "summary": (_text(obj["summary"], "summary", empty_ok=True)
+                            if legacy else None)}
     except ResultError as exc:
         raise ResultError(f"{unit_id}: {exc}") from None
 
 
-def read_synthesis_result(rundir: Path, units: Sequence[dict]) -> SynthesisState | None:
-    """The synthesis unit as exactly one of complete, failed or missing, or ``None`` where
-    the run has no such unit at all. A unit holding both ``result.json`` and ``error.txt``
-    refuses the run here, as it does for every kind but the probe."""
-    if not units:
-        return None
-    unit = units[0]
-    state, payload = _read_unit_file(rundir, unit["id"])
-    if state != UNIT_COMPLETE:
-        return SynthesisState(unit["id"], state, _writable(str(payload)), (), {}, (), None)
-    try:
-        parsed = parse_synthesizer_result(payload, unit["id"], unit["defects"],
-                                          unit.get("defect_sites"))
-    except ResultError as exc:
-        return SynthesisState(unit["id"], UNIT_FAILED, _writable(str(exc)), (), {}, (), None)
-    return SynthesisState(unit["id"], UNIT_COMPLETE, None, tuple(parsed["tiers"]),
-                          parsed["assignments"], tuple(parsed["rejected"]), parsed["summary"])
+# The overall state of a generation some of whose batches landed and some did not. The
+# batches that landed stand; the defects of the others are reported as not written up.
+SYNTHESIS_PARTIAL = "partial"
+NOT_DISPATCHED_REASON = ("it is over its lane's hard ceiling, so it was listed and never "
+                         "sent to a model")
+
+
+def synthesis_writer(unit: dict, run_format: int | None) -> int:
+    """Which engine wrote ``unit``: its recorded writer, else — for a listing that records
+    none — this engine where the run has a run format and v2026.10.0 where it has not."""
+    writer = unit.get("writer")
+    if isinstance(writer, int) and not isinstance(writer, bool):
+        return writer
+    return SYNTHESIS_WRITER if run_format is not None else LEGACY_SYNTHESIS_WRITER
+
+
+def synthesis_generation(unit: dict) -> int:
+    """The synthesis generation ``unit`` belongs to; a listing that records none is 1."""
+    generation = unit.get("generation")
+    if isinstance(generation, int) and not isinstance(generation, bool):
+        return generation
+    return 1
+
+
+def synthesis_generations(units: Sequence[dict]) -> dict[int, list[dict]]:
+    """The synthesis units by generation, lowest first, each in listing order."""
+    out: dict[int, list[dict]] = {}
+    for unit in units:
+        out.setdefault(synthesis_generation(unit), []).append(unit)
+    return dict(sorted(out.items()))
+
+
+def read_synthesis_result(rundir: Path, units: Sequence[dict]) -> tuple[SynthesisState, ...]:
+    """Each synthesis unit as exactly one of complete, failed or missing, in listing order;
+    empty where the run has no such unit. A unit holding both ``result.json`` and
+    ``error.txt`` refuses the run here, as it does for every kind but the probe. A unit
+    never dispatched for being over its hard ceiling is missing, and says why."""
+    run_format = read_run_format(rundir) if units else None
+    out: list[SynthesisState] = []
+    for unit in units:
+        state, payload = _read_unit_file(rundir, unit["id"])
+        if state == UNIT_MISSING and unit.get("dispatch") is False:
+            out.append(SynthesisState(unit["id"], state, NOT_DISPATCHED_REASON, (), {}, (),
+                                      None))
+            continue
+        if state != UNIT_COMPLETE:
+            out.append(SynthesisState(unit["id"], state, _writable(str(payload)), (), {}, (),
+                                      None))
+            continue
+        try:
+            parsed = parse_synthesizer_result(
+                payload, unit["id"], unit["defects"], unit.get("defect_sites"),
+                legacy=synthesis_writer(unit, run_format) == LEGACY_SYNTHESIS_WRITER)
+        except ResultError as exc:
+            out.append(SynthesisState(unit["id"], UNIT_FAILED, _writable(str(exc)), (), {},
+                                      (), None))
+            continue
+        out.append(SynthesisState(unit["id"], UNIT_COMPLETE, None, tuple(parsed["tiers"]),
+                                  parsed["assignments"], tuple(parsed["rejected"]),
+                                  parsed["summary"]))
+    return tuple(out)
 
 
 def check_synthesis(defects: Sequence[Defect], units: Sequence[dict],
                     written: Sequence[Defect] | None = None) -> None:
-    """The synthesis listing against the run's own defects: at most one unit, holding
-    exactly the defect ids that need a write-up. Refused by name before any result is read,
-    as :func:`check_clustering` refuses the same shape one stage earlier.
+    """The synthesis listing against the run's own defects: each generation's units
+    together hold exactly the defect ids that need a write-up, each in one unit. Refused by
+    name before any result is read, as :func:`check_clustering` refuses the same shape one
+    stage earlier.
 
     ``defects`` is every defect in the run and ``written`` is :func:`needs_a_write_up`'s
-    answer over them; ``None`` is every defect. **The listing must cover every defect that
+    answer over them; ``None`` is every defect. **A generation must cover every defect that
     needs a write-up, name nothing that is not this run's, and name nothing twice** — not
     equal ``written`` exactly. A listing of every defect, from a round planned before
     refuted defects and coverage gaps were left out, passes; so does one planned before a
@@ -8100,38 +8940,52 @@ def check_synthesis(defects: Sequence[Defect], units: Sequence[dict],
     """
     if not units:
         return
-    if len(units) > 1:
-        raise RunDirError(
-            f"synthesis units {units[0].get('id', '(unnamed)')!s} and "
-            f"{units[1].get('id', '(unnamed)')!s} both name the synthesis round; synthesize "
-            f"writes one unit, so {UNITS_FILE_NAME} is not the engine's"
-        )
-    unit = units[0]
-    # The row's own shape first. A listing this engine did not write can carry a null
-    # defect list, and reaching the comparison below with one raises out of the run as a
-    # traceback instead of the refusal this promises.
-    if (not isinstance(unit.get("defects"), list)
-            or not all(isinstance(did, str) for did in unit["defects"])):
-        raise RunDirError(
-            f"synthesis unit {unit.get('id', '(unnamed)')!s} has no list of defect ids; "
-            f"{UNITS_FILE_NAME} is not the engine's"
-        )
+    named: set[str] = set()
+    for unit in units:
+        # The row's own shape first. A listing this engine did not write can carry a null
+        # defect list, and reaching the comparison below with one raises out of the run as
+        # a traceback instead of the refusal this promises.
+        if (not isinstance(unit.get("defects"), list)
+                or not all(isinstance(did, str) for did in unit["defects"])):
+            raise RunDirError(
+                f"synthesis unit {unit.get('id', '(unnamed)')!s} has no list of defect ids; "
+                f"{UNITS_FILE_NAME} is not the engine's"
+            )
+        if unit.get("id") in named:
+            raise RunDirError(f"synthesis unit {unit['id']} is listed twice; "
+                              f"{UNITS_FILE_NAME} is not the engine's")
+        named.add(unit.get("id"))
     ids = [defect.id for defect in (defects if written is None else written)]
-    listed = unit["defects"]
-    if (len(set(listed)) != len(listed) or not set(listed) <= {d.id for d in defects}
-            or not set(ids) <= set(listed)):
-        raise RunDirError(
-            f"synthesis unit {unit['id']} is listed with defects that are not this run's "
-            f"defects ({len(unit['defects'])} listed, {len(ids)} in the run need a "
-            f"write-up); the round is handed each of those exactly once, so "
-            f"{UNITS_FILE_NAME} is not the engine's"
-        )
+    known = {defect.id for defect in defects}
+    for members in synthesis_generations(units).values():
+        holder: dict[str, str] = {}
+        repeated = False
+        for unit in members:
+            for did in unit["defects"]:
+                if did in holder and holder[did] != unit["id"]:
+                    raise RunDirError(
+                        f"synthesis units {holder[did]} and {unit['id']} both hold {did}; "
+                        f"each defect is written up by exactly one unit, so "
+                        f"{UNITS_FILE_NAME} is not the engine's")
+                repeated = repeated or did in holder
+                holder[did] = unit["id"]
+        if repeated or not set(holder) <= known or not set(ids) <= set(holder):
+            several = len(members) > 1
+            raise RunDirError(
+                f"synthesis {'units' if several else 'unit'} "
+                f"{', '.join(unit['id'] for unit in members)} {'are' if several else 'is'} "
+                f"listed with defects that are not this run's defects ({len(holder)} listed, "
+                f"{len(ids)} in the run need a write-up); the round is handed each of those "
+                f"exactly once, so {UNITS_FILE_NAME} is not the engine's"
+            )
     # A listing written before defects could hold several sites has no record of them, and
     # every defect in it is one site. Where the record is there, a regrouping since the
     # round was planned changed what a defect id means, and the round no longer applies.
-    held = unit.get("defect_sites")
-    if held is not None:
-        now = {defect.id: list(defect.sites) for defect in defects}
+    now = {defect.id: list(defect.sites) for defect in defects}
+    for unit in units:
+        held = unit.get("defect_sites")
+        if held is None:
+            continue
         if (not isinstance(held, list) or len(held) != len(unit["defects"])
                 or any(now[did] != sites for did, sites in zip(unit["defects"], held))):
             raise RunDirError(
@@ -8142,18 +8996,73 @@ def check_synthesis(defects: Sequence[Defect], units: Sequence[dict],
                 f"rounds again")
 
 
-def build_synthesis(units: Sequence[dict], state: SynthesisState | None) -> Synthesis | None:
-    """The round as the report reads it, or ``None`` where the run has no synthesis round.
+def build_synthesis(units: Sequence[dict], states: Sequence[SynthesisState],
+                    run_format: int | None) -> Synthesis | None:
+    """One generation of the round as the report reads it, or ``None`` where the run has no
+    synthesis round. ``units`` are that generation's units and ``states`` their
+    :func:`read_synthesis_result`, in the same order.
 
-    A round that failed, never landed or returned something the engine could not believe
-    leaves every defect unjudged and says which unit it was and what state it came back in.
-    **Nothing is dropped**: a judgment stage cannot remove a defect from the run, so the
-    degrade costs the report its tiers and its narrative and costs the run nothing — the
-    same asymmetry the clustering round is built on, one stage later.
+    **The record's shape follows the generation's writer.** A generation v2026.10.0 wrote is
+    one unit, recorded as it always was, so an old report re-renders unchanged. One this
+    engine wrote is a list of its batches, each with its own state, tiers and refused
+    entries, under the generation's overall state and the tiers of the batches that landed
+    in batch order, a name two batches spelled identically appearing once, where it first
+    appears.
+
+    A batch that failed, never landed or returned something the engine could not believe
+    leaves its own defects unjudged and says which unit it was and what state it came back
+    in; the batches beside it stand. **Nothing is dropped**: a judgment stage cannot remove
+    a defect from the run, so the degrade costs the report write-ups and costs the run
+    nothing — the same asymmetry the clustering round is built on, one stage later.
     """
     if not units:
         return None
-    unit = units[0]
+    writer = synthesis_writer(units[0], run_format)
+    if writer == LEGACY_SYNTHESIS_WRITER:
+        return _legacy_synthesis(units[0], states[0] if states else None)
+    batches: list[dict] = []
+    assignments: dict[str, dict | None] = {}
+    batch_of: dict[str, str] = {}
+    tiers: list[str] = []
+    rejected: list[str] = []
+    landed = 0
+    for unit, state in zip(units, states):
+        batches.append({"unit": unit["id"], "lane": unit.get("lane"),
+                        "defects": list(unit["defects"]), "state": state.state,
+                        "reason": state.reason, "tiers": list(state.tiers),
+                        "rejected": list(state.rejected)})
+        for did in unit["defects"]:
+            batch_of[did] = unit["id"]
+        if state.state != UNIT_COMPLETE:
+            continue
+        landed += 1
+        assignments.update(state.assignments)
+        tiers += [tier for tier in state.tiers if tier not in tiers]
+        rejected += state.rejected
+    if landed == len(batches):
+        overall = UNIT_COMPLETE
+    elif landed:
+        overall = SYNTHESIS_PARTIAL
+    else:
+        overall = (UNIT_MISSING if all(b["state"] == UNIT_MISSING for b in batches)
+                   else UNIT_FAILED)
+    return Synthesis(assignments=assignments, record={
+        "generation": synthesis_generation(units[0]),
+        "writer": writer,
+        "state": overall,
+        "units": batches,
+        # Every defect the generation was handed, in batch order. A defect not among them
+        # needed no write-up, so its missing tier is not an entry the round lost.
+        "defects": [did for batch in batches for did in batch["defects"]],
+        "tiers": tiers,
+        "rejected": rejected,
+        # Written by a later round; none yet.
+        "overview": None,
+    }, writer=writer, batch_of=batch_of)
+
+
+def _legacy_synthesis(unit: dict, state: SynthesisState | None) -> Synthesis:
+    """A generation v2026.10.0 wrote: its one unit, recorded in that engine's shape."""
     if state is None or state.state != UNIT_COMPLETE:
         return Synthesis(assignments={}, record={
             "unit": unit["id"],
@@ -8161,7 +9070,7 @@ def build_synthesis(units: Sequence[dict], state: SynthesisState | None) -> Synt
             "state": state.state if state is not None else UNIT_MISSING,
             "reason": state.reason if state is not None else None,
             "tiers": [], "rejected": [], "summary": None,
-        })
+        }, writer=LEGACY_SYNTHESIS_WRITER, batch_of={})
     return Synthesis(assignments=dict(state.assignments), record={
         "unit": unit["id"],
         # The defects the round was handed. A defect not among them needed no write-up, so
@@ -8172,29 +9081,51 @@ def build_synthesis(units: Sequence[dict], state: SynthesisState | None) -> Synt
         "tiers": list(state.tiers),
         "rejected": list(state.rejected),
         "summary": state.summary,
-    })
+    }, writer=LEGACY_SYNTHESIS_WRITER, batch_of={})
 
 
 CROSS_REF_ABSENT = "no defect in this run carries that id"
 
 # The whole of the rule a cross-reference must pass once its id resolves: any one condition
-# keeps it. The resolver iterates this and nothing else, and the synthesizer brief, its
-# schema and the dropped reason are tested against these names, so a condition added here
-# and not to the prose fails a test instead of going untold to the writer. A tier is shared
-# only when both sides HAVE one: absent is not agreement.
-CROSS_REF_RULE: tuple[tuple[str, Callable[[frozenset[str], frozenset[str],
-                                           str | None, str | None], bool]], ...] = (
+# keeps it. The resolver iterates the rule it is handed and nothing else, and the synthesizer
+# brief, its schema and the dropped reason are tested against these names, so a condition
+# added here and not to the prose fails a test instead of going untold to the writer.
+#
+# The second half keeps a reference between two defects written up in one batch: that batch
+# read both, so the connection is its own judgment over material it held. A shared tier is
+# not used, because tiers are named per batch and reconciled only afterwards, and a shared
+# heading says nothing about two defects' code. A side with no batch shares none: absent is
+# not agreement.
+CrossRefRule = tuple[tuple[str, Callable[[frozenset[str], frozenset[str],
+                                          str | None, str | None], bool]], ...]
+CROSS_REF_RULE: CrossRefRule = (
+    ("touch a file in common", lambda mine, theirs, _a, _b: bool(mine & theirs)),
+    ("were written up in one batch", lambda _m, _t, batch, their_batch:
+        batch is not None and batch == their_batch),
+)
+# The rule a generation v2026.10.0 wrote is checked by: its one unit named the run's one
+# vocabulary, so a shared tier was that unit's own judgment. Kept so an old report re-renders
+# with the references it had.
+LEGACY_CROSS_REF_RULE: CrossRefRule = (
     ("touch a file in common", lambda mine, theirs, _a, _b: bool(mine & theirs)),
     ("sit under one tier", lambda _m, _t, tier, their_tier:
         tier is not None and tier == their_tier),
 )
-CROSS_REF_APART = "the two defects neither " + " nor ".join(
-    name for name, _ in CROSS_REF_RULE)
+
+
+def cross_ref_apart(rule: CrossRefRule) -> str:
+    """Why a reference was dropped under ``rule``: every condition it names failed."""
+    return "the two defects neither " + " nor ".join(name for name, _ in rule)
+
+
+CROSS_REF_APART = cross_ref_apart(CROSS_REF_RULE)
+LEGACY_CROSS_REF_APART = cross_ref_apart(LEGACY_CROSS_REF_RULE)
 
 
 def resolve_cross_references(defect: str, references: Sequence[str],
                              files_of: dict[str, frozenset[str]],
-                             tier_of: dict[str, str | None] | None = None,
+                             together: Mapping[str, str | None] | None = None,
+                             rule: CrossRefRule = CROSS_REF_RULE,
                              ) -> tuple[list[str], list[dict]]:
     """A defect's cross-references split into the ones that survive checking and the ones
     dropped, each dropped one with the reason it was dropped.
@@ -8202,59 +9133,69 @@ def resolve_cross_references(defect: str, references: Sequence[str],
     Two checks, and they are the whole of what can be checked here. **The id must name a
     defect in this run** — a reference to something that does not exist resolves to
     nothing, and rendered it would send a reader looking for a heading that is not on the
-    page. **The two defects must touch a file in common, or sit under one tier**: a
-    reference sharing neither rests on nothing the engine can see, and the brief already
-    tells the writer that sitting in one file is not by itself a connection.
+    page. **Then one condition of ``rule`` must hold**: under :data:`CROSS_REF_RULE`, the
+    two defects touch a file in common or were written up in one batch; under
+    :data:`LEGACY_CROSS_REF_RULE`, for a generation v2026.10.0 wrote, a file in common or
+    one tier. ``together`` maps each defect to its batch, or to its tier under the legacy
+    rule; a side with none shares nothing.
 
-    The tier half admits what the file half cannot: the cross-file connections a reader
-    most wants -- a reverse endpoint with no idempotency key beside a lost-response refund
-    being retried, say, or a refund chain across three files. The synthesis round assigns
-    tiers to group chains exactly like those, so two defects it put under one theme are
-    connected by that round's own judgment. An ABSENT tier is not a shared one: a run with
-    no synthesis round has none at all, and reading absence as agreement would turn this
+    The second half admits what the file half cannot: the cross-file connections a reader
+    most wants — a reverse endpoint with no idempotency key beside a lost-response refund
+    being retried, say — where one unit read both defects and judged them connected. An
+    ABSENT batch or tier is not a shared one: reading absence as agreement would turn this
     check into "keep everything" on precisely the runs with the least to go on.
 
     The file half could be stated as "the same file, or an overlapping line range". Those
     are one test rather than two: two ranges in different files cannot overlap, so every
     pair an overlap would admit shares a file already, and testing the ranges as well would
     only ADD a way to accept a pair in two different files — which is the thing the check
-    exists to refuse. The file test is therefore the whole disjunction, and writing it as
-    two clauses would suggest a reference could pass on ranges alone.
+    exists to refuse.
 
     What this cannot check is whether the two defects are related **in the way the prose
-    says**. That would need a stage that read both, which would be a fifth round, and none
-    exists. A surviving reference is therefore checked, not verified, and the reference
-    the round is trusted for is the one it does not make.
+    says**. That would need a stage that read both and checked the claim, and none exists.
+    A surviving reference is therefore checked, not verified, and the reference the round
+    is trusted for is the one it does not make.
     """
     mine = files_of.get(defect, frozenset())
-    tiers = tier_of or {}
-    my_tier = tiers.get(defect)
+    groups = together or {}
+    my_group = groups.get(defect)
+    apart = cross_ref_apart(rule)
     kept: list[str] = []
     dropped: list[dict] = []
     for reference in references:
         if reference not in files_of:
             dropped.append({"defect": reference, "reason": CROSS_REF_ABSENT})
-        elif any(holds(mine, files_of[reference], my_tier, tiers.get(reference))
-                 for _, holds in CROSS_REF_RULE):
+        elif any(holds(mine, files_of[reference], my_group, groups.get(reference))
+                 for _, holds in rule):
             kept.append(reference)
         else:
-            dropped.append({"defect": reference, "reason": CROSS_REF_APART})
+            dropped.append({"defect": reference, "reason": apart})
     return kept, dropped
+
+
+def synthesis_head(companions: SynthesisCompanions, problem: str) -> str:
+    """What every payload of the round carries whatever its defects: the payload of an
+    empty batch, which is what the packer measures once per unit."""
+    return render_synthesizer_payload(companions.synthesizer_brief, problem, (), (),
+                                      schema=companions.synthesizer_schema)
 
 
 def write_synthesis(rundir: Path, units_doc: dict, units: Sequence[SynthesisUnit],
                     material: Sequence[dict], companions: SynthesisCompanions,
-                    problem: str) -> None:
-    """Write ``units/<id>/`` for the synthesis unit, then ``units.json`` at the synthesis
-    stage listing everything that came before it and it. Every file lands by the
-    exclusive-create-then-replace rule, and a failure part-way takes back what this stage
+                    problem: str, index_cap: int | None = None,
+                    generation: int = 1) -> None:
+    """Write ``units/<id>/`` for each batch, then ``units.json`` listing everything that
+    came before them and them: at the synthesis stage for generation 1, and at the stage it
+    was at for a later generation, which is planned on a reported run and leaves it
+    reported. ``index_cap`` is the synthesis index limit each batch's index is held to.
+    Every file lands by the exclusive-create-then-replace rule, and a failure part-way takes back what this stage
     wrote. ``units.json`` is rewritten last, so the stage marker moves only once the
     payload is on disk.
 
     A unit directory an interrupted synthesize left is reclaimed rather than refused: the
     caller holds synthesize's claim and reached here with the marker still at the clustering
     stage, so no other synthesize is working and none has committed. The manifest is the
-    unit this call is about to write and nothing wider, and a directory holding anything
+    units this call is about to write and nothing wider, and a directory holding anything
     synthesize does not write is refused rather than deleted."""
     for unit in units:
         target = rundir / UNITS_DIR / unit.id
@@ -8263,14 +9204,15 @@ def write_synthesis(rundir: Path, units_doc: dict, units: Sequence[SynthesisUnit
                 f"{target} already exists and is a link or a file rather than a unit "
                 f"directory this stage wrote; move it aside and synthesize again"
             )
-    _reclaim("synthesize", rundir, (),
+    _reclaim_rounds("synthesize", rundir, units_doc["units"])
+    record_path = round_record_path(rundir, generation, 1)
+    _reclaim("synthesize", rundir, (record_path,),
              tuple((rundir / UNITS_DIR / unit.id, UNIT_CONTENTS) for unit in units),
              (rundir / UNITS_FILE_NAME,))
     created: list[Path] = []
     try:
         by_id = {defect["id"]: defect for defect in material}
-        index = [{"id": defect["id"], "consequence": defect["consequence"]}
-                 for defect in material]
+        files_of = synthesis_files(material)
         listing = list(units_doc["units"])
         for unit in units:
             unit_dir = rundir / UNITS_DIR / unit.id
@@ -8279,10 +9221,11 @@ def write_synthesis(rundir: Path, units_doc: dict, units: Sequence[SynthesisUnit
             except OSError as exc:
                 raise InventoryError(f"cannot create {unit_dir}: {exc}") from exc
             created.append(unit_dir)
+            index, cut = synthesis_index(unit.defects, material, files_of, index_cap)
             text = render_synthesizer_payload(
                 companions.synthesizer_brief, problem, index,
                 [by_id[did] for did in unit.defects],
-                schema=companions.synthesizer_schema)
+                schema=companions.synthesizer_schema, cut=cut)
             write_text(unit_dir / PAYLOAD_NAME, text)
             write_json(unit_dir / SCHEMA_NAME, companions.synthesizer_schema)
             lines, size = measure_payload(text)
@@ -8292,14 +9235,28 @@ def write_synthesis(rundir: Path, units_doc: dict, units: Sequence[SynthesisUnit
                 # Which sites each defect held when the round was planned, beside it: a D id
                 # alone survives a regrouping that changes what the defect is.
                 "defect_sites": [by_id[did]["sites"] for did in unit.defects],
+                # Which generation of the round this is and which engine wrote it, which
+                # decide how its reply and its record are read.
+                "generation": generation,
+                "writer": SYNTHESIS_WRITER,
+                "round": 1,
+                "limits": unit.limits,
+                "oversize": unit.oversize,
+                "dispatch": unit.dispatch,
+                # How many outside defects sharing a file the index cap left out.
+                "index_cut": cut,
                 "payload": f"{UNITS_DIR}/{unit.id}/{PAYLOAD_NAME}",
                 "schema": f"{UNITS_DIR}/{unit.id}/{SCHEMA_NAME}",
                 "payload_lines": lines,
                 "payload_bytes": size,
             })
+        # The round's record after its units and before the listing that commits them.
+        if units:
+            _write_round_record(rundir, record_path, batches_round_record(
+                listing[len(units_doc["units"]):]))
         write_json(rundir / UNITS_FILE_NAME, {
-            "stage": SYNTHESIZED_STAGE, "lanes": units_doc.get("lanes", list(LANES)),
-            "units": listing,
+            "stage": SYNTHESIZED_STAGE if generation == 1 else units_doc["stage"],
+            "lanes": units_doc.get("lanes", list(LANES)), "units": listing,
         })
     except BaseException:
         # Best effort, deciding nothing: a directory that will not come away is left on
@@ -8315,10 +9272,1059 @@ def synthesis_summary(units: Sequence[SynthesisUnit], defects: Sequence[Defect],
            + (f"; {left_out} refuted at every site or a coverage gap, which need no write-up"
               if left_out else "")]
     for unit in units:
-        out.append(f"  {unit.id}  {_plural(len(unit.defects), 'defect')}  lane {unit.lane}")
+        flag = ("  over the hard ceiling: listed, never dispatched" if not unit.dispatch
+                else "  over the planning ceiling: alone" if unit.oversize else "")
+        out.append(f"  {unit.id}  {_plural(len(unit.defects), 'defect')}  lane {unit.lane}"
+                   f"{flag}")
     if not units:
         out.append("  no synthesis unit: the run found nothing that needs a write-up")
     return "\n".join(out) + "\n"
+
+
+# --------------------------------------------------------------------------- #
+# synthesis rounds — the batches' tier names reconciled, the tiers summarized, the overview
+# --------------------------------------------------------------------------- #
+# After the batches, a generation runs as rounds while the marker stays `synthesized`: one
+# that reconciles the names the batches gave their tiers (in levels when the names do not
+# fit one unit), then the tier summaries (in levels when a tier does not fit one unit), then
+# the overview, reduced the same way. Every round goes ahead on whatever the round before
+# it landed. All of them run on the first lane and need no file of the tree.
+TIER_NAMER_KIND = "tier-namer"
+SUMMARIZER_KIND = "summarizer"
+# Every kind the synthesis round dispatches.
+SYNTHESIS_KINDS = (SYNTHESIZER_KIND, TIER_NAMER_KIND, SUMMARIZER_KIND)
+TIER_NAMES_SCHEMA_NAME = "tier-names-schema.json"
+OVERVIEW_SCHEMA_NAME = "overview-schema.json"
+# Where each round's record lives: `rounds/synthesis-g<n>-<r>.json`, written after the
+# round's units and before `units.json`, which is the commit. A record naming a unit the
+# listing does not hold was never committed, and the next call takes it back.
+ROUNDS_DIR = "rounds"
+_ROUND_RECORD = re.compile(r"\Asynthesis-g([1-9][0-9]*)-([1-9][0-9]*)\.json\Z")
+_ROUND_UNIT_ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9-]*\Z")
+PHASE_BATCHES = "batches"
+PHASE_TIER_NAMES = "tier-names"
+PHASE_TIER_SUMMARIES = "tier-summaries"
+PHASE_OVERVIEW = "overview"
+TIER_NAMES_RESULT_KEYS = ("tiers", "map")
+TIER_MAP_KEYS = ("entry", "tier")
+SUMMARY_RESULT_KEYS = ("summary",)
+# A final tier name's length: the schema's `maxLength`, held by the parser as well, since a
+# reply is priced at it and a longer name could carry the reply past the limit it was packed
+# under.
+TIER_NAME_CHARS = 80
+
+
+def json_string_bytes(text: str) -> int:
+    """The bytes ``text`` takes written inside a JSON string, quotes excluded: what a
+    reply carrying it costs, which a quote, backslash or control character makes larger
+    than the text."""
+    return len(json.dumps(text, ensure_ascii=False).encode("utf-8")) - 2
+
+
+# What a tier-name reply is estimated at: the object's own keys once, and per entry a map
+# record and one final name at the length cap in the characters JSON writes longest, with
+# its quotes and separator. There are never more final names than entries, and the map
+# names a final tier by position, so this bounds every reply the parser accepts.
+TIER_NAMES_REPLY_HEAD = 256
+TIER_NAMES_REPLY_PRICES = {"entry": 64 + json_string_bytes("\x00" * TIER_NAME_CHARS) + 16}
+# A summary's reply is its text and the object around it. The text, measured as JSON writes
+# it, is capped at a third of
+# the input limit, so two summaries and a payload's fixed part fit one unit whenever the
+# fixed part fits a third, and each level of a reduction has fewer units than the one before.
+SUMMARY_REPLY_HEAD = 64
+# How many of an entry's defects' headings a tier-name payload shows beside its name.
+TIER_HEADINGS_KEPT = 2
+ENTRY_ID_PREFIX = "N"
+NAMES_HEADING = "\n## The names\n"
+SUMMARIZE_HEADING = "\n## What you summarize\n"
+# What a later round, or the names it reconciles, came to.
+ROUND_NOT_NEEDED = "not needed"
+ROUND_NOT_RUN = "not run"
+ROUND_PENDING = "pending"
+NAMES_RECONCILED = "reconciled"
+NAMES_NOT_RECONCILED = "not reconciled"
+SUMMARY_PARTIAL = SYNTHESIS_PARTIAL
+SUMMARY_NONE = "none"
+SUMMARY_STOPPED = "stopped"
+
+
+@dataclass(frozen=True)
+class RoundCompanions:
+    """What the rounds after the batches ship beside the engine: one brief and one schema
+    for the tier names, and one of each for every summary, the overview included."""
+
+    tier_names_brief: str
+    tier_names_schema: dict | None
+    overview_brief: str
+    overview_schema: dict | None
+
+
+def load_round_companions() -> RoundCompanions:
+    return RoundCompanions(
+        tier_names_brief=load_brief("tier-names"),
+        tier_names_schema=load_schema(TIER_NAMES_SCHEMA_NAME),
+        overview_brief=load_brief("overview"),
+        overview_schema=load_schema(OVERVIEW_SCHEMA_NAME),
+    )
+
+
+@dataclass(frozen=True)
+class RoundUnit:
+    """One planned unit of a round after the batches: its id and kind, the level of the
+    reduction, the tier it summarizes (by position, or ``None``), what it was handed (entry
+    ids, defect ids or the units whose summaries it reads), its payload, its summary's byte
+    cap, and what it was planned under."""
+
+    id: str
+    kind: str
+    level: int
+    tier: int | None
+    entries: tuple[str, ...]
+    text: str
+    summary_bytes: int | None
+    limits: dict
+    oversize: bool = False
+    dispatch: bool = True
+
+
+@dataclass(frozen=True)
+class PlannedRound:
+    """The next round of a generation: which, its units, the input it was planned from,
+    and the tiers whose reduction stopped at this level for limits too small to go on."""
+
+    generation: int
+    round: int
+    phase: str
+    level: int
+    input: dict
+    units: tuple[RoundUnit, ...]
+    stopped: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class RoundState:
+    """One unit of a later round as it came back: complete with its parsed value — the
+    final tiers and each entry's final name for a tier-name unit, the text for a summary —
+    or failed or missing with the reason."""
+
+    id: str
+    state: str
+    reason: str | None
+    value: object = None
+
+
+@dataclass(frozen=True)
+class SynthesisRounds:
+    """A generation's later rounds replayed from its records: the tiers each defect is
+    reported under, what the tier names, the tier summaries and the overview came to, and
+    the next round to plan, if any. ``waiting`` is the latest round's units with no answer
+    yet; no round is planned while any is."""
+
+    generation: int
+    tiers: tuple[str, ...]
+    final_of: dict[str, str]
+    tier_names: dict
+    tier_summaries: list[dict]
+    overview: dict
+    overview_text: str | None
+    limits_too_small: bool
+    next_round: PlannedRound | None
+    waiting: tuple[str, ...]
+
+
+def synthesis_unit_id(generation: int, rest: str) -> str:
+    """A synthesis unit's id: ``synth-<rest>`` in generation 1, ``synth-g<n>-<rest>`` after."""
+    return (f"{SYNTHESIS_UNIT_PREFIX}{rest}" if generation == 1
+            else f"{SYNTHESIS_UNIT_PREFIX}g{generation}-{rest}")
+
+
+def _digest_of(obj: object) -> str:
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, ensure_ascii=False,
+                                     separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _round_record(generation: int, number: int, phase: str, level: int | None,
+                  units: Sequence[str], inp: dict, limits: object,
+                  stopped: Sequence[int] = ()) -> dict:
+    return {"generation": generation, "round": number, "phase": phase, "level": level,
+            "units": list(units), "input_digest": _digest_of(inp),
+            "limits_digest": _digest_of(limits), "writer": SYNTHESIS_WRITER,
+            "stopped": list(stopped)}
+
+
+def batches_round_input(batches: Sequence[dict]) -> dict:
+    """What the batches were planned from: each defect the round was handed and the sites
+    it held, which is what :func:`check_synthesis` holds against the run's grouping."""
+    return {"phase": PHASE_BATCHES,
+            "defects": [[did, sites] for unit in batches
+                        for did, sites in zip(unit["defects"],
+                                              unit.get("defect_sites")
+                                              or [None] * len(unit["defects"]))]}
+
+
+def _shared_limits(units: Sequence[dict]) -> object:
+    """The limits a round's units were packed under: those of its first unit that did not
+    go alone, since a defect alone may record the limits of the one lane that takes it."""
+    return next((unit.get("limits") for unit in units if not unit.get("oversize")),
+                units[0].get("limits"))
+
+
+def batches_round_record(batches: Sequence[dict]) -> dict:
+    """Round 1's record, from the batch rows as the listing holds them."""
+    return _round_record(synthesis_generation(batches[0]), 1, PHASE_BATCHES, None,
+                         [unit["id"] for unit in batches], batches_round_input(batches),
+                         _shared_limits(batches))
+
+
+def round_record_of(planned: PlannedRound) -> dict:
+    return _round_record(planned.generation, planned.round, planned.phase, planned.level,
+                         [unit.id for unit in planned.units], planned.input,
+                         planned.units[0].limits, planned.stopped)
+
+
+def round_record_path(rundir: Path, generation: int, number: int) -> Path:
+    return rundir / ROUNDS_DIR / f"synthesis-g{generation}-{number}.json"
+
+
+def _round_record_files(rundir: Path) -> list[tuple[int, int, Path]]:
+    """Every synthesis round record on disk, as ``(generation, round, path)``, in order."""
+    directory = rundir / ROUNDS_DIR
+    if _lstat_or_absent(directory, ROUNDS_DIR, RunDirError) is None:
+        return []
+    if directory.is_symlink() or _is_junction(directory) or not directory.is_dir():
+        raise RunDirError(f"{directory} is not a directory the engine wrote; move it aside")
+    try:
+        names = sorted(entry.name for entry in directory.iterdir())
+    except OSError as exc:
+        raise RunDirError(f"cannot read {directory}: {_os_reason(exc)}") from exc
+    found = []
+    for name in names:
+        match = _ROUND_RECORD.match(name)
+        if match:
+            found.append((int(match[1]), int(match[2]), directory / name))
+    return sorted(found)
+
+
+def _read_round_record(path: Path) -> dict:
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise RunDirError(f"cannot read the synthesis round record {path}: {exc}") from exc
+    units = doc.get("units") if isinstance(doc, dict) else None
+    if (not isinstance(units, list) or not units
+            or not all(isinstance(uid, str) and _ROUND_UNIT_ID.match(uid) for uid in units)):
+        raise RunDirError(f"{path} is not a synthesis round record the engine wrote")
+    return doc
+
+
+def committed_rounds(rundir: Path, listing: Sequence[dict]) -> dict[tuple[int, int], dict]:
+    """Every round record whose units the listing holds, by ``(generation, round)``."""
+    listed = {unit.get("id") for unit in listing}
+    out = {}
+    for generation, number, path in _round_record_files(rundir):
+        doc = _read_round_record(path)
+        if set(doc["units"]) <= listed:
+            out[(generation, number)] = doc
+    return out
+
+
+def _reclaim_rounds(what: str, rundir: Path, listing: Sequence[dict]) -> None:
+    """Take back every round record the listing does not commit, and the unit directories
+    it names that the listing does not hold."""
+    listed = {unit.get("id") for unit in listing}
+    files: list[Path] = []
+    dirs: list[tuple[Path, frozenset[str]]] = []
+    for _generation, _number, path in _round_record_files(rundir):
+        doc = _read_round_record(path)
+        if set(doc["units"]) <= listed:
+            continue
+        files.append(path)
+        dirs += [(rundir / UNITS_DIR / uid, UNIT_CONTENTS)
+                 for uid in doc["units"] if uid not in listed]
+    if files:
+        _reclaim(what, rundir, tuple(files), tuple(dirs))
+
+
+def _check_round(records: Mapping[tuple[int, int], dict], generation: int, number: int,
+                 units: Sequence[dict], inp: dict) -> None:
+    """A committed round against its record: the units it names, the input it was planned
+    from and the limits its units record. Refused by name where any differs: a round whose
+    earlier results changed under it describes other material than the run now holds."""
+    ids = [unit["id"] for unit in units]
+    where = f"synthesis round {number} of generation {generation} ({', '.join(ids)})"
+    rounds_seen = {unit.get("round", 1) for unit in units}
+    if rounds_seen != {number}:
+        raise RunDirError(f"{where} is listed as round {sorted(rounds_seen, key=str)}; "
+                          f"{UNITS_FILE_NAME} is not the engine's")
+    record = records.get((generation, number))
+    if record is None:
+        raise RunDirError(
+            f"{where} has no record under {ROUNDS_DIR}/; every round is recorded before it "
+            f"is listed, so {UNITS_FILE_NAME} is not the engine's")
+    if sorted(record["units"]) != sorted(ids):
+        raise RunDirError(f"{where} is recorded with other units "
+                          f"({', '.join(record['units'])}); {UNITS_FILE_NAME} is not the "
+                          f"engine's")
+    if record.get("input_digest") != _digest_of(inp):
+        raise RunDirError(
+            f"{where} was planned from other results than the run holds now: a result an "
+            f"earlier round landed has changed since. Take the synthesis back with "
+            f"`cluster --redo` and run it again")
+    # A unit that went alone may record the limits of the lane that takes it; every other
+    # unit records the limits the round was packed under.
+    if not {_digest_of(unit.get("limits")) for unit in units
+            if not unit.get("oversize")} <= {record.get("limits_digest")}:
+        raise RunDirError(f"{where} records other limits than its units were planned "
+                          f"under; {UNITS_FILE_NAME} is not the engine's")
+
+
+# -- payloads --------------------------------------------------------------- #
+def render_tier_entry(entry_id: str, entry: dict) -> str:
+    """One name a tier-name payload lists: its id, the name, how many defects it heads and
+    up to two of their headings."""
+    out = [f"\n### {entry_id}\n\n", *_payload_field("Name: ", entry["name"]),
+           f"Defects: {entry['count']}\n"]
+    for heading in entry["headings"]:
+        out += _payload_field("- ", heading)
+    return "".join(out)
+
+
+def render_tier_names_payload(brief: str, problem: str,
+                              entries: Sequence[tuple[str, dict]],
+                              schema: dict | None = None) -> str:
+    out = [brief.rstrip("\n"), "\n", PROBLEM_HEADING, "\n", problem, "\n", NAMES_HEADING]
+    out += [render_tier_entry(entry_id, entry) for entry_id, entry in entries]
+    out += _schema_section(schema)
+    return "".join(out)
+
+
+def tier_summary_what(name: str, level: int) -> str:
+    """What a tier summary's payload says it is handed."""
+    if level == 1:
+        return (f"The headings of defects under one tier, each under its defect's id: all of "
+                f"them, or one part of them that a later reader summarizes with the rest.\n"
+                f"\nTier: {' '.join(name.split())}")
+    return (f"Summaries of parts of one tier, each written by another reader.\n"
+            f"\nTier: {' '.join(name.split())}")
+
+
+def overview_what(level: int) -> str:
+    """What an overview payload says it is handed."""
+    if level == 1:
+        return ("The summary of each tier of the run, under the tier's name: all of them, "
+                "or one part of them that a later reader summarizes with the rest.")
+    return "Summaries of parts of the run's tiers, each written by another reader."
+
+
+def render_summary_entry(label: str, text: str) -> str:
+    return "".join([f"\n### {' '.join(label.split())}\n\n", *_payload_field("", text)])
+
+
+def render_summary_payload(brief: str, problem: str, what: str, cap: int,
+                           entries: Sequence[tuple[str, str]],
+                           schema: dict | None = None) -> str:
+    out = [brief.rstrip("\n"), "\n", PROBLEM_HEADING, "\n", problem, "\n",
+           SUMMARIZE_HEADING, "\n", f"{what}\n",
+           f"\nYour summary may run to at most {cap} bytes of UTF-8 as written in the "
+           f"JSON string, where an escaped character counts at its escape.\n"]
+    out += [render_summary_entry(label, text) for label, text in entries]
+    out += _schema_section(schema)
+    return "".join(out)
+
+
+def summary_cap(limits: Limits) -> int:
+    """The bytes a summary may run to under ``limits``: a third of the input limit, and no
+    more than the reply limit leaves beside the object around it."""
+    return min(limits.input_bytes // 3, limits.reply_bytes - SUMMARY_REPLY_HEAD)
+
+
+def _two_summaries_fit(head: str, cap: int, limits: Limits) -> bool:
+    """Whether one unit holds two summaries at their cap beside ``head``: what makes every
+    level of a reduction smaller than the one before."""
+    part = measure_payload(render_summary_entry("Part 99", "x" * max(cap, 0)))[1]
+    return cap >= 1 and measure_payload(head)[1] + 2 * part <= limits.input_bytes
+
+
+# -- parsing ---------------------------------------------------------------- #
+def parse_tier_names_result(obj: object, unit_id: str, handed: Sequence[str],
+                            ) -> tuple[tuple[str, ...], dict[str, str]]:
+    """Strictly parse one tier-name unit's reply: the final tiers it used, in its order,
+    and each entry it was handed to its final name.
+
+    **The map is proved before it is believed**, as a synthesis batch's partition is: an
+    entry left unmapped, mapped twice or not handed, a position outside the list, or more
+    final names than entries handed, fails the whole unit, and the report keeps the batches'
+    own names. A final name no entry maps to heads nothing and is left out."""
+    try:
+        if not isinstance(obj, dict):
+            raise ResultError(f"result must be a JSON object (found {type(obj).__name__})")
+        _check_keys(obj, "result", frozenset(TIER_NAMES_RESULT_KEYS), TIER_NAMES_RESULT_KEYS,
+                    ResultError)
+        tiers = _parse_tiers(obj["tiers"])
+        # The reply limit prices one final name per entry handed, so a longer list could
+        # run past the limit the unit was packed under.
+        if len(tiers) > len(handed):
+            raise ResultError(f"field 'tiers' names {len(tiers)} tiers, and this unit was "
+                              f"handed {len(handed)} entr{'y' if len(handed) == 1 else 'ies'}"
+                              f"; a reply names at most one final tier per entry")
+        for index, name in enumerate(tiers):
+            _limited(name, f"tiers[{index}]", TIER_NAME_CHARS)
+        if not isinstance(obj["map"], list):
+            raise ResultError(f"field 'map' must be a list (found {type(obj['map']).__name__})")
+        wanted = frozenset(handed)
+        mapped: dict[str, int] = {}
+        for index, record in enumerate(obj["map"]):
+            where = f"map[{index}]"
+            if not isinstance(record, dict):
+                raise ResultError(f"field '{where}' must be a JSON object "
+                                  f"(found {type(record).__name__})")
+            _check_keys(record, where, frozenset(TIER_MAP_KEYS), TIER_MAP_KEYS, ResultError)
+            entry = _text(record["entry"], f"{where}.entry")
+            if entry not in wanted:
+                raise ResultError(f"field '{where}.entry' names {entry!r}, which this unit "
+                                  f"was not handed")
+            if entry in mapped:
+                raise ResultError(f"entry {entry} is mapped twice, and '{where}' is the "
+                                  f"second; every entry is mapped exactly once")
+            position = _integer(record["tier"], f"{where}.tier", 1)
+            if position > len(tiers):
+                raise ResultError(f"field '{where}.tier' is {position}, and the reply names "
+                                  f"{len(tiers)} tier(s)")
+            mapped[entry] = position
+        missing = [entry for entry in handed if entry not in mapped]
+        if missing:
+            raise ResultError(f"every entry this unit was handed is mapped exactly once, and "
+                              f"{len(missing)} of {len(handed)} are not: {', '.join(missing)}")
+        used = set(mapped.values())
+        return (tuple(name for position, name in enumerate(tiers, 1) if position in used),
+                {entry: tiers[position - 1] for entry, position in mapped.items()})
+    except ResultError as exc:
+        raise ResultError(f"{unit_id}: {exc}") from None
+
+
+def parse_summary_result(obj: object, unit_id: str, cap: int | None) -> str:
+    """Strictly parse one summary: its text, refused whole where it runs over ``cap`` bytes
+    as JSON writes it. The cap is what keeps every level of a reduction smaller than the one
+    before, and is measured escaped because the reply it bounds is."""
+    try:
+        if not isinstance(obj, dict):
+            raise ResultError(f"result must be a JSON object (found {type(obj).__name__})")
+        _check_keys(obj, "result", frozenset(SUMMARY_RESULT_KEYS), SUMMARY_RESULT_KEYS,
+                    ResultError)
+        text = _text(obj["summary"], "summary")
+        size = json_string_bytes(text)
+        if cap is not None and size > cap:
+            raise ResultError(f"field 'summary' runs to {size} bytes as JSON writes it; the "
+                              f"limit is {cap} bytes, which is what keeps a summary of "
+                              f"summaries shorter")
+        return text
+    except ResultError as exc:
+        raise ResultError(f"{unit_id}: {exc}") from None
+
+
+def round_state(unit: dict, state: str, payload: object) -> RoundState:
+    """One later-round unit as it came back, from what :func:`_read_unit_file` read."""
+    if state == UNIT_MISSING and unit.get("dispatch") is False:
+        return RoundState(unit["id"], state, NOT_DISPATCHED_REASON)
+    if state != UNIT_COMPLETE:
+        return RoundState(unit["id"], state, _writable(str(payload)))
+    try:
+        if unit.get("kind") == TIER_NAMER_KIND:
+            value: object = parse_tier_names_result(payload, unit["id"],
+                                                    unit.get("entries") or ())
+        else:
+            value = parse_summary_result(payload, unit["id"], unit.get("summary_bytes"))
+    except ResultError as exc:
+        return RoundState(unit["id"], UNIT_FAILED, _writable(str(exc)))
+    return RoundState(unit["id"], UNIT_COMPLETE, None, value)
+
+
+def read_round_unit(rundir: Path, unit: dict) -> RoundState:
+    return round_state(unit, *_read_unit_file(rundir, unit["id"]))
+
+
+def _waiting(unit: dict, state: str) -> bool:
+    """A unit with no answer yet that a dispatcher is still to send: not one never
+    dispatched for being over its hard ceiling."""
+    return state == UNIT_MISSING and unit.get("dispatch") is not False
+
+
+def _unit_line(unit: dict, state: RoundState) -> dict:
+    return {"unit": unit["id"], "level": unit.get("level"), "state": state.state,
+            "reason": state.reason}
+
+
+# -- planning --------------------------------------------------------------- #
+def _round_limits(limits: RunLimits) -> tuple[Limits, Limits | None]:
+    lane = (LANES[0],)
+    return limits.planning("synthesis", lane), limits.hard_ceiling(lane)
+
+
+def plan_tier_names(generation: int, number: int, level: int, entries: Sequence[dict],
+                    companions: RoundCompanions, problem: str,
+                    limits: RunLimits) -> PlannedRound:
+    """One level of the tier-name round: ``entries`` numbered ``N1``… and packed in order
+    under the synthesis limits of the first lane, which every chunk runs on."""
+    planning, hard = _round_limits(limits)
+    named = [(f"{ENTRY_ID_PREFIX}{k}", entry) for k, entry in enumerate(entries, 1)]
+    by_id = dict(named)
+    head = render_tier_names_payload(companions.tier_names_brief, problem, (),
+                                     companions.tier_names_schema)
+    items = [PackItem(id=entry_id, folder="", record=render_tier_entry(entry_id, entry),
+                      counts={"entry": 1})
+             for entry_id, entry in named]
+    packs = pack_items(items, head=head, reply_head=TIER_NAMES_REPLY_HEAD,
+                       per_entry=TIER_NAMES_REPLY_PRICES, limits=planning, hard=hard)
+    units = tuple(RoundUnit(
+        id=synthesis_unit_id(generation, f"tiers-l{level}-c{k}"), kind=TIER_NAMER_KIND,
+        level=level, tier=None, entries=pack.items,
+        text=render_tier_names_payload(companions.tier_names_brief, problem,
+                                       [(eid, by_id[eid]) for eid in pack.items],
+                                       companions.tier_names_schema),
+        summary_bytes=None, limits=pack.limits_record(), oversize=pack.oversize,
+        dispatch=pack.dispatch) for k, pack in enumerate(packs, 1))
+    return PlannedRound(generation, number, PHASE_TIER_NAMES, level,
+                        _tier_names_input(level, entries), units)
+
+
+def _tier_names_input(level: int, entries: Sequence[dict]) -> dict:
+    return {"phase": PHASE_TIER_NAMES, "level": level,
+            "entries": [[e["name"], e["count"], list(e["headings"])] for e in entries]}
+
+
+def _pack_summaries(entries: Sequence[tuple[str, str, str]], head: str, cap: int,
+                    planning: Limits, hard: Limits | None) -> tuple[Pack, ...]:
+    """``entries`` — ``(key, label, text)`` — packed in order under ``planning``."""
+    items = [PackItem(id=key, folder="", record=render_summary_entry(label, text), counts={})
+             for key, label, text in entries]
+    return pack_items(items, head=head, reply_head=SUMMARY_REPLY_HEAD + cap, per_entry={},
+                      limits=planning, hard=hard)
+
+
+def _summary_units(packs: Sequence[Pack], entries: Sequence[tuple[str, str, str]],
+                   ids: Sequence[str], level: int, tier: int | None, what: str, cap: int,
+                   companions: RoundCompanions, problem: str) -> list[RoundUnit]:
+    by_key = {key: (label, text) for key, label, text in entries}
+    return [RoundUnit(
+        id=unit_id, kind=SUMMARIZER_KIND, level=level, tier=tier, entries=pack.items,
+        text=render_summary_payload(companions.overview_brief, problem, what, cap,
+                                    [by_key[key] for key in pack.items],
+                                    companions.overview_schema),
+        summary_bytes=cap, limits=pack.limits_record(), oversize=pack.oversize,
+        dispatch=pack.dispatch) for unit_id, pack in zip(ids, packs)]
+
+
+def _reduces(packs: Sequence[Pack], entries: Sequence, head: str, cap: int,
+             planning: Limits, level: int) -> bool:
+    """Whether a level may be planned: it fits one unit, or two summaries fit a unit and
+    (above the first level) it has fewer units than entries."""
+    if len(packs) <= 1:
+        return True
+    if not _two_summaries_fit(head, cap, planning):
+        return False
+    return level == 1 or len(packs) < len(entries)
+
+
+# -- replay ----------------------------------------------------------------- #
+class _Replay:
+    """The state a replay carries from round to round, and what it returns."""
+
+    def __init__(self, generation: int, units: Sequence[dict]):
+        self.generation = generation
+        self.later = [unit for unit in units
+                      if unit.get("kind") in (TIER_NAMER_KIND, SUMMARIZER_KIND)]
+        self.consumed: set[str] = set()
+        self.tiers: list[str] = []
+        self.final_of: dict[str, str] = {}
+        self.tier_names = {"state": ROUND_NOT_NEEDED, "reason": None, "units": []}
+        self.tier_summaries: list[dict] = []
+        self.overview = {"state": ROUND_NOT_RUN, "reason": None, "units": []}
+        self.overview_text: str | None = None
+        self.limits_too_small = False
+
+    def step_units(self, phase: str, level: int) -> list[dict]:
+        found = [unit for unit in self.later
+                 if unit.get("phase") == phase and unit.get("level") == level]
+        self.consumed.update(unit["id"] for unit in found)
+        return found
+
+    def done(self, next_round: PlannedRound | None = None,
+             waiting: Sequence[str] = ()) -> SynthesisRounds:
+        stray = [unit["id"] for unit in self.later if unit["id"] not in self.consumed]
+        if stray:
+            raise RunDirError(
+                f"synthesis unit(s) {', '.join(stray)} are listed for a round the "
+                f"generation's own results never call for; {UNITS_FILE_NAME} is not the "
+                f"engine's")
+        return SynthesisRounds(
+            generation=self.generation, tiers=tuple(self.tiers),
+            final_of=dict(self.final_of), tier_names=self.tier_names,
+            tier_summaries=self.tier_summaries, overview=self.overview,
+            overview_text=self.overview_text, limits_too_small=self.limits_too_small,
+            next_round=next_round, waiting=tuple(waiting))
+
+
+def batch_tier_entries(batches: Sequence[dict], states: Sequence[SynthesisState],
+                       ) -> list[dict]:
+    """Every name the landed batches filed a defect under, identical spellings as one
+    entry: the name, how many defects it heads and the first two of their headings, in the
+    order the names first appear batch by batch."""
+    entries: dict[str, dict] = {}
+    for unit, state in zip(batches, states):
+        if state.state != UNIT_COMPLETE:
+            continue
+        for name in state.tiers:
+            for did in unit["defects"]:
+                judged = state.assignments.get(did)
+                if not judged or judged["tier"] != name:
+                    continue
+                entry = entries.setdefault(name, {"name": name, "count": 0, "headings": []})
+                entry["count"] += 1
+                if judged.get("heading") and len(entry["headings"]) < TIER_HEADINGS_KEPT:
+                    entry["headings"].append(judged["heading"])
+    return list(entries.values())
+
+
+def _merge_chunks(chunks: Sequence[tuple[tuple[str, ...], dict[str, str]]],
+                  entries: Sequence[tuple[str, dict]]) -> list[dict]:
+    """The next level's entries: each chunk's final tiers, with the counts and headings of
+    the entries mapped to them, and a name two chunks both returned as one entry."""
+    by_id = dict(entries)
+    merged: dict[str, dict] = {}
+    for tiers, final in chunks:
+        for name in tiers:
+            entry = merged.setdefault(name, {"name": name, "count": 0, "headings": []})
+            for entry_id, target in final.items():
+                if target != name:
+                    continue
+                entry["count"] += by_id[entry_id]["count"]
+                for heading in by_id[entry_id]["headings"]:
+                    if len(entry["headings"]) < TIER_HEADINGS_KEPT:
+                        entry["headings"].append(heading)
+    return list(merged.values())
+
+
+def replay_synthesis(units: Sequence[dict], batch_states: Sequence[SynthesisState],
+                     read: Callable[[dict], RoundState],
+                     records: Mapping[tuple[int, int], dict],
+                     companions: RoundCompanions, problem: str,
+                     limits: RunLimits) -> SynthesisRounds:
+    """Replay one generation's rounds from its listing, its results and its round records,
+    and say what the next round is.
+
+    ``units`` is every unit of the generation, the batches first, and ``batch_states`` the
+    batches' :func:`read_synthesis_result`. Each committed round is held to its record —
+    the units it names, the input it was planned from as recomputed now from the results of
+    the rounds before it, and the limits its units record — so a result that changed under
+    a later round is refused rather than read. The next round is planned against
+    ``limits``, the run's limits now: a rewrite reaches only what is planned afterwards.
+
+    **Every round goes ahead on what landed.** The names are reconciled from the batches
+    that landed, the tiers summarized from the defects written up, the overview written
+    from the tier summaries there are. A tier-name round that does not complete leaves the
+    batches' own names, and that never marks the overview incomplete; a reduction stops,
+    and the overview is incomplete, only where the limits cannot fit two summaries in a
+    unit or a level would not be smaller than the one before. Nothing is planned while a
+    unit of the latest round is still to land.
+    """
+    batches = [unit for unit in units if unit.get("kind") == SYNTHESIZER_KIND]
+    generation = synthesis_generation(batches[0])
+    run = _Replay(generation, units)
+    _check_round(records, generation, 1, batches, batches_round_input(batches))
+    run.tiers = []
+    for state in batch_states:
+        if state.state == UNIT_COMPLETE:
+            run.tiers += [tier for tier in state.tiers if tier not in run.tiers]
+    run.final_of = {tier: tier for tier in run.tiers}
+    waiting = [unit["id"] for unit, state in zip(batches, batch_states)
+               if _waiting(unit, state.state)]
+    landed = [state for state in batch_states if state.state == UNIT_COMPLETE]
+    entries = batch_tier_entries(batches, batch_states)
+    needed = len(landed) >= 2 and len(entries) >= 2
+    if waiting:
+        if needed:
+            run.tier_names = {"state": ROUND_NOT_RUN, "reason": None, "units": []}
+        return run.done(waiting=waiting)
+    number = 1
+    if needed:
+        level = 1
+        mapping = {entry["name"]: entry["name"] for entry in entries}
+        while True:
+            number += 1
+            step = run.step_units(PHASE_TIER_NAMES, level)
+            if not step:
+                run.tier_names = {"state": ROUND_NOT_RUN, "reason": None,
+                                  "units": run.tier_names["units"]}
+                return run.done(plan_tier_names(generation, number, level, entries,
+                                                companions, problem, limits))
+            _check_round(records, generation, number, step, _tier_names_input(level, entries))
+            states = [read(unit) for unit in step]
+            run.tier_names["units"] += [_unit_line(u, s) for u, s in zip(step, states)]
+            waiting = [u["id"] for u, s in zip(step, states) if _waiting(u, s.state)]
+            if waiting:
+                run.tier_names.update(
+                    state=ROUND_PENDING,
+                    reason=f"{', '.join(waiting)} {'has' if len(waiting) == 1 else 'have'} "
+                           f"not landed")
+                return run.done(waiting=waiting)
+            lost = [s for s in states if s.state != UNIT_COMPLETE]
+            if lost:
+                run.tier_names.update(
+                    state=NAMES_NOT_RECONCILED,
+                    reason=f"{', '.join(s.id for s in lost)} did not come back usable")
+                break
+            named = [(f"{ENTRY_ID_PREFIX}{k}", entry) for k, entry in enumerate(entries, 1)]
+            name_of = {entry_id: entry["name"] for entry_id, entry in named}
+            chunks = [state.value for state in states]
+            step_map = {name_of[entry_id]: final for _tiers, final in chunks
+                        for entry_id, final in final.items()}
+            mapping = {first: step_map[now] for first, now in mapping.items()}
+            if len(step) == 1:
+                run.tiers = list(chunks[0][0])
+                run.final_of = mapping
+                run.tier_names.update(state=NAMES_RECONCILED, reason=None)
+                break
+            following = _merge_chunks(chunks, named)
+            if len(following) == 1:
+                # Every chunk came to one name: there is nothing left to reconcile.
+                run.tiers = [following[0]["name"]]
+                run.final_of = mapping
+                run.tier_names.update(state=NAMES_RECONCILED, reason=None)
+                break
+            if len(following) >= len(entries):
+                run.tier_names.update(
+                    state=NAMES_NOT_RECONCILED,
+                    reason=f"level {level} would not reduce the names: {len(entries)} "
+                           f"became {len(following)}")
+                break
+            entries, level = following, level + 1
+        run.tier_names["names"] = dict(run.final_of)
+    # The tier summaries: every tier holding a written-up defect, level by level.
+    planning, hard = _round_limits(limits)
+    cap = summary_cap(planning)
+    held: dict[int, list[tuple[str, str, str]]] = {}
+    for unit, state in zip(batches, batch_states):
+        if state.state != UNIT_COMPLETE:
+            continue
+        for did in unit["defects"]:
+            judged = state.assignments.get(did)
+            if judged:
+                position = run.tiers.index(run.final_of[judged["tier"]]) + 1
+                held.setdefault(position, []).append(
+                    (did, did, judged.get("heading") or judged["what_goes_wrong"]))
+    tiers = {position: {"tier": run.tiers[position - 1], "state": ROUND_NOT_RUN,
+                        "summary": None, "units": []} for position in sorted(held)}
+    run.tier_summaries = list(tiers.values())
+    active = {position: held[position] for position in sorted(held)}
+    lost_any: set[int] = set()
+    level = 1
+    while active:
+        number += 1
+        step = run.step_units(PHASE_TIER_SUMMARIES, level)
+        if not step and any(unit.get("phase") == PHASE_OVERVIEW for unit in run.later):
+            # The overview was planned after this level, so every tier left stopped here:
+            # a level with no unit has no record, and limits rewritten since must not
+            # reopen a decision a later round was planned on.
+            for position in active:
+                tiers[position]["state"] = SUMMARY_STOPPED
+            run.limits_too_small = True
+            number -= 1
+            break
+        if not step:
+            planned_units: list[RoundUnit] = []
+            stopped: list[int] = []
+            for position, items in active.items():
+                what = tier_summary_what(run.tiers[position - 1], level)
+                head = render_summary_payload(companions.overview_brief, problem, what, cap,
+                                              (), companions.overview_schema)
+                packs = (_pack_summaries(items, head, cap, planning, hard)
+                         if cap >= 1 else ())
+                if not packs or not _reduces(packs, items, head, cap, planning, level):
+                    stopped.append(position)
+                    continue
+                planned_units += _summary_units(
+                    packs, items, [synthesis_unit_id(generation,
+                                                     f"tier-{position}-l{level}-c{k}")
+                                   for k in range(1, len(packs) + 1)],
+                    level, position, what, cap, companions, problem)
+            if planned_units:
+                inp = _summaries_input(PHASE_TIER_SUMMARIES, level, active, run.tiers)
+                return run.done(PlannedRound(generation, number, PHASE_TIER_SUMMARIES, level,
+                                             inp, tuple(planned_units), tuple(stopped)))
+            for position in stopped:
+                tiers[position]["state"] = SUMMARY_STOPPED
+            run.limits_too_small = run.limits_too_small or bool(stopped)
+            number -= 1
+            break
+        _check_round(records, generation, number, step,
+                     _summaries_input(PHASE_TIER_SUMMARIES, level, active, run.tiers))
+        states = [read(unit) for unit in step]
+        waiting = [u["id"] for u, s in zip(step, states) if _waiting(u, s.state)]
+        for unit, state in zip(step, states):
+            if unit.get("tier") not in active:
+                raise RunDirError(
+                    f"synthesis unit {unit['id']} summarizes tier {unit.get('tier')!r}, "
+                    f"which round {number} of generation {generation} has no defects "
+                    f"under; {UNITS_FILE_NAME} is not the engine's")
+            tiers[unit["tier"]]["units"].append(_unit_line(unit, state))
+        if waiting:
+            for position in active:
+                tiers[position]["state"] = ROUND_PENDING
+            return run.done(waiting=waiting)
+        record = records[(generation, number)]
+        following: dict[int, list[tuple[str, str, str]]] = {}
+        for position in active:
+            mine = [(u, s) for u, s in zip(step, states) if u.get("tier") == position]
+            if not mine:
+                if position not in record.get("stopped", ()):
+                    raise RunDirError(
+                        f"synthesis round {number} of generation {generation} plans no unit "
+                        f"for tier {position} and does not record it as stopped; "
+                        f"{UNITS_FILE_NAME} is not the engine's")
+                tiers[position]["state"] = SUMMARY_STOPPED
+                run.limits_too_small = True
+                continue
+            texts = [(u["id"], s.value) for u, s in mine if s.state == UNIT_COMPLETE]
+            if len(texts) < len(mine):
+                lost_any.add(position)
+            if len(mine) == 1 or len(texts) <= 1:
+                tiers[position]["summary"] = texts[0][1] if texts else None
+                tiers[position]["state"] = (
+                    SUMMARY_NONE if not texts
+                    else SUMMARY_PARTIAL if position in lost_any else UNIT_COMPLETE)
+                continue
+            following[position] = [(uid, f"Part {k}", text)
+                                   for k, (uid, text) in enumerate(texts, 1)]
+        active = following
+        level += 1
+    # The overview: from every tier summary that landed, reduced the same way.
+    summaries = [(tier_unit, tier["tier"], tier["summary"])
+                 for tier in run.tier_summaries if tier["summary"] is not None
+                 for tier_unit in [_summary_source(tier)]]
+    if not summaries:
+        run.overview.update(state=SUMMARY_NONE,
+                            reason=("no tier holds a written-up defect" if not held
+                                    else "no tier summary landed"))
+        return run.done()
+    items = summaries
+    level = 1
+    lost = False
+    while True:
+        number += 1
+        step = run.step_units(PHASE_OVERVIEW, level)
+        what = overview_what(level)
+        head = render_summary_payload(companions.overview_brief, problem, what, cap, (),
+                                      companions.overview_schema)
+        if not step:
+            packs = _pack_summaries(items, head, cap, planning, hard) if cap >= 1 else ()
+            if not packs or not _reduces(packs, items, head, cap, planning, level):
+                run.overview.update(state=SUMMARY_STOPPED,
+                                    reason="the limits are too small for two summaries "
+                                           "in one unit")
+                run.limits_too_small = True
+                return run.done()
+            ids = ([synthesis_unit_id(generation, "overview")] if len(packs) == 1 else
+                   [synthesis_unit_id(generation, f"overview-l{level}-c{k}")
+                    for k in range(1, len(packs) + 1)])
+            return run.done(PlannedRound(
+                generation, number, PHASE_OVERVIEW, level,
+                _summaries_input(PHASE_OVERVIEW, level, {0: items}),
+                tuple(_summary_units(packs, items, ids, level, None, what, cap, companions,
+                                     problem))))
+        _check_round(records, generation, number, step,
+                     _summaries_input(PHASE_OVERVIEW, level, {0: items}))
+        states = [read(unit) for unit in step]
+        run.overview["units"] += [_unit_line(u, s) for u, s in zip(step, states)]
+        waiting = [u["id"] for u, s in zip(step, states) if _waiting(u, s.state)]
+        if waiting:
+            run.overview["state"] = ROUND_PENDING
+            return run.done(waiting=waiting)
+        texts = [(u["id"], s.value) for u, s in zip(step, states) if s.state == UNIT_COMPLETE]
+        lost = lost or len(texts) < len(step)
+        if len(step) == 1 or len(texts) <= 1:
+            run.overview_text = texts[0][1] if texts else None
+            run.overview.update(state=(SUMMARY_NONE if not texts
+                                       else SUMMARY_PARTIAL if lost else UNIT_COMPLETE),
+                                reason=None if texts else "no overview unit came back usable")
+            return run.done()
+        items = [(uid, f"Part {k}", text) for k, (uid, text) in enumerate(texts, 1)]
+        level += 1
+
+
+def _summary_source(tier: dict) -> str:
+    """The unit whose text is a tier's summary: the last of its units that landed."""
+    return next(line["unit"] for line in reversed(tier["units"])
+                if line["state"] == UNIT_COMPLETE)
+
+
+def _summaries_input(phase: str, level: int,
+                     active: Mapping[int, Sequence[tuple[str, str, str]]],
+                     names: Sequence[str] = ()) -> dict:
+    """What a summary round is planned from. A tier's name is part of it because the
+    payload carries the name: a final name changed under an unchanged mapping is other
+    input than the round was planned from."""
+    return {"phase": phase, "level": level,
+            "tiers": [[position, names[position - 1] if names else None,
+                       [list(item) for item in items]]
+                      for position, items in active.items()]}
+
+
+def round_unit_rows(planned: PlannedRound) -> list[dict]:
+    """The listing rows of a planned round, as ``units.json`` records them."""
+    rows = []
+    for unit in planned.units:
+        lines, size = measure_payload(unit.text)
+        rows.append({
+            "id": unit.id, "kind": unit.kind, "area": None, "lane": LANES[0], "lens": None,
+            "generation": planned.generation, "writer": SYNTHESIS_WRITER,
+            "round": planned.round, "phase": planned.phase, "level": unit.level,
+            "tier": unit.tier, "entries": list(unit.entries),
+            "summary_bytes": unit.summary_bytes, "limits": unit.limits,
+            "oversize": unit.oversize, "dispatch": unit.dispatch,
+            "payload": f"{UNITS_DIR}/{unit.id}/{PAYLOAD_NAME}",
+            "schema": f"{UNITS_DIR}/{unit.id}/{SCHEMA_NAME}",
+            "payload_lines": lines, "payload_bytes": size,
+        })
+    return rows
+
+
+def synthesis_rounds(rundir: Path, listing: Sequence[dict],
+                     companions: RoundCompanions | None = None,
+                     problem: str | None = None,
+                     generation: int | None = None) -> SynthesisRounds | None:
+    """One generation's later rounds as the run directory holds them — ``generation``, or
+    the building one where it is ``None`` — or ``None`` where there are none to replay: no
+    such generation, or one v2026.10.0 wrote, which was one unit and has no later round."""
+    every = [unit for unit in listing if unit.get("kind") in SYNTHESIS_KINDS]
+    generations = synthesis_generations(every)
+    if generation is None:
+        generation = building_generation(rundir, listing)
+    if generation not in generations:
+        return None
+    members = generations[generation]
+    batches = [unit for unit in members if unit.get("kind") == SYNTHESIZER_KIND]
+    if not batches:
+        raise RunDirError(f"synthesis generation {generation} lists later rounds and "
+                          f"no batch; {UNITS_FILE_NAME} is not the engine's")
+    if synthesis_writer(batches[0], read_run_format(rundir)) == LEGACY_SYNTHESIS_WRITER:
+        return None
+    return replay_synthesis(
+        members, read_synthesis_result(rundir, batches),
+        lambda unit: read_round_unit(rundir, unit), committed_rounds(rundir, listing),
+        companions or load_round_companions(),
+        _read_problem(rundir) if problem is None else problem, read_limits(rundir))
+
+
+def synthesis_needs_round(rundir: Path) -> bool:
+    """Whether the generation being built has a round still to plan: the marker is at
+    `synthesized` (generation 1) or `reported` (a later one), every unit of its latest round
+    has landed, and the results call for another. Derived from the round records, the
+    landed results and the publication records alone; a run part-way through publishing a
+    generation has nothing to plan.
+
+    A run this cannot read answers ``False``, which hands it to `report`: that stage reads
+    the same records and refuses by name what this could not read."""
+    try:
+        doc = _read_run_json(rundir, UNITS_FILE_NAME)
+        if (not isinstance(doc, dict)
+                or doc.get("stage") not in (SYNTHESIZED_STAGE, REPORTED_STAGE)
+                or not isinstance(doc.get("units"), list)):
+            return False
+        if publishing_generation(rundir) is not None:
+            return False
+        listing = [unit for unit in doc["units"] if isinstance(unit, dict)]
+        if any(unit.get("kind") == SYNTHESIZER_KIND
+               and (not isinstance(unit.get("defects"), list)
+                    or not all(isinstance(did, str) for did in unit["defects"]))
+               for unit in listing):
+            return False
+        rounds = synthesis_rounds(rundir, listing)
+    except ReviewPanelError:
+        return False
+    return rounds is not None and not rounds.waiting and rounds.next_round is not None
+
+
+def write_synthesis_round(rundir: Path, units_doc: dict, planned: PlannedRound,
+                          schemas: Mapping[str, dict | None]) -> None:
+    """Write ``units/<id>/`` for each unit of ``planned``, then its round record, then
+    ``units.json`` with the units appended and the marker where it was. A
+    record nothing lists, from an interrupted call, is taken back first with the unit
+    directories it named; a failure part-way takes back what this call wrote."""
+    for unit in planned.units:
+        target = rundir / UNITS_DIR / unit.id
+        if _not_a_unit_directory(target):
+            raise RunDirError(
+                f"{target} already exists and is a link or a file rather than a unit "
+                f"directory this stage wrote; move it aside and synthesize again")
+    _reclaim_rounds("synthesize", rundir, units_doc["units"])
+    record_path = round_record_path(rundir, planned.generation, planned.round)
+    _reclaim("synthesize", rundir, (record_path,),
+             tuple((rundir / UNITS_DIR / unit.id, UNIT_CONTENTS) for unit in planned.units),
+             (rundir / UNITS_FILE_NAME,))
+    created: list[Path] = []
+    try:
+        for unit in planned.units:
+            unit_dir = rundir / UNITS_DIR / unit.id
+            try:
+                unit_dir.mkdir(parents=True)
+            except OSError as exc:
+                raise InventoryError(f"cannot create {unit_dir}: {exc}") from exc
+            created.append(unit_dir)
+            write_text(unit_dir / PAYLOAD_NAME, unit.text)
+            write_json(unit_dir / SCHEMA_NAME, schemas[unit.kind])
+        _write_round_record(rundir, record_path, round_record_of(planned))
+        write_json(rundir / UNITS_FILE_NAME, {
+            "stage": units_doc["stage"], "lanes": units_doc.get("lanes", list(LANES)),
+            "units": [*units_doc["units"], *round_unit_rows(planned)],
+        })
+    except BaseException:
+        for unit_dir in created:
+            shutil.rmtree(unit_dir, ignore_errors=True)
+        raise
+
+
+def _write_round_record(rundir: Path, path: Path, record: dict) -> None:
+    directory = path.parent
+    if directory.is_symlink() or _is_junction(directory):
+        raise RunDirError(f"{directory} is a link; move it aside and synthesize again")
+    try:
+        directory.mkdir(exist_ok=True)
+    except OSError as exc:
+        raise InventoryError(f"cannot create {directory}: {exc}") from exc
+    if not _inside(rundir, path):
+        raise RunDirError(f"{path} resolves outside {rundir}; move {directory} aside")
+    write_json(path, record)
+
+
+def round_summary(planned: PlannedRound | None, rounds: SynthesisRounds) -> str:
+    """What `synthesize` prints after planning a later round, or finding none to plan."""
+    if planned is None:
+        return ("synthesis is complete: nothing to plan"
+                + ("; the overview is incomplete because the limits are too small"
+                   if rounds.limits_too_small else "") + "\n")
+    out = [f"round {planned.round}: {planned.phase}, level {planned.level}, "
+           f"{_plural(len(planned.units), 'unit')}"]
+    for unit in planned.units:
+        flag = ("  over the hard ceiling: listed, never dispatched" if not unit.dispatch
+                else "  over the planning ceiling: alone" if unit.oversize else "")
+        out.append(f"  {unit.id}  {_plural(len(unit.entries), 'entry', 'entries')}  "
+                   f"lane {LANES[0]}{flag}")
+    return "\n".join(out) + "\n"
+
+
+def apply_synthesis_rounds(synthesis: Synthesis, rounds: SynthesisRounds) -> Synthesis:
+    """``synthesis`` with each defect under its final tier, and the record carrying the
+    tier names, the tier summaries and the overview."""
+    assignments = {did: (None if judged is None
+                         else {**judged, "tier": rounds.final_of.get(judged["tier"],
+                                                                     judged["tier"])})
+                   for did, judged in synthesis.assignments.items()}
+    record = {**synthesis.record, "tiers": list(rounds.tiers),
+              "tier_names": rounds.tier_names, "tier_summaries": rounds.tier_summaries,
+              "overview": rounds.overview_text, "overview_round": rounds.overview,
+              "limits_too_small": rounds.limits_too_small}
+    return Synthesis(assignments=assignments, record=record, writer=synthesis.writer,
+                     batch_of=synthesis.batch_of)
 
 
 # --------------------------------------------------------------------------- #
@@ -8545,12 +10551,123 @@ def published_report(rundir: Path, outputs: Sequence[Path]) -> bool:
     files rather than of any marker, because report's own artifacts are the only state no
     other stage writes.
     """
+    # A later generation part-way through its publication has swapped some of the files and
+    # not others, so what they say answers nothing until its last step is done.
+    publishing = publishing_generation(rundir)
+    if publishing is not None:
+        raise RunDirError(publishing_refusal(rundir, publishing))
+    return _report_on_disk(rundir, outputs)
+
+
+def _report_on_disk(rundir: Path, outputs: Sequence[Path]) -> bool:
     # Each output is asked about with a refusal available. Answered False for a path the
     # host would not describe, this says a finished report is not there and the stage
     # rewrites it — over prose somebody may have annotated.
     return (read_report_stamp(rundir) is not None
             and all(_lstat_or_absent(path, "the report output", RunDirError) is not None
                     for path in outputs))
+
+
+# --------------------------------------------------------------------------- #
+# generations — which synthesis is published, and which is being built
+# --------------------------------------------------------------------------- #
+# A run's first synthesis is generation 1, published by `report` directly. A
+# reported run can be synthesized again beside it (`synthesize --new-generation`), and that
+# generation is published by the steps its own record lists, `publish-g<n>.json`. Which
+# generation is published and which is being built are derived from those records, the
+# stamp and the listing each time they are asked, and stored nowhere.
+_PUBLISH_RECORD = re.compile(r"\Apublish-g([1-9][0-9]*)\.json\Z")
+
+
+def publication_record_path(rundir: Path, generation: int) -> Path:
+    return rundir / f"publish-g{generation}.json"
+
+
+def staging_path(rundir: Path, generation: int) -> Path:
+    return rundir / f"staging-g{generation}"
+
+
+def generation_dispatch_path(rundir: Path, generation: int) -> Path:
+    return rundir / f"dispatch-g{generation}.json"
+
+
+def read_stamp(rundir: Path) -> dict | None:
+    """The stamp whole: ``{"generated"}`` for generation 1, and for a later generation the
+    original clock, that generation and the clock it was resynthesized at. ``None`` where
+    there is none or it is not one this engine writes."""
+    try:
+        raw = json.loads((rundir / REPORT_STAMP_NAME).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    generated = raw.get("generated")
+    if not (isinstance(generated, str) and _STAMP_FORM.match(generated)):
+        return None
+    if "generation" not in raw:
+        return {"generated": generated}
+    generation, again = raw.get("generation"), raw.get("resynthesized")
+    if (not isinstance(generation, int) or isinstance(generation, bool) or generation < 2
+            or not isinstance(again, str) or not _STAMP_FORM.match(again)):
+        return None
+    return {"generated": generated, "generation": generation, "resynthesized": again}
+
+
+def _publication_records(rundir: Path) -> list[tuple[int, Path]]:
+    """Every ``publish-g<n>.json`` in the run directory, lowest generation first."""
+    try:
+        names = [entry.name for entry in rundir.iterdir()]
+    except OSError as exc:
+        raise RunDirError(f"cannot read {rundir}: {_os_reason(exc)}") from exc
+    found = [(int(match[1]), rundir / name) for name in names
+             for match in [_PUBLISH_RECORD.match(name)] if match]
+    return sorted(found)
+
+
+def publication_finished(rundir: Path, generation: int) -> bool:
+    """Whether generation ``generation``'s publication took its last step: the stamp names
+    it, or a later generation published since."""
+    stamp = read_stamp(rundir)
+    return stamp is not None and stamp.get("generation", 1) >= generation
+
+
+def publishing_generation(rundir: Path) -> int | None:
+    """The generation whose publication record exists and whose last step is not done."""
+    for generation, _path in _publication_records(rundir):
+        if not publication_finished(rundir, generation):
+            return generation
+    return None
+
+
+def publishing_refusal(rundir: Path, generation: int) -> str:
+    return (f"synthesis generation {generation} is part-way through its publication "
+            f"({publication_record_path(rundir, generation).name} has steps still to take), "
+            f"so each of the report's files may be from either generation; run `report` on "
+            f"this run directory to finish it")
+
+
+def published_generation(rundir: Path, listing: Sequence[dict]) -> int | None:
+    """The highest generation whose publication finished: a later one by its own record,
+    else generation 1 once the run is reported or its report is on disk. ``None`` before
+    the run has a report."""
+    finished = [generation for generation, _path in _publication_records(rundir)
+                if generation >= 2 and publication_finished(rundir, generation)]
+    if finished:
+        return max(finished)
+    outputs = [rundir / name for name in (REPORT_NAME, FINDINGS_NAME, HTML_NAME)]
+    if _units_stage(rundir) == REPORTED_STAGE or _report_on_disk(rundir, outputs):
+        return 1
+    return None
+
+
+def building_generation(rundir: Path, listing: Sequence[dict]) -> int | None:
+    """The highest generation the listing plans above the published one, if any: the one
+    whose rounds are planned and dispatched, and that a staged publication renders."""
+    published = published_generation(rundir, listing) or 0
+    above = [synthesis_generation(unit) for unit in listing
+             if isinstance(unit, dict) and unit.get("kind") in SYNTHESIS_KINDS
+             and synthesis_generation(unit) > published]
+    return max(above) if above else None
 
 
 # The lock report publishes under, spelled from the stage's name so the file `_claim_stage`
@@ -8993,6 +11110,9 @@ def read_verification_results(rundir: Path, batches: Sequence[dict],
     states: list[VerificationState] = []
     for unit in batches:
         state, payload = _read_unit_file(rundir, unit["id"])
+        if state == UNIT_MISSING and unit.get("dispatch") is False:
+            states.append(VerificationState(unit["id"], state, NOT_DISPATCHED_REASON, ()))
+            continue
         if state != UNIT_COMPLETE:
             states.append(VerificationState(unit["id"], state, payload, ()))
             continue
@@ -9022,15 +11142,29 @@ def check_routing(candidates: Sequence[dict], batches: Sequence[dict]) -> dict[s
     """Every candidate to the one verification unit that holds it. ``route`` put each in
     exactly one, so a candidate in none, in two, or listed by a batch and absent from
     ``candidates.json`` is a run directory the engine did not write — refused by name,
-    before any result is read."""
-    known = {cand["id"] for cand in candidates}
+    before any result is read.
+
+    So is a unit addressed to a lane that raised one of its candidates: a finding is
+    checked by the lane that did not raise it, and a split batch's parts each go to the
+    batch's lane. A unit listed with ``dispatch`` false is a routing like any other."""
+    raisers = {cand["id"]: {r.get("lane") for r in cand.get("raised_by", ())}
+               for cand in candidates}
     holder: dict[str, dict] = {}
+    # A candidate nobody routed first, over every unit: it says the most about the listing.
     for batch in batches:
         for cid in batch["candidates"]:
-            if cid not in known:
+            if cid not in raisers:
                 raise RunDirError(
                     f"verification unit {batch['id']} lists candidate {cid}, which "
                     f"{CANDIDATES_FILE_NAME} does not hold; {UNITS_FILE_NAME} is not the engine's"
+                )
+    for batch in batches:
+        for cid in batch["candidates"]:
+            if batch.get("lane") is not None and batch["lane"] in raisers[cid]:
+                raise RunDirError(
+                    f"verification unit {batch['id']} is addressed to lane {batch['lane']}, "
+                    f"which raised candidate {cid}; a finding is checked by the lane that did "
+                    f"not raise it, so {UNITS_FILE_NAME} is not the engine's"
                 )
             if cid in holder:
                 raise RunDirError(
@@ -9038,7 +11172,7 @@ def check_routing(candidates: Sequence[dict], batches: Sequence[dict]) -> dict[s
                     f"{batch['id']}; {UNITS_FILE_NAME} is not the engine's"
                 )
             holder[cid] = batch
-    for cid in sorted(known - set(holder)):
+    for cid in sorted(set(raisers) - set(holder)):
         raise RunDirError(f"candidate {cid} is in no verification unit; {UNITS_FILE_NAME} is not the engine's")
     return holder
 
@@ -9064,9 +11198,13 @@ def resolve(candidates: Sequence[dict], holder: dict[str, dict],
                                 verdict.unresolved_reason, verdict.covered_by,
                                 verdict.needs_files, verdict.from_verifier)
         else:
+            why = (f"not verified: verification unit {batch['id']} was never dispatched, "
+                   f"because {state.reason}"
+                   if state.reason == NOT_DISPATCHED_REASON else
+                   f"no verdict was received: verification unit {batch['id']} "
+                   f"{state.state} ({state.reason})")
             out[cid] = Resolved(
-                cid, batch["id"], batch["lane"], "unresolved", None,
-                f"no verdict was received: verification unit {batch['id']} {state.state} ({state.reason})",
+                cid, batch["id"], batch["lane"], "unresolved", None, why,
                 None, None, None, None, (), False,
             )
     return out
@@ -9207,26 +11345,53 @@ def _clustering_records(candidates: Sequence[dict], clustering: Clustering,
     built on is that there is only one. ``listed`` says whether ``units.json`` names a unit
     for the area at all, which is what separates a unit that failed from an area that was
     never dispatched one; the counts the coverage section reports are over units.
+
+    A split area has one record per part, in part order, so a part that failed is named
+    on its own and the parts that landed keep their summaries.
     """
-    state_of = {(state.area, state.asks): state for state in states}
-    ungrouped_of = {(entry.area, entry.asks): entry for entry in clustering.ungrouped}
+    states_of: dict[tuple[str, str], list[ClusterState]] = {}
+    for state in states:
+        states_of.setdefault((state.area, state.asks), []).append(state)
+    ungrouped_of = {entry.unit: entry for entry in clustering.ungrouped}
+    read = {state.id for state in states}
+    unlisted = {(entry.area, entry.asks): entry for entry in clustering.ungrouped
+                if entry.unit not in read}
     asked = {question: i for i, question in enumerate(ASKS)}
     out: list[dict] = []
     for lane in sorted({(cand["area"], asks_of(cand)) for cand in candidates},
                        key=lambda k: (k[0], asked[k[1]])):
-        state, entry = state_of.get(lane), ungrouped_of.get(lane)
-        # build_clusters made an Ungrouped entry for exactly the lanes that did not come
+        # build_clusters made an Ungrouped entry for exactly the units that did not come
         # back usable, so its words are reused rather than derived a second time here.
-        out.append({
-            "area": lane[0],
-            "asks": lane[1],
-            "unit": entry.unit if entry is not None else state.id,
-            "listed": state is not None,
-            "state": entry.state if entry is not None else state.state,
-            "reason": entry.reason if entry is not None else None,
-            "summary": state.summary if state is not None else None,
-        })
+        for state in states_of.get(lane) or (None,):
+            entry = (ungrouped_of.get(state.id) if state is not None
+                     else unlisted.get(lane))
+            out.append({
+                "area": lane[0],
+                "asks": lane[1],
+                "unit": entry.unit if entry is not None else state.id,
+                "listed": state is not None,
+                "state": entry.state if entry is not None else state.state,
+                "reason": entry.reason if entry is not None else None,
+                "summary": state.summary if state is not None else None,
+            })
     return tuple(out)
+
+
+def _record_parts(records: Sequence[dict]) -> frozenset[str]:
+    """The units among ``findings.json``'s clustering records that are parts of a split
+    area: those sharing their area and question with another record."""
+    return clustering_parts([{"id": row["unit"], "area": row["area"],
+                              "asks": row.get("asks", DEFECT_ASKS)} for row in records])
+
+
+def _unclustered(entries: Sequence[dict], parts: frozenset[str]) -> tuple[str, str]:
+    """The areas and parts left unclustered, as a count and a list of names: a part is
+    named by its unit id and area, so the reader sees the rest of that area was clustered."""
+    names = [f"{entry['unit']} (part of {entry['area']})" if entry["unit"] in parts
+             else entry["area"] for entry in entries]
+    noun = (_plural(len(entries), "area") if not parts & {e["unit"] for e in entries}
+            else _plural(len(entries), "area or part of an area", "areas or parts of areas"))
+    return noun, ", ".join(names)
 
 
 def _verification_records(records: Sequence[dict],
@@ -9255,6 +11420,9 @@ def _verification_records(records: Sequence[dict],
     :class:`VerificationState`.
     """
     finder_of = {batch["id"]: batch.get("finder") for batch in batches}
+    # The question off the listing; a v2026.10.0 listing may not record it, and its ids
+    # carry the coverage suffix last.
+    asks_of_unit = {batch["id"]: batch.get("asks") for batch in batches}
     by_unit: dict[str, list[dict]] = {}
     for record in records:
         answered_by = record["verified_by"]
@@ -9272,7 +11440,8 @@ def _verification_records(records: Sequence[dict],
         refuted = counts["refuted"] + counts[COVERAGE_GAP_REFUTED]
         out.append({
             "unit": unit,
-            "asks": COVERAGE_ASKS if unit.endswith(COVERAGE_BATCH_SUFFIX) else DEFECT_ASKS,
+            "asks": (asks_of_unit.get(unit)
+                     or (COVERAGE_ASKS if unit.endswith(COVERAGE_BATCH_SUFFIX) else DEFECT_ASKS)),
             "finder": finder_of.get(unit),
             "candidates": len(held),
             "established": established,
@@ -9506,21 +11675,29 @@ def build_findings(dispatch: DispatchRecord, candidates: Sequence[dict],
     files_of = {defect.id: frozenset(by_id[cid]["file"] for sid in defect.sites
                                      for cid in site_by_id[sid]["members"])
                 for defect in defects}
-    # And the tier each sits under, for the same reason and over the same whole run. Empty
-    # where the synthesis round did not run, which is not the same as every defect sharing
-    # one tier -- see :func:`resolve_cross_references`.
+    # And what the second half of the cross-reference rule compares, over the same whole
+    # run: the batch each defect was written up in, or for a generation v2026.10.0 wrote,
+    # the tier each sits under. Empty where the synthesis round did not run, which is not
+    # the same as every defect sharing one -- see :func:`resolve_cross_references`.
     # `assignments` maps a defect to None where the round's entry for it could not be read
     # -- an undeclared tier, an empty narrative -- which costs that defect its tier and no
     # other. So the value is checked, not the key: a rejected entry has a key and no tier.
-    tier_of: dict[str, str | None] = {}
+    legacy = synthesis is not None and synthesis.writer == LEGACY_SYNTHESIS_WRITER
+    together: dict[str, str | None] = {}
     for defect in defects:
-        entry = synthesis.assignments.get(defect.id) if synthesis is not None else None
-        tier_of[defect.id] = entry["tier"] if entry else None
+        if synthesis is None:
+            together[defect.id] = None
+        elif legacy:
+            entry = synthesis.assignments.get(defect.id)
+            together[defect.id] = entry["tier"] if entry else None
+        else:
+            together[defect.id] = synthesis.batch_of.get(defect.id)
+    rule = LEGACY_CROSS_REF_RULE if legacy else CROSS_REF_RULE
     rolled: list[dict] = []
     for defect in defects:
         judged = synthesis.assignments.get(defect.id) if synthesis is not None else None
         kept_refs, dropped_refs = resolve_cross_references(
-            defect.id, judged["cross_references"] if judged else (), files_of, tier_of)
+            defect.id, judged["cross_references"] if judged else (), files_of, together, rule)
         group = upheld.get(defect.id)
         rolled.append({
             **defect_record(defect.id, [site_by_id[sid] for sid in defect.sites]),
@@ -11810,7 +13987,10 @@ def _render_verifier_variance(findings: Findings) -> list[str]:
     ordered = sorted(rows, key=lambda r: (-share(r), r["unit"]))
     for row in ordered:
         label = row["unit"]
-        if row["state"] != UNIT_COMPLETE:
+        if row.get("reason") == NOT_DISPATCHED_REASON:
+            label += (" — not dispatched, over its lane's hard ceiling, so these findings "
+                      "were not verified")
+        elif row["state"] != UNIT_COMPLETE:
             # Said in the row, not inferred from a column of unresolved that looks like
             # thirty considered answers.
             label += f" — {row['state']}, so nothing here is a verdict"
@@ -11864,8 +14044,11 @@ def _render_clustering_notes(findings: Findings, names: PathNames) -> list[str]:
     out.append("\n#### What each clustering unit reported\n\n")
     if not reported:
         out.append("No clustering unit returned a summary.\n")
+    parts = _record_parts(findings.clustering)
     for entry in reported:
-        out += _item(f"- {entry['area']}: ", entry["summary"])
+        out += _item(f"- {entry['area']}"
+                     + (f" ({entry['unit']})" if entry["unit"] in parts else "") + ": ",
+                     entry["summary"])
     return out
 
 
@@ -11962,9 +14145,16 @@ def _render_synthesis_notes(findings: Findings) -> list[str]:
            f"**{WHAT_GOES_WRONG_LABEL[:-1]}**, **{FIX_LABEL[:-1]}** and "
            f"**{RELATED_LABEL[:-1]}** came from this round, and nothing else in this report "
            f"did.\n\n"]
+    if "units" in record:
+        out += _render_synthesis_batches(findings, record)
+        if any(line["state"] != UNIT_COMPLETE
+               for line in (*record["units"], *_later_unit_lines(record))):
+            out.append(f"- {RESYNTHESIZE_HINT}\n")
+        return out
     if record["state"] != UNIT_COMPLETE:
         out += _item(f"- {record['unit']} — {record['state']}: ",
                      record["reason"] or "no reason was recorded", SYNTHESIS_DEGRADED)
+        out.append(f"- {RESYNTHESIZE_HINT}\n")
         return out
     # A record written before the round's defects were recorded was handed every defect.
     handed = record.get("defects")
@@ -12162,7 +14352,9 @@ def _grouping_notes(findings: Findings, before_sites: bool) -> list[str]:
                                        for unit in check["units"]):
             out.append(f"- {GROUPING_CHECK_DEGRADED}\n")
     synthesis = findings.synthesis
-    if synthesis is not None and synthesis["state"] != UNIT_COMPLETE:
+    if synthesis is not None and "units" in synthesis:
+        out += _grouping_batch_notes(findings, synthesis)
+    elif synthesis is not None and synthesis["state"] != UNIT_COMPLETE:
         out.append(f"- {GROUPING_NO_SYNTHESIS}\n")
     elif synthesis is not None and synthesis["rejected"]:
         # Only what the round was HANDED can be lost by it: a defect left out of it for
@@ -12172,6 +14364,146 @@ def _grouping_notes(findings: Findings, before_sites: bool) -> list[str]:
                 and (handed is None or d["id"] in handed)]
         if lost:
             out.append(f"- {synthesis_refused_note(lost)}\n")
+    return out
+
+
+def _render_synthesis_batches(findings: Findings, record: dict) -> list[str]:
+    """The appendix lines for a generation written in batches: each batch's state, what a
+    batch that did not come back costs, each refused entry, each dropped reference, and
+    that no overview of the run was written."""
+    out: list[str] = []
+    for batch in record["units"]:
+        held = _plural(len(batch["defects"]), "defect")
+        if batch["state"] == UNIT_COMPLETE:
+            out.append(f"- {batch['unit']} — complete: "
+                       f"{_plural(len(batch['tiers']), 'tier')} named for {held}.\n")
+            continue
+        # Where no batch landed the whole report is grouped as a run without the round is,
+        # and says so in the words such a round always has.
+        out += _item(f"- {batch['unit']} — {batch['state']}: ",
+                     batch["reason"] or "no reason was recorded",
+                     SYNTHESIS_DEGRADED if record["state"] != SYNTHESIS_PARTIAL else
+                     f"Its {held} ({', '.join(batch['defects'])}) "
+                     f"{'is' if len(batch['defects']) == 1 else 'are'} not written up: no "
+                     f"tier, heading, account or fix, each grouped by its status instead.")
+    for message in record["rejected"]:
+        out += _item("- an entry could not be read, and only its own defect is affected: ",
+                     message, "That defect carries no tier and no account of itself, and "
+                     "is grouped by its status instead; a defect of several sites keeps "
+                     "the mechanism its sites were merged on.")
+    for cluster in findings.defects:
+        for dropped in cluster["dropped_cross_references"]:
+            out.append(f"- {cluster['id']} cited {_one_line(dropped['defect'])}, which was "
+                       f"dropped: {dropped['reason']}.\n")
+    return out + _render_later_rounds(record)
+
+
+def _unit_lines(lines: Sequence[dict]) -> list[str]:
+    """One line for each later-round unit that did not come back usable."""
+    out: list[str] = []
+    for line in lines:
+        if line["state"] != UNIT_COMPLETE:
+            out += _item(f"- {line['unit']} — {line['state']}: ",
+                         line["reason"] or "no reason was recorded")
+    return out
+
+
+def _render_later_rounds(record: dict) -> list[str]:
+    """The appendix lines for the rounds after the batches: what the tier names came to,
+    each tier summary and the overview that fell short, and every unit that did not come
+    back usable. A generation whose later rounds have not run says only that there is no
+    overview."""
+    out: list[str] = []
+    names = record.get("tier_names") or {}
+    out += _unit_lines(names.get("units", ()))
+    if names.get("state") == NAMES_RECONCILED:
+        out.append(f"- The tier names were reconciled: "
+                   f"{_plural(len(names.get('names', {})), 'name')} the batches used became "
+                   f"{_plural(len(record['tiers']), 'tier')}.\n")
+    elif names.get("state") in (NAMES_NOT_RECONCILED, ROUND_NOT_RUN, ROUND_PENDING):
+        out.append(f"- {TIER_NAMES_NOT_RECONCILED}: "
+                   f"{names.get('reason') or 'no round has reconciled them'}.\n")
+    for tier in record.get("tier_summaries", ()):
+        out += _unit_lines(tier["units"])
+        named = _one_line(tier["tier"])
+        if tier["state"] == SUMMARY_PARTIAL:
+            out.append(f"- The summary of the tier {named} was written from the parts of it "
+                       f"that came back.\n")
+        elif tier["state"] == SUMMARY_NONE:
+            out.append(f"- No summary was written for the tier {named}: no unit summarizing "
+                       f"it came back usable.\n")
+        elif tier["state"] == SUMMARY_STOPPED:
+            out.append(f"- The tier {named} was not summarized: the limits are too small for "
+                       f"two summaries in one unit.\n")
+    overview = record.get("overview_round") or {"state": ROUND_NOT_RUN, "units": ()}
+    out += _unit_lines(overview.get("units", ()))
+    if overview["state"] in (ROUND_NOT_RUN, ROUND_PENDING):
+        out.append(f"- {SYNTHESIS_NO_OVERVIEW}\n")
+    elif overview["state"] == SUMMARY_PARTIAL:
+        out.append("- The overview was written from the parts of it that came back.\n")
+    elif overview["state"] == SUMMARY_NONE:
+        out.append(f"- No overview was written: {overview.get('reason')}.\n")
+    if record.get("limits_too_small"):
+        out.append(f"- {OVERVIEW_INCOMPLETE_LIMITS}.\n")
+    return out
+
+
+def _later_unit_lines(record: dict) -> list[dict]:
+    """Every unit of the rounds after the batches, as the synthesis record lists them."""
+    return [*(record.get("tier_names") or {}).get("units", ()),
+            *(line for tier in record.get("tier_summaries", ()) for line in tier["units"]),
+            *(record.get("overview_round") or {}).get("units", ())]
+
+
+# Where a synthesis unit did not come back, the one recovery that keeps everything else the
+# run found: the reading, verification and grouping stand, and only the write-ups are redone.
+RESYNTHESIZE_HINT = ("The synthesis can be written again without reviewing anything again: "
+                     "run `review_panel_run.py resynthesize` on this run directory, with "
+                     "lower synthesis limits in the adapter config where a unit was too "
+                     "large to answer. It publishes a later generation over this report.")
+SYNTHESIS_NO_OVERVIEW = ("No overview of the run as a whole was written: the rounds after the "
+                         "batches, which write it, have not run.")
+TIER_NAMES_NOT_RECONCILED = ("The tier names the synthesis batches chose were not reconciled, "
+                             "so one theme may head two sections, each defect under the name "
+                             "its own batch gave it")
+OVERVIEW_INCOMPLETE_LIMITS = ("The overview is incomplete because the limits are too small: "
+                              "summarizing summaries needs room for two in one unit")
+GROUPING_BATCH_FAILED = ("did not come back usable, so {defects} {verb} not written up: each "
+                         "is headed by its first site's consequence")
+GROUPING_BATCH_UNDISPATCHED = ("was over every lane's hard ceiling and never dispatched, so "
+                               "{defects} {verb} not written up: each is headed by its first "
+                               "site's consequence")
+
+
+def _grouping_batch_notes(findings: Findings, record: dict) -> list[str]:
+    """The top-of-report lines for a generation written in batches: one per batch that did
+    not come back, naming its defects, and one for the entries refused inside the batches
+    that did."""
+    if record["state"] in (UNIT_FAILED, UNIT_MISSING):
+        return [f"- {GROUPING_NO_SYNTHESIS}\n"]
+    out: list[str] = []
+    for batch in record["units"]:
+        if batch["state"] == UNIT_COMPLETE:
+            continue
+        named = ", ".join(f"[{did}](#{did})" for did in batch["defects"])
+        verb = "is" if len(batch["defects"]) == 1 else "are"
+        said = (GROUPING_BATCH_UNDISPATCHED if batch["reason"] == NOT_DISPATCHED_REASON
+                else GROUPING_BATCH_FAILED)
+        out.append(f"- The synthesis batch {batch['unit']} "
+                   f"{said.format(defects=named, verb=verb)}; "
+                   f"**{SUBSECTION_SYNTHESIS}**, in the appendix, says why.\n")
+    landed = {did for batch in record["units"] if batch["state"] == UNIT_COMPLETE
+              for did in batch["defects"]}
+    lost = [d for d in findings.defects if d["tier"] is None and d["id"] in landed]
+    if lost:
+        out.append(f"- {synthesis_refused_note(lost)}\n")
+    if (record.get("tier_names") or {}).get("state") in (NAMES_NOT_RECONCILED, ROUND_NOT_RUN,
+                                                         ROUND_PENDING):
+        out.append(f"- {TIER_NAMES_NOT_RECONCILED}; **{SUBSECTION_SYNTHESIS}**, in the "
+                   f"appendix, says why.\n")
+    if record.get("limits_too_small"):
+        out.append(f"- {OVERVIEW_INCOMPLETE_LIMITS}; **{SUBSECTION_SYNTHESIS}**, in the "
+                   f"appendix, says which tiers.\n")
     return out
 
 
@@ -12232,6 +14564,14 @@ def _render_judgment_overview(findings: Findings) -> list[str]:
     the round had nothing to say, which is a different claim.
     """
     record = findings.synthesis
+    if record is not None and "units" in record:
+        # A generation written in batches: the overview its last round wrote, whatever
+        # state the batches beside it came back in.
+        said = record.get("overview") or ""
+        if not said.strip():
+            return []
+        return [f"\n### {SUBSECTION_OVERVIEW}\n\n", f"{OVERVIEW_LEAD}\n\n",
+                f"{_paragraph(said)}\n"]
     said = (record.get("summary") or "") if record is not None else ""
     if record is None or record["state"] != UNIT_COMPLETE or not said.strip():
         return []
@@ -13049,7 +15389,7 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
                   *, rundir: Path | None = None, generated: str | None = None,
                   job_notes: dict[str, str] | None = None,
                   report_notes: ReportNotes | None = None,
-                  before_sites: bool = False) -> str:
+                  before_sites: bool = False, resynthesized: str | None = None) -> str:
     """The whole report from the run directory's data and nothing else — no clock, and no
     path but the run directory it names — so two runs over one tree into one run directory
     render byte-identical reports, and two into different ones differ on that line alone.
@@ -13086,7 +15426,9 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
 
     ``rundir`` is where the run's payloads, results and transcripts sit; the report states
     it so a reader holding the page weeks later has a way back to them. ``generated`` is
-    when this rendering was made, for the subtitle under the title. Both are keyword-only
+    when this rendering was made, for the subtitle under the title, and ``resynthesized``
+    when the generation rendered was synthesized again, which the subtitle states beside
+    it. They are keyword-only
     and default to nothing, because neither is a fact about the run's findings: a caller
     rendering from data it has already read — a test, or a re-render of a directory it was
     handed by another name — has no run directory to state and no claim to make about a
@@ -13161,6 +15503,8 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
     taken = _one_line(inventory.get("taken", ""))
     if taken and (generated is None or taken[:10] != _one_line(generated)[:10]):
         said.insert(0, f"Read {taken}")
+    if resynthesized is not None:
+        said.insert(0, f"Resynthesized {_one_line(resynthesized)}")
     if generated is not None:
         said.insert(0, f"Generated {_one_line(generated)}")
     out = ["# Review panel report\n", f"\n{' · '.join(said)}\n",
@@ -13249,9 +15593,9 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
                    f"They are tests to write, not defects, and are counted apart from the "
                    f"line above.\n")
     if ungrouped:
-        out.append(f"- {_plural(len(ungrouped), 'area')} left unclustered, so a defect "
-                   f"raised twice there is counted twice: "
-                   f"{', '.join(entry['area'] for entry in ungrouped)}.\n")
+        noun, named = _unclustered(ungrouped, _record_parts(findings.clustering))
+        out.append(f"- {noun} left unclustered, so a defect raised twice there is counted "
+                   f"twice: {named}.\n")
     # The commit once, for every site: no line number in this report means anything without
     # it, and it is stated here rather than beside each site.
     out.append(f"- Every line number in this report refers to "
@@ -13379,6 +15723,15 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
         out += _recorded(f"- Lane {lane} adapter, as recorded by the dispatcher:", record.adapter)
         out += _recorded(f"- Lane {lane} permission, as recorded by the dispatcher:",
                          record.permission)
+    # A later synthesis generation ran on lanes of its own, recorded apart from the run's:
+    # its write-ups are attributed to those, and every other stage to the lanes above.
+    again = findings.synthesis.get("dispatch") if findings.synthesis else None
+    for lane, record in (again or {}).items():
+        where = f"lane {lane} of synthesis generation {findings.synthesis['generation']}"
+        out += _recorded(f"- The {where} adapter, as recorded by the dispatcher:",
+                         record["adapter"])
+        out += _recorded(f"- The {where} permission, as recorded by the dispatcher:",
+                         record["permission"])
     out.append(f"- {CONTAINMENT_LINE}\n")
     out.append(f"- Read: {_plural(len(inventory['files']), 'file')} ({inventory['source']}), tree "
                f"sha256 {inventory['tree_sha256']}; {len(inventory['excluded'])} excluded, "
@@ -13427,12 +15780,14 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
     rejected_any = (any(state.rejected for state in states)
                     or any(unit.get("rejected") for unit in reading))
     # The synthesis round is a unit like the others, so a round that never landed, failed or
-    # had an entry refused is a unit that did not return a valid result. Printing the line
+    # had an entry refused is a unit that did not return a valid result, and so is any unit
+    # of the tier-name, tier-summary or overview rounds after it. Printing the line
     # above the appendix note naming that round is the same contradiction as printing it
     # above a list of failed batches.
     synthesis = findings.synthesis
     synthesis_clean = synthesis is None or (
-        synthesis["state"] == UNIT_COMPLETE and not synthesis["rejected"])
+        synthesis["state"] == UNIT_COMPLETE and not synthesis["rejected"]
+        and all(line["state"] == UNIT_COMPLETE for line in _later_unit_lines(synthesis)))
     # The merge round likewise: a merge unit whose reply was not used is a unit that did not
     # return a valid result.
     merge_clean = all(
@@ -13489,9 +15844,11 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
     # it is a gap of a different kind from the two above: no finding is lost and no verdict
     # changes, and the report says which count is inflated rather than leaving the reader to
     # wonder why one defect appears twice.
+    parts = _record_parts(findings.clustering)
     for entry in ungrouped:
         out += _item(f"- {entry['unit']} (clustering, {entry['area']}) — {entry['state']}: ",
-                     entry["reason"], UNGROUPED_NOTE)
+                     entry["reason"],
+                     UNGROUPED_PART_NOTE if entry["unit"] in parts else UNGROUPED_NOTE)
 
     out.append("\n#### Not read\n\n")
     if not inventory["excluded"] and not inventory["skipped"]:
@@ -14383,8 +16740,9 @@ def report_summary(states: Sequence[VerificationState], findings: Findings,
     out.append(f"{total}: " + ", ".join(
         f"{counts[status]} {status}" for status in VERDICT_STATUSES))
     ungrouped = [e for e in findings.clustering if e["state"] != UNIT_COMPLETE]
+    noun, _names = _unclustered(ungrouped, _record_parts(findings.clustering))
     out.append(f"{_plural(len(findings.defects), 'defect')} after clustering"
-               + (f"; {_plural(len(ungrouped), 'area')} not clustered" if ungrouped else ""))
+               + (f"; {noun} not clustered" if ungrouped else ""))
     out.append("wrote " + ", ".join(str(target) for target in targets))
     return "\n".join(out) + "\n"
 
@@ -14838,6 +17196,268 @@ def remove_fix_brief(path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# publication of a later generation — staged, recorded, replayed
+# --------------------------------------------------------------------------- #
+# A later generation replaces a report somebody may already be reading, so it is rendered
+# whole into `staging-g<n>/` first, and only then is `publish-g<n>.json` written: the
+# record of every step that moves it into place. The record is written once and never
+# changed; which of its steps are done is read off the disk, each step being one a resume
+# can recognize as taken. Until the last step — the stamp — is done, every reader of
+# publication says the run is publishing.
+#
+# The files are replaced one by one, the report's three last. The fix brief directory is
+# moved aside into the staging directory, the new one moved into its place, and the old one
+# deleted: a directory is never renamed over another, which Windows refuses and POSIX does
+# only for an empty one.
+PUBLISHED_FILES = (FIX_BRIEF_DATA_NAME, FIX_BRIEF_NAME, FINDINGS_NAME, REPORT_NAME, HTML_NAME)
+PREVIOUS_FIX_BRIEF = "fix-brief.previous"
+STEP_REPLACE = "replace"
+STEP_ASIDE = "aside"
+STEP_MOVE_IN = "move-in"
+STEP_DELETE_PREVIOUS = "delete-previous"
+STEP_REMOVE_STAGING = "remove-staging"
+STEP_STAMP = "stamp"
+PUBLICATION_RECORD_KEYS = ("generation", "generated", "resynthesized", "staging", "steps")
+GENERATION_DISPATCH_KEYS = ("generation", "lanes")
+
+
+def publication_steps() -> list[dict]:
+    """Every step of a later generation's publication, in the order they are taken."""
+    return [*({"step": STEP_REPLACE, "file": name} for name in PUBLISHED_FILES),
+            {"step": STEP_ASIDE}, {"step": STEP_MOVE_IN}, {"step": STEP_DELETE_PREVIOUS},
+            {"step": STEP_REMOVE_STAGING}, {"step": STEP_STAMP}]
+
+
+def read_publication_record(rundir: Path, generation: int) -> dict:
+    """``publish-g<n>.json``, refused unless it is the record this engine writes: its own
+    generation, both clocks, its staging directory and exactly the steps
+    :func:`publication_steps` lists, in that order. A record is data, so one that skips a
+    step — a stamp certifying outputs never replaced — or names any other path is refused
+    rather than taken."""
+    path = publication_record_path(rundir, generation)
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raise RunDirError(f"cannot read the publication record {path}: {exc}") from exc
+    if (not isinstance(doc, dict) or set(doc) != set(PUBLICATION_RECORD_KEYS)
+            or doc["generation"] != generation
+            or doc["staging"] != staging_path(rundir, generation).name
+            or not all(isinstance(doc[key], str) and _STAMP_FORM.match(doc[key])
+                       for key in ("generated", "resynthesized"))
+            or doc["steps"] != publication_steps()):
+        raise RunDirError(f"{path} is not a publication record the engine wrote: its steps "
+                          f"must be every step of a publication, in order")
+    return doc
+
+
+def _present(path: Path, what: str) -> bool:
+    return _lstat_or_absent(path, what, RunDirError) is not None
+
+
+def _step_needed(rundir: Path, record: dict, step: dict) -> bool:
+    """Whether one step of ``record`` is still to take, read off the disk. A step that
+    moved something out of the staging directory is done once that thing is gone from it,
+    and every step before the stamp is done once the staging directory itself is."""
+    if step["step"] == STEP_STAMP:
+        return not publication_finished(rundir, record["generation"])
+    staging = rundir / record["staging"]
+    if not _present(staging, "the staging directory"):
+        return False
+    new, previous = staging / FIX_BRIEF_DIR, staging / PREVIOUS_FIX_BRIEF
+    if step["step"] == STEP_REPLACE:
+        return _present(staging / step["file"], "a staged file")
+    if step["step"] == STEP_ASIDE:
+        return (_present(new, "the staged fix brief directory")
+                and _present(rundir / FIX_BRIEF_DIR, "the fix brief directory"))
+    if step["step"] == STEP_MOVE_IN:
+        return _present(new, "the staged fix brief directory")
+    if step["step"] == STEP_DELETE_PREVIOUS:
+        return _present(previous, "the previous fix brief directory")
+    return True
+
+
+def _publication_step(rundir: Path, record: dict, step: dict) -> None:
+    """Take one step of ``record``. Every step is one rename, one removal or one write, so
+    a kill leaves it either taken or not, and :func:`_step_needed` tells which."""
+    staging = rundir / record["staging"]
+    new, old = staging / FIX_BRIEF_DIR, rundir / FIX_BRIEF_DIR
+    previous = staging / PREVIOUS_FIX_BRIEF
+    try:
+        if step["step"] == STEP_REPLACE:
+            _replaceable(rundir / step["file"])
+            os.replace(staging / step["file"], rundir / step["file"])
+        elif step["step"] == STEP_ASIDE:
+            fix_brief_entries(old)
+            if _present(previous, "the previous fix brief directory"):
+                raise RunDirError(f"cannot move {old} aside: {previous} already exists")
+            os.rename(old, previous)
+        elif step["step"] == STEP_MOVE_IN:
+            if _present(old, "the fix brief directory"):
+                raise RunDirError(f"cannot move {new} into place: {old} already exists, and a "
+                                  f"directory is never renamed over another")
+            fix_brief_entries(new)
+            os.rename(new, old)
+        elif step["step"] == STEP_DELETE_PREVIOUS:
+            remove_fix_brief(previous)
+        elif step["step"] == STEP_REMOVE_STAGING:
+            left = sorted(entry.name for entry in staging.iterdir())
+            if left:
+                raise RunDirError(f"{staging} still holds {left[0]!r} after every staged "
+                                  f"output was moved out; move it aside and run report again")
+            staging.rmdir()
+        else:
+            write_json(rundir / REPORT_STAMP_NAME, {
+                "generated": record["generated"], "generation": record["generation"],
+                "resynthesized": record["resynthesized"]})
+    except OSError as exc:
+        raise RunDirError(f"cannot take the {step['step']} step of "
+                          f"{publication_record_path(rundir, record['generation']).name}: "
+                          f"{_os_reason(exc)}") from exc
+
+
+def replay_publication(rundir: Path, record: dict) -> None:
+    """Take every step of ``record`` that the disk says is still to take, in order.
+
+    The staging directory and everything in it is checked first, every time, with the
+    checks that rendering into it applies: a staging directory that is a link or a junction
+    would have the steps move files out of, and delete inside, a directory outside the
+    run."""
+    staging_entries(rundir, rundir / record["staging"])
+    for step in record["steps"]:
+        if _step_needed(rundir, record, step):
+            _publication_step(rundir, record, step)
+
+
+def staging_entries(rundir: Path, staging: Path) -> list[Path]:
+    """What a staging directory holds, refused by name unless a publication wrote all of
+    it: the files it replaces, the scratch their writes go through, and the new and the
+    previous fix brief directories. Empty where there is no staging directory."""
+    info = _lstat_or_absent(staging, "the staging directory", RunDirError)
+    if info is None:
+        return []
+    if not stat.S_ISDIR(info.st_mode) or _is_junction(staging) or not _inside(rundir, staging):
+        raise RunDirError(f"{staging} is not a staging directory the report wrote; move it "
+                          f"aside and run again")
+    try:
+        entries = sorted(staging.iterdir())
+    except OSError as exc:
+        raise RunDirError(f"cannot read {staging}: {_os_reason(exc)}") from exc
+    for entry in entries:
+        if entry.name in (FIX_BRIEF_DIR, PREVIOUS_FIX_BRIEF):
+            fix_brief_entries(entry)
+        elif _unexpected(entry, frozenset(PUBLISHED_FILES)):
+            raise RunDirError(f"{staging} holds {entry.name!r}, which the report did not "
+                              f"write there; move it aside and run again")
+    return entries
+
+
+def clear_staging(rundir: Path, staging: Path) -> None:
+    """Take back a staging directory: one no publication record names, which a publication
+    killed while it rendered left, or any of them on a redo. Only what a publication writes
+    is taken; anything else is refused by name, and every refusal comes before the first
+    removal."""
+    if _lstat_or_absent(staging, "the staging directory", RunDirError) is None:
+        return
+    entries = staging_entries(rundir, staging)
+    for entry in entries:
+        try:
+            if entry.name in (FIX_BRIEF_DIR, PREVIOUS_FIX_BRIEF):
+                remove_fix_brief(entry)
+            else:
+                entry.unlink()
+        except OSError as exc:
+            raise RunDirError(f"cannot take back {entry}: {_os_reason(exc)}") from exc
+    try:
+        staging.rmdir()
+    except OSError as exc:
+        raise RunDirError(f"cannot take back {staging}: {_os_reason(exc)}") from exc
+
+
+def _lane_record(raw: object, field: str, error: type[ReviewPanelError]) -> LaneRecord:
+    if not isinstance(raw, dict):
+        raise error(f"field '{field}' must be a JSON object (found {type(raw).__name__})")
+    _check_keys(raw, field, frozenset(LANE_RECORD_KEYS), LANE_RECORD_REQUIRED, error)
+    return LaneRecord(
+        adapter=_utf8(_parse_text(raw["adapter"], f"{field}.adapter", error),
+                      f"{field}.adapter", error),
+        permission=_utf8(_parse_text(raw["permission"], f"{field}.permission", error),
+                         f"{field}.permission", error),
+        model=_parse_text(raw["model"], f"{field}.model", error) if "model" in raw else None)
+
+
+def load_generation_dispatch(rundir: Path, generation: int,
+                             units: Sequence[dict]) -> dict[str, LaneRecord]:
+    """``dispatch-g<n>.json``: the lanes generation ``generation``'s synthesis ran on and
+    what ran each, as the dispatcher recorded it. It derives no rung — the run's rung is
+    the original stages', in ``dispatch.json`` — so it may name one lane, where every unit
+    of the generation ran there. Every lane a unit of ``units`` came back from must be
+    recorded, or the report would attribute an answer to nothing."""
+    path = generation_dispatch_path(rundir, generation)
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise DispatchError(
+            f"{path} is missing; the driver writes it from the lanes that ran synthesis "
+            f"generation {generation}, and that generation is not published without it"
+        ) from None
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raise DispatchError(f"cannot read {path}: {exc}") from exc
+    if not isinstance(obj, dict):
+        raise DispatchError(f"{path} must be a JSON object (found {type(obj).__name__})")
+    _check_keys(obj, path.name, frozenset(GENERATION_DISPATCH_KEYS),
+                GENERATION_DISPATCH_KEYS, DispatchError)
+    if obj["generation"] != generation:
+        raise DispatchError(f"{path} records generation {obj['generation']!r}, not "
+                            f"{generation}")
+    raw_lanes = obj["lanes"]
+    if not isinstance(raw_lanes, dict) or not raw_lanes or not set(raw_lanes) <= set(LANES):
+        raise DispatchError(f"field 'lanes' of {path} must name one or more of the lanes "
+                            f"{', '.join(LANES)}")
+    lanes = {lane: _lane_record(raw_lanes[lane], f"lanes.{lane}", DispatchError)
+             for lane in LANES if lane in raw_lanes}
+    for unit in units:
+        state, _payload = _read_unit_file(rundir, unit["id"])
+        if state != UNIT_MISSING and unit.get("lane") not in lanes:
+            raise DispatchError(f"{unit['id']} came back from lane {unit.get('lane')} and "
+                                f"{path} records no such lane")
+    return lanes
+
+
+def lane_records(lanes: Mapping[str, LaneRecord]) -> dict[str, dict]:
+    """``lanes`` as ``findings.json`` carries them, a model only where one was recorded."""
+    return {lane: {"adapter": record.adapter, "permission": record.permission,
+                   **({"model": record.model} if record.model is not None else {})}
+            for lane, record in lanes.items()}
+
+
+# What a redo takes back of every later generation besides its units and rounds: its
+# publication record and staging directory, the records the driver keeps of it, and the
+# scratch a killed write of any of those records leaves.
+_GENERATION_RECORD = re.compile(
+    r"\A(?:publish|dispatch|budget|adapter-pin)-g[1-9][0-9]*\.json(?:\.[0-9]+\.tmp)?\Z",
+    re.ASCII)
+_STAGING_DIR = re.compile(r"\Astaging-g[1-9][0-9]*\Z")
+
+
+def generation_leftovers(rundir: Path) -> tuple[list[Path], list[Path]]:
+    """Every per-generation record file and every staging directory in the run directory,
+    each staging directory checked to hold only what a publication writes."""
+    try:
+        names = sorted(entry.name for entry in rundir.iterdir())
+    except OSError as exc:
+        raise RunDirError(f"cannot read {rundir}: {_os_reason(exc)}") from exc
+    files = [rundir / name for name in names if _GENERATION_RECORD.match(name)]
+    stagings = [rundir / name for name in names if _STAGING_DIR.match(name)]
+    for path in files:
+        if path.is_symlink() or _is_junction(path) or not path.is_file():
+            raise RunDirError(f"{path} is not a record this run wrote; move it aside and "
+                              f"run again")
+    for staging in stagings:
+        staging_entries(rundir, staging)
+    return files, stagings
+
+
+# --------------------------------------------------------------------------- #
 # redo — the last two rounds taken back off a run
 # --------------------------------------------------------------------------- #
 # Clustering and every round after it go back TOGETHER, and not for convenience. A site's
@@ -14845,7 +17465,7 @@ def remove_fix_brief(path: Path) -> None:
 # candidates reuses S1 and S2 for different members. A merge, its check or a synthesis kept
 # across that passes every id check the engine has while describing sites that are no longer
 # those sites.
-REDO_KINDS = (CLUSTERER_KIND, MERGER_KIND, MERGE_CHECKER_KIND, SYNTHESIZER_KIND)
+REDO_KINDS = (CLUSTERER_KIND, MERGER_KIND, MERGE_CHECKER_KIND, *SYNTHESIS_KINDS)
 # Everything a redo publishes over. The lock is NOT here: it is a claim, not an output.
 # The stamp IS, and for the opposite reason to the one that keeps it out of a recovery's
 # manifest: a recovery rebuilds the report a run already had, while a redo re-dispatches
@@ -14863,7 +17483,7 @@ REDO_OUTPUTS = (REPORT_NAME, HTML_NAME, FINDINGS_NAME, FIX_BRIEF_NAME, FIX_BRIEF
 # The reading round itself is untouched, which is the point: it is the expensive one, and
 # re-dispatching ONE of its units and routing again is what this exists to make possible.
 ROUTE_REDO_KINDS = (VERIFIER_KIND, CLUSTERER_KIND, MERGER_KIND, MERGE_CHECKER_KIND,
-                    SYNTHESIZER_KIND)
+                    *SYNTHESIS_KINDS)
 ROUTE_REDO_OUTPUTS = (CANDIDATES_FILE_NAME, *REDO_OUTPUTS)
 
 
@@ -14902,6 +17522,9 @@ def plan_redo(rundir: Path, units_doc: dict, kinds: Sequence[str] = REDO_KINDS,
         )
     # The per-defect directory goes with the report, and only if the report wrote all of it.
     fix_brief_entries(rundir / FIX_BRIEF_DIR)
+    # So does every later synthesis generation's publication record, staging directory and
+    # driver records, and a staging directory only if a publication wrote all of it.
+    generation_leftovers(rundir)
     taking = tuple(unit["id"] for unit in units_doc["units"]
                    if unit.get("kind") in kinds and isinstance(unit.get("id"), str))
     # Refused only where the run is ALREADY at the stage this resets to: there the plain
@@ -14947,18 +17570,42 @@ def apply_redo(rundir: Path, taking: Sequence[str], doc: dict,
     # the new grouping may not have.
     fix_dir = rundir / FIX_BRIEF_DIR
     fix_brief_entries(fix_dir)
-    for unit_id in taking:
+    leftover_files, stagings = generation_leftovers(rundir)
+    # The synthesis round records go with the units they name: a record the new listing
+    # does not commit would describe rounds the run no longer has. A unit such a record
+    # names that no listing ever held, from an interrupted call, goes with it.
+    kept = {unit.get("id") for unit in doc["units"]}
+    stale: list[Path] = []
+    orphans: list[str] = []
+    for _generation, _number, path in _round_record_files(rundir):
+        named = _read_round_record(path)["units"]
+        if not set(named) <= kept:
+            stale.append(path)
+            orphans += [uid for uid in named if uid not in kept and uid not in taking]
+    for unit_id in (*taking, *orphans):
         for parent in (UNITS_DIR, DISPATCH_DIR):
             target = rundir / parent / unit_id
             if _inside(rundir, target):
                 shutil.rmtree(target, ignore_errors=True)
-    for name in outputs:
+    for path in stale:
         try:
-            (rundir / name).unlink()
+            path.unlink()
         except FileNotFoundError:
             pass
         except OSError as exc:
-            raise RunDirError(f"cannot remove {rundir / name}: {_os_reason(exc)}") from exc
+            raise RunDirError(f"cannot remove {path}: {_os_reason(exc)}") from exc
+    # The scratch a killed write of an output left goes with the output; a report holding
+    # the lock would be writing it, and `plan_redo` refused while the lock is held.
+    scratch = _scratch_beside([rundir / name for name in outputs])
+    for path in (*(rundir / name for name in outputs), *leftover_files, *scratch):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise RunDirError(f"cannot remove {path}: {_os_reason(exc)}") from exc
+    for staging in stagings:
+        clear_staging(rundir, staging)
     try:
         remove_fix_brief(fix_dir)
     except OSError as exc:
@@ -15051,7 +17698,7 @@ def _run_sites(rundir: Path, units_doc: dict) -> Clustering:
     cluster_units = [u for u in units_doc["units"] if u.get("kind") == CLUSTERER_KIND]
     check_clustering(routed["candidates"], cluster_units)
     return build_clusters(routed["candidates"], cluster_units,
-                          read_clustering_results(rundir, cluster_units))
+                          read_clustering_results(rundir, cluster_units, routed["candidates"]))
 
 
 def _run_grouping(rundir: Path, units_doc: dict, clustering: Clustering | None = None,
@@ -15166,7 +17813,12 @@ def check_result(rundir: Path, unit_id: str, payload: object) -> CheckOutcome:
                                                     unit.get("asks", DEFECT_ASKS))
         return CheckOutcome(rejected)
     if kind == CLUSTERER_KIND:
-        parse_clusterer_result(payload, unit_id, unit.get("candidates", ()))
+        # A part is held to the rule the stage holds it to: a site in it never spans files.
+        parts = clustering_parts([u for u in units_doc["units"] if isinstance(u, dict)
+                                  and u.get("kind") == CLUSTERER_KIND])
+        files = (part_files(unit, parts, _read_candidates(rundir)["candidates"])
+                 if unit_id in parts else None)
+        parse_clusterer_result(payload, unit_id, unit.get("candidates", ()), files)
         return CheckOutcome(())
     if kind == MERGER_KIND:
         # Each site's kind comes from the clustering the stage will read, because a group
@@ -15193,9 +17845,17 @@ def check_result(rundir: Path, unit_id: str, payload: object) -> CheckOutcome:
         parse_merge_checker_result(payload, unit_id, _handed_groups(unit))
         return CheckOutcome(())
     if kind == SYNTHESIZER_KIND:
+        legacy = (synthesis_writer(unit, read_run_format(rundir))
+                  == LEGACY_SYNTHESIS_WRITER)
         parsed = parse_synthesizer_result(payload, unit_id, unit.get("defects", ()),
-                                          unit.get("defect_sites"))
+                                          unit.get("defect_sites"), legacy)
         return CheckOutcome(tuple(parsed["rejected"]))
+    if kind == TIER_NAMER_KIND:
+        parse_tier_names_result(payload, unit_id, unit.get("entries") or ())
+        return CheckOutcome(())
+    if kind == SUMMARIZER_KIND:
+        parse_summary_result(payload, unit_id, unit.get("summary_bytes"))
+        return CheckOutcome(())
     raise RunDirError(f"unit {unit_id} has kind {kind!r}, which this engine cannot parse")
 
 
@@ -15251,10 +17911,15 @@ def build_parser() -> argparse.ArgumentParser:
                                                      "proposed group site by site")
     merge_check.add_argument("rundir", help="the run directory merge wrote, its merge units "
                                             "dispatched")
-    synthesize = sub.add_parser("synthesize", help="write the one unit that names this "
-                                                   "run's tiers and accounts for every defect")
+    synthesize = sub.add_parser("synthesize", help="write the batches that account for "
+                                                   "every defect, each naming its own tiers")
     synthesize.add_argument("rundir", help="the run directory merge-check wrote, its merge "
                                            "check units dispatched")
+    synthesize.add_argument("--new-generation", action="store_true",
+                            help="plan another synthesis of a reported run beside the one it "
+                                 "published, under ids carrying -g<n>; the marker stays "
+                                 "reported, plain synthesize carries its rounds and report "
+                                 "publishes it")
     check = sub.add_parser("check", help="run the engine's own parse over a result before "
                                         "it is landed, so a reply that would be refused "
                                         "an hour later is refused now")
@@ -15332,6 +17997,8 @@ def _run_plan(args: argparse.Namespace) -> int:
                            taken=clock_now())
             write_job_copy(rundir, job)
             write_areas(rundir, job, areas)
+            # Before the listing, which is what commits a plan.
+            write_run_format(rundir)
             write_units(rundir, job, inventory, areas, companions)
         except BaseException:
             _remove_what_was_written(rundir, keep_job=keep_job, made_rundir=made_rundir)
@@ -15461,14 +18128,17 @@ def _run_route(args: argparse.Namespace) -> int:
                                        _read_context(rundir))
             candidates = check_quotes(rundir / "snapshot",
                                       build_candidates(states, reading, owner))
-            batches = route(candidates)
+            tests_of = _read_area_tests(rundir)
+            batches = route(candidates, read_limits(rundir),
+                            lambda asks, scope: render_verification_payload(
+                                companions, problem, probe, tests_of, asks, scope, ()))
             # Applied HERE, with the rest, and for the reason the clustering redo gives: a
             # run must not lose its routing to a refusal about a reading result. Everything
             # that can say no has said it by now.
             if taking:
                 apply_redo(rundir, taking, units_doc, ROUTE_REDO_OUTPUTS)
             write_route(rundir, units_doc, states, candidates, batches, companions, problem,
-                        probe, _read_area_tests(rundir))
+                        probe, tests_of)
         finally:
             _released(lock)
     except ReviewPanelError as exc:
@@ -15513,7 +18183,10 @@ def _run_cluster(args: argparse.Namespace) -> int:
             holder = check_routing(routed["candidates"], batches)
             states = read_verification_results(rundir, batches, reproducible)
             rationales = verified_rationales(routed["candidates"], holder, states)
-            units = plan_clusters(routed["candidates"])
+            units = plan_clusters(
+                routed["candidates"], limits=read_limits(rundir), rationales=rationales,
+                head=render_clusterer_payload(companions.clusterer_brief, problem, (),
+                                              rationales, schema=companions.clusterer_schema))
             if taking:
                 apply_redo(rundir, taking, units_doc)
             write_clusters(rundir, units_doc, routed["candidates"], rationales, units,
@@ -15615,11 +18288,46 @@ def _run_merge_check(args: argparse.Namespace) -> int:
     return 0
 
 
+NOTHING_TO_RESYNTHESIZE = "nothing to resynthesize: no defect in this run needs a write-up"
+
+
+def _synthesis_defects(rundir: Path, units_doc: dict, routed: dict) -> tuple:
+    """``(clustering, rationales, check, every, defects)``: the run's verified candidates,
+    clustered into sites, grouped as the merge check upheld, and the defects among them
+    that the synthesis round is handed. Every listing it reads is proved first."""
+    batches = [u for u in units_doc["units"] if u.get("kind") == VERIFIER_KIND]
+    reproducible = {c["id"]: any(r["reproduction"] is not None for r in c["raised_by"])
+                    for c in routed["candidates"]}
+    holder = check_routing(routed["candidates"], batches)
+    states = read_verification_results(rundir, batches, reproducible)
+    rationales = verified_rationales(routed["candidates"], holder, states)
+    resolved = resolve(routed["candidates"], holder, states)
+    cluster_units = [u for u in units_doc["units"] if u.get("kind") == CLUSTERER_KIND]
+    check_clustering(routed["candidates"], cluster_units)
+    cluster_states = read_clustering_results(rundir, cluster_units, routed["candidates"])
+    clustering = build_clusters(routed["candidates"], cluster_units, cluster_states)
+    # The defects are the grouping the merge check upheld, so a defect of several sites is
+    # narrated once with every site's material.
+    _merge, check, grouping = _run_grouping(rundir, units_doc, clustering)
+    every = group_sites(clustering, grouping)
+    defects = needs_a_write_up(every, site_statuses(clustering, resolved))
+    return clustering, rationales, check, every, defects
+
+
+def defects_needing_a_write_up(rundir: Path) -> int:
+    """How many defects of a reported run a later synthesis generation would be handed.
+    Reads the run and writes nothing, so a caller can decide there is nothing to do before
+    it changes anything."""
+    units_doc = _read_units_at_stage(
+        rundir, REPORTED_STAGE, "a later synthesis generation is planned on a reported run")
+    return len(_synthesis_defects(rundir, units_doc, _read_candidates(rundir))[4])
+
+
 def _run_synthesize(args: argparse.Namespace) -> int:
-    # Everything that can refuse runs before anything is written: the listing must be at the
-    # clustering stage and unsynthesized, the route record and the companions readable, the
-    # routing and the clustering listings proved and every verification and clustering
-    # result read — and only then does the unit directory land.
+    # Everything that can refuse runs before anything is written: the listing must be at
+    # the merge-check stage, or at the synthesis stage for a later round, the route record
+    # and the companions readable, the routing, the clustering and the synthesis listings
+    # proved and every result read — and only then does a unit directory land.
     #
     # ``dispatch.json`` is deliberately NOT read here. The dispatcher writes it once the
     # last round has landed, and this is that round; requiring it would make the record of
@@ -15629,43 +18337,252 @@ def _run_synthesize(args: argparse.Namespace) -> int:
     try:
         rundir = _resolve(Path(args.rundir), "rundir", RunDirError)
         # Route's reasoning again: the claim before the marker, held through the marker
-        # write, so a second synthesize cannot take back the unit this one just wrote.
+        # write, so a second synthesize cannot take back the units this one just wrote.
         lock = _claim_stage(rundir, "synthesize")
         try:
             units_doc = _read_units_at_stage(
-                rundir, MERGE_CHECKED_STAGE,
-                "synthesize runs once, after merge-check and after the merge check units "
-                "are dispatched")
+                rundir, (MERGE_CHECKED_STAGE, SYNTHESIZED_STAGE, REPORTED_STAGE),
+                "synthesize plans its first round after merge-check and after the merge "
+                "check units are dispatched, and each later round once the round before it "
+                "has landed")
+            stage = units_doc["stage"]
+            new_generation = getattr(args, "new_generation", False)
+            # A later generation is planned on a reported run and nowhere else, and only
+            # once every generation before it is published: two unpublished generations
+            # would leave no one generation for the rounds, the dispatcher and the staged
+            # report to take.
+            if new_generation and stage != REPORTED_STAGE:
+                raise RunDirError(
+                    f"{rundir / UNITS_FILE_NAME} is at stage {stage!r}; --new-generation "
+                    f"plans a later synthesis of a run that is already {REPORTED_STAGE!r}, "
+                    f"so run plain synthesize to carry this one")
+            generation = 1
+            if stage == REPORTED_STAGE:
+                publishing = publishing_generation(rundir)
+                if publishing is not None:
+                    raise RunDirError(publishing_refusal(rundir, publishing))
+                building = building_generation(rundir, units_doc["units"])
+                if new_generation and building is not None:
+                    raise RunDirError(
+                        f"synthesis generation {building} is planned and not yet "
+                        f"published; plain synthesize carries it to its last round, and "
+                        f"report publishes it, before another can be planned")
+                if not new_generation and building is None:
+                    raise RunDirError(
+                        f"{rundir / UNITS_FILE_NAME} is {REPORTED_STAGE!r} and no later "
+                        f"synthesis is being built; synthesize --new-generation plans one")
+                existing = [synthesis_generation(unit) for unit in units_doc["units"]
+                            if unit.get("kind") in SYNTHESIS_KINDS]
+                generation = 1 + max(existing, default=1) if new_generation else building
             routed = _read_candidates(rundir)
             problem = _read_problem(rundir)
             companions = load_synthesis_companions()
-            batches = [u for u in units_doc["units"] if u.get("kind") == VERIFIER_KIND]
-            reproducible = {c["id"]: any(r["reproduction"] is not None for r in c["raised_by"])
-                            for c in routed["candidates"]}
-            holder = check_routing(routed["candidates"], batches)
-            states = read_verification_results(rundir, batches, reproducible)
-            rationales = verified_rationales(routed["candidates"], holder, states)
-            resolved = resolve(routed["candidates"], holder, states)
-            cluster_units = [u for u in units_doc["units"] if u.get("kind") == CLUSTERER_KIND]
-            check_clustering(routed["candidates"], cluster_units)
-            cluster_states = read_clustering_results(rundir, cluster_units)
-            clustering = build_clusters(routed["candidates"], cluster_units, cluster_states)
-            # The defects are the grouping the merge check upheld, so a defect of several
-            # sites is narrated once with every site's material.
-            _merge, check, grouping = _run_grouping(rundir, units_doc, clustering)
-            every = group_sites(clustering, grouping)
-            upheld = _prove_grouping(every, check)
-            defects = needs_a_write_up(every, site_statuses(clustering, resolved))
-            material = synthesis_material(clustering, routed["candidates"], rationales,
-                                          defects, upheld)
-            units = plan_synthesis(defects)
-            write_synthesis(rundir, units_doc, units, material, companions, problem)
+            round_companions = load_round_companions()
+            clustering, rationales, check, every, defects = _synthesis_defects(
+                rundir, units_doc, routed)
+            later = stage == SYNTHESIZED_STAGE or (stage == REPORTED_STAGE
+                                                   and not new_generation)
+            # A later generation of nothing would plan no unit and still write the listing.
+            nothing = new_generation and not defects
+            if stage != MERGE_CHECKED_STAGE:
+                check_synthesis(every, [u for u in units_doc["units"]
+                                        if u.get("kind") == SYNTHESIZER_KIND], defects)
+            if later:
+                rounds = synthesis_rounds(rundir, units_doc["units"], round_companions,
+                                          problem, generation)
+                if rounds is not None and rounds.waiting:
+                    raise RunDirError(
+                        f"{', '.join(rounds.waiting)} of the latest synthesis round "
+                        f"{'has' if len(rounds.waiting) == 1 else 'have'} no result yet; "
+                        f"synthesize plans the next round once every unit of this one has "
+                        f"landed")
+                planned = rounds.next_round if rounds is not None else None
+                if planned is not None:
+                    write_synthesis_round(rundir, units_doc, planned, {
+                        TIER_NAMER_KIND: round_companions.tier_names_schema,
+                        SUMMARIZER_KIND: round_companions.overview_schema})
+            elif not nothing:
+                upheld = _prove_grouping(every, check)
+                material = synthesis_material(clustering, routed["candidates"], rationales,
+                                              defects, upheld)
+                limits = read_limits(rundir)
+                units = plan_synthesis(material, synthesis_head(companions, problem), limits,
+                                       generation)
+                write_synthesis(rundir, units_doc, units, material, companions, problem,
+                                limits.planning("synthesis", LANES).index_bytes, generation)
         finally:
             _released(lock)
     except ReviewPanelError as exc:
         sys.stderr.write(f"{_PROG}: {exc}\n")
         return 2
-    sys.stdout.write(synthesis_summary(units, defects, len(every) - len(defects)))
+    if later:
+        sys.stdout.write(round_summary(planned, rounds) if rounds is not None else
+                         "synthesis is complete: nothing to plan\n")
+    elif nothing:
+        sys.stdout.write(NOTHING_TO_RESYNTHESIZE + "\n")
+    else:
+        sys.stdout.write(synthesis_summary(units, defects, len(every) - len(defects)))
+    return 0
+
+
+@dataclass(frozen=True)
+class ReportMaterial:
+    """Everything a rendering of the run reads off the run directory, the structure built."""
+
+    job: dict
+    job_notes: dict[str, str] | None
+    inventory: dict
+    areas: list
+    dispatch: DispatchRecord
+    batches: list[dict]
+    states: tuple
+    routed: dict
+    findings: Findings
+    report_notes: ReportNotes | None
+
+
+def _assemble_report(rundir: Path, units_doc: dict, generation: int | None) -> ReportMaterial:
+    """The run read and proved as ``report`` reads it, with synthesis generation
+    ``generation`` as the one rendered; ``None`` renders none. A later generation carries
+    the lanes its own dispatch record names, beside the run's."""
+    routed = _read_candidates(rundir)
+    job = _read_job(rundir)
+    job_notes = _read_job_notes(rundir)
+    inventory = _read_inventory(rundir)
+    areas = _read_run_json(rundir, "areas.json")
+    if not isinstance(areas, dict) or not isinstance(areas.get("areas"), list):
+        raise RunDirError(f"areas.json under {rundir} is not the engine's")
+    dispatch = load_dispatch(rundir)
+    batches = [u for u in units_doc["units"] if u.get("kind") == VERIFIER_KIND]
+    reproducible = {c["id"]: any(r["reproduction"] is not None for r in c["raised_by"])
+                    for c in routed["candidates"]}
+    holder = check_routing(routed["candidates"], batches)
+    states = read_verification_results(rundir, batches, reproducible)
+    resolved = resolve(routed["candidates"], holder, states)
+    cluster_units = [u for u in units_doc["units"] if u.get("kind") == CLUSTERER_KIND]
+    check_clustering(routed["candidates"], cluster_units)
+    cluster_states = read_clustering_results(rundir, cluster_units, routed["candidates"])
+    clustering = build_clusters(routed["candidates"], cluster_units, cluster_states)
+    merge, merge_check, grouping = _run_grouping(rundir, units_doc, clustering)
+    synthesis_units = [u for u in units_doc["units"] if u.get("kind") == SYNTHESIZER_KIND]
+    every = group_sites(clustering, grouping)
+    check_synthesis(every, synthesis_units,
+                    needs_a_write_up(every, site_statuses(clustering, resolved)))
+    # ``check_synthesis`` above is what proves the listing is over THIS run's defects;
+    # the parse then proves the reply is over the listing. Neither needs the clusters
+    # again, so this takes the unit row and the state and nothing else.
+    shown = synthesis_generations(synthesis_units).get(generation, [])
+    synthesis = build_synthesis(shown, read_synthesis_result(rundir, shown),
+                                read_run_format(rundir))
+    # A generation this engine wrote is read through its later rounds: the reconciled
+    # tier names, the tier summaries and the overview, each held to its round record.
+    rounds = (synthesis_rounds(rundir, units_doc["units"], generation=generation)
+              if synthesis is not None and synthesis.writer != LEGACY_SYNTHESIS_WRITER
+              else None)
+    if rounds is not None:
+        synthesis = apply_synthesis_rounds(synthesis, rounds)
+    if synthesis is not None and generation is not None and generation >= 2:
+        members = [u for u in units_doc["units"] if u.get("kind") in SYNTHESIS_KINDS
+                   and synthesis_generation(u) == generation]
+        synthesis = replace(synthesis, record={
+            **synthesis.record,
+            "dispatch": lane_records(load_generation_dispatch(rundir, generation, members))})
+    snippets = {cand["id"]: extract_snippet(rundir / "snapshot", cand["file"],
+                                            cand["line_start"], cand["line_end"])
+                for cand in routed["candidates"]}
+    findings = build_findings(dispatch, routed["candidates"], resolved, clustering,
+                              cluster_states, inventory["commit"], snippets, synthesis,
+                              states, batches, grouping=grouping, merge=merge,
+                              merge_check=merge_check)
+    # Checked against the defects just built, so a note naming a defect this run does
+    # not have is refused before anything is published.
+    report_notes = _read_report_notes(rundir, [c["id"] for c in findings.defects])
+    return ReportMaterial(job, job_notes, inventory, areas["areas"], dispatch, batches,
+                          states, routed, findings, report_notes)
+
+
+def _render_outputs(rundir: Path, units_doc: dict, material: ReportMaterial, generated: str,
+                    resynthesized: str | None) -> dict[str, object]:
+    """Every file a publication writes, rendered: the report, its page and the fix brief
+    by name, and the fix brief's per-defect files under ``fix-brief/``."""
+    text = render_report(material.job, material.dispatch, material.inventory, material.areas,
+                         material.findings, material.routed["units"], material.batches,
+                         material.states, material.routed["probe"],
+                         job_notes=material.job_notes, report_notes=material.report_notes,
+                         rundir=rundir, generated=generated,
+                         before_sites=made_before_sites(units_doc),
+                         resynthesized=resynthesized)
+    text = text.encode("utf-8", "backslashreplace").decode("utf-8")
+    brief = fix_brief_document(material.findings, material.routed["probe"])
+    out: dict[str, object] = {
+        FIX_BRIEF_DATA_NAME: brief,
+        FIX_BRIEF_NAME: render_fix_brief(brief).encode("utf-8", "backslashreplace")
+                                               .decode("utf-8"),
+        FINDINGS_NAME: findings_document(material.findings),
+        REPORT_NAME: text,
+        HTML_NAME: render_html(text),
+    }
+    out.update({f"{FIX_BRIEF_DIR}/{name}.md": body.encode("utf-8", "backslashreplace")
+                .decode("utf-8") for name, body in render_fix_brief_defects(brief).items()})
+    return out
+
+
+def _publish_generation(rundir: Path, generation: int) -> int:
+    """Publish synthesis generation ``generation`` (2 or later) over the report a reported
+    run already has, or finish a publication of it a kill left part-way.
+
+    Under the report's claim, like every publication. Where no record exists yet, the
+    generation is checked complete and its dispatch record read, a staging directory an
+    earlier kill left is taken back, and the whole publication is rendered into a fresh
+    one; only then is ``publish-g<n>.json`` written, and from that moment the steps it lists
+    are what a resume takes. The original stamp is kept and the moment of the resynthesis
+    chosen once, in the record, so a resumed publication writes the bytes the first one
+    staged."""
+    lock = _claim_stage(rundir, "report")
+    try:
+        units_doc = _read_units_at_stage(rundir, REPORTED_STAGE,
+                                         "a later synthesis is published on a reported run")
+        # A kill inside the write of the record or the stamp leaves `<name>.<pid>.tmp`,
+        # which refuses the next write under a pid that comes round again. Nothing else
+        # writes either file outside the report's claim, which this holds.
+        _reclaim("report", rundir, (), (),
+                 (publication_record_path(rundir, generation), rundir / REPORT_STAMP_NAME))
+        if publication_record_path(rundir, generation).exists():
+            record = read_publication_record(rundir, generation)
+        else:
+            rounds = synthesis_rounds(rundir, units_doc["units"], generation=generation)
+            if rounds is not None and (rounds.waiting or rounds.next_round is not None):
+                raise RunDirError(
+                    f"synthesis generation {generation} has rounds still to "
+                    f"{'land' if rounds.waiting else 'plan'}; synthesize and dispatch them "
+                    f"before it is published")
+            material = _assemble_report(rundir, units_doc, generation)
+            staging = staging_path(rundir, generation)
+            clear_staging(rundir, staging)
+            target = rundir / REPORT_NAME
+            record = {"generation": generation,
+                      "generated": read_report_stamp(rundir) or _previous_stamp(target)
+                      or clock_now(),
+                      "resynthesized": clock_now(), "staging": staging.name,
+                      "steps": publication_steps()}
+            rendered = _render_outputs(rundir, units_doc, material, record["generated"],
+                                       record["resynthesized"])
+            try:
+                (staging / FIX_BRIEF_DIR).mkdir(parents=True)
+                for name, content in rendered.items():
+                    if isinstance(content, str):
+                        write_text(staging / name, content)
+                    else:
+                        write_json(staging / name, content)
+            except OSError as exc:
+                raise RunDirError(f"cannot write {staging}: {_os_reason(exc)}") from exc
+            write_json(publication_record_path(rundir, generation), record)
+        replay_publication(rundir, record)
+    finally:
+        _released(lock)
+    sys.stdout.write(f"published synthesis generation {generation}: "
+                     f"{', '.join(PUBLISHED_FILES)} and {FIX_BRIEF_DIR}/ replaced, "
+                     f"{REPORT_STAMP_NAME} rewritten last\n")
     return 0
 
 
@@ -15698,6 +18615,19 @@ def _run_report(args: argparse.Namespace) -> int:
         written = (brief_data_target, brief_target, data_target, target, html_target)
         for path in written:
             _replaceable(path)
+        # A later generation is published by its own record, never by the rendering below:
+        # finished where it is part-way, and staged where it is built and not yet published.
+        if _units_stage(rundir) == REPORTED_STAGE:
+            publishing = publishing_generation(rundir)
+            if publishing is not None and args.rerender:
+                raise RunDirError(publishing_refusal(rundir, publishing))
+            if publishing is not None:
+                return _publish_generation(rundir, publishing)
+            if not args.rerender:
+                doc = _read_units_at_stage(rundir, REPORTED_STAGE, "")
+                building = building_generation(rundir, doc["units"])
+                if building is not None:
+                    return _publish_generation(rundir, building)
         fix_brief_entries(fix_dir)
         # **What is on disk says which of three things happened, and a file alone says
         # none of them.** The stamp lands before the first of the three and nothing lands
@@ -15755,44 +18685,20 @@ def _run_report(args: argparse.Namespace) -> int:
             # The publication this recovery was going to record is gone, so there is
             # nothing to record. Carry on and render one: the ordinary path takes the lock
             # again and refuses there if a report has since been published.
-        routed = _read_candidates(rundir)
-        job = _read_job(rundir)
-        job_notes = _read_job_notes(rundir)
-        inventory = _read_inventory(rundir)
-        areas = _read_run_json(rundir, "areas.json")
-        if not isinstance(areas, dict) or not isinstance(areas.get("areas"), list):
-            raise RunDirError(f"areas.json under {rundir} is not the engine's")
-        dispatch = load_dispatch(rundir)
-        batches = [u for u in units_doc["units"] if u.get("kind") == VERIFIER_KIND]
-        reproducible = {c["id"]: any(r["reproduction"] is not None for r in c["raised_by"])
-                        for c in routed["candidates"]}
-        holder = check_routing(routed["candidates"], batches)
-        states = read_verification_results(rundir, batches, reproducible)
-        resolved = resolve(routed["candidates"], holder, states)
-        cluster_units = [u for u in units_doc["units"] if u.get("kind") == CLUSTERER_KIND]
-        check_clustering(routed["candidates"], cluster_units)
-        cluster_states = read_clustering_results(rundir, cluster_units)
-        clustering = build_clusters(routed["candidates"], cluster_units, cluster_states)
-        merge, merge_check, grouping = _run_grouping(rundir, units_doc, clustering)
-        synthesis_units = [u for u in units_doc["units"] if u.get("kind") == SYNTHESIZER_KIND]
-        every = group_sites(clustering, grouping)
-        check_synthesis(every, synthesis_units,
-                        needs_a_write_up(every, site_statuses(clustering, resolved)))
-        # ``check_synthesis`` above is what proves the listing is over THIS run's defects;
-        # the parse then proves the reply is over the listing. Neither needs the clusters
-        # again, so this takes the unit row and the state and nothing else.
-        synthesis = build_synthesis(synthesis_units,
-                                    read_synthesis_result(rundir, synthesis_units))
-        snippets = {cand["id"]: extract_snippet(rundir / "snapshot", cand["file"],
-                                                cand["line_start"], cand["line_end"])
-                    for cand in routed["candidates"]}
-        findings = build_findings(dispatch, routed["candidates"], resolved, clustering,
-                                  cluster_states, inventory["commit"], snippets, synthesis,
-                                  states, batches, grouping=grouping, merge=merge,
-                                  merge_check=merge_check)
-        # Checked against the defects just built, so a note naming a defect this run does
-        # not have is refused before anything is published.
-        report_notes = _read_report_notes(rundir, [c["id"] for c in findings.defects])
+        # The generation this report renders: the published one once the run is
+        # reported, and before that the one being built, which is generation 1.
+        building = building_generation(rundir, units_doc["units"])
+        shown_generation = (building if building is not None
+                            and units_doc["stage"] != REPORTED_STAGE
+                            else published_generation(rundir, units_doc["units"]))
+        material = _assemble_report(rundir, units_doc, shown_generation)
+        job, job_notes, inventory = material.job, material.job_notes, material.inventory
+        areas, dispatch, batches = material.areas, material.dispatch, material.batches
+        states, routed, findings = material.states, material.routed, material.findings
+        report_notes = material.report_notes
+        stamp = read_stamp(rundir)
+        resynthesized = (stamp.get("resynthesized") if stamp is not None
+                         and stamp.get("generation") == shown_generation else None)
         # All three files are one output and they publish under one lock, and so do the
         # stamp they state and the marker that commits them. The lock is a file of its own
         # and NOT one of the three: a claim that is also a published artifact stops being a
@@ -15892,11 +18798,12 @@ def _run_report(args: argparse.Namespace) -> int:
             # would leave it standing over no report at all. A stamp that was already there
             # is somebody else's record and stays.
             try:
-                text = render_report(job, dispatch, inventory, areas["areas"], findings,
+                text = render_report(job, dispatch, inventory, areas, findings,
                                      routed["units"], batches, states, routed["probe"],
                                      job_notes=job_notes, report_notes=report_notes,
                                      rundir=rundir, generated=generated,
-                                     before_sites=made_before_sites(units_doc))
+                                     before_sites=made_before_sites(units_doc),
+                                     resynthesized=resynthesized)
             except BaseException:
                 if wrote_stamp:
                     with contextlib.suppress(OSError):

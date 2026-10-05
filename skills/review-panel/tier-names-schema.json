@@ -1,0 +1,36 @@
+{
+  "title": "review-panel tier names result",
+  "description": "The run's report sections, reconciled. Each batch of the synthesis round named the sections its own defects belong under, independently, so two batches can have named one theme in two phrasings. This reply is the final list of section names, in the order a reader should work through them, and a map from every entry the payload lists to exactly one of those names. It moves no defect between themes on its own judgment of the defect: it decides only which names mean the same thing. An entry left unmapped, mapped twice, or one the payload never listed fails the reply whole.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["tiers", "map"],
+  "properties": {
+    "tiers": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string", "minLength": 1, "maxLength": 80},
+      "description": "The final section names, in the order a reader should work through them, each named once: a short plain-language name, in this project's own terms, for what the defects under it break. Keep an entry's name where it already says that well; write a new one only where two or more entries mean one theme and neither name covers both. A name over 80 characters fails the reply whole."
+    },
+    "map": {
+      "type": "array",
+      "description": "One record per entry the payload lists, in any order, saying which final name it belongs under. Together the records cover the payload's entries exactly: none twice, none left out, none invented.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["entry", "tier"],
+        "properties": {
+          "entry": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The entry id, spelled as the payload spells it, e.g. `N3`."
+          },
+          "tier": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "The position of this entry's final name in `tiers`, counting the first as 1."
+          }
+        }
+      }
+    }
+  }
+}

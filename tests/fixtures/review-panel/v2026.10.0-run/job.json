@@ -1,0 +1,1 @@
+{"problem": "Find every place the installer can leave a half-written file.", "root": "/tmp/rp-v2026.10.0/root", "exclude": [], "partition": "file", "lenses": ["bottom-up from the code", "top-down from the contract"]}

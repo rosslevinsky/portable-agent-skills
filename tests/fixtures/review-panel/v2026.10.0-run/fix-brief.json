@@ -1,0 +1,127 @@
+{
+  "defects": [
+    {
+      "account": "synthesis",
+      "fix": "Check for an empty input before indexing, at both sites.",
+      "heading": "An empty input stops the run with a traceback.",
+      "id": "D1",
+      "related": [],
+      "severity": "blocker",
+      "sites": [
+        {
+          "file": "engine/core.py",
+          "fix_size": "1 line",
+          "id": "S1",
+          "line_end": 3,
+          "line_start": 2,
+          "note": null,
+          "outcome": "established",
+          "reproduction": null,
+          "severity": "major",
+          "test_first": "tests/test_engine.py: call it with an empty list and assert it returns None.",
+          "unsettled": null,
+          "what_is_wrong_here": "A run over an empty input stops with a traceback instead of finishing."
+        },
+        {
+          "file": "engine/core.py",
+          "fix_size": "1 line",
+          "id": "S2",
+          "line_end": 5,
+          "line_start": 5,
+          "note": "Here the empty input is the argument list, at start-up.",
+          "outcome": "established",
+          "reproduction": {
+            "argv": [
+              "python3",
+              "run.py"
+            ],
+            "cwd": ".",
+            "exit_status": 1,
+            "expect": null,
+            "kind": "run",
+            "output": "Traceback ...\nIndexError: list index out of range",
+            "output_cut": false,
+            "shows": "Shows the call raising IndexError on an empty argument list."
+          },
+          "severity": "blocker",
+          "test_first": "tests/test_engine.py: call it with an empty list and assert it returns None.",
+          "unsettled": null,
+          "what_is_wrong_here": "Running the tool with no arguments fails instead of printing help."
+        }
+      ],
+      "status": "established",
+      "what_goes_wrong": "An empty input is indexed before anything checks it, so the call dies where it should have done nothing."
+    },
+    {
+      "account": "synthesis",
+      "fix": "Skip a missing value.",
+      "heading": "A missing value doubles the total.",
+      "id": "D2",
+      "related": [],
+      "severity": "minor",
+      "sites": [
+        {
+          "file": "engine/core.py",
+          "fix_size": "1 line",
+          "id": "S3",
+          "line_end": 8,
+          "line_start": 8,
+          "note": null,
+          "outcome": "established",
+          "reproduction": null,
+          "severity": "minor",
+          "test_first": "tests/test_engine.py: call it with an empty list and assert it returns None.",
+          "unsettled": null,
+          "what_is_wrong_here": null
+        }
+      ],
+      "status": "established",
+      "what_goes_wrong": "A missing value is doubled rather than skipped."
+    }
+  ],
+  "guide": [
+    "A defect (`D1`, `D2`, \u2026) is one mistake. Its sites (`S1`, `S2`, \u2026) are the places it has to be fixed: code, documents, tests. A defect is fixed when every one of its sites is.",
+    "`established`: the review's check upheld the site, by running code or by reading it.",
+    "`unresolved`: nothing settled the site. Confirm it before changing anything; the site says what stopped the review.",
+    "Write the test that should fail first before the fix, and see it fail.",
+    "A heading, *What goes wrong*, *Fix* and a site's note are one agent's reading of the run, and nothing checked them. Where a fix names an order, follow it.",
+    "Established defects come first, then unresolved; within each, most severe first, then fewest sites. Refuted sites and defects are left out: there is nothing to fix at them."
+  ],
+  "setup": {
+    "commit": {
+      "commit": "",
+      "committed": "",
+      "dirty": null,
+      "state": "not-a-repository"
+    },
+    "probe": {
+      "build": {
+        "answer": "yes",
+        "argv": [
+          "python3",
+          "-m",
+          "compileall",
+          "-q",
+          "."
+        ],
+        "cwd": ".",
+        "exit_status": 0
+      },
+      "reason": null,
+      "state": "complete",
+      "summary": "Compiles; the suite runs and one test fails.",
+      "tests": {
+        "answer": "yes",
+        "argv": [
+          "python3",
+          "-m",
+          "unittest",
+          "discover"
+        ],
+        "cwd": ".",
+        "exit_status": 1
+      }
+    }
+  },
+  "tests_to_write": []
+}

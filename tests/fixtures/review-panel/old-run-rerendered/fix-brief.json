@@ -1,0 +1,244 @@
+{
+  "defects": [
+    {
+      "account": "synthesis",
+      "fix": "Return y + 2.",
+      "heading": "Every total built on helper comes out twice as large as the contract says.",
+      "id": "D2",
+      "related": [],
+      "severity": "blocker",
+      "sites": [
+        {
+          "file": "engine/core.py",
+          "fix_size": "1 line",
+          "id": "S2",
+          "line_end": 6,
+          "line_start": 5,
+          "note": null,
+          "outcome": "established",
+          "reproduction": {
+            "argv": [
+              "python3",
+              "-c",
+              "from engine.core import helper; print(helper(3))"
+            ],
+            "cwd": ".",
+            "exit_status": 0,
+            "expect": null,
+            "kind": "run",
+            "output": "6",
+            "output_cut": false,
+            "shows": "Shows helper(3) returning 6."
+          },
+          "severity": "blocker",
+          "test_first": "tests/test_engine.py: call helper(3) and assert it returns 5.",
+          "unsettled": null,
+          "what_is_wrong_here": null
+        }
+      ],
+      "status": "established",
+      "what_goes_wrong": "helper multiplies by two where the contract adds two, so every total built on it is too large."
+    },
+    {
+      "account": "synthesis",
+      "fix": "Return non-zero when no work was done.",
+      "heading": "The tool exits 0 even when it did nothing.",
+      "id": "D4",
+      "related": [],
+      "severity": "major",
+      "sites": [
+        {
+          "file": "run.py",
+          "fix_size": "medium",
+          "id": "S4",
+          "line_end": 2,
+          "line_start": 1,
+          "note": null,
+          "outcome": "established",
+          "reproduction": {
+            "argv": [
+              "python3",
+              "run.py"
+            ],
+            "cwd": ".",
+            "exit_status": 0,
+            "expect": null,
+            "kind": "run",
+            "output": null,
+            "output_cut": false,
+            "shows": "Shows the tool exiting 0 having printed nothing."
+          },
+          "severity": "major",
+          "test_first": "tests/test_engine.py: call helper(3) and assert it returns 5.",
+          "unsettled": null,
+          "what_is_wrong_here": null
+        }
+      ],
+      "status": "established",
+      "what_goes_wrong": "main returns 0 whether or not it did anything, so a caller cannot see a failure."
+    },
+    {
+      "account": "synthesis",
+      "fix": "State what helper returns.",
+      "heading": "The guide describes the engine without the helper's doubling, so a reader trusts it.",
+      "id": "D7",
+      "related": [],
+      "severity": "minor",
+      "sites": [
+        {
+          "file": "docs/guide.md",
+          "fix_size": "1 line",
+          "id": "S7",
+          "line_end": 3,
+          "line_start": 3,
+          "note": null,
+          "outcome": "established",
+          "reproduction": null,
+          "severity": "minor",
+          "test_first": "tests/test_engine.py: call helper(3) and assert it returns 5.",
+          "unsettled": null,
+          "what_is_wrong_here": null
+        }
+      ],
+      "status": "established",
+      "what_goes_wrong": "The guide says nothing of what helper returns, so a reader trusts the wrong total."
+    },
+    {
+      "account": "synthesis",
+      "fix": "Refuse a non-number with a message before the addition.",
+      "heading": "A string passed to core raises instead of being refused with a message.",
+      "id": "D1",
+      "related": [
+        "D2"
+      ],
+      "severity": "major",
+      "sites": [
+        {
+          "file": "engine/core.py",
+          "fix_size": "small",
+          "id": "S1",
+          "line_end": 2,
+          "line_start": 1,
+          "note": null,
+          "outcome": "unresolved",
+          "reproduction": null,
+          "severity": "major",
+          "test_first": null,
+          "unsettled": {
+            "accounts": [
+              "Whether a string can reach core is not visible here."
+            ],
+            "label": "Needs a file outside the reviewed scope",
+            "needs_files": [],
+            "reason": "needs_a_file_outside_the_scope",
+            "what_to_do": "Read the files it needs and confirm the claim before changing anything."
+          },
+          "what_is_wrong_here": null
+        }
+      ],
+      "status": "unresolved",
+      "what_goes_wrong": "core adds to x before anything checks x is a number, so a string raises."
+    },
+    {
+      "account": "synthesis",
+      "fix": "Return a value derived from the call.",
+      "heading": "util returns a constant string, so callers cannot tell two calls apart.",
+      "id": "D3",
+      "related": [],
+      "severity": "minor",
+      "sites": [
+        {
+          "file": "engine/util.py",
+          "fix_size": "small",
+          "id": "S3",
+          "line_end": 2,
+          "line_start": 1,
+          "note": null,
+          "outcome": "unresolved",
+          "reproduction": null,
+          "severity": "minor",
+          "test_first": null,
+          "unsettled": {
+            "accounts": [
+              "Could not run it here."
+            ],
+            "label": "Needs a run",
+            "needs_files": [],
+            "reason": "needs_a_run",
+            "what_to_do": "Run the reproduction, or write the test, and confirm the failure before changing anything."
+          },
+          "what_is_wrong_here": null
+        }
+      ],
+      "status": "unresolved",
+      "what_goes_wrong": "util returns one constant whatever it is asked, so no caller can tell two calls apart."
+    }
+  ],
+  "guide": [
+    "A defect (`D1`, `D2`, \u2026) is one mistake. Its sites (`S1`, `S2`, \u2026) are the places it has to be fixed: code, documents, tests. A defect is fixed when every one of its sites is.",
+    "`established`: the review's check upheld the site, by running code or by reading it.",
+    "`unresolved`: nothing settled the site. Confirm it before changing anything; the site says what stopped the review.",
+    "Write the test that should fail first before the fix, and see it fail.",
+    "A heading, *What goes wrong*, *Fix* and a site's note are one agent's reading of the run, and nothing checked them. Where a fix names an order, follow it.",
+    "Established defects come first, then unresolved; within each, most severe first, then fewest sites. Refuted sites and defects are left out: there is nothing to fix at them."
+  ],
+  "setup": {
+    "commit": {
+      "commit": "",
+      "committed": "",
+      "dirty": null,
+      "state": "not-a-repository"
+    },
+    "probe": {
+      "build": {
+        "answer": "yes",
+        "argv": [
+          "python3",
+          "-m",
+          "compileall",
+          "-q",
+          "."
+        ],
+        "cwd": ".",
+        "exit_status": 0
+      },
+      "reason": null,
+      "state": "complete",
+      "summary": "Compiles; the suite runs and its one test fails to import.",
+      "tests": {
+        "answer": "yes",
+        "argv": [
+          "python3",
+          "-m",
+          "unittest",
+          "discover"
+        ],
+        "cwd": ".",
+        "exit_status": 1
+      }
+    }
+  },
+  "tests_to_write": [
+    {
+      "heading": "A negative multiplier is never exercised.",
+      "id": "D5",
+      "sites": [
+        {
+          "check_found": "No test constructs a negative y.",
+          "file": "engine/core.py",
+          "id": "S5",
+          "line_end": 6,
+          "line_start": 5,
+          "no_test_constructs": "helper distinguishes y below zero and no test constructs one.",
+          "outcome": "established",
+          "proposed": "Add a case in tests/test_engine.py with y = -1.",
+          "test_class": "tests/test_engine.py",
+          "test_first": "tests/test_engine.py: call helper(3) and assert it returns 5.",
+          "uncovered": "A negative multiplier is never exercised.",
+          "unsettled": null
+        }
+      ],
+      "status": "established"
+    }
+  ]
+}
