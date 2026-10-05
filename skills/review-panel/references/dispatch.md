@@ -8,7 +8,7 @@ to run a review: read it to write the adapter config, and to answer a run that s
 The driver names no product anywhere. Each lane's command line arrives as **data** and the
 driver only renders and runs it, so the same run works under any runtime whose CLI can be
 spelled here. Permission is per unit rather than per lane — readers, clusterers and the
-merge and its check read, while verifiers, the synthesis unit and the capability probe run
+merge and its check read, while verifiers, the synthesis batches and the capability probe run
 builds and reproductions and write — so each lane declares two commands.
 
 ```json
@@ -89,6 +89,17 @@ seconds and the lane pauses having read nothing.
   to change**, so what counts as one lives here and never in the code. Declaring none is a
   valid answer: every failure is then the worker's until two of them explain nothing, which
   pauses the account anyway.
+- `limits` sizes the units of verification, clustering and synthesis when each is planned.
+  It takes `verification`, `clustering` and `synthesis`, each with `input_bytes` and
+  `reply_bytes` (synthesis also `index_bytes`), and what it leaves out keeps the engine's
+  default. `hard`, with `input_bytes` and `reply_bytes`, is the size this lane's model is
+  known to take: a planning value above it is lowered to it, an item over it is listed and
+  never dispatched, and the report names the stage that did not do it. The driver writes the merged values into the run as
+  `limits.json`; a resume may change them, and only units planned afterwards follow. The
+  merge and its check keep their own limits. The synthesis rounds after the batches run on
+  the first lane under its `synthesis` limits, and a summary may run to a third of
+  `input_bytes`: limits too small to hold two summaries in a unit stop the reduction, and
+  the report says the overview is incomplete.
 - Each mode object takes `command` and `permission`, and optionally `result_mode`
   (default `stream-transcript`), `idle` (900 s) and `deadline` (3600 s). An hour is not
   generous: a reader on a slower model can take more than half of one.
@@ -211,3 +222,23 @@ unit that did not raise it. The driver stops at the first round boundary where n
 left that could change it, so the rounds that could not have rescued it are not spawned. It
 is not resumable: those units are already answered by an error. Read `dispatch/<unit>/` for
 what each attempt did, put that right, and plan a new run.
+
+A run whose **synthesis** fell short — a batch that never came back, which the report's
+appendix says — keeps everything else it found. Write the synthesis again as a later
+generation, without reviewing anything again:
+
+```
+review_panel_run.py resynthesize <rundir> --adapter <config> [--max-hours <h>]
+```
+
+- It takes a run at `reported`, a v2026.10.0 run directory included, and leaves the marker
+  there, so `run` on the directory still finds it finished. It takes the same supervisor
+  options as a run.
+- It writes `limits.json` from the adapter config before planning, so lower synthesis
+  limits there plan smaller batches. The adapter may differ from the run's; the report
+  credits the write-ups to the lanes they ran on and every other stage to the run's.
+- The generation has its own budget (`budget-g<n>.json`) and its own pin
+  (`adapter-pin-g<n>.json`); a stale drain request is cleared at start, as for a run.
+- Run it again on a generation it left unpublished — drained, out of budget, killed — and it
+  carries that generation on, keeping every landed unit; with a different adapter it is
+  refused, naming the pin. `status` shows the published generation and the one being built.

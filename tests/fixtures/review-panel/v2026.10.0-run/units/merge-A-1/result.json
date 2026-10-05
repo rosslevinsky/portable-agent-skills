@@ -1,0 +1,1 @@
+{"groups": [{"sites": ["S1", "S2"], "mechanism": "An empty input is indexed before it is checked; check it first.", "instances": [{"site": "S1", "instance": "core indexes the last row of an empty list."}, {"site": "S2", "instance": "run.py indexes an argument list that is empty."}], "reason_kept_apart": null}], "compound": [], "summary": "grouped by mechanism"}

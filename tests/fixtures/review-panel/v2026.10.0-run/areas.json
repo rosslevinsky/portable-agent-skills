@@ -1,0 +1,56 @@
+{
+  "areas": [
+    {
+      "also_read": [],
+      "audit_bytes": 165,
+      "audit_lines": 13,
+      "audit_oversize": false,
+      "audited": true,
+      "bytes": 361,
+      "files": [
+        "README.md",
+        "docs/guide.md",
+        "engine/core.py",
+        "engine/sub/deep.py",
+        "engine/util.py",
+        "run.py",
+        "tests/test_engine.py",
+        "vendor/lib.py"
+      ],
+      "id": "area-01",
+      "lenses": [
+        "bottom-up from the code",
+        "top-down from the contract"
+      ],
+      "lines": 24,
+      "oversize": false,
+      "part": null,
+      "subject": null,
+      "tested": [
+        {
+          "path": "engine/core.py",
+          "tests": [
+            {
+              "how": "mention",
+              "test": "tests/test_engine.py"
+            }
+          ]
+        },
+        {
+          "path": "run.py",
+          "tests": [
+            {
+              "how": "mention",
+              "test": "tests/test_engine.py"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "ceiling": {
+    "bytes": 204800,
+    "lines": 2000
+  },
+  "partition": "file"
+}

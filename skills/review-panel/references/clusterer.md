@@ -65,6 +65,10 @@ empty. A reply that drops an id, repeats one, or names one the payload does not 
 refused whole, and the area is then reported with no merging at all rather than with your
 grouping partly applied.
 
+An area too large for one unit is split by file, so your payload may be one part of an
+area. A site cannot span parts, so in a part a cluster never holds candidates from two
+files: one that does is refused whole, like a broken partition.
+
 ## How to answer
 
 End your reply with one JSON object valid against the schema in this payload's

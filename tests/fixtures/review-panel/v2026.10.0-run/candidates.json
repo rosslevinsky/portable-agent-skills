@@ -1,0 +1,191 @@
+{
+  "candidates": [
+    {
+      "area": "area-01",
+      "failure": "An empty list reaches the loop and the index on the last line raises.",
+      "file": "engine/core.py",
+      "id": "cand-001",
+      "line_end": 3,
+      "line_start": 2,
+      "quote_check": "differs",
+      "raised_by": [
+        {
+          "area": "area-01",
+          "consequence": "A run over an empty input stops with a traceback instead of finishing.",
+          "direction": "Guard the empty case before indexing.",
+          "fix_size": "1 line",
+          "kind": "reader",
+          "lane": "A",
+          "lens": "bottom-up from the code",
+          "quote": "for row in rows:\n    return rows[-1]",
+          "reproduction": null,
+          "severity": "major",
+          "unit": "area-01-A1"
+        }
+      ]
+    },
+    {
+      "area": "area-01",
+      "failure": "An empty list reaches the loop and the index on the last line raises.",
+      "file": "engine/core.py",
+      "id": "cand-002",
+      "line_end": 3,
+      "line_start": 2,
+      "quote_check": "differs",
+      "raised_by": [
+        {
+          "area": "area-01",
+          "consequence": "A run over an empty input stops with a traceback instead of finishing.",
+          "direction": "Guard the empty case before indexing.",
+          "fix_size": "1 line",
+          "kind": "reader",
+          "lane": "B",
+          "lens": "top-down from the contract",
+          "quote": "for row in rows:\n    return rows[-1]",
+          "reproduction": null,
+          "severity": "major",
+          "unit": "area-01-B1"
+        }
+      ]
+    },
+    {
+      "area": "area-01",
+      "failure": "run.py exits 1 on an empty argv.",
+      "file": "engine/core.py",
+      "id": "cand-003",
+      "line_end": 5,
+      "line_start": 5,
+      "quote_check": "differs",
+      "raised_by": [
+        {
+          "area": "area-01",
+          "consequence": "A run over an empty input stops with a traceback instead of finishing.",
+          "direction": "Guard the empty case before indexing.",
+          "fix_size": "1 line",
+          "kind": "reader",
+          "lane": "A",
+          "lens": "bottom-up from the code",
+          "quote": "for row in rows:\n    return rows[-1]",
+          "reproduction": {
+            "argv": [
+              "python3",
+              "run.py"
+            ],
+            "cwd": ".",
+            "expect": "IndexError on stderr, exit 1"
+          },
+          "severity": "major",
+          "unit": "area-01-A1"
+        }
+      ]
+    },
+    {
+      "area": "area-01",
+      "failure": "helper doubles a None.",
+      "file": "engine/core.py",
+      "id": "cand-004",
+      "line_end": 8,
+      "line_start": 8,
+      "quote_check": "unreadable",
+      "raised_by": [
+        {
+          "area": "area-01",
+          "consequence": "A run over an empty input stops with a traceback instead of finishing.",
+          "direction": "Guard the empty case before indexing.",
+          "fix_size": "1 line",
+          "kind": "reader",
+          "lane": "B",
+          "lens": "top-down from the contract",
+          "quote": "for row in rows:\n    return rows[-1]",
+          "reproduction": null,
+          "severity": "minor",
+          "unit": "area-01-B1"
+        }
+      ]
+    }
+  ],
+  "probe": {
+    "build": {
+      "answer": "yes",
+      "argv": [
+        "python3",
+        "-m",
+        "compileall",
+        "-q",
+        "."
+      ],
+      "cwd": ".",
+      "exit_status": 0,
+      "output": "",
+      "truncated": false
+    },
+    "reason": null,
+    "state": "complete",
+    "summary": "Compiles; the suite runs and one test fails.",
+    "tests": {
+      "answer": "yes",
+      "argv": [
+        "python3",
+        "-m",
+        "unittest",
+        "discover"
+      ],
+      "cwd": ".",
+      "exit_status": 1,
+      "output": "FAILED (failures=1)\n",
+      "truncated": false
+    },
+    "unit": "probe-A"
+  },
+  "stage": "routed",
+  "units": [
+    {
+      "area": "area-01",
+      "dropped": 0,
+      "findings": 2,
+      "id": "area-01-A1",
+      "kind": "reader",
+      "lane": "A",
+      "lens": "bottom-up from the code",
+      "reason": null,
+      "rejected": [],
+      "state": "complete"
+    },
+    {
+      "area": "area-01",
+      "dropped": 0,
+      "findings": 2,
+      "id": "area-01-B1",
+      "kind": "reader",
+      "lane": "B",
+      "lens": "top-down from the contract",
+      "reason": null,
+      "rejected": [],
+      "state": "complete"
+    },
+    {
+      "area": "area-01",
+      "dropped": 0,
+      "findings": 0,
+      "id": "audit-area-01-A",
+      "kind": "auditor",
+      "lane": "A",
+      "lens": null,
+      "reason": null,
+      "rejected": [],
+      "state": "complete"
+    },
+    {
+      "area": "area-01",
+      "dropped": 0,
+      "findings": 0,
+      "id": "audit-area-01-B",
+      "kind": "auditor",
+      "lane": "B",
+      "lens": null,
+      "reason": "error.txt: the reply was not a JSON object",
+      "rejected": [],
+      "state": "failed"
+    }
+  ]
+}

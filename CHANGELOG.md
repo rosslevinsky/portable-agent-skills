@@ -8,6 +8,58 @@ Versions use [Calendar Versioning](https://calver.org/) in the form
 A MICRO bump in the same month indicates a follow-up release; a new month
 starts from `.0` again.
 
+## [2026.10.1] - 2026-10-05
+
+### Added
+
+- **`/review-panel` writes up a run of hundreds of defects in full.** The write-up round
+  used to hand one worker every defect in the run at once, and on a run of a few hundred
+  defects that worker could return nothing, leaving the report without write-ups or
+  sections. The rounds that check findings, group them and write them up now size each unit
+  when they plan it, splitting the work so a unit stays within its limits. The limits have
+  defaults and can be set per lane for each of those three rounds in the adapter config;
+  the merge rounds keep their own fixed limits. One finding's file or one defect is never
+  split, so an item larger than the limits on its own is still sent alone. A lane can also
+  be given a hard limit. A finding to check goes only to the lane that did not raise it, so
+  over that lane's hard limit it is not sent; work to group or write up goes to a lane whose
+  hard limit takes it, and is not sent only when it is over every lane's. Either way the
+  report says what was not done for it.
+- **Write-ups come in batches, under headings in the project's own words, with an
+  overview.** Defects are written up a folder at a time. Each batch names the sections its
+  defects belong under, and a later step merges names that mean the same thing into one
+  list for the report, and the report prints an overview of the whole run. A batch that
+  fails costs only its own defects their write-ups, and the report says which defects were
+  not written up and why.
+- **`review_panel_run.py resynthesize <rundir> --adapter <config>` writes a finished run's
+  write-ups again.** It starts from the findings the run already read, checked and grouped,
+  and runs only the write-up rounds again; those workers still read the code as they write.
+  Use it when a run's write-ups came back empty or partial — runs made by 2026.10.0 included
+  — after lowering the sizes in the adapter config if a unit was too large. It has a time
+  budget of its own, picks up where it stopped if interrupted, and replaces the report only
+  once the new one is complete.
+- **The run says how much work each round is.** The preview before a run starts says how
+  many units the first round runs, each later round says how many it planned, and `status`
+  counts the units of each kind.
+
+### Changed
+
+- **A `/review-panel` run started with 2026.10.0 has to finish on 2026.10.0.** This version
+  refuses to resume such a run before its report is written, and says so. Once that run's
+  report exists, `resynthesize` from this version can write its write-ups again.
+- **Links between defects follow a new rule in a new write-up.** A write-up's link to
+  another defect is kept when the two share a file or were written up in the same batch;
+  sharing a section heading alone no longer keeps it. Reports written by 2026.10.0 re-render with
+  their links as they were.
+- **The write-up part of `findings.json` has a new shape for runs written by this version.**
+  It lists the write-up units, and the overview, instead of one unit and a run-wide summary;
+  and a write-up worker's reply no longer carries a summary of its own. Anything that reads
+  `findings.json` with its own tools needs updating for new runs, and for a 2026.10.0 run
+  once `resynthesize` has written it again; a 2026.10.0 run left as it is keeps its old
+  shape.
+- **Grouping a large area splits it by file, and a group never spans two files there.** In
+  an area too large for one unit, findings are grouped one part at a time, and a reply that
+  puts findings from two files in one group is refused for that part.
+
 ## [2026.10.0] - 2026-10-04
 
 ### Changed
@@ -870,6 +922,7 @@ release](README.md#installing-a-previous-release) to return to it.
 
 Initial release.
 
+[2026.10.1]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.10.1
 [2026.10.0]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.10.0
 [2026.09.8]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.8
 [2026.09.7]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.7

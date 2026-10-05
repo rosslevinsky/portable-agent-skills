@@ -13,8 +13,8 @@ Four pieces, each owning one thing.
 - **The driver, `review_panel_run.py`** — the loop and **every worker spawn**: bootstrap, the
   run lock, the attempt protocol, landing a reply, resume, providers, storage headroom, and
   the disposable working copies. It imports the engine and calls its stages **in-process**, so
-  no stage outlives the process that owns the run. Its command surface is four verbs — `run`,
-  `status`, `resolve-attempt`, `resolve-unit` — and `run` is filled in when the first
+  no stage outlives the process that owns the run. Its command surface is five verbs — `run`,
+  `resynthesize`, `status`, `resolve-attempt`, `resolve-unit` — and `run` is filled in when the first
   argument is none of them.
 - **The engine, `review_panel.py`** — stage logic, and **it never spawns a worker**: `plan`,
   `route`, `cluster`, `merge`, `merge-check`, `synthesize`, `report`, plus `check` for parsing one reply. It does run
@@ -69,7 +69,7 @@ still a committed round.
 | `clustered` | the clustering round, then `merge` |
 | `merged` | the merge round, then `merge-check` |
 | `merge-checked` | the merge check, then `synthesize` |
-| `synthesized` | the synthesis round, then `report` |
+| `synthesized` | the synthesis rounds, then `report` |
 | `reported` | nothing: the run is finished |
 
 That table is the driver's `ROUNDS`, which maps each marker to the unit kinds its round
@@ -86,6 +86,39 @@ commits its marker. Defect ids are assigned from the grouping the check accepted
 grouping is positional state like a clustering: a redo from clustering or routing removes
 both rounds' units, and a synthesis or check planned against another grouping is refused by
 name rather than rendered.
+
+**`synthesized` holds several rounds under one marker.** `synthesize` plans the batches at
+`merge-checked`, and at `synthesized` it plans the next round from what the last one landed:
+the tier-name round, which merges the names the batches gave their tiers, then the tier
+summaries, then the overview. The tier names and each summary reduce level by level when one
+unit cannot hold them. The driver calls `synthesize` while `synthesis_needs_round` says a
+round is still to plan, and `report` once none is; it counts a round the listing newly commits
+as progress, since none moves the marker. Each round is recorded as
+`rounds/synthesis-g<n>-<r>.json` after its units and before `units.json`, which commits it. A
+record the listing does not commit is taken back on the next call, and a round whose earlier
+results changed since it was planned is refused by name. The later rounds run on the first
+lane, read no file of the tree, and are not write-capable.
+
+**A reported run can be synthesized again, as a later generation.** `synthesize
+--new-generation` plans generation n at `reported`, under ids carrying `-g<n>` after `synth`,
+and leaves the marker there; plain `synthesize` carries its rounds as above. Which generation
+is published and which is being built are derived, never stored: generation 1 is published
+once the run is reported, a later one once its `publish-g<n>.json` has taken its last step,
+and the building one is the highest planned above the published. Round planning,
+`synthesis_needs_round`, the driver's choice of units and the staged report take the
+building generation; the published report and `--rerender` take the published one. A new
+generation is refused while one is unpublished.
+
+`report` publishes a later generation as one recoverable transaction. It needs the
+generation's `dispatch-g<n>.json` (the lanes its synthesis ran on; the run's rung stays
+`dispatch.json`'s), renders every output into `staging-g<n>/`, then writes
+`publish-g<n>.json`, which lists the steps: each file replaced, the old `fix-brief/` moved
+aside into the staging directory, the new one moved in, the old one deleted, the staging
+directory removed, and the stamp rewritten last. The record is never changed; which steps
+are done is read off the disk, so a resumed `report` takes the rest. A directory is never
+renamed over another. Until the stamp step, every reader of publication — `published_report`
+included — refuses with the run named as publishing. A redo takes back every generation with
+its rounds, publication records, staging directories and per-generation driver records.
 
 **`ROUTED_STAGE` is an eighth constant and not an eighth stage**, which is worth knowing
 before it misleads you. `"routed"` is written into `candidates.json` and never into
@@ -135,6 +168,28 @@ the stamp carries the timestamp the report was generated with. Fewer than three 
 the stamp is an interrupted publication and is reclaimed like anything else. And `plan`
 refuses a run directory holding anything but the job file it was given, by name, before there
 is any marker to consult.
+
+**Two records beside the listing say how a run is planned.** `plan` writes
+`run-format.json` before `units.json`; a directory without it was planned by v2026.10.0 or
+earlier, and the driver refuses to resume one before `reported`. The driver writes
+`limits.json` after `plan` and before the rename that publishes the run directory, as it does
+the job notes, and rewrites it on a resume when the adapter's limits changed. It holds each
+lane's planning ceilings for verification, clustering and synthesis, the engine's defaults
+under the lane's own, and the lane's hard ceiling where one is stated. The engine reads limits
+from that file alone and uses its defaults when it is absent; the merge rounds keep their own
+constants. Limits are not part of the adapter pin, because a unit records the limits it was
+planned under, so a rewrite reaches only what is planned after it.
+
+Units are sized by `pack_items`: the payload's measured bytes, a reply estimated from the
+nested entries it must hold, and folders taken whole while they fit, as `plan_merge` does. A
+unit whose lane is fixed before packing is held to that lane's limits, and one assigned a lane
+afterwards to the smallest of the lanes it could go to. Each planning limit is lowered to the
+hard ceiling where that is smaller, so no dispatched unit is over it. An item is never split:
+one over the planning ceiling goes alone, flagged `oversize`, and one over the hard ceiling is
+listed with `dispatch: false`, which the driver counts finished and never sends. Where the
+lane is assigned afterwards, an item over the smallest hard ceiling goes alone to a lane whose
+own ceiling takes it, recording that lane's limits, and is listed undispatched only when no
+lane takes it.
 
 Two vocabularies of the driver's sit beside the marker, both on disk.
 

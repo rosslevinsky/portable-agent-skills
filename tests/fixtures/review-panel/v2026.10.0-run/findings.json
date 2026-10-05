@@ -1,0 +1,590 @@
+{
+  "candidates": [
+    {
+      "answered": true,
+      "area": "area-01",
+      "asks": "defect",
+      "axis_a": "both",
+      "axis_b": "by reading",
+      "consequence": "A run over an empty input stops with a traceback instead of finishing.",
+      "covered_by": null,
+      "defect": "D1",
+      "direction": "Guard the empty case before indexing.",
+      "evidence": null,
+      "failure": "An empty list reaches the loop and the index on the last line raises.",
+      "file": "engine/core.py",
+      "fix_size": "1 line",
+      "id": "cand-001",
+      "line_end": 3,
+      "line_start": 2,
+      "needs_files": [],
+      "quote_check": "differs",
+      "raised_by": [
+        {
+          "area": "area-01",
+          "kind": "reader",
+          "lane": "A",
+          "lens": "bottom-up from the code",
+          "quote": "for row in rows:\n    return rows[-1]",
+          "reproduction": null,
+          "severity": "major",
+          "unit": "area-01-A1"
+        }
+      ],
+      "rationale": "Lines 2-3 index without a guard.",
+      "revision": null,
+      "severity_final": "major",
+      "severity_proposed": "major",
+      "siblings": 1,
+      "site": "S1",
+      "snippet": {
+        "cites_from": 2,
+        "cites_to": 3,
+        "first_line": 1,
+        "lines": [
+          "def core(x):",
+          "    return x + 1",
+          "",
+          "",
+          "def helper(y):"
+        ],
+        "truncated": false
+      },
+      "status": "confirmed_by_reading",
+      "test_first": "tests/test_engine.py: call it with an empty list and assert it returns None.",
+      "unresolved_reason": null,
+      "verified_by": {
+        "lane": "B",
+        "unit": "verify-area-01-A"
+      }
+    },
+    {
+      "answered": true,
+      "area": "area-01",
+      "asks": "defect",
+      "axis_a": "both",
+      "axis_b": "by reading",
+      "consequence": "A run over an empty input stops with a traceback instead of finishing.",
+      "covered_by": null,
+      "defect": "D1",
+      "direction": "Guard the empty case before indexing.",
+      "evidence": null,
+      "failure": "An empty list reaches the loop and the index on the last line raises.",
+      "file": "engine/core.py",
+      "fix_size": "1 line",
+      "id": "cand-002",
+      "line_end": 3,
+      "line_start": 2,
+      "needs_files": [],
+      "quote_check": "differs",
+      "raised_by": [
+        {
+          "area": "area-01",
+          "kind": "reader",
+          "lane": "B",
+          "lens": "top-down from the contract",
+          "quote": "for row in rows:\n    return rows[-1]",
+          "reproduction": null,
+          "severity": "major",
+          "unit": "area-01-B1"
+        }
+      ],
+      "rationale": "Lines 2-3 index without a guard.",
+      "revision": null,
+      "severity_final": "major",
+      "severity_proposed": "major",
+      "siblings": 1,
+      "site": "S1",
+      "snippet": {
+        "cites_from": 2,
+        "cites_to": 3,
+        "first_line": 1,
+        "lines": [
+          "def core(x):",
+          "    return x + 1",
+          "",
+          "",
+          "def helper(y):"
+        ],
+        "truncated": false
+      },
+      "status": "confirmed_by_reading",
+      "test_first": "tests/test_engine.py: call it with an empty list and assert it returns None.",
+      "unresolved_reason": null,
+      "verified_by": {
+        "lane": "A",
+        "unit": "verify-area-01-B"
+      }
+    },
+    {
+      "answered": true,
+      "area": "area-01",
+      "asks": "defect",
+      "axis_a": "one",
+      "axis_b": "by running",
+      "consequence": "A run over an empty input stops with a traceback instead of finishing.",
+      "covered_by": null,
+      "defect": "D1",
+      "direction": "Guard the empty case before indexing.",
+      "evidence": {
+        "argv": [
+          "python3",
+          "run.py"
+        ],
+        "cwd": ".",
+        "exit_status": 1,
+        "output": "Traceback ...\nIndexError: list index out of range\n",
+        "run_kind": "executed",
+        "shows": "Shows the call raising IndexError on an empty argument list.",
+        "truncated": false
+      },
+      "failure": "run.py exits 1 on an empty argv.",
+      "file": "engine/core.py",
+      "fix_size": "1 line",
+      "id": "cand-003",
+      "line_end": 5,
+      "line_start": 5,
+      "needs_files": [],
+      "quote_check": "differs",
+      "raised_by": [
+        {
+          "area": "area-01",
+          "kind": "reader",
+          "lane": "A",
+          "lens": "bottom-up from the code",
+          "quote": "for row in rows:\n    return rows[-1]",
+          "reproduction": {
+            "argv": [
+              "python3",
+              "run.py"
+            ],
+            "cwd": ".",
+            "expect": "IndexError on stderr, exit 1"
+          },
+          "severity": "major",
+          "unit": "area-01-A1"
+        }
+      ],
+      "rationale": "The run raised as claimed.",
+      "revision": {
+        "rationale": "Every invocation hits it.",
+        "severity": "blocker"
+      },
+      "severity_final": "blocker",
+      "severity_proposed": "major",
+      "siblings": 0,
+      "site": "S2",
+      "snippet": {
+        "cites_from": 5,
+        "cites_to": 5,
+        "first_line": 3,
+        "lines": [
+          "",
+          "",
+          "def helper(y):",
+          "    return y * 2"
+        ],
+        "truncated": false
+      },
+      "status": "reproduced",
+      "test_first": "tests/test_engine.py: call it with an empty list and assert it returns None.",
+      "unresolved_reason": null,
+      "verified_by": {
+        "lane": "B",
+        "unit": "verify-area-01-A"
+      }
+    },
+    {
+      "answered": true,
+      "area": "area-01",
+      "asks": "defect",
+      "axis_a": "one",
+      "axis_b": "by reading",
+      "consequence": "A run over an empty input stops with a traceback instead of finishing.",
+      "covered_by": null,
+      "defect": "D2",
+      "direction": "Guard the empty case before indexing.",
+      "evidence": null,
+      "failure": "helper doubles a None.",
+      "file": "engine/core.py",
+      "fix_size": "1 line",
+      "id": "cand-004",
+      "line_end": 8,
+      "line_start": 8,
+      "needs_files": [],
+      "quote_check": "unreadable",
+      "raised_by": [
+        {
+          "area": "area-01",
+          "kind": "reader",
+          "lane": "B",
+          "lens": "top-down from the contract",
+          "quote": "for row in rows:\n    return rows[-1]",
+          "reproduction": null,
+          "severity": "minor",
+          "unit": "area-01-B1"
+        }
+      ],
+      "rationale": "helper doubles a None it is given.",
+      "revision": null,
+      "severity_final": "minor",
+      "severity_proposed": "minor",
+      "siblings": 0,
+      "site": "S3",
+      "snippet": null,
+      "status": "confirmed_by_reading",
+      "test_first": "tests/test_engine.py: call it with an empty list and assert it returns None.",
+      "unresolved_reason": null,
+      "verified_by": {
+        "lane": "A",
+        "unit": "verify-area-01-B"
+      }
+    }
+  ],
+  "clustering": [
+    {
+      "area": "area-01",
+      "asks": "defect",
+      "listed": true,
+      "reason": null,
+      "state": "complete",
+      "summary": "Three defects; the first was reported by both readers.",
+      "unit": "cluster-area-01"
+    }
+  ],
+  "commit": {
+    "commit": "",
+    "committed": "",
+    "dirty": null,
+    "state": "not-a-repository"
+  },
+  "coverage": [],
+  "coverage_defects": [],
+  "coverage_sites": [],
+  "defects": [
+    {
+      "areas": [
+        "area-01"
+      ],
+      "asks": "defect",
+      "axis_a": "one",
+      "axis_b": null,
+      "consequence": "A run over an empty input stops with a traceback instead of finishing.",
+      "corroborated_sites": 1,
+      "cross_references": [],
+      "dropped_cross_references": [],
+      "file": "engine/core.py",
+      "fix": "Check for an empty input before indexing, at both sites.",
+      "fix_size": "1 line",
+      "heading": "An empty input stops the run with a traceback.",
+      "id": "D1",
+      "instances": [
+        {
+          "instance": "core indexes the last row of an empty list.",
+          "site": "S1"
+        },
+        {
+          "instance": "run.py indexes an argument list that is empty.",
+          "site": "S2"
+        }
+      ],
+      "line_end": 3,
+      "line_start": 2,
+      "mechanism": "An empty input is indexed before it is checked; check it first.",
+      "members": [
+        "cand-001",
+        "cand-002",
+        "cand-003"
+      ],
+      "outcomes": {
+        "established": 2,
+        "refuted": 0,
+        "unresolved": 0
+      },
+      "severity": "blocker",
+      "severity_site": "S2",
+      "site_notes": {
+        "S2": "Here the empty input is the argument list, at start-up."
+      },
+      "sites": [
+        "S1",
+        "S2"
+      ],
+      "split_reason": null,
+      "status": "established",
+      "tier": "A run stops instead of finishing",
+      "unresolved_reason": null,
+      "unresolved_reasons": [],
+      "what_goes_wrong": "An empty input is indexed before anything checks it, so the call dies where it should have done nothing."
+    },
+    {
+      "areas": [
+        "area-01"
+      ],
+      "asks": "defect",
+      "axis_a": "one",
+      "axis_b": "by reading",
+      "consequence": "A missing value is doubled and the total comes out wrong.",
+      "corroborated_sites": 0,
+      "cross_references": [],
+      "dropped_cross_references": [],
+      "file": "engine/core.py",
+      "fix": "Skip a missing value.",
+      "fix_size": "1 line",
+      "heading": "A missing value doubles the total.",
+      "id": "D2",
+      "instances": null,
+      "line_end": 8,
+      "line_start": 8,
+      "mechanism": null,
+      "members": [
+        "cand-004"
+      ],
+      "outcomes": {
+        "established": 1,
+        "refuted": 0,
+        "unresolved": 0
+      },
+      "severity": "minor",
+      "severity_site": "S3",
+      "site_notes": {},
+      "sites": [
+        "S3"
+      ],
+      "split_reason": null,
+      "status": "established",
+      "tier": "The total comes out wrong",
+      "unresolved_reason": null,
+      "unresolved_reasons": [],
+      "what_goes_wrong": "A missing value is doubled rather than skipped."
+    }
+  ],
+  "merge": {
+    "batched": true,
+    "units": [
+      {
+        "compound": [],
+        "groups": [
+          {
+            "instances": [
+              {
+                "instance": "core indexes the last row of an empty list.",
+                "site": "S1"
+              },
+              {
+                "instance": "run.py indexes an argument list that is empty.",
+                "site": "S2"
+              }
+            ],
+            "mechanism": "An empty input is indexed before it is checked; check it first.",
+            "reason_kept_apart": null,
+            "sites": [
+              "S1",
+              "S2"
+            ]
+          }
+        ],
+        "reason": null,
+        "sites": [
+          "S1",
+          "S2"
+        ],
+        "state": "complete",
+        "summary": "grouped by mechanism",
+        "unit": "merge-A-1"
+      },
+      {
+        "compound": [],
+        "groups": [
+          {
+            "instances": null,
+            "mechanism": null,
+            "reason_kept_apart": null,
+            "sites": [
+              "S3"
+            ]
+          }
+        ],
+        "reason": null,
+        "sites": [
+          "S3"
+        ],
+        "state": "complete",
+        "summary": "grouped by mechanism",
+        "unit": "merge-A-2"
+      }
+    ]
+  },
+  "merge_check": {
+    "batched": false,
+    "groups": [
+      {
+        "accepted": [
+          "S1",
+          "S2"
+        ],
+        "checked": true,
+        "fix_touches_refuted": {
+          "sites": [],
+          "value": false
+        },
+        "group": "G1",
+        "hidden_claims": [],
+        "instances": [
+          {
+            "instance": "core indexes the last row of an empty list.",
+            "site": "S1"
+          },
+          {
+            "instance": "run.py indexes an argument list that is empty.",
+            "site": "S2"
+          }
+        ],
+        "mechanism": "An empty input is indexed before it is checked; check it first.",
+        "removed": [],
+        "sites": [
+          "S1",
+          "S2"
+        ],
+        "verdicts": [
+          {
+            "reason": "S1 is this mistake.",
+            "site": "S1",
+            "verdict": "fits"
+          },
+          {
+            "reason": "S2 is this mistake.",
+            "site": "S2",
+            "verdict": "fits"
+          }
+        ]
+      }
+    ],
+    "units": [
+      {
+        "groups": [
+          "G1"
+        ],
+        "reason": null,
+        "state": "complete",
+        "summary": "Checked every group against its mechanism.",
+        "unit": "mergecheck-B"
+      }
+    ]
+  },
+  "outside_scope": [],
+  "rung": "two-runtimes",
+  "sites": [
+    {
+      "area": "area-01",
+      "asks": "defect",
+      "axis_a": "both",
+      "axis_b": "by reading",
+      "consequence": "A run over an empty input stops with a traceback instead of finishing.",
+      "defect": "D1",
+      "file": "engine/core.py",
+      "fix_size": "1 line",
+      "grouped": true,
+      "id": "S1",
+      "line_end": 3,
+      "line_start": 2,
+      "members": [
+        "cand-001",
+        "cand-002"
+      ],
+      "severity": "major",
+      "split_reason": null,
+      "status": "established",
+      "test_first": "tests/test_engine.py: call it with an empty list and assert it returns None.",
+      "unresolved_reason": null,
+      "unresolved_reasons": []
+    },
+    {
+      "area": "area-01",
+      "asks": "defect",
+      "axis_a": "one",
+      "axis_b": "by running",
+      "consequence": "Running the tool with no arguments fails instead of printing help.",
+      "defect": "D1",
+      "file": "engine/core.py",
+      "fix_size": "1 line",
+      "grouped": true,
+      "id": "S2",
+      "line_end": 5,
+      "line_start": 5,
+      "members": [
+        "cand-003"
+      ],
+      "severity": "blocker",
+      "split_reason": null,
+      "status": "established",
+      "test_first": "tests/test_engine.py: call it with an empty list and assert it returns None.",
+      "unresolved_reason": null,
+      "unresolved_reasons": []
+    },
+    {
+      "area": "area-01",
+      "asks": "defect",
+      "axis_a": "one",
+      "axis_b": "by reading",
+      "consequence": "A missing value is doubled and the total comes out wrong.",
+      "defect": "D2",
+      "file": "engine/core.py",
+      "fix_size": "1 line",
+      "grouped": true,
+      "id": "S3",
+      "line_end": 8,
+      "line_start": 8,
+      "members": [
+        "cand-004"
+      ],
+      "severity": "minor",
+      "split_reason": null,
+      "status": "established",
+      "test_first": "tests/test_engine.py: call it with an empty list and assert it returns None.",
+      "unresolved_reason": null,
+      "unresolved_reasons": []
+    }
+  ],
+  "synthesis": {
+    "defects": [
+      "D1",
+      "D2"
+    ],
+    "reason": null,
+    "rejected": [],
+    "state": "complete",
+    "summary": "Two tiers; one mistake made at two sites.",
+    "tiers": [
+      "A run stops instead of finishing",
+      "The total comes out wrong"
+    ],
+    "unit": "synth-A"
+  },
+  "verification": [
+    {
+      "asks": "defect",
+      "candidates": 2,
+      "established": 2,
+      "finder": "A",
+      "reason": null,
+      "refuted": 0,
+      "state": "complete",
+      "summary": "read one, ran one",
+      "unit": "verify-area-01-A",
+      "unresolved": 0
+    },
+    {
+      "asks": "defect",
+      "candidates": 2,
+      "established": 2,
+      "finder": "B",
+      "reason": null,
+      "refuted": 0,
+      "state": "complete",
+      "summary": "read two",
+      "unit": "verify-area-01-B",
+      "unresolved": 0
+    }
+  ]
+}

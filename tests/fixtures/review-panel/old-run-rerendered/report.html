@@ -1,0 +1,741 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Review panel report</title>
+<style>:root { color-scheme: light dark; }
+/* One measure for the whole page: prose and tables alike. A narrow column for prose beside
+   a wide one for tables leaves the text pinned to the left of a half-empty screen, and a
+   table squeezed into a reading measure has to be read sideways. Wide, and the same wide. */
+body { font: 16px/1.55 system-ui, sans-serif; margin: 0 auto; max-width: 72em; padding: 2rem 1rem; }
+/* Worker text and file names have no length a page can rely on. Break inside a long word
+   in a cell, where a column is narrow; let prose wrap on word boundaries as usual. */
+body, h1, h2, h3, h4, td { overflow-wrap: break-word; }
+/* A column heading is a short label and must never be hyphenated down the middle:
+   "Corroboration" broken as "Corrobora/tion" is the table telling the reader it ran out of
+   room. Headings keep their width, the short value columns keep theirs, and the one long
+   column takes whatever is left. */
+th { white-space: nowrap; }
+/* Only a table genuinely wider than the page scrolls, and it scrolls inside its own box
+   rather than widening the document. */
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+th, td { border: 1px solid #8884; padding: 0.35rem 0.5rem; text-align: left; vertical-align: top; }
+/* Short columns stay short so the long one gets the room it needs. */
+td code, th code { white-space: nowrap; }
+pre { background: #7f7f7f1a; border: 1px solid #8883; border-radius: 4px; padding: 0.75rem;
+      overflow-x: auto; white-space: pre-wrap; }
+/* Seven colors, defined for both schemes. The gutter takes tango's decimal-literal green,
+   which is what a pandoc-rendered report gives a line number and reads well against code
+   without competing with it. Unselectable, so copying a snippet does not drag the numbers
+   along with it. */
+.hl-g { color: #40a070; user-select: none; }
+.hl-c { color: #6a7b86; font-style: italic; }
+.hl-k { color: #a4478c; }
+.hl-s { color: #2e7d55; }
+.hl-n { color: #b06000; }
+.hl-t { color: #2b6cb0; }
+.hl-a { color: #8a6d3b; }
+@media (prefers-color-scheme: dark) {
+  .hl-g { color: #5fbf8f; }
+  .hl-c { color: #7d8b99; } .hl-k { color: #d58fc4; } .hl-s { color: #7fc9a0; }
+  .hl-n { color: #e0a052; } .hl-t { color: #7fb3e0; } .hl-a { color: #c9a227; }
+}
+code, pre { font-family: ui-monospace, monospace; font-size: 0.9em; }
+/* An inline name of code is shaded so it reads as a thing and not as a word. A fence
+   carries its own background already, so the spans inside one take none of their own. */
+code { background: #7f7f7f24; border-radius: 3px; padding: 0.08em 0.32em; }
+pre code, pre code span { background: none; padding: 0; }
+blockquote { border-left: 3px solid #8884; margin: 0; padding-left: 1rem; }
+/* The two ways back read as one thing, so they are set as one thing: the link at the end of
+   a defect heading and the one a section heading carries. Set at different sizes, or one
+   faded and the other not, the same gesture would look like two. */
+.back, .toc-jump::after { font-size: 0.7em; font-weight: normal; opacity: 0.6; }
+.back { margin-left: 0.5rem; }
+/* A section heading is a way back to the contents, and it SAYS SO WHETHER OR NOT the pointer
+   is over it — `::after` and not `:hover::after`. Shown only on hover it would be a
+   different thing from the arrow on a defect heading, which is a real element and always
+   there: one gesture that the page advertised in one place and hid in the other, so a reader
+   who never happened to hover would learn that a heading was clickable only by accident. It is also
+   invisible to anyone reading without a pointer at all.
+
+   The arrow is CSS's own escape for U+2191 and the backslash is DOUBLED to reach the
+   stylesheet: in a Python string `91` is an octal escape, which reads as U+0011
+   followed by "91" — so the affordance would say " 91 contents". */
+.toc-jump { cursor: pointer; }
+.toc-jump::after { content: " \2191 Contents"; }
+nav.contents { border: 1px solid #8884; padding: 0.5rem 1rem; margin: 1.5rem 0; scroll-margin-top: 1rem; }
+h2, h3 { scroll-margin-top: 1rem; }
+nav.contents ul { margin: 0.25rem 0; padding-left: 1.25rem; }
+h2 { border-bottom: 1px solid #8884; padding-bottom: 0.2rem; margin-top: 2.5rem; }
+h4 { margin-top: 2rem; }
+/* The title block: the title and the one paragraph directly under it. Centered together,
+   because they are what the page IS rather than the first thing it says — and the subtitle
+   is set smaller for the same reason: when it was made, how many files, at which commit.
+   Selected structurally rather than by a class, so the prose stays prose in report.md and
+   the page needs no markup of its own. Presentation only, and it stops at these two: every
+   heading below is a section of the document and reads from the left like its body. */
+/* The title block: the title and the one paragraph under it sit TOGETHER, then the
+   document starts. The stamp belongs to the title, not to the prose below it, so the gap
+   above it is closed to nothing and the gap below it is the one that separates the block
+   from the body. */
+h1 { text-align: center; margin-bottom: 0.2rem; }
+h1 + p { font-size: 0.85em; opacity: 0.75; text-align: center;
+         margin-top: 0; margin-bottom: 3rem; }
+</style>
+</head>
+<body>
+<h1>Review panel report</h1>
+<p>
+Generated 2026-09-27 22:44:41 UTC · 7 files from a tree that is not a repository
+</p>
+<p>
+review-panel was given this prompt:
+</p>
+<blockquote>
+<p>Find every place the helper's result is wrong, and every document that says so.</p>
+</blockquote>
+<p>
+This run read the 7 files under the job's root as 3 areas from the 3 subjects the job named, under the 2 lenses the job names. The rest of the job is in the appendix, at <a href="#the-job">this link</a>: the root, what was excluded and the instruction each reader was handed, together with the job itself and what it takes to run the same audit again.
+</p>
+<p>
+Those fields were settled before the panel read anything, and not by the panel: either in an interview with whoever asked for the audit, or handed over ready-made as a job file. Nothing in the run directory records which.
+</p>
+<nav class="contents"><p><strong>Contents</strong></p><ul><li><a href="#report-description">1. Report description</a><ul><li><a href="#the-judgment-round-s-overview">The judgment round's overview</a></li><li><a href="#defects-by-tier">Defects by tier</a></li><li><a href="#what-this-report-does-not-tell-you">What this report does not tell you</a></li></ul></li><li><a href="#the-operator-s-notes">2. The operator's notes</a><ul><li><a href="#answers-to-the-owner-s-questions">Answers to the owner's questions</a></li><li><a href="#the-operator-s-corrections">The operator's corrections</a></li><li><a href="#caveats-about-the-whole-run">Caveats about the whole run</a></li></ul></li><li><a href="#index">3. Indices</a><ul><li><a href="#every-defect-most-severe-first">Every defect — most severe first</a></li><li><a href="#by-file">By file</a></li></ul></li><li><a href="#established-defects">4. Established defects (3)</a><ul><li><a href="#a-result-is-wrong">A result is wrong (2)</a></li><li><a href="#the-documents-do-not-say-what-the-code-does">The documents do not say what the code does (1)</a></li></ul></li><li><a href="#unresolved">5. Unresolved (2)</a><ul><li><a href="#needs-a-run-a-result-is-wrong">Needs a run — A result is wrong (1)</a></li><li><a href="#needs-a-file-outside-the-reviewed-scope-a-result-is-wrong">Needs a file outside the reviewed scope — A result is wrong (1)</a></li></ul></li><li><a href="#refuted">6. Refuted (1)</a></li><li><a href="#corroborated-by-both-models">7. Corroborated by both models (2)</a></li><li><a href="#tests-to-write">8. Tests to write (1)</a></li><li><a href="#evidence">9. Evidence (6)</a></li><li><a href="#appendix">10. Appendix</a><ul><li><a href="#coverage-gaps-a-test-already-covers">Coverage gaps a test already covers (0)</a></li><li><a href="#what-each-verification-unit-returned">What each verification unit returned (5)</a></li><li><a href="#what-one-more-file-would-settle">What one more file would settle (0)</a></li><li><a href="#clustering-notes">Clustering notes</a></li><li><a href="#the-synthesis-round">The synthesis round</a></li><li><a href="#what-the-evidence-leaves-out">What the evidence leaves out</a></li><li><a href="#path-legend">Path legend</a></li><li><a href="#how-this-ran">How this ran</a></li><li><a href="#the-job">The job</a></li><li><a href="#coverage">Coverage</a></li><li><a href="#provenance">Provenance</a></li></ul></li></ul></nav>
+<h2 id="report-description">1. Report description</h2>
+<p>
+A panel of agents read this tree in bounded pieces. Whatever one agent raised was sent to another agent that had not raised it, to be checked.
+A <strong>defect</strong> (<code>D1</code>, <code>D2</code>, …) is one mistake. A <strong>site</strong> (<code>S1</code>, <code>S2</code>, …) is one place — a function, a document passage, a test — where that mistake has to be fixed. Every site was read and checked on its own, and keeps its own outcome, severity, test and evidence. Each site's quoted source is shown in its defect's entry; the rest of its evidence is under <a href="#evidence"><strong>Evidence</strong></a>, near the end, under the same number.
+<strong>Established</strong> means a checker that had not raised the claim upheld it. <a href="#unresolved"><strong>Unresolved</strong></a> means nothing settled it, and the group it sits under says what would. <a href="#refuted"><strong>Refuted</strong></a> means a check dismissed it, so there is nothing to do about it; it is listed under <a href="#refuted"><strong>Refuted</strong></a> with the reason. A defect is placed under Established when any of its sites is, and under Refuted only when all of them are.
+The <strong>appendix</strong> at the end is the record of the run rather than the work it found. Nothing in it is needed to fix anything.
+</p>
+<ul>
+<li>This run directory was written before a defect could have several sites, so every site is its own defect and keeps the number the report rendered then gave it: <code>D<n></code> holds <code>S<n></code>.
+</li>
+<li>Defects by placement: 3 established, 1 refuted, 2 unresolved.
+<ul>
+<li>The operator corrected 2 of these: <a href="#D2">D2</a>, <a href="#D6">D6</a>. The counts are the panel's own and stay as they are; the corrections are under <a href="#the-operator-s-notes"><strong>The operator's notes</strong></a>.
+</li>
+</ul>
+</li>
+<li>Sites by outcome: 3 established, 1 refuted, 2 unresolved.
+</li>
+<li>Candidates behind them: 8 — 2 reproduced, 2 confirmed by reading, 2 refuted, 2 unresolved.
+</li>
+<li>Defects: 6 at 6 sites from 8 candidates; every candidate is at exactly one site and every site in exactly one defect.
+</li>
+<li>Coverage gaps: 1 from 1 finding — 1 standing, 0 covered by a test already, 0 unresolved. They are tests to write, not defects, and are counted apart from the line above.
+</li>
+<li>Every line number in this report refers to a tree that is not a repository; <a href="#how-this-ran"><strong>How this ran</strong></a>, in the appendix, names it in full.
+</li>
+<li>Where things are: the defects, each with its account, its sites and the source at each site, are under <a href="#established-defects"><strong>Established defects</strong></a>, <a href="#unresolved"><strong>Unresolved</strong></a> and <a href="#refuted"><strong>Refuted</strong></a>; everything else the review recorded about each site is under <a href="#evidence"><strong>Evidence</strong></a>, by the site's number.
+</li>
+<li>Reading units: 8 — 8 complete, 0 failed, 0 missing.
+</li>
+<li>Verification units: 5 — 5 complete, 0 failed, 0 missing.
+</li>
+<li>Clustering units: 3 — 3 complete, 0 failed, 0 missing.
+</li>
+<li>Rung: two runtimes. Reading units: 8 — 8 complete, 0 failed, 0 missing; 3 of 3 areas read by both models. Candidates: 8 — 6 checked by the other model, 2 left unresolved. Where the lanes disagree, the disagreement is between two different models.
+</li>
+<li>Executability, as a separate unit found it in a disposable copy of the snapshot: this tree builds — yes; its tests run — yes.
+<ul>
+<li>What the probe reported: Compiles; the suite runs and its one test fails to import.
+</li>
+<li><strong>Corrected by the operator</strong>, on whether it builds; see <a href="#the-operator-s-corrections">The operator's corrections</a>.
+</li>
+</ul>
+</li>
+<li>Reproductions: 2 proposed, 2 run — 2 executed. Whether this tree builds and its tests run, how many reproductions were proposed and how many ran are three separate facts, and each is counted on its own.
+</li>
+<li>Reachability: the reviewed set was not compared with the files the repository tracks, so it is unknown whether anything that reaches these defects was left out.
+</li>
+<li>This report names every file by a short name; the <a href="#path-legend"><strong>Path legend</strong></a>, in the appendix, gives each one's full path.
+</li>
+</ul>
+<h3 id="the-judgment-round-s-overview">The judgment round's overview</h3>
+<p>
+One paragraph the judgment round wrote about the run as a whole. It is a reading, and nobody checked it: only the defects it names were verified, each on its own entry below.
+</p>
+<p>
+Two tiers: a wrong result, and documents that do not say what the code does.
+</p>
+<h3 id="defects-by-tier">Defects by tier</h3>
+<p>
+What the run found, grouped by the themes the judgment round named. The table holds counts only; the three views below are the lists to work from.
+</p>
+<div class="scroll"><table><thead><tr><th> Tier </th><th> Blocker </th><th> Major </th><th> Minor </th><th> Nit </th><th> Defects </th></tr></thead><tbody>
+<tr><td> A result is wrong </td><td> 1 </td><td> 2 </td><td> 1 </td><td> 0 </td><td> 4 </td></tr>
+<tr><td> The documents do not say what the code does </td><td> 0 </td><td> 0 </td><td> 2 </td><td> 0 </td><td> 2 </td></tr>
+</tbody></table></div>
+<h3 id="what-this-report-does-not-tell-you">What this report does not tell you</h3>
+<p>
+<strong>What this run covered.</strong> Readers covered all 7 files in scope. 1 more file was excluded by the job or skipped. <a href="#coverage"><strong>Coverage</strong></a>, in the appendix, names them. 2 sites were checked and not settled either way; see <a href="#unresolved"><strong>Unresolved</strong></a>.
+</p>
+<p>
+<strong>What no run can tell you: what it missed.</strong> A panel reports what its readers happened to raise; it does not look for any particular bug, so one in a file it read can still be absent here, and a longer report is not a more complete one. To learn whether a run would catch a bug that matters to you, give it one you already know about and see whether it appears.
+</p>
+<h2 id="the-operator-s-notes">2. The operator's notes</h2>
+<p>
+Written by whoever ran the panel, after the run, with this report, the code and the owner's questions in view. It is their own reading and nothing checked it: only the defects it cites were verified, each on its own entry. The counts in the section above are the panel's, and nothing here changes them.
+</p>
+<h3 id="answers-to-the-owner-s-questions">Answers to the owner's questions</h3>
+<p>
+The job asked:
+</p>
+<blockquote>
+<p>Is the helper's doubling ever right?</p>
+</blockquote>
+<h4>Q1. Is the helper's doubling ever right?</h4>
+<p>
+No. D2 is the doubling, and D7 is the guide that never says so.
+</p>
+<p>
+Cites <a href="#D2">D2</a>, <a href="#D7">D7</a>.
+</p>
+<h3 id="the-operator-s-corrections">The operator's corrections</h3>
+<p>
+Each is the operator's reason for disagreeing with what the panel concluded. The entry it names carries a mark pointing here, and is otherwise as the panel left it.
+</p>
+<ul>
+<li>To <a href="#D2">D2</a>, marked established by the panel: The contract changed last month; doubling was once right.
+</li>
+<li>To <a href="#D6">D6</a>, marked refuted by the panel: The README is shipped, so its claims are the product's.
+</li>
+<li>To the build check's answer on whether this tree builds, which was yes: It built only because nothing here is compiled.
+</li>
+</ul>
+<h3 id="caveats-about-the-whole-run">Caveats about the whole run</h3>
+<ul>
+<li>The tree is a fixture, read as it stands.
+</li>
+</ul>
+<h2 id="index">3. Indices</h2>
+<p>
+One list of defects, with two ways in: by rank or by file.
+</p>
+<h3 id="every-defect-most-severe-first">Every defect — most severe first</h3>
+<p>
+Every defect that needs work, most severe first and, within a severity, cheapest fix first, then fewest sites. So the first rows are the blockers, in the order to take them on.
+</p>
+<p>
+1 refuted defect is not here. Nothing needs doing about it, so it is listed under <a href="#refuted"><strong>Refuted</strong></a>, with the reason it was dismissed.
+</p>
+<div class="scroll"><table><thead><tr><th> Defect </th><th> Heading </th><th> Severity </th><th> Sites </th><th> Fix size </th></tr></thead><tbody>
+<tr><td> <a href="#D2">D2</a> </td><td> Every total built on helper comes out twice as large as the contract says. </td><td> Blocker </td><td> 1 (1 established), <a href="#the-operator-s-corrections">corrected by the operator</a> </td><td> 1 line </td></tr>
+<tr><td> <a href="#D1">D1</a> </td><td> A string passed to core raises instead of being refused with a message. </td><td> Major </td><td> 1 (1 unresolved) </td><td> Small </td></tr>
+<tr><td> <a href="#D4">D4</a> </td><td> The tool exits 0 even when it did nothing. </td><td> Major </td><td> 1 (1 established) </td><td> Medium </td></tr>
+<tr><td> <a href="#D7">D7</a> </td><td> The guide describes the engine without the helper's doubling, so a reader trusts it. </td><td> Minor </td><td> 1 (1 established) </td><td> 1 line </td></tr>
+<tr><td> <a href="#D3">D3</a> </td><td> util returns a constant string, so callers cannot tell two calls apart. </td><td> Minor </td><td> 1 (1 unresolved) </td><td> Small </td></tr>
+</tbody></table></div>
+<h3 id="by-file">By file</h3>
+<p>
+The same defects by file, so one person can take a file and close every site listed under it in one change. Fixing a file fixes those sites; a defect is closed only when all of its sites are.
+</p>
+<div class="scroll"><table><thead><tr><th> File </th><th> Most severe </th><th> Sites (defect) </th></tr></thead><tbody>
+<tr><td> core.py </td><td> Blocker </td><td> <a href="#S1-src">S1</a> (<a href="#D1">D1</a>), <a href="#S2-src">S2</a> (<a href="#D2">D2</a>) </td></tr>
+<tr><td> guide.md </td><td> Minor </td><td> <a href="#S7-src">S7</a> (<a href="#D7">D7</a>) </td></tr>
+<tr><td> run.py </td><td> Major </td><td> <a href="#S4-src">S4</a> (<a href="#D4">D4</a>) </td></tr>
+<tr><td> util.py </td><td> Minor </td><td> <a href="#S3-src">S3</a> (<a href="#D3">D3</a>) </td></tr>
+</tbody></table></div>
+<h2 id="established-defects">4. Established defects (3)</h2>
+<p>
+The <strong>tier</strong> headings below, and each defect's <strong>What goes wrong</strong>, <strong>Fix</strong> and <strong>Related</strong>, are one agent's reading of the defects beneath them. Nothing checked them. Everything else in this report traces to a unit that verified it or to the engine's own records, so read the grouping and those three lines as a proposal and the rest as a finding.
+</p>
+<p>
+Each has at least one site a checker that had not raised it confirmed. Every site keeps its own outcome, so a site nothing settled, or one a check refuted, is shown as that beside the others.
+</p>
+<h3 id="a-result-is-wrong">A result is wrong (2)</h3>
+<h4 id="D2">D2. Every total built on helper comes out twice as large as the contract says. <a class="back" href="#index">↑ Index</a></h4>
+<ul>
+<li id="S2-src"><strong>Site</strong> <a href="#S2">S2</a> · <code>core.py:5-6</code> · <strong>Outcome</strong> established · <strong>Severity</strong> blocker · <strong>Fix size</strong> 1 line
+</li>
+<li><strong>Corrected by the operator.</strong> See <a href="#the-operator-s-corrections">The operator's corrections</a>.
+</li>
+<li><strong>What goes wrong.</strong> helper multiplies by two where the contract adds two, so every total built on it is too large.
+</li>
+<li><strong>Fix.</strong> Return y + 2.
+</li>
+<li><strong>Related.</strong> <a href="#D5">D5</a>
+</li>
+<li><strong>Test that should fail first.</strong> (core.py:5-6) tests/test_engine.py: call helper(3) and assert it returns 5.
+</li>
+<li><strong>Source.</strong>
+<br>core.py:3-6 — 2 lines of context either side; the finding cites 5-6
+<pre><code class="language-python">3 | 
+4 | 
+5 | def helper(y):
+6 |     return y * 2</code></pre>
+</li>
+</ul>
+<h4 id="D4">D4. The tool exits 0 even when it did nothing. <a class="back" href="#index">↑ Index</a></h4>
+<ul>
+<li id="S4-src"><strong>Site</strong> <a href="#S4">S4</a> · <code>run.py:1-2</code> · <strong>Outcome</strong> established · <strong>Severity</strong> major · <strong>Fix size</strong> medium
+</li>
+<li><strong>What goes wrong.</strong> main returns 0 whether or not it did anything, so a caller cannot see a failure.
+</li>
+<li><strong>Fix.</strong> Return non-zero when no work was done.
+</li>
+<li><strong>Test that should fail first.</strong> tests/test_engine.py: call helper(3) and assert it returns 5.
+</li>
+<li><strong>Source.</strong>
+<pre><code class="language-python">1 | def main():
+2 |     return 0</code></pre>
+</li>
+</ul>
+<h3 id="the-documents-do-not-say-what-the-code-does">The documents do not say what the code does (1)</h3>
+<h4 id="D7">D7. The guide describes the engine without the helper's doubling, so a reader trusts it. <a class="back" href="#index">↑ Index</a></h4>
+<ul>
+<li id="S7-src"><strong>Site</strong> <a href="#S7">S7</a> · <code>guide.md:3</code> · <strong>Outcome</strong> established · <strong>Severity</strong> minor · <strong>Fix size</strong> 1 line
+</li>
+<li><strong>What goes wrong.</strong> The guide says nothing of what helper returns, so a reader trusts the wrong total.
+</li>
+<li><strong>Fix.</strong> State what helper returns.
+</li>
+<li><strong>Test that should fail first.</strong> tests/test_engine.py: call helper(3) and assert it returns 5.
+</li>
+<li><strong>Source.</strong>
+<br>guide.md:1-3 — 2 lines of context either side; the finding cites 3
+<pre><code>1 | # Guide
+2 | 
+3 | How the engine is used.</code></pre>
+</li>
+</ul>
+<h2 id="unresolved">5. Unresolved (2)</h2>
+<p>
+Nothing here is established: each is a claim a check could not settle. Where a checker answered, the entry carries <strong>What is not settled.</strong> This is that checker's own account of what stopped it; for most of these it names the one file or contract that would decide the claim. Where no checker answered, the group says so, the site's evidence says a verdict never came back, and Coverage names the unit that owes one. The defects are grouped by what would settle each, and then by what each breaks. Every defect here sits under exactly one group, so a group's size counts pieces of work, not mentions.
+</p>
+<h3 id="needs-a-run-a-result-is-wrong">Needs a run — A result is wrong (1)</h3>
+<h4 id="D3">D3. util returns a constant string, so callers cannot tell two calls apart. <a class="back" href="#index">↑ Index</a></h4>
+<ul>
+<li id="S3-src"><strong>Site</strong> <a href="#S3">S3</a> · <code>util.py:1-2</code> · <strong>Outcome</strong> unresolved · <strong>Severity</strong> minor · <strong>Fix size</strong> small
+</li>
+<li><strong>What goes wrong.</strong> util returns one constant whatever it is asked, so no caller can tell two calls apart.
+</li>
+<li><strong>What is not settled.</strong> Could not run it here.
+</li>
+<li><strong>Fix.</strong> Return a value derived from the call.
+</li>
+</ul>
+<h3 id="needs-a-file-outside-the-reviewed-scope-a-result-is-wrong">Needs a file outside the reviewed scope — A result is wrong (1)</h3>
+<h4 id="D1">D1. A string passed to core raises instead of being refused with a message. <a class="back" href="#index">↑ Index</a></h4>
+<ul>
+<li id="S1-src"><strong>Site</strong> <a href="#S1">S1</a> · <code>core.py:1-2</code> · <strong>Outcome</strong> unresolved · <strong>Severity</strong> major · <strong>Fix size</strong> small
+</li>
+<li><strong>What goes wrong.</strong> core adds to x before anything checks x is a number, so a string raises.
+</li>
+<li><strong>What is not settled.</strong> (core.py:1-2) Whether a string can reach core is not visible here.
+</li>
+<li><strong>Fix.</strong> Refuse a non-number with a message before the addition.
+</li>
+<li><strong>Related.</strong> <a href="#D2">D2</a>
+</li>
+</ul>
+<h2 id="refuted">6. Refuted (1)</h2>
+<p>
+Claims that were checked and dismissed at every site, each with the reason, so nobody goes over them again. Nothing here needs work.
+</p>
+<h3 id="D6">D6. The README calls the tree small, which it may not stay. <a class="back" href="#index">↑ Index</a></h3>
+<ul>
+<li id="S6-src"><strong>Site</strong> <a href="#S6">S6</a> · <code>README.md:3</code> · <strong>Outcome</strong> refuted · <strong>Severity</strong> minor · <strong>Fix size</strong> 1 line
+</li>
+<li><strong>Corrected by the operator.</strong> See <a href="#the-operator-s-corrections">The operator's corrections</a>.
+</li>
+<li><strong>Why it was dismissed.</strong> A description of a fixture is not a defect.
+</li>
+</ul>
+<h2 id="corroborated-by-both-models">7. Corroborated by both models (2)</h2>
+<p>
+Each of these was raised independently by a unit in each lane. Both units read blind, and neither saw the other's output. That is all this section says. What each defect is, how severe it is and where it is are in the sections above, and nothing is ranked here.
+</p>
+<div class="scroll"><table><thead><tr><th> Defect </th><th> Consequence </th></tr></thead><tbody>
+<tr><td> <a href="#D1">D1</a> </td><td> A string passed to core raises instead of being refused with a message. </td></tr>
+<tr><td> <a href="#D2">D2</a> </td><td> Every total built on helper comes out twice as large as the contract says. </td></tr>
+</tbody></table></div>
+<h2 id="tests-to-write">8. Tests to write (1)</h2>
+<p>
+Inputs the code handles differently that no test in scope constructs. <strong>None of these says the code is wrong.</strong> A branch can be correct today with no test guarding it, and a test is what keeps it correct. Each is a test to write, at the lines that decide the input, under the test class that owes it.
+</p>
+<h4>tests/test_engine.py</h4>
+<ul>
+<li><strong>Across the batch</strong> (verify-area-01-A-coverage): checked 1
+</li>
+<li id="D5"><strong>core.py:5-6</strong> — A negative multiplier is never exercised.
+<ul>
+<li>No test constructs: helper distinguishes y below zero and no test constructs one.
+</li>
+<li>The auditor proposed: Add a case in tests/test_engine.py with y = -1.
+</li>
+<li>Test that should fail first. tests/test_engine.py: call helper(3) and assert it returns 5.
+</li>
+<li>What the check found: No test constructs a negative y.
+</li>
+</ul>
+</li>
+</ul>
+<h2 id="evidence">9. Evidence (6)</h2>
+<p>
+Everything else the review recorded about each site, in site order: its severity, corroboration and verification, every report's check, and the runs and their output. Each heading gives the site's number, location, outcome and defect. Shown in the defect's entry instead of here: the site's quoted source, its first test that should fail first and, for an unresolved site, what is not settled.
+</p>
+<h3 id="S1">S1 · <code>core.py:1-2</code> · unresolved · <a href="#D1">D1</a> <a class="back" href="#index">↑ Index</a></h3>
+<ul>
+<li><strong>Severity</strong> major · <strong>Corroboration</strong> both models, 2 reports · <strong>Location</strong> <code>core.py:1-2</code> · <strong>Fix size</strong> small · <strong>Verification</strong> by reading
+</li>
+<li><strong>Checks.</strong>
+<ul>
+<li>core.py:1-2 · unresolved
+<ul>
+<li>What would settle it: needs a file outside the reviewed scope
+</li>
+</ul>
+</li>
+<li>core.py:1-2 · refuted, by reading
+</li>
+</ul>
+</li>
+</ul>
+<h3 id="S2">S2 · <code>core.py:5-6</code> · established · <a href="#D2">D2</a> <a class="back" href="#index">↑ Index</a></h3>
+<ul>
+<li><strong>Severity</strong> blocker · <strong>Corroboration</strong> both models, 2 reports · <strong>Location</strong> <code>core.py:5-6</code> · <strong>Fix size</strong> 1 line · <strong>Verification</strong> by running
+</li>
+<li><strong>Corrected by the operator.</strong> See <a href="#the-operator-s-corrections">The operator's corrections</a>.
+</li>
+<li><strong>Checks.</strong>
+<ul>
+<li>core.py:5-6 · by reading
+</li>
+<li>core.py:5-6 · by running
+<ul>
+<li>Severity revised to blocker from major: Every total is wrong.
+</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>Evidence (executed): Shows helper(3) returning 6. <code>python3 -c 'from engine.core import helper; print(helper(3))'</code> (exit 0, output complete)
+<details><summary>Captured output</summary><pre><code class="language-console">6</code></pre></details>
+</li>
+</ul>
+<h3 id="S3">S3 · <code>util.py:1-2</code> · unresolved · <a href="#D3">D3</a> <a class="back" href="#index">↑ Index</a></h3>
+<ul>
+<li><strong>Severity</strong> minor · <strong>Corroboration</strong> one model · <strong>Location</strong> <code>util.py:1-2</code> · <strong>Fix size</strong> small · <strong>Verification</strong> unresolved
+</li>
+<li><strong>Checks.</strong>
+<ul>
+<li>util.py:1-2 · unresolved
+<ul>
+<li>What would settle it: needs a run
+</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+<h3 id="S4">S4 · <code>run.py:1-2</code> · established · <a href="#D4">D4</a> <a class="back" href="#index">↑ Index</a></h3>
+<ul>
+<li><strong>Severity</strong> major · <strong>Corroboration</strong> one model · <strong>Location</strong> <code>run.py:1-2</code> · <strong>Fix size</strong> medium · <strong>Verification</strong> by running
+</li>
+<li><strong>Checks.</strong>
+<ul>
+<li>run.py:1-2 · by running
+</li>
+</ul>
+</li>
+<li>Evidence (executed): Shows the tool exiting 0 having printed nothing. <code>python3 run.py</code> (exit 0, output complete)
+</li>
+</ul>
+<h3 id="S6">S6 · <code>README.md:3</code> · refuted · <a href="#D6">D6</a> <a class="back" href="#index">↑ Index</a></h3>
+<ul>
+<li><strong>Severity</strong> minor · <strong>Corroboration</strong> one model · <strong>Location</strong> <code>README.md:3</code> · <strong>Fix size</strong> 1 line · <strong>Verification</strong> by reading
+</li>
+<li><strong>Corrected by the operator.</strong> See <a href="#the-operator-s-corrections">The operator's corrections</a>.
+</li>
+<li><strong>Checks.</strong>
+<ul>
+<li>README.md:3 · by reading — A description of a fixture is not a defect.
+</li>
+</ul>
+</li>
+<li>Reported: The README's description is a claim about size.
+</li>
+<li>Direction: Drop the size claim.
+</li>
+</ul>
+<h3 id="S7">S7 · <code>guide.md:3</code> · established · <a href="#D7">D7</a> <a class="back" href="#index">↑ Index</a></h3>
+<ul>
+<li><strong>Severity</strong> minor · <strong>Corroboration</strong> one model · <strong>Location</strong> <code>guide.md:3</code> · <strong>Fix size</strong> 1 line · <strong>Verification</strong> by reading
+</li>
+<li><strong>Checks.</strong>
+<ul>
+<li>guide.md:3 · by reading
+</li>
+</ul>
+</li>
+</ul>
+<h2 id="appendix">10. Appendix</h2>
+<p>
+The record of the run rather than the work: how the duplicates were merged, what the evidence leaves out, what was asked for and what ran where, what was not read, and which unit raised what. Nothing below is needed to fix a defect.
+</p>
+<h3 id="coverage-gaps-a-test-already-covers">Coverage gaps a test already covers (0)</h3>
+<p>
+No coverage gap was answered with a test that covers it.
+</p>
+<h3 id="what-each-verification-unit-returned">What each verification unit returned (5)</h3>
+<p>
+How each unit's answers were split. The units of one run asked the same kind of question of comparable batches, so a unit that settles far fewer than the rest tells you about that unit, not about the code it read. Each was handed one lane's findings, never its own, so the second column says whose work the row is about.
+</p>
+<div class="scroll"><table><thead><tr><th> Unit </th><th> Findings from </th><th> Handed </th><th> Established </th><th> Unresolved </th><th> Refuted </th></tr></thead><tbody>
+<tr><td> verify-area-01-A </td><td> A </td><td> 3 </td><td> 2 </td><td> 1 </td><td> 0 </td></tr>
+<tr><td> verify-area-01-B </td><td> B </td><td> 3 </td><td> 1 </td><td> 1 </td><td> 1 </td></tr>
+<tr><td> verify-area-01-A-coverage </td><td> A </td><td> 1 </td><td> 1 </td><td> 0 </td><td> 0 </td></tr>
+<tr><td> verify-area-02-A </td><td> A </td><td> 1 </td><td> 1 </td><td> 0 </td><td> 0 </td></tr>
+<tr><td> verify-area-02-B </td><td> B </td><td> 1 </td><td> 0 </td><td> 0 </td><td> 1 </td></tr>
+</tbody></table></div>
+<p>
+The share left unresolved ranges from 0% (verify-area-02-B, 0 of 1) to 33% (verify-area-01-A, 1 of 3).
+</p>
+<h4>What each unit said about its batch</h4>
+<ul>
+<li>verify-area-01-A: checked 3
+</li>
+<li>verify-area-01-B: checked 3
+</li>
+<li>verify-area-01-A-coverage: checked 1
+</li>
+<li>verify-area-02-A: checked 1
+</li>
+<li>verify-area-02-B: checked 1
+</li>
+</ul>
+<h3 id="what-one-more-file-would-settle">What one more file would settle (0)</h3>
+<p>
+No unresolved verdict named a file outside the reviewed scope.
+</p>
+<h3 id="clustering-notes">Clustering notes</h3>
+<p>
+Every candidate is in exactly one cluster: 8 candidates in 6 clusters, none dropped and none counted twice.
+</p>
+<h4>The largest clusters</h4>
+<ul>
+<li>S1 — 2 candidates (cand-003, cand-004): A string passed to core raises instead of being refused with a message.
+</li>
+<li>S2 — 2 candidates (cand-006, cand-007): Every total built on helper comes out twice as large as the contract says.
+</li>
+</ul>
+<h4>Kept apart at one location</h4>
+<p>
+No candidates at one location were split.
+</p>
+<h4>What each clustering unit reported</h4>
+<ul>
+<li>area-01: 4 groups
+</li>
+<li>area-01: 1 groups
+</li>
+<li>area-02: 2 groups
+</li>
+</ul>
+<h3 id="the-synthesis-round">The synthesis round</h3>
+<p>
+What the judgment round returned. The tier headings, <strong>What goes wrong</strong>, <strong>Fix</strong> and <strong>Related</strong> came from this round, and nothing else in this report did.
+</p>
+<ul>
+<li>synth-A — complete: 2 tiers named for 7 defects.
+</li>
+<li>D2 cited D7, which was dropped: the two defects neither touch a file in common nor sit under one tier.
+</li>
+</ul>
+<h3 id="what-the-evidence-leaves-out">What the evidence leaves out</h3>
+<p>
+Each site's evidence entry is every line its readers and checkers recorded, less exactly these:
+</p>
+<ul>
+<li>The site's <strong>What goes wrong</strong>, <strong>Fix</strong> and <strong>Related</strong>: its defect's own account replaces them.
+</li>
+<li>The line giving the site's full path and the commit: every site is at the one commit stated at the top, and the <a href="#path-legend"><strong>Path legend</strong></a> gives each path.
+</li>
+<li>The quoted source: moved to the site's place in its defect's entry.
+</li>
+<li>The site's first <strong>Test that should fail first</strong> and, for an unresolved site, <strong>What is not settled</strong>: shown in its defect's entry.
+</li>
+<li>0 clustering notes on why a report was kept apart from another at one location, where the merge then put the site in a defect of several: moved here, below.
+</li>
+<li>0 quoted sources identical to one quoted for another site, and 0 blocks of output identical to one printed under another site: each replaced by a pointer to the site that prints it.
+</li>
+</ul>
+<h3 id="path-legend">Path legend</h3>
+<p>
+Every file and directory this report names, under the short name the report uses for it. A path is spelled in full only here, so a name that appears twice below is the same file both times. Two things are copied as they were rather than written by the report, and keep their own spelling: a sentence quoted from a worker, and the job printed under <a href="#the-job"><strong>The job</strong></a>. Shortening a path in either would be editing a record, and the job has to stay something a reader can paste. Where this page would otherwise lose the whitespace in a path, that whitespace is escaped below, so the spelling names one file and no other.
+</p>
+<div class="scroll"><table><thead><tr><th> Short name </th><th> Full path </th></tr></thead><tbody>
+<tr><td> README.md </td><td> README.md </td></tr>
+<tr><td> core.py </td><td> engine/core.py </td></tr>
+<tr><td> guide.md </td><td> docs/guide.md </td></tr>
+<tr><td> lib.py </td><td> vendor/lib.py </td></tr>
+<tr><td> run.py </td><td> run.py </td></tr>
+<tr><td> util.py </td><td> engine/util.py </td></tr>
+</tbody></table></div>
+<h3 id="how-this-ran">How this ran</h3>
+<ul>
+<li>Run directory, holding every payload, result and transcript this report was built from: <code>/tmp/rp-v2026.10.0/old-run-rerendered/run</code>
+</li>
+<li>Lane A adapter, as recorded by the dispatcher:
+<pre><code>runtime-one sub-agent</code></pre>
+</li>
+<li>Lane A permission, as recorded by the dispatcher:
+<pre><code>read-only</code></pre>
+</li>
+<li>Lane B adapter, as recorded by the dispatcher:
+<pre><code>runtime-two command line</code></pre>
+</li>
+<li>Lane B permission, as recorded by the dispatcher:
+<pre><code>read-only sandbox</code></pre>
+</li>
+<li>Containment: the adapter and permission for each lane above are as the dispatcher recorded them, and the engine did not verify them. All the engine can state is that it spawned nothing and checked no sandbox, and that the files its payloads list are snapshot paths, none under the source root. It claims nothing stronger.
+</li>
+<li>Read: 7 files (walk), tree sha256 c46945e9d2fb9cd30c38348a247810f41edb639db0115b4367b75494900e245b; 1 excluded, 0 skipped.
+</li>
+<li>Pinned at: a tree that is not a repository.
+</li>
+</ul>
+<h3 id="the-job">The job</h3>
+<p>
+What this run was asked for. The problem statement under the title is one of these fields, quoted there because it is the one a reader acts on; the rest are here.
+Which fields the owner asked for and which the interview filled in is not recorded: there is no <code>job-notes.json</code> beside the job, so a job handed in ready-made and one the interview wrote look the same here.
+</p>
+<ul>
+<li>Read for: the statement under the title, carried verbatim into every reader's payload.
+</li>
+<li>Tree: the root the job names. It is in <code>job.json</code>, not on this page: the only path on this page from the machine the audit ran on is the run directory above.
+</li>
+<li>Scope: everything under the job's root.
+</li>
+<li>Excluded: 1 path the job named; <strong>Not read</strong>, under Coverage below, lists the files they took out.
+</li>
+<li>Divided: by subject — the job named 3 subjects; one area each.
+<ul>
+<li>engine — 4 files
+</li>
+<li>docs — 2 files
+</li>
+<li>rest — 1 file
+</li>
+</ul>
+</li>
+<li>Read with 2 lenses. A lens is the instruction a reader is handed for how to read its area. Every area was read once per lens, and the lenses were assigned to the two model lanes in turn.
+<ul>
+<li><strong>L1</strong> bottom-up from the code
+</li>
+<li><strong>L2</strong> top-down from the contract
+</li>
+</ul>
+</li>
+<li>Coverage: left to the tree — 1 of 3 areas earned an auditor.
+</li>
+<li>Questions: put to whoever ran the panel rather than to its readers, answered under <a href="#the-operator-s-notes"><strong>The operator's notes</strong></a>.
+</li>
+</ul>
+<h4>To run this audit again</h4>
+<p>
+The job, to paste back in when you do not have the file itself. <code>root</code> is the only field replaced: the tree is on your disk, at your path, and the only path on this page from the machine the audit ran on is the run directory above:
+</p>
+<pre><code class="language-json">{
+  "problem": "Find every place the helper's result is wrong, and every document that says so.",
+  "root": "/absolute/path/to/the/tree",
+  "exclude": [
+    "vendor/"
+  ],
+  "partition": "subject",
+  "lenses": [
+    "bottom-up from the code",
+    "top-down from the contract"
+  ],
+  "areas": [
+    {
+      "name": "engine",
+      "paths": [
+        "engine/",
+        "run.py"
+      ],
+      "also_read": [
+        "tests/test_engine.py"
+      ]
+    },
+    {
+      "name": "docs",
+      "paths": [
+        "README.md",
+        "docs/"
+      ]
+    },
+    {
+      "name": "rest",
+      "paths": [],
+      "remainder": true
+    }
+  ],
+  "questions": "Is the helper's doubling ever right?"
+}</code></pre>
+<p>
+If you still have the run directory, the same job is <code>job.json</code> in the run directory named above. Copy it out before running: the driver creates the run directory itself and refuses one that already holds a run, so a new run cannot be planned in the old directory.
+</p>
+<pre><code>cp &lt;run directory&gt;/job.json ./job.json
+python3 review_panel_run.py run \
+        --job ./job.json \
+        --rundir &lt;a directory that does not exist yet&gt; \
+        --adapter &lt;your adapter configuration&gt; \
+        --go</code></pre>
+<p>
+Three things this page cannot fill in. <code>--rundir</code> has to name a directory that does not exist yet, outside the reviewed tree and outside every git repository. <code>--adapter</code> is the configuration saying which runtime runs each lane. What ran this time is described under <a href="#how-this-ran"><strong>How this ran</strong></a> above, but the configuration itself was never in the run directory. And the tree has to be the one this report was read from, at the commit and tree sha256 named there: the job pins which files are read and not which bytes they hold, so the same job over a changed tree is a different audit.
+</p>
+<h3 id="coverage">Coverage</h3>
+<p>
+Partitioning put every file in scope into exactly one area, so a gap here is a unit that failed or returned nothing valid, or a path the job left out.
+</p>
+<h4>Units that failed or returned nothing</h4>
+<p>
+Every unit returned a valid result.
+</p>
+<h4>Not read</h4>
+<ul>
+<li>Excluded by the job (1):
+<ul>
+<li>lib.py
+</li>
+</ul>
+</li>
+</ul>
+<h3 id="provenance">Provenance</h3>
+<p>
+Which unit raised what, and which answered it. Nothing here is needed to fix a defect; it is here so the run can be audited. Everything each unit wrote is in <code>findings.json</code> beside this report, under the same candidate id, where it can be searched: what it reported, the direction and any reproduction it proposed, and what the checker concluded.
+Below, a reader's lens is cited by its tag. <a href="#the-job"><strong>The job</strong></a>, two subsections up in this appendix, spells each one out.
+</p>
+<div class="scroll"><table><thead><tr><th> Defect </th><th> Candidate </th><th> Raised by </th><th> Proposed </th><th> Answered by </th></tr></thead><tbody>
+<tr><td><a href="#D1">D1</a></td><td> cand-003 </td><td> area-01-A1 (lane A, L1) </td><td> Minor </td><td> verify-area-01-A (lane B) </td></tr>
+<tr><td><a href="#D1">D1</a></td><td> cand-004 </td><td> area-01-B1 (lane B, L2) </td><td> Major </td><td> verify-area-01-B (lane A) </td></tr>
+<tr><td><a href="#D2">D2</a></td><td> cand-006 </td><td> area-01-B1 (lane B, L2) </td><td> Blocker </td><td> verify-area-01-B (lane A) </td></tr>
+<tr><td><a href="#D2">D2</a></td><td> cand-007 </td><td> area-01-A1 (lane A, L1) </td><td> Major </td><td> verify-area-01-A (lane B) </td></tr>
+<tr><td><a href="#D3">D3</a></td><td> cand-008 </td><td> area-01-B1 (lane B, L2) </td><td> Minor </td><td> verify-area-01-B (lane A) </td></tr>
+<tr><td><a href="#D4">D4</a></td><td> cand-009 </td><td> area-01-A1 (lane A, L1) </td><td> Major </td><td> verify-area-01-A (lane B) </td></tr>
+<tr><td><a href="#D6">D6</a></td><td> cand-001 </td><td> area-02-B1 (lane B, L2) </td><td> Minor </td><td> verify-area-02-B (lane A) </td></tr>
+<tr><td><a href="#D7">D7</a></td><td> cand-002 </td><td> area-02-A1 (lane A, L1) </td><td> Minor </td><td> verify-area-02-A (lane B) </td></tr>
+<tr><td><a href="#D5">D5</a></td><td> cand-005 </td><td> audit-area-03-A (auditor, lane A) </td><td> Major </td><td> verify-area-01-A-coverage (lane B) </td></tr>
+</tbody></table></div>
+<script>
+(function () {
+  var toc = document.querySelector("nav.contents");
+  if (!toc) return;
+  document.querySelectorAll("h2, h3").forEach(function (h) {
+    if (toc.contains(h)) return;
+    h.classList.add("toc-jump");
+    h.title = "Back to the contents";
+    h.addEventListener("click", function (e) {
+      if (e.target.closest("a")) return;
+      toc.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  });
+})();
+</script>
+</body>
+</html>

@@ -26,9 +26,15 @@ in.
 
 The synthesis round is **optional**, and `report` is where that shows: the document is
 always grouped by where each defect is placed, and a round that came back with a usable answer adds its tiers as
-a level inside those sections. A round whose unit was written adds no tiers unless a
-usable result landed, and the appendix names that unit and says what the grouping is
-instead. A unit with neither a result nor an error beside it is recorded as
+a level inside those sections. The round is written in batches, each naming its own tiers,
+and a later round reconciles the names into one list; until it has, or where it did not
+complete, each defect stays under its own batch's name, a name two batches spelled alike is
+one section, and a line at the top says the names were not reconciled. The tier summaries
+and the overview come last: the report prints the overview, `findings.json` keeps the tier
+summaries, and the appendix names any summary or overview unit that did not come back and
+any tier the limits were too small to summarize. A batch adds no tiers unless a usable
+result landed, and the appendix names each batch that did not and says what its defects'
+grouping is instead, while the batches beside it stand. A unit with neither a result nor an error beside it is recorded as
 **missing** — nobody dispatched it, or something stopped its worker before it wrote
 anything, which from the run directory look the same — and one whose worker wrote an error is recorded as **failed**, with the
 diagnostic it left; the report says which, because "nobody ran it" and "it ran and broke"
@@ -37,7 +43,7 @@ written: a run where `synthesize` was never invoked, and equally one where it ra
 tree with nothing to write up. The round is handed only defects with a site that stood or
 stayed open; a defect refuted at every site and a coverage gap need no heading, fix or
 tier, and render as they would with no round.
-The round itself writes only its unit and the listing beside it; its answer reaches
+The round itself writes only its units, its round records and the listing beside them; its answer reaches
 `findings.json` because **`report` reads the result and records it there**, which is why the
 document is a pure function of the run directory and not of anything the round did while it
 ran — one answer, one reader.
@@ -87,6 +93,17 @@ note on a site the merge put in a defect of several, moved to the appendix; and 
 another site already printed, replaced by a pointer to that site. The appendix lists each,
 with the mechanism every defect of several sites was merged on, the sites the check took
 out, the compound sites and their second claims, and the record of the run.
+
+## A later synthesis generation
+
+A reported run synthesized again is published as generation n. Its stamp is
+`{"generated": <original clock>, "generation": n, "resynthesized": <clock>}`, and the
+subtitle says `Generated <original> · Resynthesized <clock>`; generation 1 keeps the
+`{"generated"}` stamp, so an old report re-renders unchanged. `findings.json`'s `synthesis`
+record is that generation's, and carries `dispatch`: the lanes `dispatch-g<n>.json` records
+for it, which **How this ran** lists beside the run's own. That file is
+`{"generation": n, "lanes": {...}}`, lanes as in `dispatch.json` but naming only those the
+generation ran on, every lane a unit of it came back from included; it states no rung.
 
 ## `dispatch.json`
 

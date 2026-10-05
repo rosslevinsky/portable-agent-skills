@@ -33,6 +33,8 @@ CLUSTERER_SCHEMA = _SKILLS / "review-panel" / "clusterer-schema.json"
 MERGER_SCHEMA = _SKILLS / "review-panel" / "merger-schema.json"
 MERGE_CHECKER_SCHEMA = _SKILLS / "review-panel" / "merge-checker-schema.json"
 SYNTHESIZER_SCHEMA = _SKILLS / "review-panel" / "synthesizer-schema.json"
+TIER_NAMES_SCHEMA = _SKILLS / "review-panel" / "tier-names-schema.json"
+OVERVIEW_SCHEMA = _SKILLS / "review-panel" / "overview-schema.json"
 
 _PY_TYPES = {
     "object": dict,
@@ -179,7 +181,7 @@ class PortabilityInvariants(unittest.TestCase):
     def _all(self):
         return [JUDGE_SCHEMA, REVIEW_SCHEMA, WORKER_SCHEMA, READER_SCHEMA, VERIFIER_SCHEMA,
                 PROBE_SCHEMA, CLUSTERER_SCHEMA, MERGER_SCHEMA, MERGE_CHECKER_SCHEMA,
-                SYNTHESIZER_SCHEMA]
+                SYNTHESIZER_SCHEMA, TIER_NAMES_SCHEMA, OVERVIEW_SCHEMA]
 
     def test_no_dollar_schema_key_anywhere(self):
         # A draft-2020-12 $schema ref is accepted by one runtime and REJECTED by the
@@ -402,9 +404,11 @@ class ReaderSchemaContract(unittest.TestCase):
     def test_a_real_result_validates_with_and_without_a_reproduction(self):
         document = _load(READER_SCHEMA)
         self.assertEqual(
-            _validate({"finding_count": 0, "findings": [], "summary": "nothing found"}, document), [])
+            _validate({"finding_count": 0, "findings": [], "summary": "nothing found"},
+                      document), [])
         self.assertEqual(
-            _validate({"finding_count": 1, "findings": [self.FINDING], "summary": "one"}, document), [])
+            _validate({"finding_count": 1, "findings": [self.FINDING], "summary": "one"},
+                      document), [])
         # The count is required, so a result that omits it is refused by the schema even
         # though the hand-parser tolerates the absence.
         self.assertEqual(_validate({"findings": [], "summary": "nothing found"}, document),
@@ -635,7 +639,8 @@ class ProbeSchemaContract(unittest.TestCase):
         for field in self.ATTEMPT:
             with self.subTest(missing=field):
                 thin = {k: v for k, v in self.ATTEMPT.items() if k != field}
-                self.assertTrue(_validate({"build": thin, "tests": self.ATTEMPT, "summary": "s"}, document))
+                self.assertTrue(_validate({"build": thin, "tests": self.ATTEMPT, "summary": "s"},
+                                          document))
         for field in ("build", "tests", "summary"):
             with self.subTest(missing=field):
                 whole = {"build": self.ATTEMPT, "tests": self.ATTEMPT, "summary": "s"}
@@ -874,8 +879,8 @@ class MergeCheckerSchemaContract(unittest.TestCase):
 
 
 class SynthesizerResultContract(unittest.TestCase):
-    """The fifth round's contract. It carries one vocabulary for the whole run and one
-    entry per defect, and it gives the unit no way to say a defect is wrong, no way to
+    """The fifth round's contract, one batch at a time. It carries the batch's own tiers and
+    one entry per defect, and it gives the unit no way to say a defect is wrong, no way to
     re-rank it, and no way to leave it out."""
 
     TIERS = ["Money can be taken twice", "A run stops instead of finishing"]
@@ -892,9 +897,12 @@ class SynthesizerResultContract(unittest.TestCase):
              "site_notes": [],
              "cross_references": []}
 
-    def test_declares_the_tiers_the_defects_and_a_summary(self):
+    def test_declares_the_tiers_and_the_defects_and_no_summary(self):
+        # A batch sees only its own defects, so a paragraph about the whole run is not one
+        # it can write.
         document = _load(SYNTHESIZER_SCHEMA)
-        self.assertEqual(set(document["required"]), {"tiers", "defects", "summary"})
+        self.assertEqual(set(document["required"]), {"tiers", "defects"})
+        self.assertEqual(set(document["properties"]), {"tiers", "defects"})
         entry = document["properties"]["defects"]["items"]
         self.assertEqual(set(entry["required"]),
                          {"defect", "heading", "tier", "what_goes_wrong", "fix", "site_notes",
@@ -909,11 +917,9 @@ class SynthesizerResultContract(unittest.TestCase):
         self.assertEqual(notes["type"], "array")
         self.assertEqual(set(notes["items"]["required"]), {"site", "note"})
         self.assertTrue(_validate({"tiers": self.TIERS, "defects": [
-            {**self.ONE, "site_notes": {"S2": "The refund path retries."}}],
-            "summary": "s"}, document))
+            {**self.ONE, "site_notes": {"S2": "The refund path retries."}}]}, document))
         self.assertTrue(_validate({"tiers": self.TIERS, "defects": [
-            {**self.ONE, "site_notes": [{"site": "S2", "note": "x", "why": "y"}]}],
-            "summary": "s"}, document))
+            {**self.ONE, "site_notes": [{"site": "S2", "note": "x", "why": "y"}]}]}, document))
 
     def test_every_text_a_defect_carries_has_a_length_limit(self):
         # The limits are the engine's to enforce, word by word; the schema states them in
@@ -927,21 +933,20 @@ class SynthesizerResultContract(unittest.TestCase):
         note = entry["site_notes"]["items"]["properties"]["note"]
         self.assertIn("maxLength", note)
         self.assertTrue(_validate({"tiers": self.TIERS,
-                                   "defects": [{**self.ONE, "heading": "x" * 121}],
-                                   "summary": "s"}, document))
+                                   "defects": [{**self.ONE, "heading": "x" * 121}]}, document))
         self.assertEqual(_validate({"tiers": self.TIERS,
-                                    "defects": [{**self.ONE, "heading": "x" * 120}],
-                                    "summary": "s"}, document), [])
+                                    "defects": [{**self.ONE, "heading": "x" * 120}]},
+                                   document), [])
         self.assertTrue(_validate({"tiers": self.TIERS, "defects": [
-            {**self.ONE, "what_goes_wrong": "x" * (entry["what_goes_wrong"]["maxLength"] + 1)}],
-            "summary": "s"}, document))
+            {**self.ONE, "what_goes_wrong": "x" * (entry["what_goes_wrong"]["maxLength"] + 1)}]},
+            document))
         self.assertTrue(_validate({"tiers": self.TIERS, "defects": [
-            {**self.ONE, "site_notes": [{"site": "S2", "note": "x" * (note["maxLength"] + 1)}]}],
-            "summary": "s"}, document))
+            {**self.ONE, "site_notes": [{"site": "S2", "note": "x" * (note["maxLength"] + 1)}]}]},
+            document))
 
-    def test_the_tier_list_belongs_to_the_run_and_not_to_a_defect(self):
-        # One vocabulary per run is the property this round exists for. A tier list nested
-        # under each defect would be a schema that invites every entry to name its own.
+    def test_the_tier_list_belongs_to_the_batch_and_not_to_a_defect(self):
+        # One vocabulary per reply: a tier list nested under each defect would be a schema
+        # that invites every entry to name its own.
         document = _load(SYNTHESIZER_SCHEMA)
         self.assertEqual(document["properties"]["tiers"]["type"], "array")
         self.assertEqual(document["properties"]["tiers"]["items"]["type"], "string")
@@ -963,22 +968,22 @@ class SynthesizerResultContract(unittest.TestCase):
 
     def test_a_real_synthesis_result_validates(self):
         document = _load(SYNTHESIZER_SCHEMA)
-        self.assertEqual(_validate({"tiers": self.TIERS, "defects": [self.ONE, self.OTHER],
-                                    "summary": "Two tiers."}, document), [])
+        self.assertEqual(_validate({"tiers": self.TIERS, "defects": [self.ONE, self.OTHER]},
+                                   document), [])
 
     def test_a_missing_field_and_an_extra_one_are_rejected(self):
         document = _load(SYNTHESIZER_SCHEMA)
         for field in self.ONE:
             with self.subTest(missing=field):
                 thin = {k: v for k, v in self.ONE.items() if k != field}
-                self.assertTrue(_validate({"tiers": self.TIERS, "defects": [thin],
-                                           "summary": "s"}, document))
+                self.assertTrue(_validate({"tiers": self.TIERS, "defects": [thin]}, document))
         self.assertTrue(_validate({"tiers": self.TIERS,
-                                   "defects": [{**self.ONE, "severity": "blocker"}],
+                                   "defects": [{**self.ONE, "severity": "blocker"}]}, document))
+        # A batch writes no paragraph about the run: a reply carrying one is refused.
+        self.assertTrue(_validate({"tiers": self.TIERS, "defects": [self.ONE],
                                    "summary": "s"}, document))
-        self.assertTrue(_validate({"tiers": self.TIERS, "defects": [self.ONE]}, document))
-        self.assertTrue(_validate({"tiers": "one", "defects": [self.ONE], "summary": "s"},
-                                  document))
+        self.assertTrue(_validate({"tiers": self.TIERS}, document))
+        self.assertTrue(_validate({"tiers": "one", "defects": [self.ONE]}, document))
 
     def test_the_synthesizer_cannot_judge_rerank_or_drop_a_defect(self):
         # The stage writes an account of defects other stages settled. A field for a
@@ -1012,38 +1017,32 @@ class SynthesizerResultContract(unittest.TestCase):
         for bad in ({}, 7, None, ["D4"]):
             with self.subTest(reference=bad):
                 self.assertTrue(_validate({"tiers": self.TIERS,
-                                           "defects": [{**self.ONE, "cross_references": [bad]}],
-                                           "summary": "s"}, document))
-        self.assertTrue(_validate({"tiers": [self.TIERS[0], 7], "defects": [self.ONE],
-                                   "summary": "s"}, document))
+                                           "defects": [{**self.ONE, "cross_references": [bad]}]},
+                                           document))
+        self.assertTrue(_validate({"tiers": [self.TIERS[0], 7], "defects": [self.ONE]}, document))
 
     def test_empty_strings_and_an_empty_tier_list_are_refused_at_the_boundary(self):
         # Constraints the parser enforces and the schema can state. An empty tier list
         # fails the whole unit; an empty narrative, fix, tier or id costs that defect its
         # assignment. Stated here they are refused before a reply is ever parsed.
         document = _load(SYNTHESIZER_SCHEMA)
-        self.assertEqual(_validate({"tiers": self.TIERS, "defects": [self.ONE, self.OTHER],
-                                    "summary": "s"}, document), [])
-        self.assertTrue(_validate({"tiers": [], "defects": [self.ONE], "summary": "s"},
+        self.assertEqual(_validate({"tiers": self.TIERS, "defects": [self.ONE, self.OTHER]},
+                                   document), [])
+        self.assertTrue(_validate({"tiers": [], "defects": [self.ONE]},
                                   document))
-        self.assertTrue(_validate({"tiers": [""], "defects": [self.ONE], "summary": "s"},
+        self.assertTrue(_validate({"tiers": [""], "defects": [self.ONE]},
                                   document))
         for field in ("defect", "heading", "tier", "what_goes_wrong", "fix"):
             with self.subTest(empty=field):
                 self.assertTrue(_validate({"tiers": self.TIERS,
-                                           "defects": [{**self.ONE, field: ""}],
-                                           "summary": "s"}, document))
+                                           "defects": [{**self.ONE, field: ""}]}, document))
         for field in ("site", "note"):
             with self.subTest(empty=field):
                 self.assertTrue(_validate({"tiers": self.TIERS, "defects": [
-                    {**self.ONE, "site_notes": [{**self.ONE["site_notes"][0], field: ""}]}],
-                    "summary": "s"}, document))
+                    {**self.ONE, "site_notes": [{**self.ONE["site_notes"][0], field: ""}]}]},
+                    document))
         self.assertTrue(_validate({"tiers": self.TIERS,
-                                   "defects": [{**self.ONE, "cross_references": [""]}],
-                                   "summary": "s"}, document))
-        # `summary` is the one string the engine accepts empty, so the schema does too.
-        self.assertEqual(_validate({"tiers": self.TIERS, "defects": [self.ONE],
-                                    "summary": ""}, document), [])
+                                   "defects": [{**self.ONE, "cross_references": [""]}]}, document))
 
     def test_uniqueness_is_the_engines_because_the_keyword_is_not_portable(self):
         """A repeated tier and a repeated cross-reference are both refused — by the
@@ -1068,10 +1067,10 @@ class SynthesizerResultContract(unittest.TestCase):
         document = _load(SYNTHESIZER_SCHEMA)
         walk(document)
         self.assertEqual(_validate({"tiers": [self.TIERS[0], self.TIERS[0]],
-                                    "defects": [self.ONE], "summary": "s"}, document), [])
+                                    "defects": [self.ONE]}, document), [])
         self.assertEqual(_validate({"tiers": self.TIERS,
-                                    "defects": [{**self.ONE, "cross_references": ["D4", "D4"]}],
-                                    "summary": "s"}, document), [])
+                                    "defects": [{**self.ONE, "cross_references": ["D4", "D4"]}]},
+                                    document), [])
 
     def test_the_partition_and_the_tier_membership_are_the_engines_to_enforce(self):
         # Neither is expressible here: a schema cannot say "exactly these ids, each once"
@@ -1079,10 +1078,9 @@ class SynthesizerResultContract(unittest.TestCase):
         # records that a green schema is not a checked result.
         document = _load(SYNTHESIZER_SCHEMA)
         invented = {**self.ONE, "tier": "A tier nobody declared"}
-        self.assertEqual(_validate({"tiers": self.TIERS, "defects": [invented],
-                                    "summary": "s"}, document), [])
-        self.assertEqual(_validate({"tiers": self.TIERS, "defects": [self.ONE, self.ONE],
-                                    "summary": "s"}, document), [])
+        self.assertEqual(_validate({"tiers": self.TIERS, "defects": [invented]}, document), [])
+        self.assertEqual(_validate({"tiers": self.TIERS, "defects": [self.ONE, self.ONE]},
+                                   document), [])
 
 
 class PhaseWorkerUnionContract(unittest.TestCase):
@@ -1246,6 +1244,76 @@ class PhaseWorkerUnionContract(unittest.TestCase):
                 found += 1
         # Non-vacuity: a skill that ships no example at all is a regression, not a pass.
         self.assertGreaterEqual(found, 2, "DONE and BLOCKED must be documented somewhere")
+
+
+
+class TierNamesResultContract(unittest.TestCase):
+    """The round that reconciles the batches' tier names: the final list, and a map from
+    every entry the payload lists to one of those names by position. Nothing in it judges,
+    re-ranks or removes a defect."""
+
+    REPLY = {"tiers": ["Money can be taken twice", "A run stops instead of finishing"],
+             "map": [{"entry": "N1", "tier": 1}, {"entry": "N2", "tier": 1},
+                     {"entry": "N3", "tier": 2}]}
+
+    def test_declares_the_final_tiers_and_the_map(self):
+        document = _load(TIER_NAMES_SCHEMA)
+        self.assertEqual(set(document["required"]), {"tiers", "map"})
+        self.assertEqual(set(document["properties"]), {"tiers", "map"})
+        record = document["properties"]["map"]["items"]
+        self.assertEqual(set(record["required"]), {"entry", "tier"})
+        self.assertEqual(record["properties"]["tier"]["type"], "integer")
+        self.assertEqual(record["properties"]["tier"]["minimum"], 1)
+        # A final name is capped, so a reply cannot outgrow the estimate it was packed under.
+        names = document["properties"]["tiers"]["items"]
+        self.assertEqual(names["maxLength"], 80)
+        self.assertTrue(_validate({**self.REPLY, "tiers": ["x" * 81]}, document))
+        self.assertEqual(_validate({**self.REPLY, "tiers": ["x" * 80, "y"]}, document), [])
+
+    def test_a_real_reply_validates_and_a_map_keyed_by_name_does_not(self):
+        # The map names a final tier by position, so it costs a few bytes per entry however
+        # long the names; a map from entry to name would be refused here.
+        document = _load(TIER_NAMES_SCHEMA)
+        self.assertEqual(_validate(self.REPLY, document), [])
+        self.assertTrue(_validate({**self.REPLY, "map": {"N1": "Money can be taken twice"}},
+                                  document))
+        self.assertTrue(_validate({**self.REPLY, "map": [{"entry": "N1", "tier": 0}]},
+                                  document))
+        self.assertTrue(_validate({**self.REPLY, "map": [{"entry": "N1",
+                                                          "tier": "Money"}]}, document))
+        self.assertTrue(_validate({"tiers": [], "map": []}, document))
+        self.assertTrue(_validate({**self.REPLY, "summary": "s"}, document))
+
+    def test_it_cannot_judge_rerank_or_drop_a_defect(self):
+        def names(node):
+            if isinstance(node, dict):
+                yield from node.get("properties", {})
+                for value in node.values():
+                    if isinstance(value, (dict, list)):
+                        yield from names(value)
+            elif isinstance(node, list):
+                for item in node:
+                    yield from names(item)
+        self.assertFalse({"defect", "defects", "status", "severity", "verdict", "dropped"}
+                         & set(names(_load(TIER_NAMES_SCHEMA))))
+
+
+class OverviewResultContract(unittest.TestCase):
+    """A tier summary, a summary of summaries and the overview share one contract: one
+    paragraph, and nothing else. Its byte limit is stated in the payload and held by the
+    engine, because it varies with the run's limits and a schema cannot carry it."""
+
+    def test_one_summary_and_nothing_else(self):
+        document = _load(OVERVIEW_SCHEMA)
+        self.assertEqual(document["required"], ["summary"])
+        self.assertEqual(set(document["properties"]), {"summary"})
+        self.assertEqual(document["properties"]["summary"]["type"], "string")
+        self.assertNotIn("maxLength", document["properties"]["summary"])
+        self.assertEqual(_validate({"summary": "Two themes; the first matters most."},
+                                   document), [])
+        self.assertTrue(_validate({"summary": ""}, document))
+        self.assertTrue(_validate({"summary": "s", "tiers": []}, document))
+        self.assertTrue(_validate({}, document))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,202 @@
+{
+  "lanes": [
+    "A",
+    "B"
+  ],
+  "stage": "reported",
+  "units": [
+    {
+      "area": "area-01",
+      "id": "area-01-A1",
+      "kind": "reader",
+      "lane": "A",
+      "lens": "bottom-up from the code",
+      "payload": "units/area-01-A1/payload.md",
+      "payload_bytes": 11724,
+      "payload_lines": 223,
+      "schema": "units/area-01-A1/schema.json"
+    },
+    {
+      "area": "area-01",
+      "id": "area-01-B1",
+      "kind": "reader",
+      "lane": "B",
+      "lens": "top-down from the contract",
+      "payload": "units/area-01-B1/payload.md",
+      "payload_bytes": 11960,
+      "payload_lines": 226,
+      "schema": "units/area-01-B1/schema.json"
+    },
+    {
+      "area": "area-01",
+      "id": "audit-area-01-A",
+      "kind": "auditor",
+      "lane": "A",
+      "lens": null,
+      "payload": "units/audit-area-01-A/payload.md",
+      "payload_bytes": 12321,
+      "payload_lines": 222,
+      "schema": "units/audit-area-01-A/schema.json"
+    },
+    {
+      "area": "area-01",
+      "id": "audit-area-01-B",
+      "kind": "auditor",
+      "lane": "B",
+      "lens": null,
+      "payload": "units/audit-area-01-B/payload.md",
+      "payload_bytes": 12321,
+      "payload_lines": 222,
+      "schema": "units/audit-area-01-B/schema.json"
+    },
+    {
+      "area": null,
+      "id": "probe-A",
+      "kind": "probe",
+      "lane": "A",
+      "lens": null,
+      "payload": "units/probe-A/payload.md",
+      "payload_bytes": 9853,
+      "payload_lines": 191,
+      "schema": "units/probe-A/schema.json"
+    },
+    {
+      "area": "area-01",
+      "asks": "defect",
+      "candidates": [
+        "cand-001",
+        "cand-003"
+      ],
+      "finder": "A",
+      "id": "verify-area-01-A",
+      "kind": "verifier",
+      "lane": "B",
+      "lens": null,
+      "payload": "units/verify-area-01-A/payload.md",
+      "payload_bytes": 18788,
+      "payload_lines": 332,
+      "routing": "raised by lane A in area-01; addressed to the other lane, B, which raised none of these",
+      "schema": "units/verify-area-01-A/schema.json"
+    },
+    {
+      "area": "area-01",
+      "asks": "defect",
+      "candidates": [
+        "cand-002",
+        "cand-004"
+      ],
+      "finder": "B",
+      "id": "verify-area-01-B",
+      "kind": "verifier",
+      "lane": "A",
+      "lens": null,
+      "payload": "units/verify-area-01-B/payload.md",
+      "payload_bytes": 18632,
+      "payload_lines": 329,
+      "routing": "raised by lane B in area-01; addressed to the other lane, A, which raised none of these",
+      "schema": "units/verify-area-01-B/schema.json"
+    },
+    {
+      "area": "area-01",
+      "asks": "defect",
+      "candidates": [
+        "cand-001",
+        "cand-002",
+        "cand-003",
+        "cand-004"
+      ],
+      "id": "cluster-area-01",
+      "kind": "clusterer",
+      "lane": "A",
+      "lens": null,
+      "payload": "units/cluster-area-01/payload.md",
+      "payload_bytes": 9608,
+      "payload_lines": 176,
+      "schema": "units/cluster-area-01/schema.json"
+    },
+    {
+      "area": null,
+      "id": "merge-A-1",
+      "kind": "merger",
+      "lane": "A",
+      "lens": null,
+      "payload": "units/merge-A-1/payload.md",
+      "payload_bytes": 9490,
+      "payload_lines": 222,
+      "schema": "units/merge-A-1/schema.json",
+      "sites": [
+        "S1",
+        "S2"
+      ]
+    },
+    {
+      "area": null,
+      "id": "merge-A-2",
+      "kind": "merger",
+      "lane": "A",
+      "lens": null,
+      "payload": "units/merge-A-2/payload.md",
+      "payload_bytes": 8896,
+      "payload_lines": 206,
+      "schema": "units/merge-A-2/schema.json",
+      "sites": [
+        "S3"
+      ]
+    },
+    {
+      "area": null,
+      "groups": [
+        {
+          "group": "G1",
+          "instances": [
+            {
+              "instance": "core indexes the last row of an empty list.",
+              "site": "S1"
+            },
+            {
+              "instance": "run.py indexes an argument list that is empty.",
+              "site": "S2"
+            }
+          ],
+          "mechanism": "An empty input is indexed before it is checked; check it first.",
+          "sites": [
+            "S1",
+            "S2"
+          ]
+        }
+      ],
+      "id": "mergecheck-B",
+      "kind": "merge-checker",
+      "lane": "B",
+      "lens": null,
+      "payload": "units/mergecheck-B/payload.md",
+      "payload_bytes": 8304,
+      "payload_lines": 225,
+      "schema": "units/mergecheck-B/schema.json"
+    },
+    {
+      "area": null,
+      "defect_sites": [
+        [
+          "S1",
+          "S2"
+        ],
+        [
+          "S3"
+        ]
+      ],
+      "defects": [
+        "D1",
+        "D2"
+      ],
+      "id": "synth-A",
+      "kind": "synthesizer",
+      "lane": "A",
+      "lens": null,
+      "payload": "units/synth-A/payload.md",
+      "payload_bytes": 15706,
+      "payload_lines": 285,
+      "schema": "units/synth-A/schema.json"
+    }
+  ]
+}

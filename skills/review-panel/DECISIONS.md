@@ -27,21 +27,33 @@ reinterprets one.
 literal, so the drive test is answered by the file rather than guessed from the text, is the
 only change that reaches this.
 
-## A verification batch is not size-bounded
+## A verification batch is split by file, and never by finding
 
-**Proposed.** Every reader payload is held to a ceiling of two thousand lines and two hundred
-kilobytes. A verification batch is built the same way and has no ceiling at all, so a large
-one can pass what every other payload could not.
+**Proposed.** Keep a verification batch — one area, one finder, one question — whole
+whatever its size, because the unit's job is to weigh one set of findings against each
+other, and half the findings in each of two units answers a different question from the one
+that was asked.
 
-**Declined.** The ceiling exists so that an area too large for one reader gets split into
-several. A verification batch cannot be split the same way: the unit's job is to weigh one set
-of findings against each other, and half the findings in each of two units answers a different
-question from the one that was asked. Adding a bound with no split behind it converts an
-oversized batch into a failed run.
+**Declined, by reading what the unit is asked.** Neither verification brief weighs one
+finding against another. Each puts one question to each candidate — is it real, or does any
+test in scope construct this input — and the engine takes exactly one verdict per candidate
+and refuses a reply that answers for one it was not handed. A part of a batch therefore asks
+of each candidate exactly what the whole batch would. And an unbounded batch grows with the
+run until it is more than one worker can read, and a worker handed that returns nothing
+usable.
 
-**What would change it.** A real batch that exceeds what the model can read, which would give
-the bound a number to be and force the routing question to be answered rather than deferred.
-Until then the cap would only ever fire on a run that would have succeeded.
+So `route` packs a batch over its lane's verification limits into parts **by file**, in
+folder order. A file's findings are never split, since every candidate cites exactly one
+file; each part goes to the batch's lane, so a finding is still checked by the lane that did
+not raise it, and `check_routing` refuses a unit addressed to a raiser. Every part of a
+coverage batch is shown the whole batch's tests. A batch that fits keeps its id; a part
+gains `-f<k>` before any `-coverage` suffix and records its question as `asks`, so no reader
+has to infer it from the id. A file over its lane's hard ceiling on its own is listed and
+never dispatched, and its findings are reported as not verified.
+
+**What would change it.** A verification brief that asks a verifier to judge findings
+together — duplicates, or one finding's verdict resting on another's. Then the item would
+be that group, not the file, and splitting by file would change the question.
 
 ## Below the supported floor there is nowhere to put the message
 
@@ -259,8 +271,8 @@ workers were launched. Nothing has needed that yet, and the placement rule in
 
 ## A synthesis unit cannot drop a defect it judges unimportant
 
-**Proposed.** The round that assigns tiers sees every defect at once, with what each is and
-what the check concluded. That is the vantage point from which a defect that is not worth a
+**Proposed.** The round that assigns tiers sees each of its defects in full, with what each
+is and what the check concluded. That is the vantage point from which a defect that is not worth a
 reader's attention is obvious, and the round is already writing the order the reader works
 in. Let it leave one out, or file it under a tier that means "ignore this", and the document
 stops spending a heading on something nobody will act on.
@@ -272,15 +284,16 @@ candidate was dropped, and into a defect under a proof that no site was. Four st
 been built to make sure a finding cannot quietly disappear. A fifth that could delete one
 would undo all of it at the last step, and
 at the step where the least evidence remains: the round is handed no status and no severity,
-so the thing it would be deleting is a defect it cannot see the standing of. So the
-assignment is proved a partition of exactly the ids the round was handed before it is
-believed, and a unit that failed, never landed or returned a non-partition leaves the run
-grouped by status rather than dropping what it could not place. A tier the reply never
-declared costs that one defect its whole assignment — the tier, the narrative, the fix and
-the references it named — because an entry filed under a name the reply did not declare is
-one the engine cannot place, not a good entry with one bad field. **The defect itself is
-untouched**: it falls back to its status group carrying everything the earlier rounds
-established about it, and the report names the refusal.
+so the thing it would be deleting is a defect it cannot see the standing of. So each batch's
+assignment is proved a partition of exactly the ids that batch was handed before it is
+believed, and a batch that failed, never landed or returned a non-partition leaves its own
+defects grouped by status rather than dropping what it could not place, while the batches
+beside it stand. A tier the batch's own reply never declared costs that one defect its whole
+assignment — the tier, the narrative, the fix and the references it named — because an
+entry filed under a name its reply did not declare is one the engine cannot place among
+that batch's tiers, not a good entry with one bad field. **The defect itself is untouched**:
+it falls back to its status group carrying everything the earlier rounds established about
+it, and the report names the refusal.
 
 **What would change it.** Nothing about the volume, which is an ordering problem and has an
 ordering answer: a tier the round declares LAST is still a tier, and a reader who stops
@@ -292,47 +305,37 @@ agent makes and another settles; a synthesis is a claim nothing settles, which i
 prose is marked as a reading. Letting it delete a defect would give the one unchecked stage
 in the run the last word over three checked ones.
 
-## The synthesis payload grows with the run, and one unit is why it grows linearly
+## The synthesis round is batched, and no payload carries the whole run
 
-**Proposed.** Every synthesis payload carries the whole defect index so that any defect can
-be cited in a cross-reference. Split the round across several units for the usual reasons —
-smaller payloads, work in parallel, a failure costing less — and each of them carries that
-index again.
+**Proposed.** Keep the round to one unit, handed every defect's material and the whole defect
+index. One unit names one vocabulary for the run, so two phrasings of one theme cannot
+appear, and any defect can be cited from anywhere. The payload grows linearly with the
+defect count, and the index cannot crowd out the detail it sits beside.
 
-**Declined for now, and the shape of the growth is why.** The payload is the brief, the
-problem statement and the inline schema — a **fixed part that does not grow at all** — plus
-the defect index and the per-defect detail. The index holds a **roughly constant share**
-of the part that does vary, whatever the defect count, because an index entry and a
-defect's own detail block both grow with the count.
+**Declined, because linear growth is still growth past what a model reads in one piece.** A
+run of a few hundred defects makes a synthesis payload near a megabyte, and a single unit
+that returns nothing leaves the report with no write-up and no tier at all. One vocabulary is
+worth nothing on a report that has none.
 
-**One unit therefore grows linearly, and the index can never crowd out the detail it sits
-beside.** Splitting the round into `k` units makes each carry the whole index again, so the
-total is **O(kN)** — quadratic only where `k` grows with the defect count, not merely because
-a split exists. Fixing `k` keeps it linear with a larger constant, and costs no
-cross-reference: every payload carries the whole index precisely so a unit can cite a defect
-it was not handed.
+So the round is planned in batches, packed in folder order under the synthesis limits in
+`limits.json` and alternating lanes. **Each batch names its own tiers**, in the project's
+own terms, for the defects it holds; a later round reconciles the names across batches, and
+until it has, two batches' identically spelled names are one section and differently spelled
+ones are two. **Each batch's index holds only the outside defects that share a file with one
+of its own** — the only outside defects a reference from it can survive to, since a reference
+across batches is kept only on a shared file — capped at the synthesis index limit, and the
+payload says how many the cap left out. A batch that fails costs its own defects their
+write-ups and nothing else.
 
 **The byte counts are deliberately not written here.** The brief is part of every payload, so
-any figure recorded in this file goes stale the next time the brief is edited — and it does
-not announce that it has, because nothing reads this file while the skill runs. What is
-recorded instead is the command that answers the question at the tree you are standing on:
+a figure for it goes stale the next time the brief is edited. Every unit records its own
+`payload_bytes` and `payload_lines` in `units.json`, and the limits it was planned under, so
+a real run states its own size without anyone measuring anything.
 
-```python
-# from the repository root
-import sys; sys.path.insert(0, "skills/review-panel")
-import review_panel as r
-payload = r.render_synthesizer_payload(
-    r.load_brief("synthesizer"), problem, index, defects,
-    schema=r.load_schema(r.SYNTHESIZER_SCHEMA_NAME))
-len(payload.encode("utf-8"))
-```
-
-Every unit the engine writes also records its own `payload_bytes` and `payload_lines` in
-`units.json`, so a real run states its own size without anyone measuring anything.
-
-**What would change it.** A run whose payload the model cannot read in one piece. The answer
-then is to split the round and accept the constant, in that order: measure first, because the
-number decides it and the intuition about quadratic growth does not.
+**What would change it.** A model that reliably reads and answers the whole run in one
+payload, measured at the sizes real runs reach. Even then a batch costs only the round that
+reconciles tier names, so the bar is the measurement, not the intuition that one unit is
+simpler.
 
 ## A cross-reference is checked, and checking is not the same as being true
 
@@ -342,7 +345,12 @@ document already says these two defects are related.
 
 **Declined — the check is narrower than the claim, and the report says so.** What the engine
 can see for itself is that the id resolves and that the two defects touch a file in common or
-sit under one tier.
+were written up in one batch. A shared tier is not used for a synthesis this engine writes:
+tiers are named per batch and reconciled only afterwards, and a shared heading says nothing
+about two defects' code, while one batch writing up both means one unit read both and judged
+them connected. A synthesis written by v2026.10.0, whose one unit named the run's one
+vocabulary, is still checked by a file in common or one tier, so its report re-renders with
+the references it had.
 What the prose asserts is that the two are related **in the way it says** — the same
 mechanism at two sites, one causing or masking the other, one fix that has to account for
 both. Nothing in this run establishes that. Confirming it would need a stage that read both
