@@ -199,7 +199,8 @@ message. A key never goes in the command line, where anyone who can list process
 
 A backend reaches an agent only when the supervisor launches that agent as a program:
 
-- `diff-review` — the different-model reviewer.
+- `diff-review` — the different-model reviewer: another runtime's CLI, or the host's own CLI
+  on a backend whose model is not the host's.
 - `plan-duel` — each of the three roles. Every role is launched through the supervisor.
 - `review-panel` — the workers in each lane (review-panel's name for each of its two groups
   of agents).
@@ -207,6 +208,9 @@ A backend reaches an agent only when the supervisor launches that agent as a pro
 - `plan-run` — a phase worker, when Codex runs the plan unattended; only a `codex` backend fits.
 - `security-review-codebase` — a deep-mode component reviewer, when Codex runs the review; only
   a `codex` backend fits.
+- `xc` — the different-model reviewer of a document, launched the way `diff-review` launches
+  its own: on the other runtime's CLI, or the host's own CLI on a backend whose model is not
+  the host's.
 
 It does not apply to an in-process sub-agent, one a host starts through its own tool, which
 runs the host's own model. Nor does it apply to work a skill does in its own context. Where

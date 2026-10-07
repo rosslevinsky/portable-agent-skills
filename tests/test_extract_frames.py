@@ -16,7 +16,10 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import sys
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _git_env  # noqa: E402,F401  every git command a test starts runs under the suite's config
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "skills" / "web-verify" / "references" / "extract-frames.sh"

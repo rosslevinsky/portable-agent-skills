@@ -12,7 +12,7 @@ description: >
 
 # Diff Review — Independent Diff-First Code Review
 
-_Classification: Degraded — independence has three rungs. Strongest is a reviewer whose **model differs from the diff's author** (context- *and* model-independent — a different model has different blind spots); next is a fresh independent sub-agent in the same runtime (context-independent); weakest is an in-context deliberate reset (read the diff as an outsider, ignoring the rationale that produced it). Rung 1 launches the other runtime under a bundled **Python 3** supervisor (`review_runner.py`); where Python 3 or the other runtime's CLI is absent, the skill falls open to rung 2. Coverage is always preserved down this ladder; only the strength of independence varies with what the host offers._
+_Classification: Degraded — independence has three rungs. Strongest is a reviewer whose **model differs from the diff's author** (context- *and* model-independent — a different model has different blind spots); next is a fresh independent sub-agent in the same runtime (context-independent); weakest is an in-context deliberate reset (read the diff as an outsider, ignoring the rationale that produced it). Rung 1 launches the other runtime — or this runtime's own CLI on a backend running a different model — under a bundled **Python 3** supervisor (`review_runner.py`); where Python 3 or that CLI is absent, the skill falls open to rung 2. Coverage is always preserved down this ladder; only the strength of independence varies with what the host offers._
 
 _Progress: observable — rungs 2–3 return in one shot; rung 1's background reviewer streams into an **append-only display log** a human may `tail -f` while it runs. The log is read by nothing on the correctness path: the supervisor (`review_runner.py`) judges liveness from the child's live stream **in-process** (never by re-reading the log), the authoritative verdict comes from a **separate findings file**, and termination is the supervisor's own (child exit / idle timeout / wall-clock deadline) — so the review completes identically whether or not anyone watches the log._
 
@@ -24,11 +24,12 @@ self-review is broad and benefits from knowing *why* the code was written this w
 this review is stronger precisely because it does **not** know or trust that
 rationale. It reads the diff on its own terms and asks whether the code is correct.
 
-**Strongest with a second runtime installed.** When the host has another runtime's CLI available
+**Strongest with a different model available.** When the host has another runtime's CLI available
 (e.g. Claude reviewing Codex-authored code, or the reverse), the review runs in the runtime that
 did *not* write the code, so a **different model** — different training, different blind spots —
 examines it, catching classes of defect the authoring model is systematically likely to miss. With
-only one runtime it falls open to a fresh **same-model** reviewer (independent context, same model),
+only one runtime, a backend that runs its CLI on a different model gives the same independence;
+with neither, it falls open to a fresh **same-model** reviewer (independent context, same model),
 so coverage is preserved either way — see the independence ladder in Step 2.
 
 Two properties are non-negotiable:
@@ -77,11 +78,12 @@ has two dimensions: **context** (the reviewer does not see the authoring convers
 strongest rung the host offers, and **fall open** down the ladder — an unavailable reviewer
 must never block the review:
 
-1. **Different runtime (strongest — context- and model-independent).** If a runtime other
-   than the author's is available, dispatch the review to it over the selected diff and
-   collect its findings. A different model catches classes of defect the author's model is
+1. **Different model (strongest — context- and model-independent).** If a runtime other
+   than the author's is available, or the user names a backend that runs this runtime's own
+   CLI on a model other than the author's, dispatch the review to it over the selected diff
+   and collect its findings. A different model catches classes of defect the author's model is
    systematically blind to. Bound it and fail open (below).
-2. **Same-model fresh reviewer (context-independent).** No other runtime available → spawn a
+2. **Same-model fresh reviewer (context-independent).** No different model available → spawn a
    fresh independent reviewer in the current runtime that reads only the selected diff and
    the minimal surrounding code, not this conversation.
 3. **In-context deliberate reset (weakest).** Cannot spawn any independent reviewer →
@@ -89,7 +91,7 @@ must never block the review:
    from scratch as though seeing it for the first time, and judge it on the code alone. Note
    in the report that the review ran in-context (Degraded).
 
-Because a spawned or cross-runtime reviewer does not inherit this skill, the prompt handed to
+Because a spawned or rung-1 reviewer does not inherit this skill, the prompt handed to
 it must carry the Step 3 correctness checklist, the Step 4 report format, and the "report
 only, never edit the tree" constraint.
 
@@ -104,8 +106,8 @@ log** (a human may `tail -f` it in a separate pane), routes the authoritative **
 heartbeat timeout** (kills on a full window of silence, judged from the child's live stream — so a
 long-but-*active* review runs to completion while a genuine hang dies early), and an absolute
 **wall-clock deadline** backstop. It prints a one-line JSON status; on a status that means the
-review did not happen — idle-timeout, deadline, launch error — or when **Python 3 or the other
-runtime's CLI is unavailable**, **fall open** to rung 2 (or 3), recording the attempted rung, the
+review did not happen — idle-timeout, deadline, launch error — or when **Python 3 or the rung-1
+reviewer's CLI is unavailable**, **fall open** to rung 2 (or 3), recording the attempted rung, the
 fallback, and the reason. **A missing verdict is not one of those.** The Codex adapter deliberately
 ships no schema flag (see the adapter note below), so a review that returns good prose and no
 parseable object is the *expected* outcome there, and it is a **successful** review — read the
@@ -188,9 +190,14 @@ refusal as grounds to fall back.
 > `<python> <skill-dir>/review_runner.py --idle 900 --deadline 1800 --cwd <dir> --display <cap> --findings <f> --result-mode stream-transcript --schema <skill-dir>/review-schema.json --verdict-json <v> -- claude -p "<review prompt>" --add-dir <dir> --permission-mode plan --json-schema ⟪schema_json⟫ --output-format stream-json --include-partial-messages --verbose`.
 > **Controller vs author / probe:** rung 1 wants a reviewer whose **model differs from the diff's
 > author**. If you — the runtime running this skill — already differ from the author, review directly:
-> you are the cross-model reviewer. Otherwise launch the *other* runtime as above, but only when its
-> CLI is on PATH (probe `command -v <cli>`; native Windows `where <cli>` / `Get-Command <cli>`) and
-> Python 3 is present; else fall open to rung 2.
+> you are the cross-model reviewer. Otherwise a named backend picks the CLI by its `harness`: the
+> other runtime's harness launches that CLI; this runtime's own harness launches this CLI, and only
+> when the backend's `model` differs from yours, compared as text — an equal model is refused for
+> rung 1, recorded, and falls to rung 2. The two rung-1 commands above belong to the CLI launched,
+> not the host: a Claude host reviewing on Claude uses the Claude line, a Codex host on Codex
+> the Codex line. With no backend, launch the *other* runtime. Launch only when the CLI is on
+> PATH (probe `command -v <cli>`; native Windows `where <cli>` / `Get-Command <cli>`) and Python 3
+> is present; else fall open to rung 2.
 
 **A backend chooses rung 1's model.** A user may keep a backends file: a JSON object at
 `~/.portable-agent-skills/backends.json` (or where `PORTABLE_AGENT_SKILLS_BACKENDS` points)
@@ -201,8 +208,10 @@ fills them, checks the backend fits the CLI launched, and hands the reviewer its
 key. With no backend named, rung 1 runs on the CLI's own sign-in. Rung 2 is the host's
 in-process sub-agent, which runs the host's own model, so **no backend applies there**; rung 3
 starts no agent. **The report says which ran**: rung 1 with the backend's name and model, or
-on the CLI's own sign-in; rung 2; or rung 3. A refused backend is a launch error: fall open
-and record why.
+on the CLI's own sign-in, and which CLI; rung 2; or rung 3. On a backend for this runtime's
+own CLI it names your own model beside the backend's and states their independence as
+unverified: the two were compared as text, and two spellings of one model compare as
+different. A refused backend is a launch error: fall open and record why.
 
 > **Adapter note — a backend on rung 1.** Add `--backend <name>` before the `--` and the markers
 > after the program: `codex exec --json -s read-only -c approval_policy="never" -m ⟪model⟫
@@ -284,7 +293,7 @@ If nothing substantive is found, say so plainly rather than inventing nits. Do n
 modify the working tree under any circumstance; the author or the phase gate applies
 fixes.
 
-**Where the review is dispatched to another runtime, the reviewer also returns this list
+**Where the review is dispatched to a rung-1 reviewer, the reviewer also returns this list
 as a JSON object** matching `review-schema.json`: `findings` (an array of
 `file` / `line` / `severity` / `summary` / `failure_scenario`), `overall`, and
 `blocking_count` — the number of `blocker` plus `major` findings, which is what a phase
@@ -295,8 +304,8 @@ object in the prompt and fall back to reading the prose list if it does not arri
 
 ## Scope note
 
-The single, bounded **rung-1 cross-runtime pass** above is a normal part of this skill and runs
-by default when another runtime is available. What stays **separate and user-triggered** is a
+The single, bounded **rung-1 different-model pass** above is a normal part of this skill and
+runs by default when a different model is available. What stays **separate and user-triggered** is a
 *heavier* review — the whole-tree, blind, multi-agent sweep the `review-panel` skill runs, or
 a cloud-based deep audit: **recommend** that when the change warrants deeper scrutiny, but do
 not launch it automatically from this skill. Where the `review-panel` skill is not installed,

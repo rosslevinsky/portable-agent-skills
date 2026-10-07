@@ -1,6 +1,6 @@
 # Which review skill does what
 
-Five skills in this pack could each be called "a review", and the phase gate in `/plan-run`
+Six skills in this pack could each be called "a review", and the phase gate in `/plan-run`
 runs two of them. They are not interchangeable. Each skill's own file describes only that
 skill and does not compare it with the others; this page does.
 
@@ -19,7 +19,7 @@ between these skills that matters.
   author's reasoning is not visible to it, so it cannot be persuaded by it.
 - **The reviewer is a different model from the one that produced the work.** A different
   model fails in different places. This needs both the `claude` and `codex` command-line
-  tools installed.
+  tools installed, or one of them on a backend running another model (see `BACKENDS.md`).
 - **The reviewer has been told to find something wrong.** It is trying to prove that a bug
   exists or that the design as a whole is unsuitable, rather than reading the work over.
 
@@ -37,10 +37,11 @@ between these skills that matters.
 | Skill | What it reads | Cost | Needs both runtimes? | Who reads the work | Reader adversarial? | Who checks a finding | Is the check adversarial, and what it takes |
 |---|---|---|---|---|---|---|---|
 | `/cyw` | The change you just made | Lowest. One pass, inside the conversation that did the work | No | One model: the one that wrote the code, which knows every reason it was written that way | **No.** It is checking its own work | Nobody separate | **No check exists.** A finding must name a concrete harm; one that cannot is recorded and deliberately left unfixed |
-| `/diff-review` | One change set | One separate reviewer | Optional. With both installed, the reviewer is the other model | One model, which is never shown the authoring conversation | **Yes, toward the code** | Nobody | **No check exists.** The finder is the only one who assesses it, and runs the confirming test where one exists |
+| `/diff-review` | One change set | One separate reviewer | Optional. With both installed, or a backend running another model, the reviewer is a different model | One model, which is never shown the authoring conversation | **Yes, toward the code** | Nobody | **No check exists.** The finder is the only one who assesses it, and runs the confirming test where one exists |
 | `/security-review-codebase` | The whole tree | One pass, or four to eight component reviews in deep mode | No. One model throughout | One model: whichever one is hosting the run, with a fresh context per component in deep mode | **Yes, toward the code.** It looks for vulnerabilities by category | A work unit that did not produce the finding. Same model, fresh context | **Yes.** It must show a concrete attack path — input, route, line — and rate its confidence at 0.8 or higher. Many findings are expected to fail |
-| `/plan-duel` | A plan, before any code exists | Highest. Three model calls per round, up to ten rounds | **Yes.** Both command-line tools must be installed | Two models, each writing a plan and criticizing the other's. Each one sees the other's plan | **Yes, in both directions.** Criticism is the mechanism | The opposing model, every round | **Yes.** It must make an argument that convinces a third judge, which scores the plan out of ten |
-| `/review-panel` | Any set of files you name | Two readers per area, plus one check for every finding | Optional. With both installed, the checker is the other model | Two models, both reading every area. Neither can see the other's work. Each is given a different angle to read for | **No, and deliberately.** They read independently; the challenge happens at the next stage | Never the finder. The other model, or the claim run in a separate copy of the tree | **Yes.** It must reproduce the claim and report the command, exit status and output, or else refute it |
+| `/plan-duel` | A plan, before any code exists | Highest. Three model calls per round, up to ten rounds | **Yes.** Both command-line tools, or one with a role on a backend running another model | Two models, each writing a plan and criticizing the other's. Each one sees the other's plan | **Yes, in both directions.** Criticism is the mechanism | The opposing model, every round | **Yes.** It must make an argument that convinces a third judge, which scores the plan out of ten |
+| `/xc` | A document: a plan, a phase breakdown, a design note | One separate review, one send-back round, a single `cyw` pass before (skipped when one just ran) and the full `cyw` loop after | Optional. With both installed, or a backend running another model, the reviewer is a different model; with neither, a fresh reviewer of the same model, never the author alone | One model, never shown the authoring conversation. It may be given context documents to check the target against | **Yes, toward the document** | The author decides each finding, and every rejection goes back to the reviewer once | **Partly.** The reviewer can answer a rejection with new evidence; a finding still disputed comes to you and is not applied |
+| `/review-panel` | Any set of files you name | Two readers per area, plus one check for every finding | Optional. When its two lanes run different models (both runtimes, or one running two models), the checker is the other model | Two models, both reading every area. Neither can see the other's work. Each is given a different angle to read for | **No, and deliberately.** They read independently; the challenge happens at the next stage | Never the finder. The other model, or the claim run in a separate copy of the tree | **Yes.** It must reproduce the claim and report the command, exit status and output, or else refute it |
 
 A review has two stages: reading the work, and checking a finding somebody raised. The two
 are independent, and the two adversarial columns show it. Read those columns across rather
@@ -63,7 +64,7 @@ because it does not work like a single review.
    adversarial, and not meant to be.
 2. **A separate reviewer checks the diff** with `/diff-review`. That reviewer is never shown
    the authoring conversation, and it is a different model where both runtimes are
-   installed. Adversarial.
+   installed or a backend runs your CLI on another model. Adversarial.
 
 So the gate is not somewhere between the two rows in the chart. It is **both rows, run one
 after the other**, on every phase, automatically. That is what the gate is for: you get the
@@ -88,12 +89,13 @@ right". It has one real safeguard: an issue that cannot be stated as a concrete 
 recorded and left unfixed, because a review that changes code it cannot show to be wrong
 makes the work worse. A phase gate runs it cut down to a single pass.
 
-**`/diff-review` is the only skill that reaches a different runtime.** At its strongest level
-it launches the other tool's command-line program under a small bundled supervisor. Two
+**`/diff-review` reaches a different model at its strongest.** It launches the other tool's
+command-line program, or your own on a backend running another model, under a small bundled
+supervisor. Two
 models are involved, one that wrote the code and one that reads it, but only one model
 reviews. No stage tries to disprove the findings; the nearest thing is asking the finder to
-run the confirming test and say which findings it confirmed. It degrades in steps: with one
-runtime you get a separate reviewer of the same model, and if no separate reviewer can be
+run the confirming test and say which findings it confirmed. It degrades in steps: with no
+different model available you get a separate reviewer of the same model, and if no separate reviewer can be
 started at all, the review happens in the authoring context and is reported as having done
 so.
 
@@ -110,6 +112,13 @@ other's work.** Each model criticizing the other is how it works, so it gives up
 purpose. The judge is a third party whose verdict must fit a fixed structure, and which plan
 came from which model is withheld from everyone, the judge included, until the summary is
 written.
+
+**`/xc` reviews a document the way `/diff-review` reviews code, then argues back.** It uses
+`/diff-review`'s launch commands and supervisor, so it reaches a different model the same
+way. What it adds is the round after the review: the author rejects a finding only with a
+concrete reason, the reviewer can answer once with new evidence, and anything still disputed
+comes to you unapplied. It will not review its own work: with no separate reviewer it stops
+and says so. `/plan-init` and `/plan-phase` offer it when they finish.
 
 **`/review-panel` does two things nothing else here does.** First, it proves its coverage:
 every file is accounted for, and the run fails, naming the path, if anything was left
@@ -142,6 +151,7 @@ The chart above makes the pack look safer than it is. These are the gaps.
 | You just finished something and the context is still loaded | `/cyw` |
 | You are at a phase or pull-request boundary | `/diff-review`. `/plan-run` runs it and `/cyw` automatically at every gate |
 | You face a large decision and no code exists yet | `/plan-duel` |
+| You just wrote a plan, a phase breakdown or another document someone will act on | `/xc`. `/plan-init` and `/plan-phase` offer it when they finish |
 | You are about to publish | `/security-review-codebase` for vulnerabilities, `/review-panel` for correctness. They do not substitute for each other |
 
 Watch one overlap: at a gate, `/cyw` and `/diff-review` both read the same diff. They ask

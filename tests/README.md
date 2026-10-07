@@ -105,6 +105,7 @@ Paired positive / negative fixtures:
 | `test_validate_stale_runtime_claim.md` | **Fails** — outdated "Codex cannot…" wording |
 | `test_validate_codex_skill_path.md` | **Fails** — points at `~/.codex/skills` instead of the documented `$HOME/.agents/skills` |
 | `test_validate_unknown_skill_reference.md` | **Fails** — references a skill name that isn't in `skills/` |
+| `test_validate_builtin_clear.md` | **Passes** — names `/clear`, a command both runtimes build in, which is not an unknown skill |
 | `test_validate_plan_duel_relative_prompt.md` | **Fails** — workdir-relative companion skill path like `../plan-init/SKILL.md` |
 | `test_validate_readme_inventory.md` | **Fails** — a README-style skill-inventory table that lists a retired skill, omits a real one, and hardcodes a stale skill count |
 | `test_validate_readme_inventory_clean.md` | **Passes** — the same table in sync with the skills listing, count matching |

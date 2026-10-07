@@ -3,14 +3,16 @@
   "commit": 1826,
   "cyw": 642,
   "demo-video": 1880,
-  "diff-review": 3595,
+  "diff-review": 3771,
   "extract-hooks": 862,
+  "handoff": 641,
   "plan-duel": 5223,
-  "plan-init": 2289,
-  "plan-phase": 3256,
-  "plan-run": 9870,
+  "plan-init": 2359,
+  "plan-phase": 3313,
+  "plan-run": 9871,
   "review-panel": 22924,
   "security-review-codebase": 5578,
   "tdd": 771,
-  "web-verify": 1927
+  "web-verify": 1927,
+  "xc": 1122
 }

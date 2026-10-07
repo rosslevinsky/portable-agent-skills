@@ -5,8 +5,8 @@ description: >
   Reads plan.md + the execution.md checkbox tracker + the current phase doc (never
   phases.md), and runs phases in order, resuming from the first unticked box and
   re-reading that phase document before executing it. Runs the per-phase gate (scoped
-  tests + web-verify for UI + a single-pass cyw author review + diff-review, cross-runtime
-  when a second runtime is available, on any diff with reviewable code), fills each phase's
+  tests + web-verify for UI + a single-pass cyw author review + diff-review, by a different
+  model when one is available, on any diff with reviewable code), fills each phase's
   evidence record, makes at most one commit of its own work per phase, and assembles an
   as-built.md drift report. Refuses a plan that
   carries no `Format: v2` marker. Use when the user invokes /plan-run, or says
@@ -150,7 +150,7 @@ assumption). Read `plan.md` in full.
 
 **Optional opt-out.** A `--no-cross-review` flag on the invocation — or a note in `plan.md`
 saying the same — tells Gate to begin its independent review at **rung 2** of `diff-review`'s
-independence ladder: a fresh same-model reviewer, skipping the cross-runtime rung 1. Coverage
+independence ladder: a fresh same-model reviewer, skipping the different-model rung 1. Coverage
 is unchanged; the only thing given up is model-independence, and Gate records that it was.
 `diff-review` has no flag of its own to receive this and needs none — the choice is which rung
 Gate asks for, so it is made here and nothing is passed through.
@@ -438,11 +438,12 @@ skill below, including Step 4.
   author already ran green. Where no independent reviewer can be reached at all, do the
   equivalent yourself in a deliberate context reset: re-read the diff with fresh eyes,
   ignoring the implementation rationale, and address correctness findings. How independent
-  that reviewer is, how it is bounded, what it does when the other runtime stalls, and what
+  that reviewer is, how it is bounded, what it does when the rung-1 reviewer stalls, and what
   each severity means are `diff-review`'s to decide — do not re-derive them here. The one
   thing decided *here* is the starting rung: with `--no-cross-review` in effect (Step 1),
-  start at rung 2 and note in the evidence record that the cross-model rung was skipped by
-  request, so a reader can tell an opted-out run from one where the other runtime was absent.
+  start at rung 2 and note in the evidence record that the different-model rung was skipped
+  by request, so a reader can tell an opted-out run from one where no different model was
+  available.
 
 **Both review axes are skipped when the phase produced no reviewable diff** — its only changes
 are metadata under `plans/<slug>/`, as for a pure closing or verification-gate phase. Tick

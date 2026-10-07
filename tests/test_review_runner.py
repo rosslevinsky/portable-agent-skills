@@ -27,6 +27,8 @@ import unittest
 import inspect
 import unittest.mock
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _git_env  # noqa: E402,F401  every git command a test starts runs under the suite's config
 
 _ENGINE_DIR = Path(__file__).resolve().parent.parent / "skills" / "diff-review"
 if str(_ENGINE_DIR) not in sys.path:
