@@ -8,6 +8,40 @@ Versions use [Calendar Versioning](https://calver.org/) in the form
 A MICRO bump in the same month indicates a follow-up release; a new month
 starts from `.0` again.
 
+## [2026.10.2] - 2026-10-07
+
+### Added
+
+- **`/handoff` writes a restart prompt you can pick up after clearing the context.** It saves
+  the goal, what is done and what is next, the decisions already made, the traps found and
+  the uncommitted work to `~/.handoff/<project>.md`, and ends with one line to paste after
+  `/clear`; the fresh session reads the file and carries on. It names files by path rather
+  than restating them. A later run for the same project replaces its own file and never
+  another project's, even when two projects share a folder name. Where it cannot write the
+  file, it prints the prompt instead.
+- **`/xc` cross-checks a document with a different model.** Give it a plan, a phase
+  breakdown or any document. It runs a `cyw` pass, has another model review the document,
+  and decides each finding on its merits. Every finding it rejects goes back to the
+  reviewer once, with the reason; one still disputed after that is listed for you and not
+  applied. It applies what survives and runs the full `cyw` loop again. The reviewer is
+  launched the way `/diff-review` launches its own, so a different model needs that skill
+  and Python 3; without one, `/xc` uses a fresh reviewer on your own model, and with no
+  separate reviewer at all it stops and says so rather than presenting its own review as a
+  second opinion.
+
+### Changed
+
+- **`/plan-init` and `/plan-phase` offer `/xc` when they finish.** Each asks whether to have
+  a different model cross-check what it just wrote, before its next step. An unattended run
+  never starts the review, which costs time and money; it names it as an optional step.
+- **`/diff-review` gives a different-model review with only one CLI installed.** Name a
+  backend that runs your own CLI on another model, and the review runs there instead of
+  falling back to a second copy of the same model; `/plan-run`'s phase gate gets the same
+  through it. A backend written for the other CLI still launches that CLI, and a backend
+  whose model name matches your own is not used as the different-model reviewer. Model
+  names are compared as text, so the report names both models and says their independence
+  is unverified: two spellings of one model would pass as different.
+
 ## [2026.10.1] - 2026-10-05
 
 ### Added
@@ -923,6 +957,7 @@ release](README.md#installing-a-previous-release) to return to it.
 
 Initial release.
 
+[2026.10.2]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.10.2
 [2026.10.1]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.10.1
 [2026.10.0]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.10.0
 [2026.09.8]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.09.8

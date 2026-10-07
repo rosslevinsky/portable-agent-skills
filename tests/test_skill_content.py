@@ -17,6 +17,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _git_env  # noqa: E402,F401  every git command a test starts runs under the suite's config
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SKILLS = REPO_ROOT / "skills"
@@ -1531,6 +1533,7 @@ class EveryDispatchingSkillNamesItsMechanism(unittest.TestCase):
         "review-panel": ("SKILL.md", "references/dispatch.md"),
         "plan-run": ("SKILL.md",),
         "security-review-codebase": ("references/hierarchical-mode.md",),
+        "xc": ("SKILL.md",),
     }
     # The skills with a path that starts no program: an in-process sub-agent, or no agent.
     FALL_BACK = ("plan-run", "security-review-codebase")
@@ -2306,7 +2309,7 @@ class ShippedTextSaysWhatTheCodeDoes(unittest.TestCase):
     def test_plan_phase_does_not_send_the_reader_to_its_own_step_5(self):
         """Step 5 writes phase documents. The cross-model review lives in `plan-run`."""
         text = self._norm("plan-phase", "SKILL.md")
-        start = text.index("cross-model")
+        start = text.index("different-model")
         if "see Step 5" in text[start:start + 300]:
             self.fail("the overview sends the reader to Step 5 for the cross-model review, "
                       "which Step 5 never mentions")
@@ -2923,6 +2926,357 @@ class TheMaintainersGuideNamesNothingThatWasRenamed(unittest.TestCase):
         skill = (SKILLS / "review-panel" / "SKILL.md").read_text(encoding="utf-8")
         self.assertEqual(skill.count("references/architecture.md"), 1,
                          "SKILL.md points at the maintainer's guide more than once")
+
+
+class HandoffKeepsItsPromises(unittest.TestCase):
+    """`handoff` writes a restart prompt where a fresh session can find it, and never
+    overwrites another project's. Each test names the promise the user acts on."""
+
+    def setUp(self):
+        raw = (SKILLS / "handoff" / "SKILL.md").read_text(encoding="utf-8")
+        self.text = " ".join(re.sub(r"(?m)^\s*>\s?", "", raw).replace("**", "").split())
+        self.folded = self.text.casefold()
+        self.description = re.search(r"(?m)^description:(.*)$", raw).group(1)
+
+    def has(self, token):
+        return token.casefold() in self.folded
+
+    def test_it_triggers_on_the_users_own_words(self):
+        for phrase in ("/handoff", "restart prompt so I can clear context", "write a handoff"):
+            self.assertIn(phrase, self.description,
+                          f"the description never names {phrase!r}, so the skill is not "
+                          f"chosen when the user says it")
+
+    def test_it_writes_one_file_per_project_under_the_home_folder(self):
+        self.assertTrue(self.has("~/.handoff/<project>.md"), "the file's location is not named")
+
+    def test_it_never_overwrites_another_projects_file(self):
+        """Two projects can share a folder name. The file's first line records whose it is,
+        and the check runs before every write, or the second project's prompt replaces the
+        first's and the first's pasted line loads the wrong work."""
+        for token in ("first line", "absolute path", "before every write", "next parent folder"):
+            self.assertTrue(self.has(token), f"the collision rule has lost {token!r}")
+        self.assertRegex(self.text, r"(?i)never overwrit",
+                         "nothing says a file recording another project is left alone")
+
+    def test_only_its_own_header_licenses_an_overwrite(self):
+        """An empty or unrecognized first line is neither this project's path nor another's.
+        Without a rule for it, the file falls through to the write and is replaced."""
+        self.assertTrue(self.has("exactly `Project: <this project's absolute path>`"),
+                        "the overwrite is not tied to an exact header naming this project")
+        self.assertTrue(self.has("any other first line"),
+                        "an empty or unrecognized first line has no rule")
+
+    def test_the_collision_loop_ends(self):
+        """`/a/p` beside `p.md` and `a-p.md` written by other projects has no parent folder
+        left. A loop told to continue until free cannot finish."""
+        self.assertTrue(self.has("if the parent folders run out first, write nothing and print "
+                                 "the prompt"),
+                        "nothing ends the search with no file written and the prompt printed")
+        self.assertTrue(self.has("drive"), "a Windows drive could become part of a name")
+
+    def test_its_last_output_is_the_line_to_paste(self):
+        self.assertTrue(self.has("Read <absolute path> and continue from it."),
+                        "the line to paste is not spelled out")
+        self.assertTrue(self.has("`/clear`"), "the user is never told when to paste the line")
+
+    def test_an_unwritable_file_prints_the_prompt_instead(self):
+        """A Codex sandbox can forbid writes outside the workspace. A run that reported the
+        line anyway would hand the user a path to nothing."""
+        self.assertTrue(self.has("fenced block"), "no fallback for an unwritable file")
+        self.assertTrue(self.has("_Classification: Degraded"), "the fallback is not declared")
+
+    def test_the_prompt_carries_what_a_fresh_session_needs(self):
+        for token in ("branch", "last commit", "uncommitted", "decisions", "files to read first",
+                      "current state"):
+            self.assertTrue(self.has(token), f"the prompt's contents omit {token!r}")
+
+    def test_files_are_named_not_paraphrased(self):
+        """A paraphrase of a file's contents drifts from the file, and the next session reads
+        the file itself."""
+        self.assertTrue(self.has("never restate its contents"),
+                        "the prompt may paraphrase files the next session can read")
+
+    def test_the_prompt_carries_no_secret(self):
+        self.assertTrue(self.has("Never write a secret, key, token, password or credential"),
+                        "nothing keeps a key or token out of a file left in the home folder")
+
+
+class DiffReviewTakesASameCliBackend(unittest.TestCase):
+    """Rung 1 is keyed on the model, not the harness: a user with one CLI and a backend that
+    runs it on another model still gets a different-model review."""
+
+    def _folded(self, path):
+        raw = path.read_text(encoding="utf-8")
+        return " ".join(re.sub(r"(?m)^\s*>\s?", "", raw).replace("**", "").split()).casefold()
+
+    def setUp(self):
+        self.text = self._folded(SKILLS / "diff-review" / "SKILL.md")
+
+    def test_rung_one_names_the_same_cli_route(self):
+        self.assertIn("this runtime's own cli on a backend", self.text,
+                      "rung 1 still means only the other runtime, so a one-CLI user with a "
+                      "backend on another model falls to a same-model review")
+
+    def test_the_backend_harness_picks_the_cli(self):
+        """A Claude host given a Codex backend must still launch Codex: routing every named
+        backend to the host's CLI makes the supervisor refuse the mismatch."""
+        self.assertIn("a named backend picks the cli by its `harness`", self.text)
+
+    def test_an_equal_model_is_refused_for_rung_one(self):
+        self.assertIn("an equal model is refused for rung 1", self.text,
+                      "a backend running the author's own model would pass as a second opinion")
+
+    def test_the_commands_belong_to_the_cli_launched(self):
+        """The Codex line sits in the Claude note and the reverse. A Claude host launching
+        Claude needs to know the claude line is its own."""
+        self.assertIn("belong to the cli launched, not the host", self.text)
+
+    def test_the_report_names_the_backend_and_model(self):
+        self.assertIn("rung 1 with the backend's name and model", self.text)
+
+    def test_a_same_cli_report_shows_both_models(self):
+        """The models are compared as text, so two spellings of one model pass as different.
+        Naming both lets the reader see what was compared."""
+        self.assertIn("names your own model beside the backend's", self.text)
+        self.assertIn("independence as unverified", self.text,
+                      "the report still claims a model-independent review it only compared by name")
+
+    def test_a_one_cli_host_does_not_fall_open_for_want_of_the_other_cli(self):
+        """The fallback keys on the rung-1 reviewer's CLI. Keyed on "the other runtime's CLI",
+        a Claude-only host with a valid Claude backend on another model falls to rung 2."""
+        self.assertNotIn("the other runtime's cli is unavailable", self.text)
+        self.assertIn("the rung-1 reviewer's cli is unavailable", self.text)
+
+    def test_no_passage_still_scopes_rung_one_to_another_runtime(self):
+        """A same-CLI reviewer outside "dispatched to another runtime" may skip the verdict
+        object, and a scope note calling rung 1 cross-runtime misdescribes its review."""
+        for stale in ("dispatched to another runtime", "rung-1 cross-runtime pass"):
+            self.assertNotIn(stale, self.text)
+
+    def test_each_host_is_told_its_own_line(self):
+        self.assertIn("a claude host reviewing on claude uses the claude line", self.text)
+        self.assertIn("a codex host on codex the codex line", self.text)
+
+    def test_no_skill_still_calls_rung_one_cross_runtime(self):
+        """Rung 1 is "a different model": a skill that calls it cross-runtime tells a
+        one-CLI user with a backend on another model that the strong rung is out of reach."""
+        for skill in ("diff-review", "plan-run", "plan-phase"):
+            text = self._folded(SKILLS / skill / "SKILL.md")
+            for stale in ("cross-runtime", "second runtime", "other runtime was absent",
+                          "when the other runtime stalls"):
+                with self.subTest(skill=skill, stale=stale):
+                    self.assertNotIn(stale, text)
+        readme = self._folded(REPO_ROOT / "README.md")
+        self.assertNotIn("cross-runtime when a second runtime is available", readme)
+
+    def test_the_review_guide_knows_the_same_cli_route_and_xc(self):
+        """README sends a reader choosing a review skill to REVIEWS.md. A guide that says a
+        different model needs both CLIs, or that omits xc, sends them the wrong way."""
+        guide = self._folded(REPO_ROOT / "REVIEWS.md")
+        self.assertNotIn("the only skill that reaches a different runtime", guide)
+        self.assertNotIn("with both installed, the reviewer is the other model", guide)
+        self.assertIn("a backend running another model", guide)
+        self.assertIn("| `/xc` |", guide)
+
+    def test_the_readme_review_section_knows_the_same_cli_route_and_xc(self):
+        """The README's review section is where a reader learns what a different-model review
+        needs. Told it needs both CLIs, a one-CLI user with a backend thinks it is out of reach;
+        with xc missing from its prose, the skill is only a table row nobody reads about."""
+        raw = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        start = raw.index("### Cross-model adversarial review")
+        section = " ".join(raw[start:raw.index("\n### ", start + 1)].replace("**", "").split()).casefold()
+        self.assertNotIn("(install both claude and codex)", section)
+        self.assertIn("one runtime plus a backend on another model", section)
+        self.assertIn("`/xc`", section)
+        self.assertIn("six skills here could all be called", section)
+        rest = raw[raw.index("### The rest of the pack"):raw.index("## Skill Inventory")]
+        self.assertIn("`/handoff`", rest)
+        cycle = raw[raw.index("### The planning cycle"):raw.index("### Generations")]
+        self.assertIn("`/xc`", cycle)
+
+    def test_the_readme_no_longer_requires_both_clis(self):
+        readme = self._folded(REPO_ROOT / "README.md")
+        self.assertNotIn("cross-model when both clis are present", readme)
+
+
+class XcKeepsItsPromises(unittest.TestCase):
+    """`xc` gets a second opinion on a document from a model that did not write it, settles
+    each disagreement once, and applies only what survives."""
+
+    def setUp(self):
+        raw = (SKILLS / "xc" / "SKILL.md").read_text(encoding="utf-8")
+        self.text = " ".join(re.sub(r"(?m)^\s*>\s?", "", raw).replace("**", "").split())
+        self.folded = self.text.casefold()
+        self.description = re.search(r"(?m)^description:(.*)$", raw).group(1).casefold()
+
+    def assertSays(self, phrase, why):
+        self.assertTrue(phrase.casefold() in self.folded, why)
+
+    def test_it_triggers_on_the_users_own_words(self):
+        for phrase in ("/xc", "see what codex thinks", "arbitrate with codex", "cross-check"):
+            self.assertIn(phrase, self.description, f"the description never names {phrase!r}")
+        self.assertIn("use diff-review instead", self.description,
+                      "a code diff at a merge boundary is not pointed at diff-review")
+
+    def test_an_earlier_cyw_pass_is_not_repeated(self):
+        self.assertSays("if a `cyw` pass ran on these files earlier in this conversation and none "
+                        "of them has changed since, skip this pass",
+                        "a cyw pass is repeated on files nothing has touched")
+
+    def test_there_is_no_third_rung(self):
+        """A self-review presented as a second opinion is the misleading output. With no
+        independent reviewer the skill stops and says the cyw pass is all there was."""
+        self.assertSays("there is no third rung", "rung 3 is not ruled out")
+        self.assertSays("the step 1 pass is the only review", "the stop does not say what ran")
+
+    def test_rung_two_never_runs_a_native_code_review(self):
+        """A native review command reviews the working tree's changes, not the document."""
+        self.assertSays("never a native code-review command", "rung 2 may review the wrong thing")
+
+    def test_a_named_backend_picks_its_cli(self):
+        self.assertSays("a named backend's `harness` picks which cli launches",
+                        "a backend could be launched on the CLI it was not written for")
+        self.assertSays("on a backend the user names whose model is not yours",
+                        "a backend on the host's own model could pass as a second opinion")
+
+    def test_the_reviewer_runs_where_the_target_is(self):
+        self.assertSays("`--cwd` set to the repository holding the target",
+                        "a reviewer may be unable to read a target outside its working folder")
+
+    def test_context_documents_reach_the_reviewer_and_stay_unedited(self):
+        """Run from plan-phase, plan.md is context: the reviewer must read it, or a
+        requirement the phases dropped goes unseen, and xc must not edit it."""
+        self.assertSays("context documents the caller names", "no slot for context documents")
+        self.assertSays("read-only context", "the reviewer is not told to read the context")
+        self.assertSays("never edit a context document", "a context document could be edited")
+
+    def test_the_verdict_fields_need_no_other_skill(self):
+        self.assertSays("spelled here so a sub-agent needs no other skill",
+                        "a rung-2 sub-agent depends on diff-review for its report shape")
+        self.assertSays("`blocking_count`", "the verdict fields are not spelled out")
+        self.assertSays("with `diff-review` absent, that launch is unavailable",
+                        "rung 2's CLI launch has no answer when diff-review is missing")
+
+    def test_a_missing_verdict_object_is_still_a_review(self):
+        """Codex's rung-1 command carries no schema flag, so prose with no closing object is
+        its expected success. Read as a failure, a finished cross-model review is thrown away
+        and redone same-model."""
+        self.assertSays("no parseable verdict object is still a review",
+                        "a prose-only rung-1 review would be redone at rung 2")
+
+    def test_the_send_back_is_one_launch(self):
+        """One launch per rejected finding multiplies a paid cross-model review by the count."""
+        self.assertSays("in one fresh launch", "the send-back could be one launch per finding")
+
+    def test_the_schema_goes_only_where_the_command_takes_one(self):
+        """diff-review's Codex line deliberately carries no schema flag."""
+        self.assertSays("for the verdict where that command takes one",
+                        "a schema flag could be added to a command that omits it on purpose")
+
+    def test_a_same_cli_report_shows_both_models(self):
+        self.assertSays("your own model beside it",
+                        "a same-CLI review does not show which models were compared")
+        self.assertSays("independence as unverified",
+                        "the report claims a model-independent review it only compared by name")
+
+    def test_each_disagreement_is_sent_back_once(self):
+        self.assertSays("send every rejection and partial back once", "no single send-back round")
+        self.assertSays("it is not applied", "an open disagreement could be applied anyway")
+
+    def test_a_disputed_partial_is_not_applied(self):
+        """A partial whose alternative fix the reviewer disputes is an open disagreement. An
+        apply step covering "every partial" would apply it, and so could the final cyw."""
+        self.assertSays("an open disagreement is never applied",
+                        "the apply step does not exclude open disagreements")
+        self.assertSays("tell the final `cyw` which findings are open",
+                        "the final cyw may apply a disputed finding")
+
+    def test_no_rejection_is_exempt_from_the_send_back(self):
+        self.assertNotIn("never send one back", self.folded,
+                         "a rejected nit skips the send-back that every rejection is promised")
+
+    def test_the_manual_loop_confirms_a_clean_first_pass(self):
+        self.assertSays("a clean first pass still gets a confirming second",
+                        "the manual fallback stops after one clean pass, where cyw would not")
+
+    def test_the_last_cyw_is_the_full_loop(self):
+        self.assertSays("the full loop, not single-pass", "the final cyw is a single pass")
+        self.assertSays("at most three passes", "the manual fallback is not the full loop")
+
+    def test_the_report_names_the_reviewer_and_every_decision(self):
+        self.assertSays("which reviewer ran", "the report does not name the reviewer")
+        self.assertSays("a table: finding, severity, decision, reason, applied",
+                        "the report does not list each decision")
+
+    def test_every_question_has_an_autonomous_answer(self):
+        self.assertSays("autonomously: the most recently modified document",
+                        "target choice has no autonomous fallback")
+        self.assertSays("autonomously: leave them unapplied",
+                        "open disagreements have no autonomous fallback")
+
+    def test_it_declares_its_classification_and_progress(self):
+        self.assertSays("_classification: degraded", "no classification line")
+        self.assertSays("_progress: observable", "no progress declaration")
+
+
+class PlanSkillsOfferXc(unittest.TestCase):
+    """`plan-init` and `plan-phase` end by asking whether to cross-check what they wrote,
+    so the check is one "yes" away. Asking, not running: a cross-model review costs minutes
+    and money, and the user does not always want it."""
+
+    def _folded(self, skill):
+        raw = (SKILLS / skill / "SKILL.md").read_text(encoding="utf-8")
+        return " ".join(re.sub(r"(?m)^\s*>\s?", "", raw).replace("**", "").split()).casefold()
+
+    def test_plan_init_offers_xc_on_the_plan(self):
+        text = self._folded("plan-init")
+        self.assertIn("ask whether to run the `xc` skill on `plan.md`", text)
+
+    def test_the_offer_squares_with_an_unedited_plan(self):
+        """`plan.md` is never modified by later skills, and `xc` edits its target. Without
+        saying the pass is still authoring, an agent refuses the edit or breaks the rule."""
+        self.assertIn("still part of writing it", self._folded("plan-init"))
+
+    def test_plan_phase_offers_xc_on_what_it_wrote(self):
+        """`plan-phase` writes several documents; an offer on "the document" would let the
+        tracker, written last, stand for the phases plan-run will execute."""
+        text = self._folded("plan-phase")
+        self.assertIn("ask whether to run the `xc` skill on the phase documents and "
+                      "`execution.md`", text)
+        self.assertIn("`plan.md` given as context", text)
+
+    def test_each_offer_has_both_fallbacks(self):
+        for skill in ("plan-init", "plan-phase"):
+            with self.subTest(skill=skill):
+                text = self._folded(skill)
+                self.assertIn("autonomously, do not run it", text,
+                              "an unattended run would start a paid review nobody asked for")
+                self.assertIn("if the `xc` skill is unavailable, make no offer", text)
+
+    def test_unattended_names_it_as_an_optional_step(self):
+        for skill in ("plan-init", "plan-phase"):
+            with self.subTest(skill=skill):
+                self.assertIn("name it in the summary as an optional step", self._folded(skill))
+
+    def test_the_offer_comes_before_the_next_step(self):
+        """The optional review comes first; a next step printed before it reads as the end."""
+        for skill, nxt in (("plan-init", "next step: \"run `/plan-phase"),
+                           ("plan-phase", "the next step: \"run `/plan-run")):
+            with self.subTest(skill=skill):
+                text = self._folded(skill)
+                offer = text.find("ask whether to run the `xc` skill")
+                self.assertTrue(0 <= offer < text.find(nxt),
+                                "the next step is printed before the offer")
+
+    def test_the_next_step_line_survives(self):
+        self.assertIn("run `/plan-phase <path>`", self._folded("plan-init"))
+        self.assertIn("run `/plan-run <the plan file you read>`", self._folded("plan-phase"))
+
+    def test_the_v1_skills_do_not_offer_it(self):
+        for skill in ("plan-init-v1", "plan-phase-v1"):
+            with self.subTest(skill=skill):
+                self.assertNotIn("`xc`", self._folded(skill))
 
 
 if __name__ == "__main__":

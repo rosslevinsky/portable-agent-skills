@@ -182,6 +182,9 @@ installed. **A fix to one side of a mirrored block is also made in its mirror, i
   nothing edits it after `plan-init` writes it; v1 keeps `Phase` / `State` / `Blocker` /
   `Last updated`. v2's `plans/README.md` index has no `Status` column. Do not restore mutable
   status fields to v2, and do not remove v1's.
+- **The `xc` offer is v2-only.** `plan-init` and `plan-phase` end by asking whether to run
+  the `xc` skill on what they wrote; `plan-init-v1` and `plan-phase-v1` do not. It is a
+  capability, not a fix, so it is not backported.
 - **Delegation is v2-only.** v2's `plan-run` tags each transition worker-safe or
   orchestrator-only and ships `references/phase-worker-contract.md`. v1 has no worker concept.
   Do not backport it; it is a capability, not a fix.

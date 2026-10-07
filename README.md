@@ -9,7 +9,7 @@ A collection of portable, cross-runtime agent skills for [Claude Code](https://d
 
 AI coding agents benefit from reusable, well-shaped workflows — "write a failing test first, then implement," "audit this codebase for security issues," "break a large task into committable phases." This repository packages those workflows as plain-markdown `SKILL.md` files that both **Claude Code** (Anthropic) and **Codex CLI** (OpenAI) can invoke, with equivalent behavior enforced by an automated portability contract.
 
-One install command copies 17 skills to where both runtimes look for them. CI enforces a
+One install command copies 19 skills to where both runtimes look for them. CI enforces a
 contract that forbids runtime-specific tool names, requires a fallback wherever a skill depends
 on a companion skill, and flags private paths before they ship.
 
@@ -72,12 +72,16 @@ For work bigger than a one-shot edit, the intended flow is:
   a CI fix, which goes through the gate like any other change. That gate runs scoped tests,
   plus **`/web-verify`** (screenshot-first UI verification) where the phase has UI. Wherever
   the phase produced a reviewable diff, the gate also runs a single-pass **`/cyw`** author
-  review and **`/diff-review`** (independent, diff-first review, cross-runtime when a second
-  runtime is available); a phase that only touched plan metadata skips both and records why.
+  review and **`/diff-review`** (independent, diff-first review, by a different model when
+  one is available); a phase that only touched plan metadata skips both and records why.
   It fills each evidence record, and assembles an `as-built.md` drift report for a
   non-trivial plan. Safe to restart: already-completed phases are skipped.
 
 Insert `/cyw` freely between steps. Common spots: after `/plan-init` (sanity-check the plan before breaking it down), after `/plan-phase` (sanity-check the breakdown before executing), and after `/plan-run` finishes (final sweep).
+
+`/plan-init` and `/plan-phase` each end by asking whether to run **`/xc`** on what they just
+wrote: a different model's review of the plan or the breakdown before any work starts. It
+never runs unattended; see [Cross-model adversarial review](#cross-model-adversarial-review-a-second-cli-or-a-backend-on-another-model).
 
 Two of the skills the gate calls also stand on their own — **`/web-verify`** and
 **`/diff-review`** — and **`/demo-video`** takes over once the feature is finished. All three
@@ -109,8 +113,9 @@ started under it.
 
 The row that matters most is the review one. Under `-v1` a phase is committed once the
 agent has checked its own work, and nobody else has. The current suite adds a second
-reviewer, and how independent that reviewer is depends on the host. Another runtime is best,
-and a fresh sub-agent in the same runtime is next. Where neither can be started, the same
+reviewer, and how independent that reviewer is depends on the host. A different model is
+best — another runtime, or your own on a backend running another model — and a fresh
+sub-agent in the same runtime is next. Where neither can be started, the same
 context re-reads the diff from scratch with the rationale set aside. Only the last of those
 has seen the reasoning behind the code. Coverage is the same either way; the strength of the
 second opinion is not.
@@ -142,31 +147,46 @@ judge), so a duel that runs to the cap makes around thirty, each reading and wri
 document. That takes minutes and costs real money on a metered plan. Use it on work where the
 plan itself is the risk, not on routine changes.
 
-### Cross-model adversarial review (install both Claude and Codex)
+### Cross-model adversarial review (a second CLI, or a backend on another model)
 
-The independent-review step is stronger when you have **both the `claude` and `codex` CLIs
-installed**. `/diff-review` — and the `/plan-run` gate that runs it on every phase with a
-reviewable diff — hands the
-review to the runtime that *didn't* write the code: **Codex reviews Claude's work, or Claude
-reviews Codex's.** A different model has different training and different blind spots, so it flags
-bugs, wrong assumptions, and missed edge cases the authoring model is systematically unlikely to
-catch on its own. It is an **adversarial** second opinion, not a restatement of the author's own view.
+The independent-review step is stronger when the reviewer is a **different model**: install
+**both the `claude` and `codex` CLIs**, or point your own CLI at another model through a
+backend. `/diff-review` — and the `/plan-run` gate that runs it on every phase with a
+reviewable diff — hands the review to a model that *didn't* write the code: **Codex reviews
+Claude's work, Claude reviews Codex's, or your own CLI reviews on the backend's model.** A
+different model has different training and different blind spots, so it flags bugs, wrong
+assumptions, and missed edge cases the authoring model is systematically unlikely to catch on
+its own. It is an **adversarial** second opinion, not a restatement of the author's own view.
 
-This does at review time what `/plan-duel` does at plan time. Install both runtimes and you get
-a second, different model at the two moments where it matters most: **designing the plan**
-(`/plan-duel`) and **reviewing the code** (`/diff-review`).
+This does at review time what `/plan-duel` does at plan time. With a second model available
+you get it at the moments where it matters most: **designing the plan** (`/plan-duel`),
+**checking a plan or any document you already wrote** (`/xc`), and **reviewing the code**
+(`/diff-review`).
 
-When something is missing it falls back in steps, and each step still works. It runs in either
-direction (Claude-driven or Codex-driven):
+**`/xc` is the same second opinion for a document.** It runs a `cyw` pass, has the other model
+review the document, and decides each finding on its merits. A finding it rejects goes back to
+the reviewer once, with the reason; one still disputed after that comes to you and is not
+applied. It applies what survives and runs the full `cyw` loop again. It reaches the other
+model the way `/diff-review` does. With no different model available it falls back to a fresh
+reviewer running your own model, which has not seen the conversation; with no separate
+reviewer at all it stops and says so rather than passing off its own review as a second
+opinion.
+
+When something is missing, `/diff-review` falls back in steps, and each step still works. It
+runs in either direction (Claude-driven or Codex-driven):
 
 - **Both runtimes present** → the review runs cross-model, in the *other* runtime, through a
   small bundled Python 3 program, the supervisor. It shows the reviewer's output as it arrives
   and stops the reviewer at a time limit (a timeout when no output arrives for too long, and an
   overall deadline), so a reviewer that hangs never blocks you.
-- **Only one runtime (or no Python 3)** → it falls back to a fresh **same-model** reviewer — still
-  independent of the authoring conversation, just not a different model. With a backend (see
-  [Choosing the model a second agent runs on](#choosing-the-model-a-second-agent-runs-on)), a
-  single runtime can still run the reviewer on a different model.
+- **One runtime plus a backend on another model** → the same review runs on your own CLI,
+  on the backend's model (see
+  [Choosing the model a second agent runs on](#choosing-the-model-a-second-agent-runs-on)).
+  The report names both models and says their independence is unverified, because model
+  names are compared as text and two spellings of one model would pass as different.
+- **Only one runtime and no such backend (or no Python 3)** → it falls back to a fresh
+  **same-model** reviewer — still independent of the authoring conversation, just not a
+  different model.
 - **No independent reviewer can be spawned at all** → the review still happens, in the authoring
   context, by deliberately setting the rationale aside and re-reading the diff as an outsider.
   It is reported as in-context, because that reviewer has seen the reasoning. At every step the
@@ -176,7 +196,7 @@ direction (Claude-driven or Codex-driven):
 Either way, only **blocker/major** findings block a commit; style nits are recorded as non-blocking
 follow-ups. Turn the cross-model step off for a run with `/plan-run --no-cross-review`.
 
-**Five skills here could all be called "a review", and they are not interchangeable.**
+**Six skills here could all be called "a review", and they are not interchangeable.**
 [`REVIEWS.md`](REVIEWS.md) sets them side by side: who reads the work, how much that reader
 knows, whether a second model is involved at all, and — the part most people never ask —
 who gets to challenge a finding once somebody raises it. Read it if you are choosing between
@@ -198,8 +218,9 @@ things.
 which settles the claim by *running* it in a separate copy of the tree rather than by arguing
 about it, and reports the command, the exit status and the output. A claim nothing can run is
 judged by reading the code instead, and says which of the two it was; a run that only searched
-the source is labeled as that rather than as a run of your code. With both runtimes installed,
-the agent that checks a finding runs on the other model.
+the source is labeled as that rather than as a run of your code. When its two lanes run
+different models — both runtimes, or one runtime running two models — the agent that checks a
+finding runs on the other model.
 
 One round asks a different question: **which shapes of input none of your tests construct**.
 What it finds is reported as a test to write rather than as a defect, because a missing test
@@ -227,8 +248,15 @@ reads whatever you point it at, for whatever problem you state.
 
 ### The rest of the pack
 
-Every skill here can be invoked on its own, whether or not you use the planning cycle. Six of
-them have not been described yet:
+Every skill here can be invoked on its own, whether or not you use the planning cycle. Seven
+of them have not been described yet:
+
+- **`/handoff`** — when the context is full and the work is not, it writes a restart prompt
+  for the current work to `~/.handoff/<project>.md`: the goal, what is done and what is next,
+  the decisions already made, the traps found and the uncommitted work. It ends with one line
+  to paste after `/clear`, and the fresh session picks the work up from the file. It never
+  overwrites another project's file, and where it cannot write the file it prints the prompt
+  instead.
 
 - **`/tdd <feature>`** — red/green/refactor, enforced. It writes the failing tests first and
   **confirms they actually fail** before writing any implementation, then implements the
@@ -279,12 +307,14 @@ runtimes.
 | `plan-init` | Interviews you and writes a `Format: v2` plan registered in `plans/README.md`. The start of any non-trivial feature or refactor | Full |
 | `plan-phase` | Breaks a plan into an ordered phase list plus the `execution.md` tracker. After `/plan-init` or `/plan-duel` | Full |
 | `plan-run` | Executes the phases in order with a per-phase gate, and writes `as-built.md` for a non-trivial plan. After `/plan-phase` | Full |
-| `plan-duel` | Two models write competing plans and refine them against each other; needs Python 3.10+, the `diff-review` skill and **both** CLIs. In place of `/plan-init` when the plan itself is the risk | Degraded |
-| `diff-review` | Diff-first review by a second reviewer, as independent as the host allows and cross-model when both CLIs are present; never edits the tree. Before a merge, and inside the `/plan-run` gate | Degraded |
+| `plan-duel` | Two models write competing plans and refine them against each other; needs Python 3.10+, the `diff-review` skill and, as shipped, **both** CLIs (or one CLI with a role on a backend running another model). In place of `/plan-init` when the plan itself is the risk | Degraded |
+| `diff-review` | Diff-first review by a second reviewer, as independent as the host allows and cross-model when a second CLI, or a backend running a different model, is available; never edits the tree. Before a merge, and inside the `/plan-run` gate | Degraded |
+| `xc` | Cross-checks a document — a plan, a phase breakdown, a design note — with a different model: a `cyw` pass, the other model's review, each disagreement settled once, only the survivors applied, and `cyw` again. After `/plan-init` or `/plan-phase`, or before acting on any document | Degraded |
 | `review-panel` | Blind multi-agent sweep of a file set: bounded areas, readers who see nothing of each other, every finding checked by one who did not raise it; writes a report for you and a fix brief for an agent, never edits. Before publishing something. Needs a host that runs two workers at once and refuses one that cannot | Runtime-limited |
 | `security-review-codebase` | Whole-codebase audit for exploitable vulnerabilities; single-pass by default, hierarchical deep mode on request | Degraded |
 | `tdd` | Red/green/refactor, with the failing test confirmed before any implementation. When getting the behavior right matters more than getting it quickly | Full |
 | `commit` | Stages the paths the change touched, never a sweep of the tree, and writes the message from the diff; pushes only when asked | Full |
+| `handoff` | Writes a restart prompt for the current work to a file and prints the one line to paste after `/clear`. When the context is full and the work is not | Degraded |
 | `web-verify` | Screenshots a running web UI and inspects the images against anchored assertions. After changing UI; needs an existing Playwright setup | Degraded |
 | `demo-video` | Records a guided-tour walkthrough of a finished feature with timed subtitles. When the feature is done and you want to show it | Degraded |
 | `extract-hooks` | Moves non-UI logic out of `.tsx` components into custom hooks. React and TypeScript only | Full |
@@ -480,6 +510,7 @@ Ask in plain words and name the backend; the skill passes it on.
 | `review-panel` | "Run the panel with its second group of readers on backend `glm53-claude-fireworks`." The panel runs two groups of readers, called lanes, and each can take its own backend. |
 | `plan-run` | "Run the plan, with phase workers on backend `kimik3-codex-fireworks`." |
 | `security-review-codebase` | "Deep review, with component reviewers on backend `glm53-codex-fireworks`." |
+| `xc` | "Cross-check this plan with the reviewer on backend `kimik3-claude-fireworks`." From Claude Code, that is the same CLI on another model. |
 
 Pick a backend whose middle word matches the CLI that runs that agent: `-claude-` for an agent
 Claude Code runs, `-codex-` for one Codex runs. A mismatch is refused before launch. Two skills
@@ -729,7 +760,7 @@ and anything else in `~/.portable-agent-skills` are left in place.
 python3 install.py
 ```
 
-Installing 17 skills is a copy of about 55,000 words, fast enough to run after every edit.
+Installing 19 skills is a copy of about 80,000 words, fast enough to run after every edit.
 The runtimes read the installed copy, not this checkout, so an edit here changes nothing
 until it is reinstalled.
 

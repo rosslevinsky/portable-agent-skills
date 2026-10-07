@@ -29,6 +29,8 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _git_env  # noqa: E402,F401  every git command a test starts runs under the suite's config
 from unittest import mock
 
 _ENGINE_DIR = Path(__file__).resolve().parent.parent / "skills" / "review-panel"

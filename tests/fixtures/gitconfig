@@ -1,0 +1,14 @@
+# The global git configuration every test runs under, in place of the developer's own.
+#
+# A test that builds a throwaway repository and commits in it must not depend on how the
+# person running the suite has set up git. A global config that signs every commit, or that
+# refuses to commit without an identity it routes by remote, makes every such test fail on
+# that machine alone. This file is global-level, so an identity a test sets in its own
+# repository still wins, and the system-level config is left as it is.
+[user]
+	name = Test Suite
+	email = test-suite@example.invalid
+[commit]
+	gpgsign = false
+[tag]
+	gpgsign = false

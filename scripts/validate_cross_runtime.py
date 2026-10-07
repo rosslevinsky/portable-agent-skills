@@ -228,8 +228,9 @@ SIBLING_SKILL_PATH_RE = re.compile(r"\bskills[\\/][A-Za-z0-9_.-]+[\\/][^\s`'\"<>
 # which is what keeps `plans/<slug>/plan.md` from reading as a reference to `/plan`.
 SLASH_COMMAND_RE = re.compile(r"`/([a-z][a-z0-9-]*)`")
 # Backtick-slash tokens that are not this pack's skills. Enumerated rather than pattern-
-# matched, and short by measurement: these are the only two in the shipped tree.
+# matched, and short by measurement: these are the only three in the shipped tree.
 NON_SKILL_SLASH_COMMANDS = frozenset({
+    "clear",   # built into Claude Code and Codex alike; handoff's line is pasted after it
     "review",  # Codex's own native command, named by diff-review as the rung-2 alternative
     "tmp",     # a filesystem path that happens to be written in backticks
 })
@@ -3079,6 +3080,17 @@ def run_test_fixtures(fixtures_dir: Path) -> list[str]:
         if not result:
             errors.append(
                 "  FIXTURE FAIL: test_validate_unknown_skill_reference.md should have been rejected but passed"
+            )
+    else:
+        errors.append(f"  Fixture not found: {f}")
+
+    # Test: a runtime's built-in command is not an unknown skill
+    f = fixtures_dir / "test_validate_builtin_clear.md"
+    if f.exists():
+        result = check_cross_skill_references(f, ["cyw"])
+        if result:
+            errors.append(
+                f"  FIXTURE FAIL: test_validate_builtin_clear.md should have passed but was rejected: {result}"
             )
     else:
         errors.append(f"  Fixture not found: {f}")

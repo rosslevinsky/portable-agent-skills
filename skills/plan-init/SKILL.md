@@ -232,6 +232,11 @@ Print a brief summary:
 - How many files are in "will change"
 - That the plan is stamped `Format: v2`, and that it is indexed in `plans/README.md` —
   or, for a plan outside `plans/`, that it was **not** indexed and why
+- An offer, before the next step: ask whether to run the `xc` skill on `plan.md` first, for
+  a different model's review of the plan before it is broken down. `xc` may edit `plan.md`:
+  before `/plan-phase` reads it, that is still part of writing it. Autonomously, do not run
+  it; name it in the summary as an optional step before `/plan-phase`. If the `xc` skill is
+  unavailable, make no offer.
 - Next step: "Run `/plan-phase <path>` to break this into executable phases and generate the `execution.md` tracker."
 
 ---

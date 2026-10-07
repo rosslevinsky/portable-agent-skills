@@ -33,8 +33,9 @@ Two things distinguish this from `/plan-phase-v1`:
    touch `phases.md`.
 
 Each phase is independently committable and sized for review cost. Every phase it emits carries a
-per-phase gate whose independent-review axis is a **cross-model** `diff-review` when a second
-runtime is installed (Codex reviewing Claude's code or the reverse — `plan-run` runs it), giving at review
+per-phase gate whose independent-review axis is a **different-model** `diff-review` when one is
+available (the other CLI, or your own CLI on a backend running another model — `plan-run`
+runs it), giving at review
 time the same different-model scrutiny `/plan-duel` gives at plan time. The document
 contract (phase-document shape and tracker structure) is defined in
 `references/v2-templates.md` — emit against it exactly. Where the pack's tracker check is
@@ -229,10 +230,17 @@ must satisfy the same contract either way.
 ## Step 7 — Report to the user
 
 Print a summary: the location of `execution.md` and the phase files; a one-line
-description of each phase (and which, if any, are independent of one another); the
-total checklist items; and the next step: "Run `/plan-run <the plan file you read>` to
-execute the phases." Name its real path — a literal `plans/<slug>/plan.md` points the
-runner at a file that does not exist whenever the plan came from anywhere else.
+description of each phase (and which, if any, are independent of one another); and the
+total checklist items.
+
+Then ask whether to run the `xc` skill on the phase documents and `execution.md`, with
+`plan.md` given as context, for a different model's review before anything runs.
+Autonomously, do not run it; name it in the summary as an optional step before `/plan-run`.
+If the `xc` skill is unavailable, make no offer.
+
+Last, the next step: "Run `/plan-run <the plan file you read>` to execute the phases." Name
+its real path — a literal `plans/<slug>/plan.md` points the runner at a file that does not
+exist whenever the plan came from anywhere else.
 
 ## References
 
