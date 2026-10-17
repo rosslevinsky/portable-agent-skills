@@ -239,6 +239,28 @@ or one defect's file to each. Give them the tree the review read: the commit the
 plus any uncommitted changes the review saw. The brief does not carry notes you add to the
 report, so leave out, or tell the agent about, any defect you marked as wrong.
 
+Commands in the fix brief are written for bash. Where PowerShell would read one differently, a
+PowerShell version follows it; from CMD, run them in PowerShell.
+
+**It can also hand back a failing test for each defect.** Ask for test patches when you set up
+the review, and the agent that checks a finding also writes a test that shows it and confirms
+the test fails for the reason it gives. Each such defect whose test can travel as a text patch
+then comes with `fix-brief/D<n>.patch`, a patch that adds the test to your suite, and its
+`D<n>.md` says how to apply it and where to run it. A test that cannot, such as one that needs a
+binary file or changes a file over 256 KiB, is not handed back, and its `D<n>.md` says why.
+Where that agent cannot run the tests, it still writes one, labeled *written, not run*: run it
+yourself before you trust it. The report says how many defects have a test. Apply a patch from
+the top of your repository, then either take one defect's test alongside its fix, or apply them
+all at once, marked as expected failures until each fix lands. **It can make the review take
+much longer, close to twice as long**: setup also works out how your tests are written, and each
+test is written and run in turn, so the cost grows with the number of tests and with how slow
+your suite is. In the job this is `test_patches`: `{"mode": "on", "min_severity": "major"}`,
+where `min_severity` is the lowest severity worth a test, so a higher one means fewer tests and
+less added time, or `{"mode": "off"}`, which takes no `min_severity`. If your tests live outside
+the files under review, list them under `support`: they are copied in for the tests to run
+against, and nobody reviews them. Without `test_patches`, the default, a review asks for no
+test conventions and writes no test patches.
+
 It never edits your tree. It needs Python 3.10+ for its bundled engine and the `diff-review`
 skill installed beside it. It is not a cheap run: two readers per area, plus a check for every
 finding. Use it before publishing something, not at every commit.

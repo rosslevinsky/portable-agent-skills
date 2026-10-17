@@ -23,12 +23,20 @@ _SKILLS = Path(__file__).resolve().parent.parent / "skills"
 
 sys.path.insert(0, str(_SKILLS.parent / "scripts"))
 import validate_cross_runtime as vcr  # noqa: E402
+sys.path.insert(0, str(_SKILLS / "review-panel"))
+import review_panel  # noqa: E402
 JUDGE_SCHEMA = _SKILLS / "plan-duel" / "judge-schema.json"
 REVIEW_SCHEMA = _SKILLS / "diff-review" / "review-schema.json"
 WORKER_SCHEMA = _SKILLS / "plan-run" / "references" / "phase-worker-schema.json"
 READER_SCHEMA = _SKILLS / "review-panel" / "reader-schema.json"
 VERIFIER_SCHEMA = _SKILLS / "review-panel" / "verifier-schema.json"
+# Not a result schema of its own: the `test` property a defect verifier's schema gains on a
+# run that asks for tests, and only there.
+VERIFIER_TEST_SCHEMA = _SKILLS / "review-panel" / "verifier-failing-test-schema.json"
 PROBE_SCHEMA = _SKILLS / "review-panel" / "probe-schema.json"
+# Not a result schema of its own either: the `conventions` property the probe's schema gains
+# on a run that asks for tests, and only there.
+PROBE_CONVENTIONS_SCHEMA = _SKILLS / "review-panel" / "probe-conventions-schema.json"
 CLUSTERER_SCHEMA = _SKILLS / "review-panel" / "clusterer-schema.json"
 MERGER_SCHEMA = _SKILLS / "review-panel" / "merger-schema.json"
 MERGE_CHECKER_SCHEMA = _SKILLS / "review-panel" / "merge-checker-schema.json"
@@ -49,6 +57,18 @@ _PY_TYPES = {
 
 def _load(path):
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _verifier_schema_with_test():
+    """The schema a defect verifier is handed on a run that asks for tests, built by the
+    engine's own merge from the two shipped files."""
+    return review_panel.with_test_property(_load(VERIFIER_SCHEMA), _load(VERIFIER_TEST_SCHEMA))
+
+
+def _probe_schema_with_conventions():
+    """The schema the probe is handed on a run that asks for tests, built the same way."""
+    return review_panel.with_conventions_property(_load(PROBE_SCHEMA),
+                                                  _load(PROBE_CONVENTIONS_SCHEMA))
 
 
 def _validate(instance, schema, path="$"):
@@ -179,9 +199,15 @@ class PortabilityInvariants(unittest.TestCase):
     """Rules every shipped schema must follow to be accepted by BOTH runtimes."""
 
     def _all(self):
-        return [JUDGE_SCHEMA, REVIEW_SCHEMA, WORKER_SCHEMA, READER_SCHEMA, VERIFIER_SCHEMA,
-                PROBE_SCHEMA, CLUSTERER_SCHEMA, MERGER_SCHEMA, MERGE_CHECKER_SCHEMA,
-                SYNTHESIZER_SCHEMA, TIER_NAMES_SCHEMA, OVERVIEW_SCHEMA]
+        """``(name, document)`` for every schema a runtime is handed: each shipped file, and
+        the verifier and probe schemas as a run that asks for tests merges them, which no
+        file holds."""
+        paths = [JUDGE_SCHEMA, REVIEW_SCHEMA, WORKER_SCHEMA, READER_SCHEMA, VERIFIER_SCHEMA,
+                 PROBE_SCHEMA, CLUSTERER_SCHEMA, MERGER_SCHEMA, MERGE_CHECKER_SCHEMA,
+                 SYNTHESIZER_SCHEMA, TIER_NAMES_SCHEMA, OVERVIEW_SCHEMA]
+        return ([(path.name, _load(path)) for path in paths]
+                + [("verifier-schema.json with test", _verifier_schema_with_test()),
+                   ("probe-schema.json with conventions", _probe_schema_with_conventions())])
 
     def test_no_dollar_schema_key_anywhere(self):
         # A draft-2020-12 $schema ref is accepted by one runtime and REJECTED by the
@@ -196,14 +222,13 @@ class PortabilityInvariants(unittest.TestCase):
                 for index, item in enumerate(node):
                     walk(item, f"{where}[{index}]")
 
-        for path in self._all():
-            walk(_load(path), path.name)
+        for name, document in self._all():
+            walk(document, name)
 
     def test_root_is_an_object_never_a_union(self):
         # Both runtimes reject a schema whose ROOT is anyOf (400 before any model call).
-        for path in self._all():
-            document = _load(path)
-            with self.subTest(schema=path.name):
+        for name, document in self._all():
+            with self.subTest(schema=name):
                 self.assertEqual(document.get("type"), "object")
                 self.assertNotIn("anyOf", document)
 
@@ -227,8 +252,8 @@ class PortabilityInvariants(unittest.TestCase):
                 for index, item in enumerate(node):
                     walk(item, f"{where}[{index}]")
 
-        for path in self._all():
-            walk(_load(path), path.name)
+        for name, document in self._all():
+            walk(document, name)
 
     def test_no_unique_items_anywhere(self):
         # One runtime rejects a structured-output schema carrying `uniqueItems` before any
@@ -242,8 +267,8 @@ class PortabilityInvariants(unittest.TestCase):
                 for index, item in enumerate(node):
                     walk(item, f"{where}[{index}]")
 
-        for path in self._all():
-            walk(_load(path), path.name)
+        for name, document in self._all():
+            walk(document, name)
 
 
 class JudgeSchemaContract(unittest.TestCase):
@@ -460,6 +485,12 @@ class VerifierSchemaContract(unittest.TestCase):
         "unresolved_reason": None,
         "needs_files": None,
     }
+    TEST = {"files": ["tests/test_install_junction.py"],
+            "argv": ["python3", "-m", "unittest", "tests.test_install_junction"], "cwd": ".",
+            "exit_status": 1, "output": "AssertionError: outside/ was deleted\n",
+            "truncated": False, "state": "red",
+            "fails_because": "Uninstall deletes the directory a junction points at.",
+            "expected_failure": "AssertionError: outside/ was deleted"}
 
     def test_declares_one_verdict_per_candidate_with_the_four_statuses(self):
         document = _load(VERIFIER_SCHEMA)
@@ -529,6 +560,61 @@ class VerifierSchemaContract(unittest.TestCase):
                 spiked = {**self.VERDICT, "status": "reproduced", "evidence": thin}
                 self.assertTrue(_validate({"verdicts": [spiked], "summary": "s"}, document))
 
+    def test_a_written_test_is_a_closed_nullable_object_in_two_states(self):
+        # What the verifier wrote and ran in its copy, beside the verdict. Two texts on
+        # purpose: `fails_because` is for a person and `expected_failure` is the literal the
+        # engine looks for in the output, and a literal good enough to match is rarely a
+        # sentence a person can read.
+        test = _load(VERIFIER_TEST_SCHEMA)
+        self.assertEqual(test["type"], ["object", "null"])
+        self.assertIs(test["additionalProperties"], False)
+        self.assertEqual(set(test["required"]), set(test["properties"]))
+        self.assertEqual(set(test["properties"]),
+                         {"files", "argv", "cwd", "exit_status", "output", "truncated",
+                          "state", "fails_because", "expected_failure"})
+        props = test["properties"]
+        self.assertEqual(props["state"]["enum"], ["red", "written_not_run"])
+        self.assertEqual(props["files"]["items"]["type"], "string")
+        self.assertEqual(props["argv"]["items"]["type"], "string")
+        self.assertEqual(props["exit_status"]["type"], ["integer", "null"])
+        self.assertEqual(props["expected_failure"]["type"], ["string", "null"])
+        self.assertEqual(props["truncated"]["type"], "boolean")
+        # With the switch off the payload states no threshold, and the schema the verifier
+        # reads must not ask for a test there either.
+        self.assertTrue(test["description"].startswith("Null unless the payload states a threshold"),
+                        test["description"])
+        document = _verifier_schema_with_test()
+        self.assertEqual(document["properties"]["verdicts"]["items"]["properties"]["test"], test)
+        self.assertIn("test", document["properties"]["verdicts"]["items"]["required"])
+        self.assertEqual(_validate({"verdicts": [{**self.VERDICT, "test": None}], "summary": "s"},
+                                   document), [])
+        self.assertTrue(_validate({"verdicts": [self.VERDICT], "summary": "s"}, document))
+        red = {**self.VERDICT, "test": self.TEST}
+        unrun = {**self.VERDICT, "candidate": "cand-002",
+                 "test": {**self.TEST, "state": "written_not_run", "exit_status": None,
+                          "output": "", "expected_failure": None}}
+        self.assertEqual(_validate({"verdicts": [red, unrun], "summary": "two"}, document), [])
+        for field in self.TEST:
+            with self.subTest(missing=f"test.{field}"):
+                thin = {k: v for k, v in self.TEST.items() if k != field}
+                self.assertTrue(_validate({"verdicts": [{**self.VERDICT, "test": thin}],
+                                           "summary": "s"}, document))
+        self.assertTrue(_validate({"verdicts": [{**self.VERDICT, "test": {**self.TEST,
+                                                                          "state": "green"}}],
+                                   "summary": "s"}, document))
+
+    def test_a_run_that_asks_for_no_test_hands_over_a_schema_with_no_test_in_it(self):
+        # The shipped file is what a run with the switch off sends, so a verdict carrying a
+        # test is invalid against it; the engine sets one aside if it arrives anyway.
+        document = _load(VERIFIER_SCHEMA)
+        self.assertNotIn("test", document["properties"]["verdicts"]["items"]["properties"])
+        self.assertTrue(_validate({"verdicts": [{**self.VERDICT, "test": self.TEST}],
+                                   "summary": "s"}, document))
+        # The merge copies: the shipped document is not changed by building the other.
+        before = json.dumps(document, sort_keys=True)
+        review_panel.with_test_property(document, _load(VERIFIER_TEST_SCHEMA))
+        self.assertEqual(json.dumps(document, sort_keys=True), before)
+
     def test_test_first_is_nullable_so_a_refuted_finding_can_carry_none(self):
         # Required on every verdict, nullable in value: a refuted finding has nothing to
         # fix and so no test to write, and the engine refuses one that carries a test anyway.
@@ -596,10 +682,47 @@ class ProbeSchemaContract(unittest.TestCase):
                "exit_status": 0, "output": "", "truncated": False}
     NOTHING_RAN = {"answer": "unknown", "argv": [], "cwd": ".", "exit_status": None,
                    "output": "", "truncated": False}
+    NOTE = {"suite": "tests", "runner": "pytest", "run_one": ["python3", "-m", "pytest", "{test}"],
+            "location": "tests/test_<module>.py", "naming": "test_<behavior> functions",
+            "helpers": ["tests/conftest.py"], "example": "tests/test_core.py",
+            "rules": "CONTRIBUTING: every fix comes with a test."}
+    NOTE_KEYS = {"suite", "runner", "run_one", "location", "naming", "helpers", "example", "rules"}
+
+    def test_conventions_is_a_list_of_notes_with_every_key_required(self):
+        # One note per test suite, every key required so a strict runtime always sends it;
+        # what can be unknown is nullable, so unknown is expressible and never guessed.
+        conventions = _load(PROBE_CONVENTIONS_SCHEMA)
+        self.assertEqual(_probe_schema_with_conventions()["properties"]["conventions"], conventions)
+        self.assertEqual(conventions["type"], "array")
+        note = conventions["items"]
+        self.assertFalse(note["additionalProperties"])
+        self.assertEqual(set(note["required"]), self.NOTE_KEYS)
+        self.assertEqual(set(note["properties"]), self.NOTE_KEYS)
+        types = {key: note["properties"][key]["type"] for key in self.NOTE_KEYS}
+        self.assertEqual(types["suite"], "string")
+        self.assertEqual(types["helpers"], "array")
+        for key in ("runner", "location", "naming", "example", "rules"):
+            with self.subTest(nullable=key):
+                self.assertEqual(types[key], ["string", "null"])
+        self.assertEqual(types["run_one"], ["array", "null"])
+
+    def test_a_note_with_a_missing_or_unknown_key_is_rejected(self):
+        document = _probe_schema_with_conventions()
+        whole = {"build": self.ATTEMPT, "tests": self.ATTEMPT, "summary": "s"}
+        self.assertTrue(_validate(whole, document), "conventions is required when asked for")
+        self.assertEqual(_validate({**whole, "conventions": [self.NOTE, {**self.NOTE, "suite": "."}]},
+                                   document), [])
+        self.assertTrue(_validate({**whole, "conventions": [{**self.NOTE, "extra": 1}]}, document))
+        for key in self.NOTE_KEYS:
+            with self.subTest(missing=key):
+                thin = {k: v for k, v in self.NOTE.items() if k != key}
+                self.assertTrue(_validate({**whole, "conventions": [thin]}, document))
 
     def test_declares_a_build_answer_a_tests_answer_and_a_summary(self):
         document = _load(PROBE_SCHEMA)
         self.assertEqual(set(document["required"]), {"build", "tests", "summary"})
+        self.assertEqual(_probe_schema_with_conventions()["required"],
+                         [*document["required"], "conventions"])
         for name in ("build", "tests"):
             with self.subTest(attempt=name):
                 attempt = document["properties"][name]
@@ -631,6 +754,12 @@ class ProbeSchemaContract(unittest.TestCase):
         failed = {**self.ATTEMPT, "answer": "no", "exit_status": 1, "output": "error: no such module\n"}
         self.assertEqual(_validate({"build": failed, "tests": self.NOTHING_RAN,
                                     "summary": "the build fails."}, document), [])
+        asked = _probe_schema_with_conventions()
+        self.assertEqual(_validate({"build": self.ATTEMPT, "tests": self.ATTEMPT,
+                                    "summary": "builds and tests.",
+                                    "conventions": [self.NOTE]}, asked), [])
+        self.assertEqual(_validate({"build": self.NOTHING_RAN, "tests": self.NOTHING_RAN,
+                                    "summary": "no suite here.", "conventions": []}, asked), [])
 
     def test_an_unknown_answer_word_and_a_missing_field_are_rejected(self):
         document = _load(PROBE_SCHEMA)
@@ -645,6 +774,17 @@ class ProbeSchemaContract(unittest.TestCase):
             with self.subTest(missing=field):
                 whole = {"build": self.ATTEMPT, "tests": self.ATTEMPT, "summary": "s"}
                 self.assertTrue(_validate({k: v for k, v in whole.items() if k != field}, document))
+
+    def test_a_run_that_asks_for_no_test_hands_over_a_schema_with_no_conventions(self):
+        # The shipped file is what a run with the switch off sends, so a reply carrying notes
+        # is invalid against it; the engine drops them if they arrive anyway.
+        document = _load(PROBE_SCHEMA)
+        self.assertNotIn("conventions", document["properties"])
+        self.assertTrue(_validate({"build": self.ATTEMPT, "tests": self.ATTEMPT, "summary": "s",
+                                   "conventions": []}, document))
+        before = json.dumps(document, sort_keys=True)
+        review_panel.with_conventions_property(document, _load(PROBE_CONVENTIONS_SCHEMA))
+        self.assertEqual(json.dumps(document, sort_keys=True), before)
 
     def test_the_probe_cannot_report_a_finding(self):
         # It establishes capability and nothing else. A probe able to return findings would
@@ -661,8 +801,9 @@ class ProbeSchemaContract(unittest.TestCase):
                 for item in node:
                     yield from names(item)
 
-        self.assertFalse({"findings", "severity", "file", "line_start", "failure", "direction"}
-                         & set(names(_load(PROBE_SCHEMA))))
+        for document in (_load(PROBE_SCHEMA), _probe_schema_with_conventions()):
+            self.assertFalse({"findings", "severity", "file", "line_start", "failure", "direction"}
+                             & set(names(document)))
 
 
 class ClustererSchemaContract(unittest.TestCase):

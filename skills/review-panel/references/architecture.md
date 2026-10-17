@@ -211,6 +211,14 @@ Two vocabularies of the driver's sit beside the marker, both on disk.
   `infrastructure`, `operator-failed`, `operator-retry`. A unit is terminal only when its
   publication exists **and names the disposition that produced it**.
 
+**Landing a verifier's reply writes one file before `result.json`.** On a run with test
+patches on, `publish` writes `units/<id>/test-patches.json`: each written test the engine's
+own verifier parse keeps, diffed out of the landed attempt's working copy. It happens there
+because the copy is released once the unit is terminal, so landing is the last moment it is
+sure to exist. The order is the patches, the result, then `landed.json`, so a replay after a
+kill finds the same copy and writes the same bytes. A patch that cannot be made is recorded
+with its reason and never fails the landing.
+
 ## How a test resolves to the code it is about
 
 `subject_map` answers this by running two rules and taking their **union**.

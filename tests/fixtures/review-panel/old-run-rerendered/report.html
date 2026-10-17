@@ -151,6 +151,8 @@ The <strong>appendix</strong> at the end is the record of the run rather than th
 </li>
 <li>Reachability: the reviewed set was not compared with the files the repository tracks, so it is unknown whether anything that reaches these defects was left out.
 </li>
+<li>Commands in this report are written for bash. For the defects to fix, <code>fix-brief.md</code> adds a PowerShell version wherever PowerShell needs one.
+</li>
 <li>This report names every file by a short name; the <a href="#path-legend"><strong>Path legend</strong></a>, in the appendix, gives each one's full path.
 </li>
 </ul>
@@ -413,7 +415,8 @@ Everything else the review recorded about each site, in site order: its severity
 </li>
 </ul>
 </li>
-<li>Evidence (executed): Shows helper(3) returning 6. <code>python3 -c 'from engine.core import helper; print(helper(3))'</code> (exit 0, output complete)
+<li>Evidence (executed): Shows helper(3) returning 6. (exit 0, output complete)
+<pre><code class="language-bash">python3 -c 'from engine.core import helper; print(helper(3))'</code></pre>
 <details><summary>Captured output</summary><pre><code class="language-console">6</code></pre></details>
 </li>
 </ul>
@@ -442,7 +445,8 @@ Everything else the review recorded about each site, in site order: its severity
 </li>
 </ul>
 </li>
-<li>Evidence (executed): Shows the tool exiting 0 having printed nothing. <code>python3 run.py</code> (exit 0, output complete)
+<li>Evidence (executed): Shows the tool exiting 0 having printed nothing. (exit 0, output complete)
+<pre><code class="language-bash">python3 run.py</code></pre>
 </li>
 </ul>
 <h3 id="S6">S6 · <code>README.md:3</code> · refuted · <a href="#D6">D6</a> <a class="back" href="#index">↑ Index</a></h3>

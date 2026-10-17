@@ -35,6 +35,7 @@ The **appendix** at the end is the record of the run rather than the work it fou
   - **Corrected by the operator**, on whether it builds; see [The operator's corrections](#the-operator-s-corrections).
 - Reproductions: 2 proposed, 2 run — 2 executed. Whether this tree builds and its tests run, how many reproductions were proposed and how many ran are three separate facts, and each is counted on its own.
 - Reachability: the reviewed set was not compared with the files the repository tracks, so it is unknown whether anything that reaches these defects was left out.
+- Commands in this report are written for bash. For the defects to fix, `fix-brief.md` adds a PowerShell version wherever PowerShell needs one.
 - This report names every file by a short name; the **Path legend**, in the appendix, gives each one's full path.
 
 ### The judgment round's overview
@@ -262,7 +263,10 @@ Everything else the review recorded about each site, in site order: its severity
   - core.py:5-6 · by reading
   - core.py:5-6 · by running
     - Severity revised to blocker from major: Every total is wrong.
-- Evidence (executed): Shows helper(3) returning 6. `python3 -c 'from engine.core import helper; print(helper(3))'` (exit 0, output complete)
+- Evidence (executed): Shows helper(3) returning 6. (exit 0, output complete)
+  ```bash
+  python3 -c 'from engine.core import helper; print(helper(3))'
+  ```
   ```console
   6
   ```
@@ -283,7 +287,10 @@ Everything else the review recorded about each site, in site order: its severity
 - **Severity** major · **Corroboration** one model · **Location** `run.py:1-2` · **Fix size** medium · **Verification** by running
 - **Checks.**
   - run.py:1-2 · by running
-- Evidence (executed): Shows the tool exiting 0 having printed nothing. `python3 run.py` (exit 0, output complete)
+- Evidence (executed): Shows the tool exiting 0 having printed nothing. (exit 0, output complete)
+  ```bash
+  python3 run.py
+  ```
 
 <a id="S6"></a>
 

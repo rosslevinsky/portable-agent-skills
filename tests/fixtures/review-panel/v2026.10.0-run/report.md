@@ -164,7 +164,10 @@ Everything else the review recorded about each site, in site order: its severity
 - **Checks.**
   - core.py:5 · by running
     - Severity revised to blocker from major: Every invocation hits it.
-- Evidence (executed): Shows the call raising IndexError on an empty argument list. `python3 run.py` (exit 1, output complete)
+- Evidence (executed): Shows the call raising IndexError on an empty argument list. (exit 1, output complete)
+  ```bash
+  python3 run.py
+  ```
   ```console
   Traceback ...
   IndexError: list index out of range

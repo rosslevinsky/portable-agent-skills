@@ -1,0 +1,74 @@
+{
+  "type": [
+    "object",
+    "null"
+  ],
+  "additionalProperties": false,
+  "required": [
+    "files",
+    "argv",
+    "cwd",
+    "exit_status",
+    "output",
+    "truncated",
+    "state",
+    "fails_because",
+    "expected_failure"
+  ],
+  "description": "Null unless the payload states a threshold under `## Tests to write` and this verdict establishes the candidate at or above it, judged on the severity it settles on, revision included. Then: the failing test written in the disposable copy, the command that runs it and what that run printed. A test the engine cannot accept is set aside with the reason and the verdict stands.",
+  "properties": {
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Every file written for this test, relative to the copy's root: the test file, and any fixture it needs. Never a file under review, never under `.git`, never with `..`."
+    },
+    "argv": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "The command that runs this one test, first element the program. Given for `written_not_run` too: the command that would run it."
+    },
+    "cwd": {
+      "type": "string",
+      "description": "Working directory for `argv`, relative to the root of the copy; `.` for the root."
+    },
+    "exit_status": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "description": "The exit status of the run: non-zero for `red`; null for `written_not_run`, where nothing ran."
+    },
+    "output": {
+      "type": "string",
+      "description": "Captured stdout and stderr of the run, bounded as evidence output is; the tail is kept when cut. Empty for `written_not_run`."
+    },
+    "truncated": {
+      "type": "boolean",
+      "description": "Whether `output` was cut to the bound."
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "red",
+        "written_not_run"
+      ],
+      "description": "red = it ran and failed by assertion, for the stated reason; written_not_run = no run was possible here. A test that passed, or failed at an import or a typo, is neither: it is not reported."
+    },
+    "fails_because": {
+      "type": "string",
+      "pattern": "\\S",
+      "description": "One sentence for a person: the assertion that fails and why that is the defect."
+    },
+    "expected_failure": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The exact text the failing run prints that shows the defect, such as the assertion message, copied from `output`; the engine looks for it there. Required for `red`; for `written_not_run`, what the owner should see, or null."
+    }
+  }
+}

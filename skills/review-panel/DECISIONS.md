@@ -698,6 +698,13 @@ locates in a file that is not in the snapshot names no file it could open and is
 **What would change it.** An owner who wants the whole tree built and accepts that the models
 may read all of it. That is an opt-in on the job, not the default.
 
+**The opt-in, as built: `support`.** The job names exactly what else the snapshot carries —
+a test directory, its helpers, a build file — so a verifier's test can run there. Support
+files are copied beside the lockfiles, listed as support in `inventory.json`, read by no
+reader, kept out of the tree digest, and refused as a finding's location; the run counts
+them apart from the lockfiles before it starts. The job, not the engine, decides what the
+models may read beyond the review, so the reason for declining the whole tree still holds.
+
 ## A correction sits beside a count and never changes it
 
 **Proposed.** When the operator records in `report-notes.json` that an established defect is
@@ -715,3 +722,118 @@ never writes to the notes file.
 
 **What would change it.** A correction that is itself checked — sent to a verifier the way a
 finding is, and settled by one. That would be a verdict, and it would belong in the counts.
+
+## A bad test costs the test, not the verdict
+
+**Proposed.** Refuse a verdict whose `test` is malformed, the way a verdict that breaks its
+own rules is refused: a red test with exit status 0, a written test with a path outside the
+copy, or a red test whose output does not hold the text it said the failure prints. A
+verifier that cannot report a test correctly may not have judged the claim correctly either.
+
+**Declined.** The verdict and the test are separate acts. The judgment was made before the
+test was written, the test is an optional field, and the default dispatch does not enforce
+the reply schema, so a malformed one is ordinary. Refusing the verdict would turn an
+established defect into `unresolved` over a field the run only asked for. So a test the
+engine cannot accept is set aside with the reason, the verdict stands, and the record says
+why no patch shipped. The same holds for a test the run did not ask for: with the switch
+off, beside a verdict that is not established, or below the threshold. The engine checks
+the message rather than trusting the label: a red test whose output lacks its
+`expected_failure` is set aside, never relabeled, because an import error also exits
+non-zero.
+
+**What would change it.** Evidence that a malformed test predicts a wrong verdict — runs
+where the verdicts beside set-aside tests are refuted on a second check more often than the
+rest. Then the test would be evidence about the verdict, and belong in its rules.
+
+## A run that asks for no test tells its verifiers nothing about one
+
+**Proposed.** Keep the test-writing section in the verifier brief and the `test` property in
+the verifier schema, so every defect payload carries both and a run with the switch off reads
+past a section that opens by saying it does not apply. One brief, one schema, and a payload
+whose size moves the way any brief edit moves it.
+
+**Declined: off costs nothing and changes nothing.** The section and the property reach a
+verifier only when the run asks for tests: `references/verifier-failing-test.md` follows the
+brief and `verifier-failing-test-schema.json` joins the schema, in the payload and in the
+unit's `schema.json` alike. A run with the switch off sends the base brief and schema alone,
+so each defect payload is smaller by that section and that property, more candidates fit in a
+batch, and no verifier is handed instructions for a field it must leave null.
+
+**What would change it.** Tests asked for on most runs, such as a mode that is on by
+default. The split would then save almost nothing, and one brief is simpler to keep true.
+
+## A run that asks for no test asks its probe for no conventions
+
+**Proposed.** Keep the conventions section in the probe brief and the `conventions` property
+in the probe schema, and tell the probe in its payload to return an empty list when the run
+asks for none. The schema stays one file and the probe always answers in one shape.
+
+**Declined, on the rule the verifier entry above follows: off costs nothing and changes
+nothing.** The request, the section and the property reach the probe only when the run asks
+for tests: `references/probe-test-conventions.md` follows the brief, the payload's
+`## Test conventions` line asks for the notes, and `probe-conventions-schema.json` joins the
+schema, in the payload and in the unit's `schema.json` alike. A run with the switch off hands
+the probe the base brief and schema alone, with no request for notes. A reply that sends
+notes anyway still parses, and the notes reach no output.
+
+**What would change it.** The same as for the verifier: tests asked for on most runs.
+
+## The report is a record and plain functions, and the record stays in memory
+
+**Proposed.** `report_document` builds a record and `render_report_document` only formats
+it, and a reader of that code expects two things beside it. A template engine — Jinja2, or
+`string.Template` — for the formatting half. And the record written beside the report as
+`report.json`, the way `fix-brief.json` sits beside the fix brief.
+
+**Declined.** The pack is standard library only and installs by copying files, Windows
+included. Jinja2 would need an install or a vendored copy, with MarkupSafe beside it.
+`string.Template` substitutes names but cannot loop or branch, and every section of the
+report does both. Markdown's tables, its whitespace rules and the escaping every worker
+string needs would sit inside template syntax, where they are harder to see than in a
+function. With the renderer handed only data, one plain function per section is the
+template.
+
+The record is not written because nothing reads it. `fix-brief.json` is on disk because an
+agent fixes from it. A `report.json` would be a published file with no reader: it would join
+`PUBLISHED_FILES` and the run-directory inventory, the reference docs would describe it,
+and every run directory written before it would lack it. The record holds JSON values only
+— strings, numbers, booleans, `None`, lists and dicts — so writing it is one call once
+something needs it.
+
+**What would change it.** For a template engine: a dependency the pack takes on for another
+reason, or a report format edited by someone who does not read Python. For `report.json`: a
+reader — a tool or an agent step that needs the report's facts without parsing its
+Markdown. It would then be a published file with a schema, as the fix brief's record is.
+
+## Commands are written for bash, with a PowerShell version only where the two differ
+
+**Proposed.** The fix brief and the report print commands someone will paste, and the reader
+may be in bash, PowerShell or CMD. A reader expects one of three things. One form that works
+in all three shells. A form for each shell, CMD included. Or no printed commands at all, and
+a subcommand that runs a recorded argv by its id.
+
+**Declined.** One form for all three shells works only for arguments holding no `"`, `$`,
+backtick, `!`, `%`, newline or trailing backslash, and no empty argument. Most reproductions
+fall outside that, because they are `python3 -c` with a multi-line program or a quoted string.
+CMD cannot take a pasted argument that spans lines under any quoting, so it gets no form, and
+the brief tells its user to run the commands in PowerShell. A form for Windows PowerShell 5.1
+would be a second PowerShell dialect, with its own escaping for every argument holding a `"`,
+an empty one, and one holding whitespace that ends in a backslash. A command 5.1 would change
+is marked as needing 7.3 or later instead. A rerun subcommand is right in every shell, but it
+hides the command a fixer wants to read and change. It also needs the installed skill's path,
+which differs by runtime, and it adds a way to run recorded commands to the skill. So each
+command prints in bash's quoting, and a PowerShell version follows wherever its text differs.
+That is chiefly an argument holding an apostrophe, and also one holding a character bash
+leaves bare and PowerShell does not: a leading `@`, a `,`, a `%`, `--%` itself, or a leading
+dash with a `.` or `:`.
+The report has no PowerShell form of its own and says so once, pointing at the brief.
+
+The sentence naming the shell prints only where a command quotes an argument. A command of
+plain words reads the same in all three shells, so a brief or report holding nothing else
+carries no shell sentence.
+
+**What would change it.** A rerun command from the brief's own data: `fix-brief.json` keeps
+every command as an argv list, so a consumer can build any shell's form from it. A Windows
+runner showing that 5.1 changes an argument the note does not mark moves the mark, not the
+form. The mark already covers an argument holding whitespace and ending in a backslash: 5.1
+quotes it without doubling the backslash, which then escapes the closing quote.
