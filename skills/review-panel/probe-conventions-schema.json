@@ -1,0 +1,76 @@
+{
+  "type": "array",
+  "description": "One note per test suite, so a later agent can write one more test the way this tree writes them. A tree with two suites gets two notes. The empty list where the tree holds no test suite. Every path is relative to the root of the disposable copy and must exist in it as the snapshot gave it; a path that does not is dropped.",
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "suite",
+      "runner",
+      "run_one",
+      "location",
+      "naming",
+      "helpers",
+      "example",
+      "rules"
+    ],
+    "properties": {
+      "suite": {
+        "type": "string",
+        "description": "The suite's directory, `.` for the root."
+      },
+      "runner": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "The test runner this suite uses, by name; null where you could not tell."
+      },
+      "run_one": {
+        "type": [
+          "array",
+          "null"
+        ],
+        "items": {
+          "type": "string"
+        },
+        "description": "The argument vector that runs ONE test, first element the program, with `{test}` where the test's name or path goes; null where you could not tell."
+      },
+      "location": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Where the tests for a given source file live; null where you could not tell."
+      },
+      "naming": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "How test files and tests are named; null where you could not tell."
+      },
+      "helpers": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "The shared fixtures and helpers a new test would use, as paths; empty where there are none."
+      },
+      "example": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "One existing test file that is a good model to copy; null where there is none."
+      },
+      "rules": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "What the repository's own instruction and contributing documents say about writing tests, quoted with the document's path; null where they say nothing."
+      }
+    }
+  }
+}

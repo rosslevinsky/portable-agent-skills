@@ -7,8 +7,10 @@ The CLI tests run the entry point as a subprocess by an ABSOLUTE path derived fr
 file, so the suite runs from any working directory.
 """
 
+import ast
 import concurrent.futures
 import copy
+import difflib
 import errno
 import hashlib
 import html
@@ -18,6 +20,7 @@ import threading
 import types
 import contextlib
 import os
+import shlex
 import shutil
 import stat
 import pathlib
@@ -270,6 +273,108 @@ class AnOptionalKeyPresentWithTheWrongShapeIsRefused(_JobCase):
         data = copy.deepcopy(SUBJECT_JOB)
         data["areas"][0]["lenses"] = "bottom-up"
         self.refuse(data, "areas[0].lenses")
+
+
+class TheJobMayAskForTestPatchesAndNameSupportFiles(_JobCase):
+    """``test_patches`` turns on a failing test per defect; ``support`` names what the
+    snapshot carries beside the review so such a test can run. Both are optional keys:
+    absent is allowed, present with the wrong shape is refused by name."""
+
+    ON = {"mode": "on", "min_severity": "major"}
+
+    def test_both_keys_load(self):
+        job = review_panel.load_job(self.write(dict(
+            FILE_JOB, test_patches=self.ON, support=["tests/", "conftest.py"])))
+        self.assertEqual(job.test_patches, review_panel.TestPatchSetting("on", "major"))
+        self.assertEqual(job.support, ("tests/", "conftest.py"))
+        self.assertEqual(review_panel.test_patch_threshold(job), "major")
+
+    def test_off_and_absent_are_both_off(self):
+        absent = review_panel.load_job(self.write(FILE_JOB))
+        off = review_panel.load_job(self.write(dict(FILE_JOB, test_patches={"mode": "off"})))
+        self.assertIsNone(absent.test_patches)
+        self.assertEqual(absent.support, ())
+        self.assertEqual(off.test_patches, review_panel.TestPatchSetting("off", None))
+        for job in (absent, off):
+            self.assertIsNone(review_panel.test_patch_threshold(job))
+        # The same answer off the job file a run directory keeps, which is what every later
+        # stage reads.
+        self.assertIsNone(review_panel.test_patch_threshold(dict(FILE_JOB)))
+        self.assertIsNone(review_panel.test_patch_threshold(
+            dict(FILE_JOB, test_patches={"mode": "off"})))
+        self.assertEqual(review_panel.test_patch_threshold(
+            dict(FILE_JOB, test_patches={"mode": "on", "min_severity": "nit"})), "nit")
+
+    def test_every_level_is_a_threshold(self):
+        for level in review_panel.SEVERITIES:
+            with self.subTest(level=level):
+                job = review_panel.load_job(self.write(dict(
+                    FILE_JOB, test_patches={"mode": "on", "min_severity": level})))
+                self.assertEqual(review_panel.test_patch_threshold(job), level)
+
+    def test_a_wrong_shape_is_refused_by_name(self):
+        cases = [
+            ("on", "'test_patches'"),
+            (["on"], "'test_patches'"),
+            ({"mode": "on"}, "'min_severity'"),
+            ({"mode": "off", "min_severity": "major"}, "'test_patches.min_severity'"),
+            ({"mode": "auto"}, "'test_patches.mode'"),
+            ({"mode": "auto", "min_severity": "major"}, "'test_patches.mode'"),
+            ({"mode": True}, "'test_patches.mode'"),
+            ({"mode": "on", "min_severity": "critical"}, "'test_patches.min_severity'"),
+            ({"mode": "on", "min_severity": "major", "threshold": 1}, "'threshold'"),
+            ({"min_severity": "major"}, "'mode'"),
+        ]
+        for raw, fragment in cases:
+            with self.subTest(test_patches=raw):
+                self.refuse(dict(FILE_JOB, test_patches=raw), fragment)
+
+    def test_an_unknown_mode_or_level_is_named_in_the_refusal(self):
+        self.refuse(dict(FILE_JOB, test_patches={"mode": "auto"}), "'auto'", "on", "off")
+        self.refuse(dict(FILE_JOB, test_patches={"mode": "on", "min_severity": "critical"}),
+                    "'critical'", "blocker", "nit")
+
+    def test_support_is_a_non_empty_list_of_paths_normalized_as_exclude_is(self):
+        self.refuse(dict(FILE_JOB, support=[]), "'support'", "omit")
+        self.refuse(dict(FILE_JOB, support="tests/"), "'support'")
+        self.refuse(dict(FILE_JOB, support=["tests/*.py"]), "'support[0]'", "glob")
+        self.refuse(dict(FILE_JOB, support=["../tests/"]), "'support[0]'", "'..'")
+        self.refuse(dict(FILE_JOB, support=["/tests/"]), "'support[0]'", "absolute")
+        self.refuse(dict(FILE_JOB, support=["tests", "tests/"]),
+                    "declared both as a file and as a prefix")
+        job = review_panel.load_job(self.write(dict(FILE_JOB, support=["tests\\unit\\"])))
+        self.assertEqual(job.support, ("tests/unit/",))
+
+    def test_support_may_repeat_an_exclusion(self):
+        job = review_panel.load_job(self.write(dict(FILE_JOB, exclude=["tests/"],
+                                                    support=["tests/"])))
+        self.assertEqual((job.exclude, job.support), (("tests/",), ("tests/",)))
+
+    def test_the_run_directory_copy_is_re_read_with_both_keys(self):
+        rundir = self.tmp / "run"
+        rundir.mkdir()
+        good = dict(FILE_JOB, root=str(self.root), test_patches=self.ON, support=["tests/"])
+        (rundir / "job.json").write_text(json.dumps(good), encoding="utf-8")
+        self.assertEqual(review_panel._read_job(rundir)["support"], ["tests/"])
+        for key, bad in (("test_patches", "on"), ("test_patches", {"min_severity": "major"}),
+                         ("test_patches", {"mode": "on", "min_severity": "critical"}),
+                         ("test_patches", {"mode": "on"}),
+                         ("test_patches", {"mode": "off", "min_severity": "major"}),
+                         ("support", "tests/")):
+            with self.subTest(key=key, value=bad):
+                (rundir / "job.json").write_text(json.dumps(dict(good, **{key: bad})),
+                                                 encoding="utf-8")
+                with self.assertRaises(review_panel.RunDirError) as ctx:
+                    review_panel._read_job(rundir)
+                self.assertIn(key, str(ctx.exception))
+
+    def test_the_notes_may_speak_for_both_keys(self):
+        rundir = self.tmp / "run"
+        rundir.mkdir()
+        (rundir / review_panel.JOB_NOTES_FILE_NAME).write_text(json.dumps(
+            {"test_patches": "interview", "support": "stated"}), encoding="utf-8")
+        self.assertEqual(review_panel._read_job_notes(rundir),
+                         {"test_patches": "interview", "support": "stated"})
 
 
 class TheJobMayCarryQuestionsForTheOperator(_JobCase):
@@ -1461,6 +1566,154 @@ class AJobMayNameAnExplicitFileList(_TreeCase):
         self.assertEqual(data["coverage"]["tracked_not_reviewed"],
                          ["README.md", "docs/guide.md", "engine/core.py", "engine/sub/deep.py",
                           "engine/util.py", "tests/test_engine.py", "vendor/lib.py"])
+
+
+class SupportFilesAreCopiedBesideTheReviewAndReadByNobody(_TreeCase):
+    """``support`` is the job naming what extra the snapshot carries so a test can run there:
+    copied, listed as support, out of the tree digest, and no place a finding may be."""
+
+    REVIEWED = ["run.py", "engine/core.py"]
+    TEST = "tests/test_engine.py"
+
+    def measured(self, **over):
+        job = self.job(**over)
+        return job, review_panel.measure_files(job, review_panel.enumerate_files(job))
+
+    def snapshotted(self, **over):
+        job, inv = self.measured(**over)
+        review_panel.write_snapshot(job, inv, self.rundir)
+        return json.loads((self.rundir / "inventory.json").read_text(encoding="utf-8"))
+
+    def check_copied(self):
+        _, without = self.measured(files=self.REVIEWED)
+        data = self.snapshotted(files=self.REVIEWED, support=["tests/"])
+        snap = self.rundir / "snapshot"
+        self.assertEqual((snap / self.TEST).read_bytes(), (self.root / self.TEST).read_bytes())
+        self.assertEqual(data["support"], [self.TEST])
+        self.assertIn(self.TEST, [e["path"] for e in data["context"]])
+        self.assertNotIn(self.TEST, [e["path"] for e in data["files"]])
+        # The digest is over what was reviewed, so naming support moves nothing in it.
+        self.assertEqual(data["tree_sha256"], without.tree_sha256)
+        # No reader may locate a finding in it: it is outside the review's scope.
+        files = frozenset(e["path"] for e in data["files"])
+        with self.assertRaises(review_panel.OutOfScope):
+            review_panel._location(self.TEST, "f.file", files,
+                                   review_panel._read_context(self.rundir))
+
+    def test_a_files_job_copies_the_tests_it_names_as_support(self):
+        self.make_repo()
+        self.check_copied()
+
+    def test_outside_a_repository_the_walked_files_are_matched(self):
+        self.check_copied()
+
+    def test_an_excluded_directory_named_as_support_is_copied(self):
+        self.make_repo()
+        data = self.snapshotted(exclude=["tests/"], support=["tests/"])
+        self.assertIn(self.TEST, data["excluded"])
+        self.assertEqual(data["support"], [self.TEST])
+        self.assertTrue((self.rundir / "snapshot" / self.TEST).is_file())
+
+    def test_a_support_entry_naming_a_reviewed_file_is_refused_by_name(self):
+        self.make_repo()
+        with self.assertRaises(review_panel.InventoryError) as ctx:
+            self.measured(files=self.REVIEWED, support=["run.py"])
+        message = str(ctx.exception)
+        self.assertIn("support[0]", message)
+        self.assertIn("'run.py'", message)
+        self.assertIn("under review", message)
+
+    def test_a_support_entry_matching_nothing_is_refused_by_name(self):
+        self.make_repo()
+        for entry in ("ghost/", "ghost.py", "docs/guide.md/"):
+            with self.subTest(entry=entry):
+                with self.assertRaises(review_panel.InventoryError) as ctx:
+                    self.measured(files=self.REVIEWED, support=["tests/", entry])
+                self.assertIn("support[1]", str(ctx.exception))
+                self.assertIn(entry, str(ctx.exception))
+        # A prefix whose every file is under review brings nothing beside it.
+        with self.assertRaises(review_panel.InventoryError) as ctx:
+            self.measured(support=["tests/"])
+        self.assertIn("support[0]", str(ctx.exception))
+
+    def test_a_prefix_copies_only_what_the_review_does_not_already_hold(self):
+        self.make_repo()
+        (self.root / "tests" / "helpers.py").write_text("HELP = 1\n", encoding="utf-8")
+        self.git("add", ".")
+        self.git("commit", "-q", "-m", "helpers")
+        data = self.snapshotted(files=["run.py", self.TEST], support=["tests/"])
+        self.assertEqual(data["support"], ["tests/helpers.py"])
+        self.assertEqual([e["path"] for e in data["files"]], ["run.py", self.TEST])
+
+    def test_a_job_without_support_writes_the_inventory_as_before(self):
+        self.make_repo()
+        self.assertNotIn("support", self.snapshotted(files=self.REVIEWED))
+
+    def test_the_preview_counts_support_files_apart_from_lockfiles(self):
+        (self.root / "vendor" / "package-lock.json").write_text("{}\n", encoding="utf-8")
+        self.make_repo()
+        job, inv = self.measured(files=self.REVIEWED, support=["tests/"])
+        text = review_panel.preview(job, inv, review_panel.partition(job, inv))
+        self.assertIn(review_panel.COPIED_OUTSIDE_SCOPE_LINE.format(n=1), text)
+        self.assertIn(review_panel.SUPPORT_COPIED_LINE.format(n=1), text)
+        self.assertEqual(review_panel.copied_outside_scope_line(
+            ["vendor/package-lock.json", self.TEST], [self.TEST]),
+            review_panel.COPIED_OUTSIDE_SCOPE_LINE.format(n=1) + "\n"
+            + review_panel.SUPPORT_COPIED_LINE.format(n=1))
+        self.assertEqual(review_panel.copied_outside_scope_line([self.TEST], [self.TEST]),
+                         review_panel.SUPPORT_COPIED_LINE.format(n=1))
+        self.assertEqual(review_panel.copied_outside_scope_line([]), "")
+
+
+class ATestPatchRunWithNoTestInItSaysSo(_TreeCase):
+    """With test patches on and no existing test in the snapshot, the preview says so before
+    anything is dispatched, and names ``support`` as the fix. A warning: the plan still
+    succeeds, since a run that can only read is still a run."""
+
+    ON = {"mode": "on", "min_severity": "major"}
+
+    def previewed(self, **over):
+        job = self.job(**over)
+        inv = review_panel.measure_files(job, review_panel.enumerate_files(job))
+        return review_panel.preview(job, inv, review_panel.partition(job, inv))
+
+    def test_a_files_job_holding_no_test_is_warned_and_still_plans(self):
+        self.assertIn(review_panel.NO_TEST_IN_SNAPSHOT_LINE,
+                      self.previewed(files=["run.py"], test_patches=self.ON))
+        self.assertIn("'support'", review_panel.NO_TEST_IN_SNAPSHOT_LINE)
+        self.write(dict(copy.deepcopy(FILE_JOB), files=["run.py"], test_patches=self.ON))
+        proc = _run("plan", str(self.job_path), "--rundir", str(self.rundir))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(review_panel.NO_TEST_IN_SNAPSHOT_LINE, proc.stdout)
+
+    def test_naming_the_tests_as_support_removes_the_warning(self):
+        self.assertNotIn(review_panel.NO_TEST_IN_SNAPSHOT_LINE, self.previewed(
+            files=["run.py"], test_patches=self.ON, support=["tests/"]))
+
+    def test_a_test_under_review_is_a_test_in_the_snapshot(self):
+        self.assertNotIn(review_panel.NO_TEST_IN_SNAPSHOT_LINE,
+                         self.previewed(test_patches=self.ON))
+
+    def test_with_the_switch_off_there_is_no_warning(self):
+        for over in ({}, {"test_patches": {"mode": "off"}}):
+            with self.subTest(**over):
+                self.assertNotIn(review_panel.NO_TEST_IN_SNAPSHOT_LINE,
+                                 self.previewed(files=["run.py"], **over))
+
+    def test_a_support_test_gone_before_the_copy_is_judged_by_what_was_written(self):
+        # The snapshot leaves out a support file that vanished after it was measured, so
+        # the preview must count and warn from the snapshot, not the measurement.
+        job = self.job(files=["run.py"], test_patches=self.ON, support=["tests/"])
+        inv = review_panel.measure_files(job, review_panel.enumerate_files(job))
+        self.assertTrue(inv.support, "the fixture names no support test")
+        for path in inv.support:
+            (self.root / path).unlink()
+        review_panel.write_snapshot(job, inv, self.rundir)
+        written = review_panel.as_written(inv, self.rundir)
+        self.assertEqual((written.context, written.support), ((), ()))
+        text = review_panel.preview(job, written, review_panel.partition(job, written))
+        self.assertIn(review_panel.NO_TEST_IN_SNAPSHOT_LINE, text)
+        self.assertNotIn(review_panel.SUPPORT_COPIED_LINE.format(n=len(inv.support)), text)
 
 
 class FileModePartition(_TreeCase):
@@ -3837,7 +4090,14 @@ class ReadingResultsAreParsedStrictly(_RouteCase):
         verifier = json.loads((_ENGINE_DIR / "verifier-schema.json").read_text(encoding="utf-8"))
         verdict = verifier["properties"]["verdicts"]["items"]
         self.assertEqual(set(review_panel.VERIFIER_RESULT_KEYS), set(verifier["properties"]))
-        self.assertEqual(set(review_panel.VERDICT_KEYS), set(verdict["properties"]))
+        # The parser reads the verdict a run that asks for tests is handed, which is the
+        # shipped schema with the `test` property merged in.
+        test = json.loads((_ENGINE_DIR / review_panel.VERIFIER_TEST_SCHEMA_NAME)
+                          .read_text(encoding="utf-8"))
+        self.assertEqual(set(review_panel.VERDICT_KEYS),
+                         set(verdict["properties"]) | {review_panel.TEST_KEY})
+        self.assertNotIn(review_panel.TEST_KEY, verdict["properties"])
+        self.assertEqual(set(review_panel.TEST_KEYS), set(test["properties"]))
         self.assertEqual(set(review_panel.EVIDENCE_KEYS),
                          set(verdict["properties"]["evidence"]["properties"]))
         self.assertEqual(set(review_panel.REVISION_KEYS),
@@ -3857,7 +4117,15 @@ class ReadingResultsAreParsedStrictly(_RouteCase):
         self.assertEqual(set(review_panel.CLUSTERER_RESULT_KEYS), set(clusterer["properties"]))
         self.assertEqual(set(review_panel.CLUSTER_KEYS), set(cluster["properties"]))
         probe = json.loads((_ENGINE_DIR / "probe-schema.json").read_text(encoding="utf-8"))
-        self.assertEqual(set(review_panel.PROBE_RESULT_KEYS), set(probe["properties"]))
+        # Likewise the probe result a run that asks for tests is handed: the shipped schema
+        # with the `conventions` property merged in.
+        conventions = json.loads((_ENGINE_DIR / review_panel.PROBE_CONVENTIONS_SCHEMA_NAME)
+                                 .read_text(encoding="utf-8"))
+        self.assertEqual(set(review_panel.PROBE_RESULT_KEYS),
+                         set(probe["properties"]) | {review_panel.PROBE_CONVENTIONS_KEY})
+        self.assertNotIn(review_panel.PROBE_CONVENTIONS_KEY, probe["properties"])
+        self.assertEqual(set(review_panel.PROBE_CONVENTION_KEYS),
+                         set(conventions["items"]["properties"]))
         for name in review_panel.PROBE_ATTEMPTS:
             with self.subTest(attempt=name):
                 self.assertEqual(set(review_panel.PROBE_ATTEMPT_KEYS),
@@ -4450,7 +4718,7 @@ class RoutingRefusesAPartSentToItsRaiser(unittest.TestCase):
             (rundir / "units" / "verify-area-01-A").mkdir(parents=True)
             states = review_panel.read_verification_results(
                 rundir, [self.unit("verify-area-01-A", ["cand-001"], dispatch=False)],
-                {"cand-001": False})
+                {"cand-001": False}, asked=None)
         self.assertEqual(states[0].state, review_panel.UNIT_MISSING)
         self.assertEqual(states[0].reason, review_panel.NOT_DISPATCHED_REASON)
         resolved = review_panel.resolve(
@@ -5911,7 +6179,7 @@ class TheCapabilityProbeIsPlannedReadAndFoldedIn(_ReportCase):
         self.plan()
         expected = review_panel.render_probe_payload(
             review_panel.load_brief("probe"), FILE_JOB["problem"],
-            schema=review_panel.load_schema(review_panel.PROBE_SCHEMA_NAME))
+            schema=review_panel.load_schema(review_panel.PROBE_SCHEMA_NAME), conventions=False)
         payload = (self.unit_dir(self.PROBE) / "payload.md").read_bytes()
         self.assertEqual(payload, expected.encode("utf-8"))
         text = payload.decode("utf-8")
@@ -6185,6 +6453,241 @@ class TheCapabilityProbeIsPlannedReadAndFoldedIn(_ReportCase):
                                  list(by_id[unit]["candidates"]))
                 self.assertIn("### cand-002", text)
                 self.assertIn("### cand-003", text)
+
+
+NOTE_UNITTEST = {"suite": "tests", "runner": "unittest",
+                 "run_one": ["python3", "-m", "unittest", "{test}"],
+                 "location": "one tests/test_<module>.py per module",
+                 "naming": "test_<behavior> methods on a TestCase class",
+                 "helpers": ["engine/util.py"], "example": "tests/test_engine.py",
+                 "rules": "README.md: run the whole suite before sending a change."}
+NOTE_DOCS = {"suite": "docs", "runner": "doctest",
+             "run_one": ["python3", "-m", "doctest", "{test}"],
+             "location": "examples inline in docs/*.md", "naming": None, "helpers": [],
+             "example": "docs/guide.md", "rules": None}
+
+
+class TheProbeWritesTestConventionsOncePerSuite(_ReportCase):
+    """With test patches on, the probe also writes one note per test suite — how to run one
+    test, where tests live, what to copy — and every verifier payload carries the notes, so
+    the conventions are learned once per run and not once per defect. When test patches
+    are off, nothing about tests reaches a verifier, and the route record holds neither
+    ``conventions`` nor ``conventions_set_aside``."""
+
+    PROBE = "probe-A"
+    ON = {"mode": "on", "min_severity": "major"}
+
+    def route_with(self, landed, **job):
+        self.plan(**job)
+        self.land("area-01-A1", [FINDING])
+        self.land("area-01-B1", [{**FINDING, "line_start": 8, "line_end": 8}])
+        if isinstance(landed, str):
+            self.fail_unit(self.PROBE, landed)
+        elif landed is not None:
+            (self.unit_dir(self.PROBE) / "result.json").write_text(json.dumps(landed),
+                                                                   encoding="utf-8")
+        return self.route()
+
+    def payloads(self):
+        return {u["id"]: (self.rundir / u["payload"]).read_text(encoding="utf-8")
+                for u in self.verifiers()}
+
+    def conventions(self, text):
+        """The conventions section of one verifier payload, up to the candidates."""
+        _, sep, rest = text.partition(review_panel.CONVENTIONS_HEADING)
+        self.assertTrue(sep, "no conventions section")
+        return rest.partition(review_panel.CANDIDATES_HEADING)[0]
+
+    # -- parsed ------------------------------------------------------------
+    def test_a_note_parses_with_every_field(self):
+        parsed = review_panel.parse_probe_result(
+            {**PROBE_RESULT, "conventions": [NOTE_UNITTEST, NOTE_DOCS]}, self.PROBE)
+        self.assertEqual(parsed["conventions"], [NOTE_UNITTEST, NOTE_DOCS])
+        self.assertEqual(parsed["build"], PROBE_BUILD)
+
+    def test_an_absent_key_reads_as_an_empty_list(self):
+        # A run planned before the key existed still parses, and its probe still answers.
+        parsed = review_panel.parse_probe_result(PROBE_RESULT, self.PROBE)
+        self.assertEqual(parsed["conventions"], [])
+        self.assertEqual(len(parsed["conventions_set_aside"]), 1)
+        self.assertIn("no `conventions` key", parsed["conventions_set_aside"][0])
+        returned = review_panel.parse_probe_result({**PROBE_RESULT, "conventions": []}, self.PROBE)
+        self.assertEqual(returned["conventions_set_aside"], [])
+
+    def test_a_malformed_note_costs_that_note_and_never_the_probe(self):
+        # The default dispatch does not hold a reply to the schema while it is written, so one
+        # bad note must not throw away the build and tests answers beside it.
+        for bad, fragment in (
+                ({**NOTE_UNITTEST, "extra": 1}, "'extra'"),
+                ({k: v for k, v in NOTE_UNITTEST.items() if k != "runner"}, "'runner'"),
+                ({**NOTE_UNITTEST, "run_one": "python3 -m unittest"}, "run_one"),
+                ({**NOTE_UNITTEST, "run_one": []}, "run_one"),
+                ({**NOTE_UNITTEST, "helpers": "engine/util.py"}, "helpers"),
+                ({**NOTE_UNITTEST, "helpers": None}, "helpers"),
+                ({**NOTE_UNITTEST, "example": 3}, "example"),
+                ({**NOTE_UNITTEST, "suite": None}, "suite"),
+                ("a note", "JSON object"),
+                ({**NOTE_UNITTEST, "\ud800": 1}, "\\ud800")):
+            with self.subTest(fragment=fragment, bad=bad):
+                parsed = review_panel.parse_probe_result(
+                    {**PROBE_RESULT, "conventions": [bad, NOTE_DOCS]}, self.PROBE)
+                self.assertEqual(parsed["build"], PROBE_BUILD)
+                self.assertEqual(parsed["tests"], PROBE_TESTS)
+                self.assertEqual(parsed["summary"], PROBE_RESULT["summary"])
+                self.assertEqual(parsed["conventions"], [NOTE_DOCS])
+                [reason] = parsed["conventions_set_aside"]
+                self.assertIn(fragment, reason)
+                self.assertIn("conventions[0]", reason)
+                reason.encode("utf-8")  # the payload write a lone surrogate would fail
+
+    def test_conventions_that_are_not_a_list_cost_the_notes_and_never_the_probe(self):
+        parsed = review_panel.parse_probe_result({**PROBE_RESULT, "conventions": "tests"},
+                                                 self.PROBE)
+        self.assertEqual(parsed["build"], PROBE_BUILD)
+        self.assertEqual(parsed["conventions"], [])
+        [reason] = parsed["conventions_set_aside"]
+        self.assertIn("'conventions'", reason)
+        self.assertIn("list", reason)
+
+    def test_a_set_aside_note_reaches_the_record_and_every_verifier(self):
+        self.route_with({**PROBE_RESULT, "conventions": [{**NOTE_UNITTEST, "run_one": []},
+                                                         NOTE_DOCS]}, test_patches=self.ON)
+        probe = self.candidates()["probe"]
+        self.assertEqual(probe["state"], "complete")
+        self.assertEqual(probe["build"], PROBE_BUILD)
+        self.assertEqual([n["runner"] for n in probe["conventions"]], ["doctest"])
+        self.assertIn("run_one", probe["conventions_set_aside"][0])
+        for unit, text in self.payloads().items():
+            with self.subTest(unit=unit):
+                section = self.conventions(text)
+                self.assertIn("doctest", section)
+                self.assertIn("run_one", section)
+                self.assertIn("Whether the tree builds: yes", text)
+
+    def test_a_probe_that_wrote_no_conventions_key_does_not_claim_there_is_no_suite(self):
+        # A run planned before the key existed, resumed with test patches on: the probe ran
+        # the tests and simply was not asked, so "no test suite" would be false.
+        self.route_with(PROBE_RESULT, test_patches=self.ON)
+        for unit, text in self.payloads().items():
+            with self.subTest(unit=unit):
+                section = self.conventions(text)
+                self.assertNotIn("no test suite", section)
+                self.assertIn("wrote no notes", section)
+
+    def test_a_path_not_in_the_snapshot_is_dropped_and_the_note_says_so(self):
+        # A helper may be a directory of fixtures; the example is one file to copy.
+        note = {**NOTE_UNITTEST, "helpers": ["tests/gone.py", "engine/util.py", "engine/sub/"],
+                "example": "nope.py", "suite": "./tests"}
+        missing_suite = {**NOTE_DOCS, "suite": "spec", "example": "../outside.md"}
+        self.route_with({**PROBE_RESULT, "conventions": [note, missing_suite]},
+                        test_patches=self.ON)
+        kept = self.candidates()["probe"]["conventions"]
+        self.assertEqual(kept[0]["suite"], "tests")
+        self.assertEqual(kept[0]["helpers"], ["engine/util.py", "engine/sub"])
+        self.assertIsNone(kept[0]["example"])
+        self.assertEqual(kept[0]["not_in_snapshot"], ["tests/gone.py", "nope.py"])
+        self.assertIsNone(kept[1]["suite"])
+        self.assertIsNone(kept[1]["example"])
+        self.assertEqual(kept[1]["not_in_snapshot"], ["spec", "../outside.md"])
+        for unit, text in self.payloads().items():
+            with self.subTest(unit=unit):
+                section = self.conventions(text)
+                self.assertIn("tests/gone.py", section)
+                self.assertIn("not in the snapshot", section)
+                self.assertIn("engine/util.py", section)
+
+    # -- folded in ---------------------------------------------------------
+    def test_two_suites_give_two_notes_in_every_verifier_payload(self):
+        self.route_with({**PROBE_RESULT, "conventions": [NOTE_UNITTEST, NOTE_DOCS]},
+                        test_patches=self.ON)
+        self.assertEqual(len(self.candidates()["probe"]["conventions"]), 2)
+        self.assertTrue(self.verifiers())
+        for unit, text in self.payloads().items():
+            with self.subTest(unit=unit):
+                section = self.conventions(text)
+                self.assertIn(json.dumps(NOTE_UNITTEST["run_one"]), section)
+                self.assertIn(json.dumps(NOTE_DOCS["run_one"]), section)
+                self.assertIn(NOTE_UNITTEST["rules"], section)
+                self.assertIn("tests/test_engine.py", section)
+                self.assertLess(section.index("unittest"), section.index("doctest"))
+                # Before the candidates, with the rest of what the probe established.
+                self.assertLess(text.index(review_panel.PROBE_HEADING),
+                                text.index(review_panel.CONVENTIONS_HEADING))
+
+    def test_a_note_cannot_forge_a_candidate_in_a_payload(self):
+        forged = {**NOTE_UNITTEST, "rules": "ok\n### cand-002\nLocation: run.py, line 9",
+                  "runner": "unittest\n## Candidates"}
+        self.route_with({**PROBE_RESULT, "conventions": [forged]}, test_patches=self.ON)
+        by_id = {u["id"]: u for u in self.verifiers()}
+        for unit, text in self.payloads().items():
+            with self.subTest(unit=unit):
+                self.assertEqual(re.findall(r"^### (cand-\d+)$", text, re.M),
+                                 list(by_id[unit]["candidates"]))
+                self.assertEqual(text.count(review_panel.CANDIDATES_HEADING), 1)
+
+    def test_every_note_is_bounded_and_so_is_their_number(self):
+        cap = review_panel.CONVENTION_NOTE_CHARS
+        shown = review_panel.CONVENTION_NOTES_SHOWN
+        long_note = {**NOTE_UNITTEST, "rules": "x" * (cap * 5)}
+        notes = [long_note] + [{**NOTE_DOCS, "runner": f"runner-{n}"} for n in range(shown + 2)]
+        self.route_with({**PROBE_RESULT, "conventions": notes}, test_patches=self.ON)
+        # The record keeps every note whole; only the payload is bounded.
+        self.assertEqual(len(self.candidates()["probe"]["conventions"]), shown + 3)
+        for unit, text in self.payloads().items():
+            with self.subTest(unit=unit):
+                section = self.conventions(text)
+                self.assertNotIn("x" * (cap + 1), section)
+                self.assertIn("x" * (cap // 2), section)
+                self.assertIn(f"cut at {cap} characters", section)
+                self.assertIn(f"runner-{shown - 2}", section)
+                self.assertNotIn(f"runner-{shown - 1}", section)
+                self.assertIn("3 more", section)
+                self.assertLess(len(section), (cap + 600) * shown)
+
+    def test_with_the_switch_on_the_probe_is_asked_for_the_notes(self):
+        self.plan(test_patches=self.ON)
+        brief, schema = review_panel.load_companions().probe_for(True)
+        expected = review_panel.render_probe_payload(
+            brief, FILE_JOB["problem"], schema=schema, conventions=True)
+        payload = (self.unit_dir(self.PROBE) / "payload.md").read_text(encoding="utf-8")
+        self.assertEqual(payload, expected)
+        self.assertIn(review_panel.CONVENTIONS_ASKED, payload)
+        self.assertIn(review_panel.load_brief(review_panel.PROBE_CONVENTIONS_BRIEF_NAME).rstrip("\n"),
+                      payload)
+
+    def test_a_probe_that_did_not_answer_leaves_the_conventions_unknown(self):
+        self.route_with("the probe ran out of time\n", test_patches=self.ON)
+        self.assertEqual(self.candidates()["probe"]["conventions"], [])
+        for unit, text in self.payloads().items():
+            with self.subTest(unit=unit):
+                self.assertIn(review_panel.PROBE_UNKNOWN_WORD, self.conventions(text))
+
+    def test_a_probe_that_found_no_suite_says_so(self):
+        self.route_with({**PROBE_FOUND_NOTHING, "conventions": []}, test_patches=self.ON)
+        for unit, text in self.payloads().items():
+            with self.subTest(unit=unit):
+                self.assertIn("no test suite", self.conventions(text))
+
+    # -- off ---------------------------------------------------------------
+    def test_with_the_switch_off_nothing_about_tests_reaches_a_verifier(self):
+        for n, job in enumerate(({}, {"test_patches": {"mode": "off"}})):
+            with self.subTest(job=job):
+                self.rundir = self.tmp / f"run-{n}"
+                # A probe that wrote notes anyway: they are not asked for and go nowhere.
+                self.route_with({**PROBE_RESULT, "conventions": [NOTE_UNITTEST]}, **job)
+                probe_payload = (self.unit_dir(self.PROBE) / "payload.md").read_text(
+                    encoding="utf-8")
+                # Not asked, and told nothing about them.
+                self.assertNotIn(review_panel.CONVENTIONS_HEADING, probe_payload)
+                self.assertNotIn("conventions", probe_payload)
+                # A run that asks for no test records no conventions.
+                self.assertNotIn("conventions", self.candidates()["probe"])
+                self.assertTrue(self.verifiers())
+                for unit, text in self.payloads().items():
+                    with self.subTest(unit=unit):
+                        self.assertNotIn(review_panel.CONVENTIONS_HEADING, text)
+                        self.assertNotIn(NOTE_UNITTEST["rules"], text)
+                        self.assertNotIn("{test}", text)
 
 
 class TheClusteringRoundGroupsWhatVerificationSettled(_ReportCase):
@@ -7284,6 +7787,1166 @@ class VerificationResultsAreReadStrictly(_ReportCase):
         for cid, line in statuses.items():
             with self.subTest(candidate=cid):
                 self.assertIn(line.split()[0].rstrip(","), review_panel.VERDICT_STATUSES)
+
+
+# A test as a verifier writes it beside a verdict: one new file, run once, red by assertion.
+RED_TEST = {"files": ["tests/test_empty_input.py"],
+            "argv": ["python3", "-m", "unittest", "tests.test_empty_input"], "cwd": ".",
+            "exit_status": 1,
+            "output": "F\nFAIL: test_empty\nAssertionError: None != []\n\nFAILED (failures=1)\n",
+            "truncated": False, "state": "red",
+            "fails_because": "An empty input returns None where the caller needs a list.",
+            "expected_failure": "AssertionError: None != []"}
+UNRUN_TEST = {**RED_TEST, "exit_status": None, "output": "", "state": "written_not_run",
+              "expected_failure": None}
+
+
+def _asked(threshold="major", **proposed):
+    """What a run with test patches on asks: the threshold, and each candidate's proposal."""
+    return review_panel.AskedTests(threshold, {"cand-001": "major", "cand-002": "minor",
+                                               **proposed})
+
+
+class AVerdictsTestIsReadApartFromTheVerdict(unittest.TestCase):
+    """A ``test`` beside a verdict is parsed by its own rules, and **a bad test costs the
+    test and never the verdict**: the verdict stands, the test is set aside, and the reason
+    is kept. The default dispatch does not enforce the reply schema, so a malformed optional
+    field must not turn a judgment somebody made into ``unresolved``."""
+
+    BATCH = {"cand-001": False, "cand-002": False}
+
+    def parse(self, test=_UNSET, status="confirmed_by_reading", asked=_UNSET, candidate="cand-001",
+              **over):
+        verdict = dict(_verdict(candidate, status, EVIDENCE if status == "reproduced" else None,
+                                rationale="Lines 2-3 index without a guard."), **over)
+        if test is not _UNSET:
+            verdict["test"] = test
+        parsed, rejected = review_panel.parse_verifier_result(
+            {"verdicts": [verdict], "summary": "checked"}, "verify-area-01-A",
+            {candidate: False}, asked=_asked() if asked is _UNSET else asked)
+        self.assertEqual(rejected, (), "a bad test cost the verdict")
+        self.assertEqual(parsed[0].status, status, "the verdict did not stand")
+        return parsed[0]
+
+    def set_aside(self, *fragments, **kw):
+        verdict = self.parse(**kw)
+        self.assertIsNone(verdict.test)
+        self.assertIsNotNone(verdict.test_set_aside)
+        for fragment in fragments:
+            self.assertIn(fragment, verdict.test_set_aside)
+        return verdict
+
+    def test_a_red_test_and_a_written_one_both_parse(self):
+        red = self.parse(test=RED_TEST, status="reproduced")
+        self.assertEqual(red.test, RED_TEST)
+        self.assertIsNone(red.test_set_aside)
+        unrun = self.parse(test=UNRUN_TEST)
+        self.assertEqual(unrun.test, UNRUN_TEST)
+        self.assertIsNone(unrun.test_set_aside)
+        # A written test may say what the owner should see, or null.
+        said = self.parse(test={**UNRUN_TEST, "expected_failure": "AssertionError"})
+        self.assertEqual(said.test["expected_failure"], "AssertionError")
+
+    def test_absent_and_null_are_no_test_and_nothing_set_aside(self):
+        for test in (_UNSET, None):
+            with self.subTest(test="absent" if test is _UNSET else test):
+                verdict = self.parse(test=test)
+                self.assertEqual((verdict.test, verdict.test_set_aside), (None, None))
+
+    def test_a_malformed_test_keeps_the_verdict_and_names_the_reason(self):
+        cases = [
+            ({**RED_TEST, "exit_status": 0}, "exit_status"),
+            ({**RED_TEST, "exit_status": None}, "exit_status"),
+            ({**RED_TEST, "argv": []}, "argv"),
+            ({**UNRUN_TEST, "argv": []}, "argv"),
+            ({**UNRUN_TEST, "exit_status": 1}, "written_not_run"),
+            ({**RED_TEST, "files": ["/abs/test_x.py"]}, "absolute"),
+            ({**RED_TEST, "files": ["../test_x.py"]}, "'..'"),
+            ({**RED_TEST, "files": [".git/hooks/pre-commit"]}, ".git"),
+            ({**RED_TEST, "files": []}, "files"),
+            ({**RED_TEST, "files": "tests/test_x.py"}, "files"),
+            ({**RED_TEST, "state": "green"}, "state"),
+            ({**RED_TEST, "fails_because": " "}, "fails_because"),
+            ({**RED_TEST, "extra": 1}, "'extra'"),
+            ({k: v for k, v in RED_TEST.items() if k != "cwd"}, "'cwd'"),
+            ({**RED_TEST, "cwd": "../elsewhere"}, "'..'"),
+            ({**RED_TEST, "cwd": ".git/hooks"}, ".git"),
+            ({**RED_TEST, "cwd": "sub/.GIT"}, ".git"),
+            # A drive or a stream inside a path: joined on Windows, it leaves the copy.
+            ({**RED_TEST, "files": ["tests/C:/secret.txt"]}, "':'"),
+            ({**RED_TEST, "files": ["tests/x.py:stream"]}, "':'"),
+            ({**RED_TEST, "cwd": "tests/D:"}, "':'"),
+            ("tests/test_x.py", "object"),
+            ([RED_TEST], "object"),
+        ]
+        for test, fragment in cases:
+            with self.subTest(test=test):
+                self.set_aside(fragment, test=test, status="reproduced")
+
+    def test_a_test_on_a_refuted_or_unresolved_verdict_is_set_aside(self):
+        self.set_aside("refuted", test=RED_TEST, status="refuted")
+        self.set_aside("unresolved", test=UNRUN_TEST, status="unresolved")
+
+    def test_a_red_test_sits_only_on_a_reproduced_verdict(self):
+        # A red test is an executed run of the code, and a reading verdict may carry only a
+        # documentary run; kept, the report would call a defect "confirmed by reading" beside
+        # a test that ran and failed.
+        verdict = self.set_aside("red", "confirmed_by_reading", "reproduced", test=RED_TEST,
+                                 status="confirmed_by_reading")
+        self.assertEqual(verdict.rationale, "Lines 2-3 index without a guard.")
+        self.assertEqual(self.parse(test=RED_TEST, status="reproduced").test, RED_TEST)
+        self.assertEqual(self.parse(test=UNRUN_TEST, status="confirmed_by_reading").test,
+                         UNRUN_TEST)
+
+    def test_a_test_below_the_threshold_is_set_aside(self):
+        # cand-002 is proposed minor; the run asks from major up.
+        self.set_aside("minor", "major", test=UNRUN_TEST, candidate="cand-002")
+        # At the threshold, and above it, it stands.
+        self.assertEqual(self.parse(test=UNRUN_TEST).test, UNRUN_TEST)
+        self.assertEqual(self.parse(test=UNRUN_TEST, asked=_asked("blocker",
+                                                                  **{"cand-001": "blocker"})).test,
+                         UNRUN_TEST)
+        self.assertEqual(self.parse(test=UNRUN_TEST, candidate="cand-002",
+                                    asked=_asked("nit")).test, UNRUN_TEST)
+
+    def test_a_test_sent_with_the_switch_off_is_set_aside_and_the_verdict_kept(self):
+        verdict = self.set_aside("off", test=RED_TEST, status="reproduced", asked=None)
+        self.assertEqual(verdict.evidence["argv"], EVIDENCE["argv"])
+
+    def test_the_severity_judged_is_the_one_the_report_shows(self):
+        minor_to_major = {"severity": "major", "rationale": "Every empty input hits it."}
+        major_to_minor = {"severity": "minor", "rationale": "Only a debug path reaches it."}
+        kept = self.parse(test=UNRUN_TEST, candidate="cand-002", revision=minor_to_major)
+        self.assertEqual(kept.test, UNRUN_TEST)
+        lost = self.set_aside("minor", test=UNRUN_TEST, revision=major_to_minor)
+        self.assertEqual(lost.revision, major_to_minor)
+
+    def test_a_test_beside_a_coverage_verdict_is_set_aside_and_the_verdict_kept(self):
+        # A gap already is a test to write, so its schema has no `test`; one sent anyway
+        # through a dispatch that does not enforce the schema costs the test alone.
+        verdict = dict(_verdict("cand-001", review_panel.COVERAGE_GAP_CONFIRMED,
+                                test_first=TEST_FIRST), test=RED_TEST)
+        parsed, rejected = review_panel.parse_verifier_result(
+            {"verdicts": [verdict], "summary": "checked"}, "verify-area-01-A-coverage",
+            {"cand-001": False}, review_panel.COVERAGE_ASKS, asked=_asked())
+        self.assertEqual(rejected, ())
+        self.assertEqual(parsed[0].status, review_panel.COVERAGE_GAP_CONFIRMED)
+        self.assertIsNone(parsed[0].test)
+        self.assertIn("coverage", parsed[0].test_set_aside)
+
+    def test_a_test_is_carried_to_the_resolved_candidate(self):
+        verdict = self.parse(test=RED_TEST, status="reproduced")
+        state = review_panel.VerificationState("verify-area-01-A", review_panel.UNIT_COMPLETE,
+                                               None, (verdict,))
+        cands = [{"id": "cand-001", "raised_by": [{"lane": "A"}]}]
+        resolved = review_panel.resolve(
+            cands, {"cand-001": {"id": "verify-area-01-A", "lane": "B"}}, [state])
+        self.assertEqual(resolved["cand-001"].test, RED_TEST)
+        self.assertIsNone(resolved["cand-001"].test_set_aside)
+        aside = self.set_aside(test=RED_TEST, status="refuted")
+        state = review_panel.VerificationState("verify-area-01-A", review_panel.UNIT_COMPLETE,
+                                               None, (aside,))
+        resolved = review_panel.resolve(
+            cands, {"cand-001": {"id": "verify-area-01-A", "lane": "B"}}, [state])
+        self.assertEqual(resolved["cand-001"].test_set_aside, aside.test_set_aside)
+
+
+class TheEngineChecksARedTestFailedWithItsOwnMessage(unittest.TestCase):
+    """A ``red`` test is one whose captured output holds the text the verifier said the
+    failure prints. The check is a plain substring, line endings normalized, so it works for
+    any language and runner. A miss is set aside and never relabeled; the verdict stands."""
+
+    def parse(self, **test):
+        verdict = dict(_verdict("cand-001", "reproduced", EVIDENCE),
+                       test={**RED_TEST, **test})
+        parsed, rejected = review_panel.parse_verifier_result(
+            {"verdicts": [verdict], "summary": "ran"}, "verify-area-01-A", {"cand-001": False},
+            asked=_asked())
+        self.assertEqual(rejected, ())
+        self.assertEqual(parsed[0].status, "reproduced")
+        return parsed[0]
+
+    def test_the_text_in_the_output_is_red(self):
+        self.assertEqual(self.parse().test["state"], "red")
+
+    def test_the_text_absent_is_set_aside_and_the_verdict_stands(self):
+        verdict = self.parse(expected_failure="AssertionError: 0 != 1")
+        self.assertIsNone(verdict.test)
+        self.assertIn(review_panel.NOT_THE_EXPECTED_FAILURE, verdict.test_set_aside)
+        self.assertNotIn("cut", verdict.test_set_aside)
+
+    def test_line_endings_do_not_decide_it(self):
+        crlf = self.parse(output="FAIL: test_empty\r\nTraceback\r\nAssertionError: None\r\n!= []\r\n",
+                          expected_failure="AssertionError: None\n!= []")
+        self.assertEqual(crlf.test["state"], "red")
+        lf_output = self.parse(output="AssertionError: None\n!= []\n",
+                               expected_failure="AssertionError: None\r\n!= []")
+        self.assertEqual(lf_output.test["state"], "red")
+
+    def test_a_miss_in_a_cut_output_says_the_output_was_cut(self):
+        verdict = self.parse(output="...the tail\n", truncated=True)
+        self.assertIsNone(verdict.test)
+        self.assertIn(review_panel.NOT_THE_EXPECTED_FAILURE, verdict.test_set_aside)
+        self.assertIn("cut", verdict.test_set_aside)
+
+    def test_the_check_reads_the_output_before_the_engine_bounds_it(self):
+        bound = review_panel.EVIDENCE_OUTPUT_BOUND
+        output = "AssertionError: None != []\n" + "x" * (2 * bound)
+        verdict = self.parse(output=output)
+        self.assertEqual(verdict.test["state"], "red")
+        self.assertTrue(verdict.test["truncated"])
+        self.assertLessEqual(len(verdict.test["output"].encode("utf-8")), bound)
+        self.assertTrue(output.endswith(verdict.test["output"]))
+
+    def test_red_with_no_expected_text_is_set_aside(self):
+        for empty in ("", "  ", None):
+            with self.subTest(expected_failure=empty):
+                verdict = self.parse(expected_failure=empty)
+                self.assertIsNone(verdict.test)
+                self.assertIn("expected_failure", verdict.test_set_aside)
+
+    def test_an_import_error_is_not_the_assertion_it_promised(self):
+        verdict = self.parse(output="Traceback (most recent call last):\n"
+                                    "ModuleNotFoundError: No module named 'enigne'\n")
+        self.assertIsNone(verdict.test)
+        self.assertIn(review_panel.NOT_THE_EXPECTED_FAILURE, verdict.test_set_aside)
+
+
+class TheSavedJobsTestPatchSwitchIsReadAsStrictlyAsTheJobFile(_JobCase):
+    """Every stage after ``plan`` reads the switch from the run directory's copy of the job,
+    so a hand-edited copy is refused by name exactly as ``load_job`` refuses the job file —
+    never read as some other setting and carried into a verifier payload."""
+
+    MALFORMED = [
+        ("on", "'test_patches'"),
+        (["on"], "'test_patches'"),
+        ({"mode": "on"}, "'min_severity'"),
+        ({"mode": "off", "min_severity": "major"}, "'test_patches.min_severity'"),
+        ({"mode": "off", "min_severity": "critical"}, "'test_patches.min_severity'"),
+        ({"mode": "auto"}, "'test_patches.mode'"),
+        ({"mode": True}, "'test_patches.mode'"),
+        ({"mode": "on", "min_severity": "critical"}, "'test_patches.min_severity'"),
+        ({"mode": "on", "min_severity": ["major"]}, "'test_patches.min_severity'"),
+        ({"mode": "on", "min_severity": "major", "threshold": 1}, "'threshold'"),
+        ({"mode": "off", "extra": True}, "'extra'"),
+        ({"min_severity": "major"}, "'mode'"),
+    ]
+
+    def test_each_malformed_switch_is_refused_on_re_read_as_load_job_refuses_it(self):
+        rundir = self.tmp / "run"
+        rundir.mkdir()
+        good = dict(FILE_JOB, root=str(self.root))
+        for raw, fragment in self.MALFORMED:
+            with self.subTest(test_patches=raw):
+                self.refuse(dict(FILE_JOB, test_patches=raw), fragment)
+                (rundir / "job.json").write_text(json.dumps(dict(good, test_patches=raw)),
+                                                 encoding="utf-8")
+                with self.assertRaises(review_panel.RunDirError) as ctx:
+                    review_panel._read_job(rundir)
+                self.assertIn("test_patches", str(ctx.exception))
+                self.assertIn(fragment, str(ctx.exception))
+
+    def test_a_well_formed_switch_is_read(self):
+        rundir = self.tmp / "run"
+        rundir.mkdir()
+        for raw in ({"mode": "off"}, {"mode": "on", "min_severity": "nit"}):
+            with self.subTest(test_patches=raw):
+                (rundir / "job.json").write_text(json.dumps(dict(
+                    FILE_JOB, root=str(self.root), test_patches=raw)), encoding="utf-8")
+                self.assertEqual(review_panel._read_job(rundir)["test_patches"], raw)
+
+
+class ATestIsPricedIntoTheVerificationReply(unittest.TestCase):
+    """With test patches on, each verdict may carry a test whose output alone can reach the
+    evidence bound, so a batch is priced with room for one per verdict and splits sooner.
+    With them off, no verdict carries a test price, so batches are sized by the verdicts
+    alone."""
+
+    FILES = ("run.py", "engine/core.py", "engine/util.py")
+
+    def candidates(self, kind="reader"):
+        return [_split_candidate(n, file, kind=kind)
+                for n, file in enumerate((f for f in self.FILES for _ in range(4)), 1)]
+
+    def test_the_price_with_a_test_is_a_named_constant_above_the_old_one(self):
+        old = review_panel.VERIFICATION_REPLY_PRICES["verdict"]
+        priced = review_panel.VERIFICATION_REPLY_PRICES_WITH_TEST["verdict"]
+        self.assertGreaterEqual(priced, old + review_panel.EVIDENCE_OUTPUT_BOUND)
+
+    def test_on_splits_a_batch_that_fit_at_the_old_price_and_every_part_fits(self):
+        # Room for one file's four verdicts with their tests, which at the old price holds
+        # all twelve.
+        limits = review_panel.Limits(
+            input_bytes=400 * 1024,
+            reply_bytes=review_panel.VERIFICATION_REPLY_HEAD
+            + 4 * review_panel.VERIFICATION_REPLY_PRICES_WITH_TEST["verdict"])
+        self.assertLessEqual(12 * review_panel.VERIFICATION_REPLY_PRICES["verdict"],
+                             4 * review_panel.VERIFICATION_REPLY_PRICES_WITH_TEST["verdict"])
+        off = review_panel.route(self.candidates(), limits=_verification_limits(B=limits))
+        self.assertEqual([b.id for b in off], ["verify-area-01-A"])
+        on = review_panel.route(self.candidates(), limits=_verification_limits(B=limits),
+                                threshold="major")
+        self.assertGreater(len(on), 1)
+        self.assertEqual([c for b in on for c in b.candidates],
+                         [c.id for c in self.candidates()])
+        price = review_panel.VERIFICATION_REPLY_PRICES_WITH_TEST["verdict"]
+        for batch in on:
+            with self.subTest(part=batch.id):
+                self.assertFalse(batch.oversize)
+                self.assertLessEqual(
+                    review_panel.VERIFICATION_REPLY_HEAD + len(batch.candidates) * price,
+                    limits.reply_bytes)
+
+    def test_off_routes_exactly_as_before(self):
+        limits = _verification_limits(B=_TWO_VERDICTS)
+        self.assertEqual(review_panel.route(self.candidates(), limits=limits),
+                         review_panel.route(self.candidates(), limits=limits, threshold=None))
+
+    def test_a_coverage_batch_carries_no_test_and_keeps_the_old_price(self):
+        limits = _verification_limits(B=_TWO_VERDICTS)
+        self.assertEqual(
+            review_panel.route(self.candidates("auditor"), limits=limits),
+            review_panel.route(self.candidates("auditor"), limits=limits, threshold="nit"))
+
+
+class TheVerifierPayloadAsksForATestOnlyWhenTheRunDoes(_ReportCase):
+    """The threshold is stated once in each defect payload with the switch on. With it off
+    the payload states none, carries no conventions and says nothing about writing a test
+    anywhere — the whole payload is checked, not one line of it."""
+
+    ON = {"mode": "on", "min_severity": "major"}
+
+    def payloads(self, rundir=None, **over):
+        rundir = rundir or self.rundir
+        self.plan_into(rundir, **over)
+        stub_dispatch(rundir, READING_TABLE, DISPATCH)
+        self.assertEqual(_run("route", str(rundir)).returncode, 0)
+        units = json.loads((rundir / "units.json").read_text(encoding="utf-8"))["units"]
+        return {u["id"]: (rundir / u["payload"]).read_text(encoding="utf-8")
+                for u in units if u.get("kind") == "verifier"}
+
+    def test_on_states_the_threshold_once_in_every_defect_payload(self):
+        payloads = self.payloads(test_patches=self.ON)
+        defect = {k: v for k, v in payloads.items() if not k.endswith("-coverage")}
+        self.assertTrue(defect)
+        for unit, text in defect.items():
+            with self.subTest(unit=unit):
+                self.assertEqual(text.count(review_panel.TESTS_ASKED_HEADING), 1)
+                section = text.partition(review_panel.TESTS_ASKED_HEADING)[2].partition(
+                    "\n## ")[0]
+                self.assertIn("`major` or above", section)
+                self.assertIn("revision", section)
+                # Above the candidates, as the probe's answer is.
+                self.assertLess(text.index(review_panel.TESTS_ASKED_HEADING),
+                                text.index(review_panel.CANDIDATES_HEADING))
+
+    def test_off_states_no_threshold_and_says_nothing_of_a_test(self):
+        brief = review_panel.load_brief("verifier")
+        test_brief = review_panel.load_brief(review_panel.VERIFIER_TEST_BRIEF_NAME)
+        for n, over in enumerate(({}, {"test_patches": {"mode": "off"}})):
+            payloads = self.payloads(self.tmp / f"run-{n}", **over)
+            self.assertTrue(payloads)
+            for unit, text in payloads.items():
+                with self.subTest(job=over, unit=unit):
+                    if unit.endswith("-coverage"):
+                        continue
+                    self.assertTrue(text.startswith(brief.rstrip("\n") + "\n" + review_panel.PROBLEM_HEADING))
+                    prose = text.partition(review_panel.RESULT_SCHEMA_HEADING)[0]
+                    self.assertNotIn(test_brief.strip().splitlines()[0], prose)
+                    self.assertNotIn(review_panel.TESTS_ASKED_HEADING, prose)
+                    self.assertNotIn(review_panel.CONVENTIONS_HEADING, prose)
+                    for word in ("threshold", "failing test", "`test`", "min_severity"):
+                        self.assertNotIn(word, prose)
+
+
+_UNIT_FILES = ("payload.md", "schema.json")
+
+
+# The files a unit is assembled from, read off disk here rather than through the engine's
+# loaders, so a test of what the engine sends does not trust the engine to say what it read.
+def _shipped_text(relative):
+    return (_ENGINE_DIR / relative).read_text(encoding="utf-8")
+
+
+def _shipped_json(relative):
+    return json.loads(_shipped_text(relative))
+
+
+class TheTestPatchFilesReachTheProbeAndVerifiersOnlyWhenOn(_ReportCase):
+    """A run that asks for no test tells nobody about one. With the switch absent or off,
+    the probe unit and every verifier unit — a defect batch and a coverage batch — are
+    assembled from their shipped brief and schema alone: no failing-test brief, no `test`
+    property, no conventions request or key, nothing else added. The expected value is
+    built from the files on disk as they are now, so an edit to a brief or a schema keeps
+    this green and test material leaking into an off-mode unit turns it red."""
+
+    ON = {"mode": "on", "min_severity": "major"}
+    PROBE = "probe-A"
+    # What a run with test patches on adds, and a run with them off must carry none of.
+    ADDED_BRIEFS = ("references/verifier-failing-test.md", "references/probe-test-conventions.md")
+    ADDED_SCHEMAS = ("verifier-failing-test-schema.json", "probe-conventions-schema.json")
+
+    def routed_units(self, rundir, **over):
+        """``{unit id: {file name: text}}`` for the probe unit and every verifier unit
+        ``route`` wrote, over a reading round whose auditor raised gaps, so both kinds of
+        batch are written."""
+        reading = {**READING_TABLE,
+                   "audit-area-01-A": {"findings": [GAP, GAP_TWO], "summary": "two gaps"},
+                   "audit-area-01-B": {"findings": [], "summary": "no gap"}}
+        self.plan_into(rundir, **over)
+        stub_dispatch(rundir, reading, DISPATCH)
+        proc = _run("route", str(rundir))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.units_doc = json.loads((rundir / "units.json").read_text(encoding="utf-8"))
+        return {u["id"]: {name: (rundir / "units" / u["id"] / name).read_text(encoding="utf-8")
+                          for name in _UNIT_FILES}
+                for u in self.units_doc["units"] if u.get("kind") in ("verifier", "probe")}
+
+    @staticmethod
+    def inline_schema(payload):
+        return json.loads(payload.partition(review_panel.RESULT_SCHEMA_HEADING)[2]
+                          .partition("```json\n")[2].partition("\n```")[0])
+
+    def shipped_for(self, unit):
+        """The brief and the schema a unit is built from when the run asks for no test."""
+        if unit == self.PROBE:
+            return _shipped_text("references/probe.md"), _shipped_json("probe-schema.json")
+        if unit.endswith("-coverage"):
+            return (_shipped_text("references/coverage-verifier.md"),
+                    _shipped_json("coverage-verifier-schema.json"))
+        return _shipped_text("references/verifier.md"), _shipped_json("verifier-schema.json")
+
+    def assert_nothing_added(self, unit, files):
+        payload, schema = files["payload.md"], json.loads(files["schema.json"])
+        brief, shipped = self.shipped_for(unit)
+        problem = FILE_JOB["problem"]
+        # The shipped brief whole and first, the problem statement straight after it.
+        self.assertTrue(payload.startswith(brief.rstrip("\n") + "\n\n## Problem statement\n\n"
+                                           + problem + "\n"))
+        self.assertEqual(payload.count(brief.rstrip("\n")), 1)
+        # The shipped schema exactly, in the payload and in the file a CLI is handed.
+        self.assertEqual(payload.count(review_panel.RESULT_SCHEMA_HEADING), 1)
+        self.assertEqual(self.inline_schema(payload), shipped)
+        self.assertEqual(schema, shipped)
+        # Not one line of what a run with tests on adds.
+        for name in self.ADDED_BRIEFS:
+            for line in _shipped_text(name).splitlines():
+                if line.strip():
+                    self.assertNotIn(line.strip(), payload, f"{name} reached {unit}")
+        for name in self.ADDED_SCHEMAS:
+            self.assertNotIn(_shipped_json(name)["description"], payload)
+            self.assertNotIn(_shipped_json(name)["description"], files["schema.json"])
+        for heading in (review_panel.TESTS_ASKED_HEADING, review_panel.CONVENTIONS_HEADING):
+            self.assertNotIn(heading, payload)
+
+    def test_off_and_absent_hand_each_unit_its_shipped_brief_and_schema_alone(self):
+        for n, over in enumerate(({}, {"test_patches": {"mode": "off"}})):
+            rundir = self.tmp / f"run-{n}"
+            got = self.routed_units(rundir, **over)
+            self.assertIn(self.PROBE, got)
+            self.assertTrue(any(unit.endswith("-coverage") for unit in got), sorted(got))
+            self.assertTrue(any(unit.startswith("verify-") and not unit.endswith("-coverage")
+                                for unit in got), sorted(got))
+            for unit, files in got.items():
+                with self.subTest(job=over, unit=unit):
+                    self.assert_nothing_added(unit, files)
+
+    def test_off_and_absent_add_nothing_between_the_brief_and_the_schema(self):
+        # The parts between are the problem, the probe's answer and the candidates, rendered
+        # from the shipped files and nothing else.
+        for n, over in enumerate(({}, {"test_patches": {"mode": "off"}})):
+            rundir = self.tmp / f"run-{n}"
+            got = self.routed_units(rundir, **over)
+            units = self.units_doc["units"]
+            probe = review_panel.read_probe_result(rundir, units)
+            cands = {c["id"]: c for c in review_panel._read_candidates(rundir)["candidates"]}
+            for unit in units:
+                if unit["id"] not in got or unit["id"].endswith("-coverage"):
+                    continue
+                brief, shipped = self.shipped_for(unit["id"])
+                if unit["kind"] == "probe":
+                    expected = (brief.rstrip("\n") + "\n" + review_panel.PROBLEM_HEADING + "\n"
+                                + FILE_JOB["problem"] + "\n"
+                                + "".join(review_panel._schema_section(shipped)))
+                else:
+                    expected = review_panel.render_verifier_payload(
+                        brief, FILE_JOB["problem"], [cands[c] for c in unit["candidates"]],
+                        probe, schema=shipped)
+                with self.subTest(job=over, unit=unit["id"]):
+                    self.assertEqual(got[unit["id"]]["payload.md"], expected)
+
+    def test_on_hands_a_defect_verifier_the_test_brief_and_the_test_property(self):
+        test_brief = _shipped_text("references/verifier-failing-test.md").rstrip("\n")
+        fragment = _shipped_json("verifier-failing-test-schema.json")
+        got = self.routed_units(self.rundir, test_patches=self.ON)
+        del got[self.PROBE]
+        self.assertTrue(got)
+        for unit, files in got.items():
+            payload, written = files["payload.md"], json.loads(files["schema.json"])
+            _, shipped = self.shipped_for(unit)
+            with self.subTest(unit=unit):
+                # The schema a CLI enforces is the one the payload shows, either way.
+                self.assertEqual(self.inline_schema(payload), written)
+                if unit.endswith("-coverage"):
+                    # A coverage verdict carries no test, so its unit is told of none.
+                    self.assertNotIn(test_brief, payload)
+                    self.assertEqual(written, shipped)
+                    continue
+                self.assertEqual(payload.count(test_brief), 1)
+                # Brief first, the problem statement after, as the brief's own text is.
+                self.assertLess(payload.index(test_brief), payload.index(review_panel.PROBLEM_HEADING))
+                verdict = written["properties"]["verdicts"]["items"]
+                self.assertEqual(verdict["properties"]["test"], fragment)
+                self.assertEqual(verdict["required"][-1], "test")
+                # Everything else is the shipped schema, untouched.
+                bare = shipped["properties"]["verdicts"]["items"]
+                self.assertEqual({k: v for k, v in verdict["properties"].items() if k != "test"},
+                                 bare["properties"])
+                self.assertEqual(verdict["required"][:-1], bare["required"])
+
+    def test_on_asks_the_probe_for_conventions_and_carries_the_property(self):
+        brief, shipped = self.shipped_for(self.PROBE)
+        added = _shipped_text("references/probe-test-conventions.md").rstrip("\n")
+        fragment = _shipped_json("probe-conventions-schema.json")
+        probe = self.routed_units(self.rundir, test_patches=self.ON)[self.PROBE]
+        payload, written = probe["payload.md"], json.loads(probe["schema.json"])
+        self.assertEqual(self.inline_schema(payload), written)
+        self.assertTrue(payload.startswith(brief.rstrip("\n")))
+        self.assertEqual(payload.count(added), 1)
+        self.assertLess(payload.index(added), payload.index(review_panel.PROBLEM_HEADING))
+        self.assertEqual(payload.count(review_panel.CONVENTIONS_HEADING), 1)
+        self.assertIn(review_panel.CONVENTIONS_ASKED, payload)
+        self.assertEqual(written["properties"]["conventions"], fragment)
+        self.assertEqual(written["required"][-1], "conventions")
+        self.assertEqual({k: v for k, v in written["properties"].items() if k != "conventions"},
+                         shipped["properties"])
+        self.assertEqual(written["required"][:-1], shipped["required"])
+
+
+class ATestTravelsIntoTheFindingsRecord(_ReportCase):
+    """The test and the reason one was set aside reach each candidate's record in
+    ``findings.json`` — written only when the run asked for tests; a run that did not has
+    no test to record, and its candidate records carry no test fields."""
+
+    def verify_with_tests(self):
+        a, b = (VERIFY_TABLE["verify-area-01-A"], VERIFY_TABLE["verify-area-01-B"])
+        return {
+            "verify-area-01-A": {**a, "verdicts": [
+                {**a["verdicts"][0], "test": UNRUN_TEST},
+                {**a["verdicts"][1], "test": {**RED_TEST, "expected_failure": "nowhere"}}]},
+            "verify-area-01-B": {**b, "verdicts": [
+                b["verdicts"][0], {**b["verdicts"][1], "test": RED_TEST}]},
+        }
+
+    def records(self):
+        doc = json.loads((self.rundir / "findings.json").read_text(encoding="utf-8"))
+        return {r["id"]: r for r in doc["candidates"]}
+
+    def test_on_carries_the_test_and_the_reason(self):
+        self.run_all(verify=self.verify_with_tests(),
+                     test_patches={"mode": "on", "min_severity": "major"})
+        records = self.records()
+        self.assertEqual(records["cand-001"]["test"], UNRUN_TEST)
+        self.assertIsNone(records["cand-001"]["test_set_aside"])
+        self.assertIsNone(records["cand-003"]["test"])
+        self.assertIn(review_panel.NOT_THE_EXPECTED_FAILURE, records["cand-003"]["test_set_aside"])
+        self.assertIsNone(records["cand-002"]["test"])
+        self.assertIsNone(records["cand-002"]["test_set_aside"])
+        self.assertIsNone(records["cand-004"]["test"])
+        self.assertIn("refuted", records["cand-004"]["test_set_aside"])
+        # Every verdict stood.
+        self.assertEqual(records["cand-003"]["status"], "reproduced")
+        self.assertEqual(records["cand-004"]["status"], "refuted")
+
+    def test_off_writes_no_test_key_even_where_a_verifier_sent_one(self):
+        self.run_all(verify=self.verify_with_tests())
+        for record in self.records().values():
+            self.assertNotIn("test", record)
+            self.assertNotIn("test_set_aside", record)
+
+
+class ATestPatchRecordTravelsIntoTheFindingsRecord(_ReportCase):
+    """The engine reads ``test-patches.json`` where it reads the unit's result, and each
+    candidate whose verdict carries a test gets its patch record in ``findings.json``. A unit
+    without the file — a run by hand, or an older run — reads as no patches."""
+
+    UNIT = "verify-area-01-A"
+    ON = {"test_patches": {"mode": "on", "min_severity": "major"}}
+
+    OTHER = {**RED_TEST, "files": ["tests/test_other.py"]}
+
+    def setUp(self):
+        super().setUp()
+        verify = copy.deepcopy(VERIFY_TABLE)
+        verify[self.UNIT]["verdicts"][0]["test"] = UNRUN_TEST
+        verify[self.UNIT]["verdicts"][1]["test"] = self.OTHER
+        self.verify = verify
+
+    def records(self):
+        doc = json.loads((self.rundir / "findings.json").read_text(encoding="utf-8"))
+        return {r["id"]: r for r in doc["candidates"]}
+
+    def rerender(self):
+        proc = _run("report", str(self.rundir), "--rerender")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return self.records()
+
+    def land_patches(self, record):
+        (self.rundir / "units" / self.UNIT / review_panel.TEST_PATCHES_NAME).write_text(
+            json.dumps(record), encoding="utf-8")
+
+    def from_a_copy(self):
+        """The record the driver writes, built by the engine from a copy holding the test."""
+        work = self.tmp / "copy"
+        shutil.copytree(self.rundir / "snapshot", work)
+        for path in [work, *work.rglob("*")]:
+            path.chmod(path.stat().st_mode | stat.S_IWUSR)
+        (work / "tests" / "test_empty_input.py").write_text("assert False\n", encoding="utf-8")
+        (work / "tests" / "test_other.py").write_text("assert 0\n", encoding="utf-8")
+        reply = json.loads((self.rundir / "units" / self.UNIT / "result.json")
+                           .read_text(encoding="utf-8"))
+        return review_panel.test_patches_record(self.rundir, self.UNIT, reply, work)
+
+    def test_the_engines_record_reaches_the_candidate(self):
+        self.run_all(verify=self.verify, **self.ON)
+        record = self.from_a_copy()
+        self.assertEqual(record["unit"], self.UNIT)
+        self.assertEqual([t["candidate"] for t in record["tests"]], ["cand-001", "cand-003"])
+        self.land_patches(record)
+        found = self.rerender()["cand-001"]["test_patch"]
+        # Where the patch lives, never its text: patches stay in the unit's record and the
+        # fix brief's directory.
+        self.assertEqual(found, {"unit": self.UNIT, "reason": None,
+                                 "files": [{"path": "tests/test_empty_input.py",
+                                            "kind": review_panel.TEST_NEW_FILE}]})
+        self.assertNotIn("+++ b/", (self.rundir / "findings.json").read_text(encoding="utf-8"))
+        self.assertIsNone(self.records()["cand-002"]["test_patch"])
+        # The text is read from the unit's record, where the report reads it.
+        verdict = _tested("cand-001", "tests/test_empty_input.py")
+        text = review_panel.read_test_patches(self.rundir, self.UNIT, [verdict])
+        self.assertIn("+++ b/tests/test_empty_input.py\n", text["cand-001"]["patch"])
+
+    def test_a_malformed_entry_costs_that_patch_alone(self):
+        self.run_all(verify=self.verify, **self.ON)
+        good = self.from_a_copy()
+        for drop in ("reason", "patch", "files", "candidate"):
+            with self.subTest(missing=drop):
+                first = {k: v for k, v in good["tests"][0].items() if k != drop}
+                self.land_patches({**good, "tests": [first, good["tests"][1]]})
+                records = self.rerender()
+                self.assertIsNone(records["cand-003"]["test_patch"]["reason"])
+                self.assertIsNotNone(records["cand-001"]["test_patch"]["reason"])
+                self.assertEqual(records["cand-001"]["status"], "confirmed_by_reading")
+
+    def test_a_unit_without_the_file_reads_as_no_patches(self):
+        self.run_all(verify=self.verify, **self.ON)
+        self.assertIsNone(self.records()["cand-001"]["test_patch"])
+
+    def test_a_record_that_cannot_be_read_costs_the_patch_and_says_why(self):
+        self.run_all(verify=self.verify, **self.ON)
+        good = self.from_a_copy()
+        bad = {**good, "tests": [{**good["tests"][0], "files": [{"path": "other.py",
+                                                                 "kind": "new_file"}]}]}
+        for written, why in ((bad, "does not match"),
+                             ({**good, "tests": "x"}, review_panel.TEST_PATCHES_NAME),
+                             ({**good, "tests": [], "reason": "the reply was unreadable"},
+                              "the reply was unreadable")):
+            with self.subTest(why=why):
+                self.land_patches(written)
+                found = self.rerender()["cand-001"]
+                self.assertNotIn("patch", found["test_patch"])
+                self.assertIn(why, found["test_patch"]["reason"])
+                self.assertEqual(found["status"], "confirmed_by_reading")
+        (self.rundir / "units" / self.UNIT / review_panel.TEST_PATCHES_NAME).write_text(
+            "{not json", encoding="utf-8")
+        self.assertIn("JSON", self.rerender()["cand-001"]["test_patch"]["reason"])
+
+    def test_off_writes_no_key_and_asks_for_no_record(self):
+        self.run_all(verify=self.verify)
+        self.assertNotIn("test_patch", self.records()["cand-001"])
+        reply = json.loads((self.rundir / "units" / self.UNIT / "result.json")
+                           .read_text(encoding="utf-8"))
+        self.assertIsNone(review_panel.test_patches_record(self.rundir, self.UNIT, reply,
+                                                           self.rundir / "snapshot"))
+
+
+def _apply_patch(before, patch):
+    """``before`` with one file's unified hunks from ``patch`` applied, every context and
+    removed line checked against it: enough to prove a patch rebuilds what it claims."""
+    old = before.decode("utf-8").splitlines(keepends=True)
+    out, at = [], 0
+    for line in patch.splitlines(keepends=True):
+        hunk = re.match(r"@@ -(\d+)(?:,(\d+))? ", line)
+        if hunk:
+            start = int(hunk.group(1)) - (0 if hunk.group(2) == "0" else 1)
+            out += old[at:start]
+            at = start
+        elif line[:1] in (" ", "-") and not line.startswith("--- "):
+            assert old[at] == line[1:], (old[at], line)
+            if line[0] == " ":
+                out.append(old[at])
+            at += 1
+        elif line[:1] == "+" and not line.startswith("+++ "):
+            out.append(line[1:])
+    return "".join(out + old[at:]).encode("utf-8")
+
+
+def _nameable(name):
+    """Whether this host's file system encoding can spell ``name``; under the C locale on
+    POSIX it is ASCII, and a non-ASCII name cannot be created at all."""
+    try:
+        os.fsencode(name)
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _tested(candidate, *files, status="reproduced"):
+    """A verdict carrying a written test that declares ``files``."""
+    return review_panel.Verdict(candidate=candidate, status=status, evidence=None,
+                                rationale="r", revision=None, test_first=None,
+                                unresolved_reason=None,
+                                test={**RED_TEST, "files": list(files)})
+
+
+class _PatchCase(unittest.TestCase):
+    """A snapshot and the verifier's copy of it, side by side."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="rp-patch-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.snapshot = self.tmp / "snapshot"
+        self.copy = self.tmp / "copy"
+        self.snapshot.mkdir()
+        self.put(self.snapshot, "engine/core.py", b"def f(x):\n    return x[0]\n")
+        self.put(self.snapshot, "tests/test_core.py",
+                 b"import unittest\n\n\nclass T(unittest.TestCase):\n    pass\n")
+        shutil.copytree(self.snapshot, self.copy)
+
+    @staticmethod
+    def put(base, rel, data):
+        path = base / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return path
+
+    def patches(self, *verdicts, prefix=""):
+        return {record["candidate"]: record for record in review_panel.diff_test_files(
+            self.snapshot, self.copy, verdicts, prefix)}
+
+
+class TheEngineDiffsATestsDeclaredFilesIntoAPatch(_PatchCase):
+    """The engine, not the model, makes the patch: only the files a test declares, diffed
+    against the snapshot with ``difflib``, as git writes them. **A test's patch is all of its
+    declared files or nothing**, and a test that cannot have one says why."""
+
+    def test_a_new_file_is_a_git_style_creation(self):
+        self.put(self.copy, "tests/test_empty.py", b"import x\n\nassert x.f([]) == []\n")
+        record = self.patches(_tested("cand-001", "tests/test_empty.py"))["cand-001"]
+        self.assertIsNone(record["reason"])
+        self.assertEqual(record["files"], [{"path": "tests/test_empty.py",
+                                            "kind": review_panel.TEST_NEW_FILE}])
+        self.assertEqual(record["patch"],
+                         "diff --git a/tests/test_empty.py b/tests/test_empty.py\n"
+                         "new file mode 100644\n"
+                         "--- /dev/null\n"
+                         "+++ b/tests/test_empty.py\n"
+                         "@@ -0,0 +1,3 @@\n"
+                         "+import x\n"
+                         "+\n"
+                         "+assert x.f([]) == []\n")
+
+    def test_an_edit_diffs_against_the_snapshot(self):
+        self.put(self.copy, "tests/test_core.py",
+                 b"import unittest\n\n\nclass T(unittest.TestCase):\n"
+                 b"    def test_empty(self):\n        self.fail()\n")
+        record = self.patches(_tested("cand-001", "tests/test_core.py"))["cand-001"]
+        self.assertEqual(record["files"], [{"path": "tests/test_core.py",
+                                            "kind": review_panel.TEST_EDITS_EXISTING}])
+        self.assertEqual(record["patch"],
+                         "diff --git a/tests/test_core.py b/tests/test_core.py\n"
+                         "--- a/tests/test_core.py\n"
+                         "+++ b/tests/test_core.py\n"
+                         "@@ -2,4 +2,5 @@\n"
+                         " \n"
+                         " \n"
+                         " class T(unittest.TestCase):\n"
+                         "-    pass\n"
+                         "+    def test_empty(self):\n"
+                         "+        self.fail()\n")
+
+    def test_a_missing_final_newline_is_marked_as_git_marks_it(self):
+        self.put(self.copy, "tests/test_tail.py", b"a\nb")
+        new = self.patches(_tested("cand-001", "tests/test_tail.py"))["cand-001"]["patch"]
+        self.assertTrue(new.endswith("+a\n+b\n\\ No newline at end of file\n"), new)
+        self.put(self.snapshot, "tests/test_was.py", b"a\nb")
+        self.put(self.copy, "tests/test_was.py", b"a\nc\n")
+        edit = self.patches(_tested("cand-002", "tests/test_was.py"))["cand-002"]["patch"]
+        self.assertTrue(edit.endswith(" a\n-b\n\\ No newline at end of file\n+c\n"), edit)
+
+    def test_crlf_is_kept_byte_for_byte(self):
+        self.put(self.copy, "tests/test_win.py", b"one\r\ntwo\r\n")
+        patch = self.patches(_tested("cand-001", "tests/test_win.py"))["cand-001"]["patch"]
+        self.assertIn("+one\r\n+two\r\n", patch)
+        self.assertTrue(patch.startswith("diff --git a/tests/test_win.py b/tests/test_win.py\n"))
+
+    def test_a_name_git_would_quote_is_quoted_as_git_quotes_it(self):
+        if not _nameable("tést"):
+            # The name cannot reach the disk here, so the test costs its patch, with why.
+            record = self.patches(_tested("cand-001", "tests/tést.py"))["cand-001"]
+            self.assertIsNone(record["patch"])
+            self.assertIn("file name encoding", record["reason"])
+        else:
+            self.put(self.copy, "tests/tést.py", b"x\n")
+            patch = self.patches(_tested("cand-001", "tests/tést.py"))["cand-001"]["patch"]
+            self.assertTrue(patch.startswith(
+                'diff --git "a/tests/t\\303\\251st.py" "b/tests/t\\303\\251st.py"\n'),
+                patch)
+            self.assertIn('+++ "b/tests/t\\303\\251st.py"\n', patch)
+        # A space is not quoted, and git ends the file lines with a tab to bound the name.
+        self.put(self.copy, "tests/a b.py", b"x\n")
+        spaced = self.patches(_tested("cand-002", "tests/a b.py"))["cand-002"]["patch"]
+        self.assertIn("diff --git a/tests/a b.py b/tests/a b.py\n", spaced)
+        self.assertIn("+++ b/tests/a b.py\t\n", spaced)
+        if os.name != "nt":
+            # A quote and a tab: names Windows cannot hold.
+            self.put(self.copy, 'tests/q"\tx.py', b"x\n")
+            odd = self.patches(_tested("cand-003", 'tests/q"\tx.py'))["cand-003"]["patch"]
+            self.assertIn('+++ "b/tests/q\\"\\tx.py"\n', odd)
+
+    def test_the_root_s_place_in_its_repository_prefixes_every_path(self):
+        self.put(self.copy, "tests/test_empty.py", b"x\n")
+        record = self.patches(_tested("cand-001", "tests/test_empty.py"), prefix="pkg/sub")
+        patch = record["cand-001"]["patch"]
+        self.assertTrue(patch.startswith(
+            "diff --git a/pkg/sub/tests/test_empty.py b/pkg/sub/tests/test_empty.py\n"), patch)
+        # The record names the file as the test declared it: relative to the root.
+        self.assertEqual(record["cand-001"]["files"][0]["path"], "tests/test_empty.py")
+
+    def test_an_empty_new_file_is_a_header_alone(self):
+        self.put(self.copy, "tests/__init__.py", b"")
+        patch = self.patches(_tested("cand-001", "tests/__init__.py"))["cand-001"]["patch"]
+        self.assertEqual(patch, "diff --git a/tests/__init__.py b/tests/__init__.py\n"
+                                "new file mode 100644\n")
+
+    def test_changes_the_test_did_not_declare_are_left_out(self):
+        self.put(self.copy, "tests/test_empty.py", b"x\n")
+        self.put(self.copy, "scratch/repro.sh", b"python3 -c 'boom'\n")
+        self.put(self.copy, "engine/core.py", b"def f(x):\n    return x[:1]\n")
+        patch = self.patches(_tested("cand-001", "tests/test_empty.py"))["cand-001"]["patch"]
+        self.assertEqual(patch.count("diff --git"), 1)
+        self.assertNotIn("repro", patch)
+        self.assertNotIn("core.py", patch)
+
+    def test_files_are_patched_in_the_order_declared(self):
+        self.put(self.copy, "tests/test_b.py", b"b\n")
+        self.put(self.copy, "tests/fixtures/data.txt", b"d\n")
+        record = self.patches(_tested("cand-001", "tests/test_b.py",
+                                      "tests/fixtures/data.txt"))["cand-001"]
+        self.assertLess(record["patch"].index("test_b.py"), record["patch"].index("data.txt"))
+        self.assertEqual([f["path"] for f in record["files"]],
+                         ["tests/test_b.py", "tests/fixtures/data.txt"])
+
+    def test_a_path_two_tests_declare_is_in_neither_patch(self):
+        self.put(self.copy, "tests/test_shared.py", b"x\n")
+        self.put(self.copy, "tests/test_own.py", b"y\n")
+        records = self.patches(_tested("cand-001", "tests/test_own.py", "tests/test_shared.py"),
+                               _tested("cand-002", "tests/test_shared.py"))
+        for cid in ("cand-001", "cand-002"):
+            with self.subTest(candidate=cid):
+                self.assertIsNone(records[cid]["patch"])
+                self.assertIn("tests/test_shared.py", records[cid]["reason"])
+                self.assertIn("another test", records[cid]["reason"])
+
+    def test_one_file_that_cannot_be_delivered_costs_the_whole_test_its_patch(self):
+        self.put(self.copy, "tests/test_img.py", b"assert load('fixture.png')\n")
+        self.put(self.copy, "tests/fixture.png", b"\x89PNG\r\n\x1a\n\x00\x00")
+        record = self.patches(_tested("cand-001", "tests/test_img.py",
+                                      "tests/fixture.png"))["cand-001"]
+        self.assertIsNone(record["patch"])
+        self.assertIn("tests/fixture.png", record["reason"])
+        self.assertIn("binary", record["reason"])
+        self.assertEqual([f["path"] for f in record["files"]],
+                         ["tests/test_img.py", "tests/fixture.png"])
+        self.assertTrue(all(f["kind"] is None for f in record["files"]))
+
+    def test_every_file_that_cannot_be_delivered_says_why(self):
+        self.put(self.copy, "tests/latin.py", b"caf\xe9\n")
+        self.put(self.copy, "tests/dir/inner.py", b"x\n")
+        cases = [("tests/latin.py", "UTF-8"),
+                 ("tests/test_never_written.py", "not a regular file in the copy"),
+                 ("tests/dir", "not a regular file in the copy"),
+                 ("tests/test_core.py", "unchanged")]
+        if hasattr(os, "symlink") and os.name != "nt":
+            os.symlink(self.copy / "tests" / "test_core.py", self.copy / "tests" / "link.py")
+            os.symlink(self.tmp, self.copy / "outside")
+            self.put(self.tmp, "escape.py", b"x\n")
+            cases += [("tests/link.py", "not a regular file in the copy"),
+                      ("outside/escape.py", "not a regular file in the copy")]
+        for path, why in cases:
+            with self.subTest(path=path):
+                record = self.patches(_tested("cand-001", path))["cand-001"]
+                self.assertIsNone(record["patch"])
+                self.assertIn(path, record["reason"])
+                self.assertIn(why, record["reason"])
+
+    def test_a_snapshot_file_that_cannot_be_read_as_text_costs_the_patch(self):
+        self.put(self.snapshot, "tests/blob.py", b"\x00\x01")
+        self.put(self.copy, "tests/blob.py", b"\x00\x02")
+        record = self.patches(_tested("cand-001", "tests/blob.py"))["cand-001"]
+        self.assertIsNone(record["patch"])
+        self.assertIn("binary", record["reason"])
+
+    def test_a_patch_over_the_bound_is_not_delivered(self):
+        self.put(self.copy, "tests/test_big.py",
+                 b"x = 1\n" * (review_panel.TEST_PATCH_BYTES // 6 + 1))
+        record = self.patches(_tested("cand-001", "tests/test_big.py"))["cand-001"]
+        self.assertIsNone(record["patch"])
+        self.assertIn(str(review_panel.TEST_PATCH_BYTES), record["reason"])
+
+    def test_a_verdict_with_no_test_has_no_record(self):
+        plain = review_panel.Verdict(candidate="cand-009", status="refuted", evidence=None,
+                                     rationale="r", revision=None, test_first=None,
+                                     unresolved_reason=None)
+        self.put(self.copy, "tests/test_empty.py", b"x\n")
+        records = self.patches(plain, _tested("cand-001", "tests/test_empty.py"))
+        self.assertEqual(sorted(records), ["cand-001"])
+
+    def test_no_copy_costs_every_test_its_patch_and_says_so(self):
+        shutil.rmtree(self.copy)
+        record = self.patches(_tested("cand-001", "tests/test_empty.py"))["cand-001"]
+        self.assertIsNone(record["patch"])
+        self.assertIn("working copy", record["reason"])
+
+    def test_a_path_that_could_leave_the_tree_is_never_joined(self):
+        # Checked as Windows spells paths, on any host: a drive inside a path jumps drives.
+        win = pathlib.PureWindowsPath("C:/run/work/tok")
+        for parts in (["tests", "D:", "secret.txt"], ["tests", "C:", "secret.txt"],
+                      ["tests", "D:secret.txt"], ["..", "x.py"], ["tests", "a\\b.py"],
+                      ["tests", ""], ["tests", "."], ["tests", "x:y.py"]):
+            with self.subTest(parts=parts):
+                self.assertFalse(review_panel._under(win, parts))
+        self.assertTrue(review_panel._under(win, ["tests", "test_x.py"]))
+        self.assertTrue(review_panel._under(pathlib.PurePosixPath("/run/work/tok"),
+                                            ["tests", "test_x.py"]))
+        # And through the diff, on this host: refused with a reason, nothing read.
+        record = self.patches(_tested("cand-001", "tests/C:/secret.txt"))["cand-001"]
+        self.assertIsNone(record["patch"])
+        self.assertIn("tests/C:/secret.txt", record["reason"])
+
+    def test_a_copy_or_snapshot_that_is_a_link_is_not_read(self):
+        self.put(self.copy, "tests/test_empty.py", b"x\n")
+        real = review_panel._is_junction
+        for which in ("copy", "snapshot"):
+            with self.subTest(junction=which):
+                root = getattr(self, which)
+                with mock.patch.object(review_panel, "_is_junction",
+                                       lambda path, root=root: path == root or real(path)):
+                    record = self.patches(_tested("cand-001", "tests/test_empty.py"))["cand-001"]
+                self.assertIsNone(record["patch"])
+                self.assertIn(which, record["reason"])
+                self.assertIn("link", record["reason"])
+        if hasattr(os, "symlink") and os.name != "nt":
+            moved = self.tmp / "real-copy"
+            self.copy.rename(moved)
+            os.symlink(moved, self.copy)
+            record = self.patches(_tested("cand-001", "tests/test_empty.py"))["cand-001"]
+            self.assertIsNone(record["patch"])
+            self.assertIn("link", record["reason"])
+
+    def test_a_file_over_the_bound_is_never_read_whole(self):
+        self.put(self.copy, "tests/huge.bin", b"\0" * (review_panel.TEST_PATCH_BYTES + 1))
+        real = pathlib.Path.read_bytes
+
+        def whole(path):
+            if path.name == "huge.bin":
+                raise AssertionError("the whole file was read")
+            return real(path)
+        with mock.patch.object(pathlib.Path, "read_bytes", whole):
+            record = self.patches(_tested("cand-001", "tests/huge.bin"))["cand-001"]
+        self.assertIsNone(record["patch"])
+        self.assertIn(str(review_panel.TEST_PATCH_BYTES), record["reason"])
+        self.assertIn("tests/huge.bin", record["reason"])
+
+    def test_a_large_edit_is_diffed_in_bounded_time_and_still_applies(self):
+        # Two shapes on which SequenceMatcher's own cost grows past a minute; each must
+        # come back promptly with a patch that rebuilds the copy's bytes exactly.
+        lines = review_panel.TEST_DIFF_LINES * 4
+        old = b"".join(b"a\n" for _ in range(lines))
+        new = b"".join(b"a\nb\n" for _ in range(lines // 2))
+        cyc_old = b"".join((b"a\n", b"b\n", b"c\n")[i % 3] for i in range(lines))
+        cyc_new = b"".join((b"c\n", b"b\n", b"a\n")[i % 3] for i in range(lines))
+        for name, before, after in (("tests/inter.py", old, new),
+                                    ("tests/cyc.py", cyc_old, cyc_new)):
+            with self.subTest(file=name):
+                self.put(self.snapshot, name, before)
+                self.put(self.copy, name, after)
+                sizes = []
+                real = difflib.SequenceMatcher
+
+                def counted(junk, a, b, **kw):
+                    sizes.append(max(len(a), len(b)))
+                    return real(junk, a, b, **kw)
+                with mock.patch.object(review_panel.difflib, "SequenceMatcher", counted):
+                    record = self.patches(_tested("cand-001", name))["cand-001"]
+                # The work is bounded by what SequenceMatcher is handed, not by a clock.
+                self.assertLessEqual(max(sizes, default=0), review_panel.TEST_DIFF_LINES)
+                self.assertIsNone(record["reason"])
+                self.assertEqual(_apply_patch(before, record["patch"]), after)
+
+    def test_a_small_edit_is_still_minimal(self):
+        body = b"".join(f"line {i}\n".encode() for i in range(review_panel.TEST_DIFF_LINES * 3))
+        self.put(self.snapshot, "tests/test_long.py", body)
+        self.put(self.copy, "tests/test_long.py", body.replace(b"line 7\n", b"line seven\n"))
+        patch = self.patches(_tested("cand-001", "tests/test_long.py"))["cand-001"]["patch"]
+        self.assertIn("@@ -5,7 +5,7 @@\n", patch)
+        self.assertEqual([line for line in patch.splitlines() if line.startswith("-")
+                          and not line.startswith("--- ")], ["-line 7"])
+
+
+@unittest.skipUnless(_have_git(), "git is not installed")
+class AGeneratedPatchAppliesWithGitApply(_PatchCase):
+    """A patch the engine wrote, applied with ``git apply`` from the directory the fix brief
+    names — the repository top — creates and edits exactly the bytes the verifier wrote, with
+    the root at the top and in a subdirectory. Each file is checked on disk afterwards,
+    because ``git apply`` with paths it cannot place writes nothing, says nothing and exits 0
+    (only ``-v`` prints "Skipped patch")."""
+
+    WRITTEN = {
+        "tests/test_new.py": b"import unittest\n\nclass T(unittest.TestCase):\n    pass\n",
+        "tests/test_crlf.py": b"one\r\ntwo\r\n",
+        "tests/test_tail.py": b"a\nb",
+        "tests/tést.py": b"x\n",
+        "tests/a b.py": b"y\n",
+        "tests/__init__.py": b"",
+        "tests/test_core.py": b"import unittest\n\n\nclass T(unittest.TestCase):\n"
+                              b"    def test_x(self):\n        self.fail()\n",
+    }
+
+    def repo(self, prefix):
+        top = self.tmp / "repo"
+        root = top / prefix if prefix else top
+        shutil.copytree(self.snapshot, root)
+        for args in (("init", "-q"), ("config", "core.autocrlf", "false"),
+                     ("add", "-A"), ("commit", "-q", "-m", "base")):
+            subprocess.run(["git", "-C", str(top), *args], check=True, capture_output=True)
+        return top, root
+
+    def apply(self, prefix):
+        top, root = self.repo(prefix)
+        written = {rel: data for rel, data in self.WRITTEN.items() if _nameable(rel)}
+        for rel, data in written.items():
+            self.put(self.copy, rel, data)
+        verdicts = [_tested(f"cand-{n:03d}", rel) for n, rel in enumerate(written, 1)]
+        records = review_panel.diff_test_files(self.snapshot, self.copy, verdicts, prefix)
+        for record in records:
+            with self.subTest(files=record["files"]):
+                self.assertIsNone(record["reason"])
+                patch = self.tmp / f"{record['candidate']}.patch"
+                patch.write_bytes(record["patch"].encode("utf-8"))
+                proc = subprocess.run(["git", "apply", str(patch)], cwd=top,
+                                      capture_output=True)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertNotIn(b"Skipped", proc.stderr)
+        for rel, data in written.items():
+            with self.subTest(file=rel):
+                self.assertTrue((root / rel).is_file(), f"{rel} was not created")
+                self.assertEqual((root / rel).read_bytes(), data)
+
+    def test_with_the_root_at_the_repository_top(self):
+        self.apply("")
+
+    def test_with_the_root_in_a_subdirectory(self):
+        self.apply("pkg/sub")
+
+    def test_a_root_relative_patch_applied_from_the_top_is_skipped_silently(self):
+        # Why every check above reads the file back: this exits 0 and creates nothing.
+        top, root = self.repo("pkg/sub")
+        self.put(self.copy, "tests/test_new.py", b"x\n")
+        record = review_panel.diff_test_files(
+            self.snapshot, self.copy, [_tested("cand-001", "tests/test_new.py")], "")[0]
+        patch = self.tmp / "wrong.patch"
+        patch.write_bytes(record["patch"].encode("utf-8"))
+        sub = top / "pkg"
+        proc = subprocess.run(["git", "apply", str(patch)], cwd=sub, capture_output=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse((root / "tests" / "test_new.py").exists())
+
+
+@unittest.skipUnless(_have_git(), "git is not installed")
+class AGeneratedPatchAppliesUnderEitherLineEndingSetting(_PatchCase):
+    """Git for Windows installs with ``core.autocrlf=true``, so a checkout there holds CRLF
+    files whatever the repository stores. A patch the engine wrote applies with ``git apply``
+    under ``true`` and under ``false``, whether the reviewed tree held LF or CRLF, for a new
+    test file and for an edit to a test file the tree already had.
+
+    The repository commits the reviewed tree's bytes under the setting and is cloned fresh
+    under it, which is the checkout a reader applies the patch in. Where git converts line
+    endings the result is compared with them normalized; where it converts nothing, byte for
+    byte. Every file is read back, because ``git apply`` can exit 0 having written nothing.
+    """
+
+    BASE = (b"import unittest", b"", b"", b"class T(unittest.TestCase):",
+            b"    def test_a(self):", b"        pass")
+    ADDED = (b"    def test_b(self):", b"        self.fail()")
+    NEW = (b"import unittest", b"", b"", b"class N(unittest.TestCase):",
+           b"    def test_n(self):", b"        self.fail()")
+    EOLS = {"lf": b"\n", "crlf": b"\r\n"}
+
+    @staticmethod
+    def text(lines, eol):
+        return b"".join(line + eol for line in lines)
+
+    @staticmethod
+    def git(*args, cwd):
+        return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+
+    def checkout(self, case, autocrlf, eol):
+        """The reviewed tree, committed under ``autocrlf`` and cloned fresh under it."""
+        origin, target = case / "origin", case / "checkout"
+        self.put(origin, "tests/test_core.py", self.text(self.BASE, eol))
+        self.git("init", "-q", cwd=origin)
+        self.git("config", "core.autocrlf", autocrlf, cwd=origin)
+        self.git("add", "-A", cwd=origin)
+        self.git("commit", "-q", "-m", "base", cwd=origin)
+        self.git("clone", "-q", "-c", f"core.autocrlf={autocrlf}", str(origin), str(target),
+                 cwd=case)
+        # Anti-vacuity: under `true` the checkout is CRLF whatever was committed, which is
+        # the case a Linux-only run never sees.
+        self.assertEqual((target / "tests" / "test_core.py").read_bytes(),
+                         self.text(self.BASE, b"\r\n" if autocrlf == "true" else eol))
+        return target
+
+    def apply(self, autocrlf, kind, eol_name):
+        eol = self.EOLS[eol_name]
+        case = self.tmp / f"{autocrlf}-{kind}-{eol_name}"
+        snapshot, copy = case / "snapshot", case / "copy"
+        self.put(snapshot, "tests/test_core.py", self.text(self.BASE, eol))
+        shutil.copytree(snapshot, copy)
+        target = self.checkout(case, autocrlf, eol)
+        rel, lines = (("tests/test_core.py", self.BASE + self.ADDED) if kind == "edit"
+                      else ("tests/test_new.py", self.NEW))
+        self.put(copy, rel, self.text(lines, eol))
+        [record] = review_panel.diff_test_files(snapshot, copy, [_tested("cand-001", rel)])
+        self.assertIsNone(record["reason"])
+        patch = case / "test.patch"
+        patch.write_bytes(record["patch"].encode("utf-8"))
+        proc = subprocess.run(["git", "apply", str(patch)], cwd=target, capture_output=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn(b"Skipped", proc.stderr)
+        self.assertTrue((target / rel).is_file(), f"{rel} was not written")
+        got = (target / rel).read_bytes()
+        if autocrlf == "true":
+            self.assertEqual(got.replace(b"\r\n", b"\n"), self.text(lines, b"\n"))
+        else:
+            self.assertEqual(got, self.text(lines, eol))
+
+    def test_every_setting_kind_and_line_ending(self):
+        for autocrlf in ("true", "false"):
+            for kind in ("new", "edit"):
+                for eol_name in self.EOLS:
+                    with self.subTest(autocrlf=autocrlf, kind=kind, eol=eol_name):
+                        self.apply(autocrlf, kind, eol_name)
 
 
 class TheReportIsHonestAboutCoverage(_ReportCase):
@@ -9142,7 +10805,9 @@ class _FindingsCase(_ReportCase):
         batches = [u for u in units_doc["units"] if u["kind"] == "verifier"]
         reproducible = {c["id"]: any(r["reproduction"] is not None for r in c["raised_by"])
                         for c in routed["candidates"]}
-        states = review_panel.read_verification_results(rundir, batches, reproducible)
+        states = review_panel.read_verification_results(
+            rundir, batches, reproducible,
+            asked=review_panel.asked_tests(review_panel._read_job(rundir), routed["candidates"]))
         areas = json.loads((rundir / "areas.json").read_text(encoding="utf-8"))["areas"]
         # The run directory is handed over too, because `report` hands it over: without
         # it every comparison against the run's own report.md differs by the line naming
@@ -10322,8 +11987,8 @@ class EveryPathIsSpelledTheOneWayThroughout(_FindingsCase):
         A path that cannot survive the page's whitespace collapse is spelled with its
         whitespace escaped, so the two rows name two files.
         """
-        rows = review_panel._render_legend(
-            review_panel.PathNames(review_panel._short_names(["a/ file.py", "a/  file.py"])))
+        rows = review_panel._render_legend(review_panel._legend_record(
+            review_panel.PathNames(review_panel._short_names(["a/ file.py", "a/  file.py"]))))
         spellings = [line.strip().strip("|").split("|")[1].strip()
                      for line in rows if line.startswith("| ") and "Short name" not in line
                      and set(line.strip().strip("|").split("|")[0].strip()) != {"-"}]
@@ -11794,7 +13459,8 @@ class TheReportWarnsWhenTrackedFilesWereNotReviewed(_FindingsCase):
                                   "tracked_not_reviewed": [f"d{i:02d}/x.py" for i in range(20)]},
                      "files": [{"path": f"d{i:02d}/seen.py"} for i in range(20)]}
         names = review_panel.PathNames([f"d{i:02d}" for i in range(20)])
-        line = "".join(review_panel._reachability(inventory, names))
+        line = "".join(review_panel._reachability(
+            review_panel._reachability_record(inventory, names)))
         self.assertIn("20 directories", line)
         self.assertEqual(line.count("\n    - "), review_panel._ADJACENT_CEILING + 1)
         self.assertIn(f"and {20 - review_panel._ADJACENT_CEILING} more.", line)
@@ -12432,9 +14098,18 @@ class WorkerArgvCannotForgeStructureEither(_FindingsCase):
         text = self.text()
         self.assertIn("Proposed reproduction, not run:", text,
                       "the fixture renders no proposal, so this escapes nothing")
-        self.assertNotIn(self.HIDDEN, text, "a raw comment opener reached the document")
-        self.assertIn("&lt;!--", text)
+        self.assert_held_in_blocks(text)
+
+    def assert_held_in_blocks(self, text):
+        """The opener reaches each document only inside a fenced block: literal in
+        `report.md`, where nothing in a fence is markup, and escaped once on the page."""
+        outside = re.sub(r"(?ms)^( *)(`{3,})[A-Za-z0-9_-]*\n.*?^\1\2\n", "", text)
+        self.assertNotIn(self.HIDDEN, outside, "a raw comment opener reached the prose")
+        self.assertIn(self.HIDDEN, text, "no block holds the argv, so this proves nothing")
         self.assertEqual(_h2s(text), REPORT_H2)
+        page = (self.rundir / "report.html").read_text(encoding="utf-8")
+        self.assertNotIn(self.HIDDEN, page)
+        self.assertIn("&lt;!--", page)
 
     def test_an_evidence_argv_and_cwd_cannot_either(self):
         evidence = {**EVIDENCE, "argv": ["python3", self.HIDDEN], "cwd": "." + self.HIDDEN}
@@ -12443,9 +14118,238 @@ class WorkerArgvCannotForgeStructureEither(_FindingsCase):
             _verdict("cand-003", "reproduced", evidence)], "summary": "ran one"}}
         self.run_all(verify=verify)
         text = self.text()
-        self.assertNotIn(self.HIDDEN, text)
-        self.assertEqual(text.count("&lt;!--"), 2)
-        self.assertEqual(_h2s(text), REPORT_H2)
+        self.assert_held_in_blocks(text)
+        # The cwd is on the evidence line, as prose, and escaped there.
+        self.assertEqual(text.count("&lt;!--"), 1)
+
+
+def working_bash():
+    """A bash that can actually RUN something, or `None`.
+
+    Not `shutil.which("bash")`. Windows ships `C:\\Windows\\System32\\bash.exe` — the WSL
+    launcher — which is on `PATH` whether or not a distribution is installed. Without one it
+    exits non-zero and writes nothing, so a test that trusted `which` would read the empty
+    output as a failed assertion.
+
+    Duplicated from the other suites that need it rather than shared: these modules are
+    self-contained by design.
+    """
+    for candidate in (os.environ.get("BASH"), shutil.which("bash")):
+        if not candidate:
+            continue
+        try:
+            probe = subprocess.run([candidate, "-c", "printf ok"], capture_output=True,
+                                   text=True, encoding="utf-8", errors="replace", timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if probe.returncode == 0 and probe.stdout.strip() == "ok":
+            return candidate
+    return None
+
+
+class EveryPrintedCommandHandsBackItsExactArgv(_FindingsCase):
+    """Every command the report prints gives back exactly the argv that was recorded, in
+    `report.md` and in `report.html` alike, read the way a person copying it reads it.
+
+    `report.md` is read as written. Markdown shows a code block's content literally, and a
+    code span's too, so an escape the report puts there is part of what a reader copies.
+    `report.html` is read as the page displays it. A command printed for bash is run through
+    bash; an argv is read as JSON. Whitespace runs, line breaks and the characters Markdown
+    and HTML escape all have to come back unchanged.
+    """
+
+    SHOWS = "Shows the search matching the line it names."
+    PROPOSED = "Proposed reproduction, not run"
+    CASES = {
+        "two-spaces": ["grep", "-n", "a  b", "src/f.py"],
+        "tab": ["grep", "-n", "a\tb", "src/f.py"],
+        "no-break-space": ["grep", "-n", "a b", "src/f.py"],
+        "leading-run": ["grep", "-n", "   a", "src/f.py"],
+        "lines-and-a-run": ["python3", "-c", "x = 1\nprint(x,  'y  z')"],
+    }
+    # Every character the report escapes on an open line, bare and inside a quoted argument.
+    MARKUP_CASES = {
+        "underscore": ["grep", "-rn", "foo_bar", "src"],
+        "underscore-quoted": ["grep", "-n", "foo_bar baz", "src"],
+        "asterisk": ["grep", "-n", "--include=*.py", "a*b", "src"],
+        "ampersand": ["sh", "-c", "true && echo done"],
+        "less-than": ["python3", "-c", "print(1 < 2)"],
+        "pipe": ["grep", "-nE", "a|b", "src"],
+        "backslash": ["grep", "-n", "a\\b", "src"],
+        "backtick": ["sh", "-c", "echo `date`"],
+        "bracket": ["grep", "-n", "[x]", "src"],
+    }
+    SHELL_CASES = {
+        "one-space": ["grep", "-n", "a b", "src/f.py"],
+        "leading-space": ["grep", "-n", " a", "src/f.py"],
+    }
+    # A line break other than LF: a code block's lines are rejoined with LF, so no pasted
+    # command keeps it, and the report prints the argv instead.
+    ARGV_CASES = {
+        "carriage-return": ["python3", "-c", "x = 1\r\nprint(x)"],
+        "line-separator": ["python3", "-c", "x_1 = 1 print(x_1)"],
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.bash = working_bash()
+
+    def render(self, name, argv):
+        """Both documents of a run whose evidence and whose unrun proposal carry ``argv``."""
+        rundir = self.tmp / f"run-{name}"
+        self.run_all(
+            rundir=rundir,
+            reading={**READING_TABLE, "area-01-A1": {
+                "findings": [FINDING, {**FINDING_REPRO, "reproduction": {**REPRO,
+                                                                         "argv": argv}}],
+                "summary": "A1"}},
+            verify={**VERIFY_TABLE, "verify-area-01-A": {"verdicts": [
+                _verdict("cand-001", "reproduced",
+                         {**DOCUMENTARY, "argv": argv, "shows": self.SHOWS}),
+                _verdict("cand-003", "unresolved", rationale="The sandbox forbids it.",
+                         unresolved_reason="blocked_by_the_environment")],
+                "summary": "one and one"}})
+        return ((rundir / "report.md").read_text(encoding="utf-8"),
+                (rundir / "report.html").read_text(encoding="utf-8"))
+
+    @staticmethod
+    def markdown_text(segment):
+        """What a line of ``report.md`` prose says, its backslash escaping and entities
+        undone."""
+        active = re.escape(review_panel._MD_ACTIVE)
+        return html.unescape(re.sub(rf"\\([{active}])", r"\1", segment))
+
+    @staticmethod
+    def page_text(segment):
+        """What the page displays: tags dropped, entities decoded."""
+        return html.unescape(re.sub(r"<[^>]+>", "", segment))
+
+    @staticmethod
+    def form_of(lang):
+        return {"bash": "shell", "json": "argv"}.get(lang, f"a block tagged {lang!r}")
+
+    def inline(self, label, rest):
+        """The command on the lead's own line, as ``(form, text)``, or None."""
+        if "argv [" in rest:
+            text = rest[rest.index("argv [") + 5:]
+            return "argv", text[:json.JSONDecoder().raw_decode(text)[1]]
+        if "`" in rest:
+            return "shell", rest[rest.index("`") + 1:rest.index("`", rest.index("`") + 1)]
+        return None
+
+    def shown_markdown(self, document):
+        """Each command ``report.md`` prints after a lead. A fenced block is read the way
+        CommonMark reads one: each line loses up to the fence's own indentation, no more."""
+        lines = document.split("\n")
+        out = []
+        for n, line in enumerate(lines):
+            lead = next((lead for lead in (self.SHOWS, self.PROPOSED) if lead in line), None)
+            if lead is None:
+                continue
+            rest = line[line.index(lead) + len(lead):]
+            # The argv form is prose, which a reader reads as Markdown renders it.
+            found = self.inline("report.md", self.markdown_text(rest)
+                                if re.search(r"argv \\?\[", rest) else rest)
+            if found:
+                out.append(found)
+                continue
+            opening = re.fullmatch(r"( *)(`{3,})([A-Za-z0-9_-]*)", lines[n + 1])
+            self.assertIsNotNone(opening, f"no command follows {lead!r}: {lines[n + 1]!r}")
+            indent, fence = len(opening.group(1)), opening.group(2)
+            end = next(k for k in range(n + 2, len(lines))
+                       if re.fullmatch(rf" *{fence}`*", lines[k]))
+            body = [re.sub(rf"^ {{0,{indent}}}", "", text) for text in lines[n + 2:end]]
+            out.append((self.form_of(opening.group(3)), "\n".join(body)))
+        return out
+
+    def shown_page(self, document):
+        """Each command ``report.html`` prints after a lead, as the page displays it."""
+        out = []
+        for lead in (self.SHOWS, self.PROPOSED):
+            for start in [m.end() for m in re.finditer(re.escape(lead), document)]:
+                rest = document[start:]
+                stop = min((rest.find(tag) for tag in ("<pre", "<ul", "<li", "</li>")
+                            if tag in rest), default=len(rest))
+                head = rest[:stop]
+                if "<code>" in head:
+                    out.append(("shell", self.page_text(
+                        head[head.index("<code>") + 6:head.index("</code>")])))
+                    continue
+                found = self.inline("report.html", self.page_text(head))
+                if found:
+                    out.append(found)
+                    continue
+                self.assertTrue(rest[stop:].startswith("<pre"),
+                                f"no command follows {lead!r}: {rest[:120]!r}")
+                block = re.match(r'<pre><code(?: class="language-([A-Za-z0-9_-]+)")?>(.*?)'
+                                 r'</code></pre>', rest[stop:], re.S)
+                self.assertNotIn("<", block.group(2), "the block holds markup")
+                out.append((self.form_of(block.group(1)), html.unescape(block.group(2))))
+        return out
+
+    def recovered(self, form, text):
+        if form == "argv":
+            return json.loads(text)
+        self.assertEqual(form, "shell")
+        if self.bash is None:
+            self.skipTest("no working bash to read the shell line back")
+        # On stdin, not as a script path: a WSL bash cannot open a Windows path.
+        script = f"words=({text})\nprintf '%s\\0' \"${{words[@]}}\"\n"
+        proc = subprocess.run([self.bash, "-s"], input=script.encode("utf-8"),
+                              capture_output=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout.decode("utf-8").split("\0")[:-1]
+
+    def check(self, name, argv):
+        """The form the evidence command printed in, after checking every command of both
+        documents comes back as ``argv``."""
+        markdown, page = self.render(name, argv)
+        evidence = set()
+        for label, printed in (("report.md", self.shown_markdown(markdown)),
+                               ("report.html", self.shown_page(page))):
+            # The evidence command and the proposal, at least: anti-vacuity.
+            self.assertGreaterEqual(len(printed), 2, f"{label} printed {printed!r}")
+            evidence.add(printed[0][0])
+            for form, text in printed:
+                with self.subTest(document=label, form=form):
+                    self.assertEqual(self.recovered(form, text), argv,
+                                     f"{label} printed {text!r}")
+        return evidence
+
+    def test_an_argument_holding_whitespace_comes_back_exactly(self):
+        for name, argv in self.CASES.items():
+            with self.subTest(case=name):
+                self.assertEqual(self.check(name, argv), {"shell"})
+
+    def test_an_argument_holding_a_character_the_report_escapes_comes_back_exactly(self):
+        for name, argv in self.MARKUP_CASES.items():
+            with self.subTest(case=name):
+                self.assertEqual(self.check(name, argv), {"shell"})
+
+    def test_a_plain_command_prints_for_bash(self):
+        for name, argv in self.SHELL_CASES.items():
+            with self.subTest(case=name):
+                self.assertEqual(self.check(name, argv), {"shell"})
+
+    def test_a_line_break_no_pasted_command_keeps_prints_the_argv(self):
+        for name, argv in self.ARGV_CASES.items():
+            with self.subTest(case=name):
+                self.assertEqual(self.check(name, argv), {"argv"})
+
+    def test_the_shell_note_is_there_exactly_when_a_bash_block_quotes_an_argument(self):
+        """The note says the report's commands are written for bash, so it follows the
+        blocks: a quoted argument in a bash block brings it, and one printed as an argv
+        does not."""
+        for name, argv, said in (("quoted-block", self.CASES["two-spaces"], True),
+                                 ("plain-block", ["grep", "-n", "x", "src"], False),
+                                 ("quoted-argv", self.ARGV_CASES["carriage-return"], False)):
+            with self.subTest(case=name):
+                markdown, page = self.render(name, argv)
+                self.assertEqual(markdown.count(f"- {review_panel.REPORT_SHELL_NOTE}\n"),
+                                 int(said))
+                self.assertEqual(html.unescape(re.sub(r"<[^>]+>", "", page)).count(
+                    review_panel.REPORT_SHELL_NOTE.replace("`", "")), int(said))
 
 
 # Source and worker text that carry every shape either document is built out of.
@@ -14235,8 +16139,8 @@ class EveryFactInTheStructureReachesTheProse(_FindingsCase):
         command and its output never say why they were run."""
         self.rich()
         self.assertIn('- Evidence (executed): Shows the call raising IndexError on an empty '
-                      'argument list. `python3 run.py` (exit 1, output complete)',
-                      self.reads_as())
+                      'argument list. (exit 1, output complete)\n  ```bash\n  python3 run.py\n',
+                      self.text())
 
     def test_a_quotation_warning_reaches_the_prose_wherever_the_defect_lands(self):
         """The warning is a RENDERING of `quote_check`, not the value, so the walk cannot
@@ -15112,7 +17016,8 @@ class TheDefectsBothModelsRaisedAreNamedTogether(_ReportCase):
              "severity": "nit", "status": "established", "members": ["cand-001"]},
         ]
         out = "".join(review_panel._render_corroborated(
-            clusters, "two-runtimes", review_panel._Sections()))
+            review_panel._corroborated_record(clusters, "two-runtimes"),
+            review_panel._Sections()))
         listed = _table_defect_ids(out)
         self.assertEqual(len(listed), 3, f"the fixture produced no rows to order: {out!r}")
         self.assertEqual(listed, ["D1", "D2", "D10"])
@@ -15890,6 +17795,44 @@ class AGapWhoseCheckersDisagreeIsFiledAsADisagreement(_CoverageCase):
         self.assertIn(review_panel.MIXED_SETTLING, gaps)
         self.assertNotIn(review_panel.UNKNOWN_SETTLING, gaps,
                          "a disagreement was filed as no verdict received")
+
+
+class TheGapsNothingSettledAreGroupedByTheRecord(unittest.TestCase):
+    """The record chooses the groups the unsettled gaps sit under and their order; the
+    renderer prints the groups it is handed, in the order it is handed them."""
+
+    @staticmethod
+    def entry(gap_id, reasons):
+        return {"id": gap_id, "part_of": None,
+                "at": {"file": "core.py", "line_start": 5, "line_end": 6},
+                "consequence": f"{gap_id} is untested.", "unresolved_reasons": reasons,
+                "failure": "an empty list", "direction": "test the empty list",
+                "test_first": None, "rationale": None, "quote_differs": False}
+
+    def test_the_order_names_every_group_once_alphabetically_by_its_heading(self):
+        every = [("agreed", reason) for reason in review_panel.UNRESOLVED_GROUPS]
+        every += [("mixed", None), ("unanswered", None)]
+        order = review_panel.GAP_SETTLING_ORDER
+        self.assertEqual(sorted(order, key=str), sorted(every, key=str))
+        self.assertEqual(len(set(order)), len(order))
+        headings = [review_panel._render_settles({"case": case, "reason": reason})
+                    for case, reason in order]
+        self.assertEqual(headings, sorted(headings))
+
+    def test_the_renderer_prints_the_groups_as_the_record_orders_them(self):
+        record = {"standing": 0, "groups": [], "unresolved_count": 2, "unresolved": [
+            {"settles": {"case": "unanswered", "reason": None},
+             "gaps": [self.entry("C1", [None])]},
+            {"settles": {"case": "agreed", "reason": "blocked_by_the_environment"},
+             "gaps": [self.entry("C2", ["blocked_by_the_environment"])]}]}
+        text = "".join(review_panel._render_coverage_gaps(
+            json.loads(json.dumps(record)), review_panel._Sections(), set()))
+        self.assertIn("Gaps nothing settled (2)", text)
+        self.assertLess(text.index(review_panel.UNKNOWN_SETTLING),
+                        text.index(review_panel.UNRESOLVED_GROUPS["blocked_by_the_environment"]))
+        self.assertLess(text.index(review_panel.UNKNOWN_SETTLING), text.index("C1 is untested"))
+        self.assertLess(text.index("C1 is untested"),
+                        text.index(review_panel.UNRESOLVED_GROUPS["blocked_by_the_environment"]))
 
 
 class AGapWhoseVerdictCouldNotBeReadShowsNoCheckersWords(_CoverageCase):
@@ -19263,16 +21206,27 @@ class TheSynthesisLandsInTheStructureAndInBothDocuments(_FindingsCase):
         # The identical run still collapses, which is the rule this must not undo.
         self.assertEqual(review_panel._render_evidence(before, ran), [])
 
-    def test_an_argument_holding_a_newline_keeps_a_form_that_preserves_it(self):
-        """A code span is one line, so collapsing the whitespace turns
-        `python3 -c 'print(1)\nprint(2)'` into two statements on one line -- a syntax error
-        for anyone who copies it. The shell line is offered for the commands it can
-        represent; the rest keep a form that survives."""
+    def test_an_argument_holding_a_newline_keeps_it_in_the_block(self):
+        """Joined onto one line, `python3 -c 'print(1)\nprint(2)'` is two statements on one
+        line -- a syntax error for anyone who copies it. A fenced block keeps the LF."""
         multi = {**EVIDENCE, "argv": ["python3", "-c", "print(1)\nprint(2)"]}
         rendered = "".join(review_panel._render_evidence(multi))
         self.assertNotIn("print(1) print(2)", rendered)
-        self.assertIn("argv", rendered)
-        self.assertIn("print(1)", rendered)
+        self.assertNotIn("argv", rendered)
+        self.assertIn("  ```bash\n  python3 -c 'print(1)\n  print(2)'\n  ```\n", rendered)
+
+    def test_every_other_line_break_keeps_the_argv_form(self):
+        """The lines of a code block are rejoined with LF, so a CR, a vertical tab or a
+        U+2028 inside an argument would reach the reader as an LF and the pasted command
+        would run something else. Those commands print their argv instead."""
+        for brk in ("\r", "\r\n", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85",
+                    "\u2028", "\u2029"):
+            with self.subTest(brk=repr(brk)):
+                argv = ["python3", "-c", f"print(1){brk}print(2)"]
+                self.assertFalse(review_panel._printed_as_bash(argv))
+                rendered = "".join(review_panel._render_evidence({**EVIDENCE, "argv": argv}))
+                self.assertIn("argv", rendered)
+                self.assertNotIn("```bash", rendered)
 
     def test_the_defect_header_names_the_run_that_earned_the_claim(self):
         """Both documentary and executed evidence carry the same axis, so the first member
@@ -19306,26 +21260,15 @@ class TheSynthesisLandsInTheStructureAndInBothDocuments(_FindingsCase):
     def test_the_command_reads_as_a_shell_line_not_a_json_array(self):
         """It arrived as an escaped JSON array, so a command holding a pipe or a backslash
         came out full of backslashes and HTML entities -- unreadable, and not what anyone
-        would type."""
-        awkward = {**EVIDENCE,
-                   "argv": ["grep", "-nE", "a|b\\c", "--include=*.java", "x >= 2", "src"]}
+        would type. In a bash block it is the line somebody would type, quoted only where a
+        shell needs it, and with nothing of the report's own escaping in it."""
+        argv = ["grep", "-nE", "a|b\\c", "--include=*.java", "x >= 2", "src"]
         self.run_all(verify={**VERIFY_TABLE, "verify-area-01-A": {"verdicts": [
-            _verdict("cand-001", "reproduced", awkward, rationale="It matches."),
+            _verdict("cand-001", "reproduced", {**EVIDENCE, "argv": argv},
+                     rationale="It matches."),
             _verdict("cand-003", "confirmed_by_reading")], "summary": "one awkward run"}})
-        text = self.text()
-        line = next(l for l in text.splitlines() if "grep" in l and "Evidence" in l)
-        # A shell line, not a JSON array: no bracketed list, no comma-separated quoting.
-        self.assertNotIn('\\["', line)
-        self.assertNotIn('", "', line)
-        self.assertIn("grep -nE", line)
-        self.assertIn("--include=", line)
-        # Quoted only where a shell needs it.
-        self.assertIn("src", line)
-        # The `&gt;` stays. A code span is not an exception to the escaping: `render_html`
-        # undoes only backslash escapes and keeps HTML's, so a span whose content skipped it
-        # puts a raw `<!--` into both documents. Readability there is not worth the hole,
-        # and `WorkerArgvCannotForgeStructureEither` is the test that proves why.
-        self.assertIn("&gt;", line)
+        self.assertIn("  ```bash\n  grep -nE 'a|b\\c' '--include=*.java' 'x >= 2' src\n  ```\n",
+                      self.text())
 
     def test_bookkeeping_trails_the_line_rather_than_leading_it(self):
         """Exit status and truncation are the supervisor keeping records. A fixer reads the
@@ -19759,13 +21702,14 @@ class UnresolvedDefectsSubGroupBySubstanceWhereTheRoundGaveOne(_FindingsCase):
         # indented bullet reads as belonging to the one above it — so it comes out.
         self.run_all(verify=self.tables(), synthesis=SYNTH_TABLE_ALL)
         judged = self.defect_block(self.text(), "D2")
-        self.assertIn("\n- Proposed reproduction, not run: ", judged)
+        # The argv's block sits under the line it belongs to, at that line's own depth.
+        self.assertIn("\n- Proposed reproduction, not run:\n  ```json\n", judged)
         self.assertNotIn("\n  - Proposed reproduction", judged)
         # Unjudged, it stays where it was: the line it hangs off is still there.
         other = self.tmp / "run-unjudged"
         self.run_all(other, verify=self.tables())
         plain = self.defect_block(self.text(other), "D2")
-        self.assertIn("\n  - Proposed reproduction, not run: ", plain)
+        self.assertIn("\n  - Proposed reproduction, not run:\n    ```json\n", plain)
 
     def test_every_unresolved_defect_still_sits_under_exactly_one_group(self):
         self.run_all(verify=self.tables(), synthesis=SYNTH_TABLE_ALL)
@@ -20216,9 +22160,9 @@ class ACorroboratedDefectSaysEachThingOnce(_FindingsCase):
     def test_a_run_prints_once_however_many_reports_rest_on_it(self):
         evidence = [line for line in self.block.splitlines() if line.startswith("- Evidence")]
         # Two distinct runs happened: the one seven reports rest on, and the zero-row call.
-        printed = [line for line in evidence if "`python3 run.py" in line]
+        printed = re.findall(r"(?m)^ *```bash\n *(python3 run\.py.*)$", self.block)
         self.assertEqual(len(printed), 2, evidence)
-        self.assertTrue(any("--rows" in line for line in printed), evidence)
+        self.assertTrue(any("--rows" in line for line in printed), printed)
         # The upheld reports that share the first run add nothing; only the refuted
         # reading of it adds a line.
         self.assertEqual(len(evidence), 3, evidence)
@@ -20372,7 +22316,7 @@ class TheReportSaysWhatItCannotTell(_ReportCase):
     def _first(facts):
         return " ".join(review_panel._render_limits(facts)[1].split())
 
-    NONE_UNRESOLVED = {"unresolved": 0, "unresolved_in": ()}
+    NONE_UNRESOLVED = {"unresolved": 0, "unresolved_in": []}
 
     def test_a_run_that_read_everything_says_so(self):
         text = self._first({"files": 12, "unread": 0, "left_out": 0, **self.NONE_UNRESOLVED})
@@ -20384,7 +22328,7 @@ class TheReportSaysWhatItCannotTell(_ReportCase):
 
     def test_what_it_left_is_counted_and_pointed_at(self):
         text = self._first({"files": 12, "unread": 3, "left_out": 1, "unresolved": 2,
-                            "unresolved_in": (review_panel.SECTION_UNRESOLVED,)})
+                            "unresolved_in": [review_panel.DEFECT_UNRESOLVED]})
         self.assertIn("Readers covered 9 of the 12 files in scope.", text)
         self.assertIn("No reader finished the area holding the other 3, so nobody read them.", text)
         self.assertIn("No reader finished, so nobody read any of them.",
@@ -20400,12 +22344,12 @@ class TheReportSaysWhatItCannotTell(_ReportCase):
         Established, so the unresolved site renders there — and a pointer to Unresolved
         alone would send a reader to a section that does not hold it."""
         text = self._first({"files": 3, "unread": 0, "left_out": 0, "unresolved": 1,
-                            "unresolved_in": (review_panel.SECTION_ESTABLISHED,)})
+                            "unresolved_in": [review_panel.DEFECT_ESTABLISHED]})
         self.assertIn(f"1 site was checked and not settled either way; see "
                       f"**{review_panel.SECTION_ESTABLISHED}**.", text)
         text = self._first({"files": 3, "unread": 0, "left_out": 0, "unresolved": 3,
-                            "unresolved_in": (review_panel.SECTION_ESTABLISHED,
-                                              review_panel.SECTION_UNRESOLVED)})
+                            "unresolved_in": [review_panel.DEFECT_ESTABLISHED,
+                                              review_panel.DEFECT_UNRESOLVED]})
         self.assertIn(f"3 sites were checked and not settled either way; see "
                       f"**{review_panel.SECTION_ESTABLISHED}** and "
                       f"**{review_panel.SECTION_UNRESOLVED}**.", text)
@@ -20434,19 +22378,19 @@ class TheReportSaysWhatItCannotTell(_ReportCase):
                    {"id": "S2", "status": established, "defect": "D2"}],
             defects=[{"id": "D1", "status": unresolved, "sites": ["S1"]},
                      {"id": "D2", "status": established, "sites": ["S2"]}])
-        self.assertEqual(review_panel._limit_facts(inventory, reading, files_of, findings),
+        self.assertEqual(review_panel._limits_record(inventory, reading, files_of, findings),
                          {"files": 5, "unread": 2, "left_out": 3, "unresolved": 1,
-                          "unresolved_in": (review_panel.SECTION_UNRESOLVED,)})
+                          "unresolved_in": [review_panel.DEFECT_UNRESOLVED]})
         # A defect with mixed site outcomes: counted as its one unresolved SITE, and pointed
         # at the section the defect is placed in.
         findings = SimpleNamespace(
             sites=[{"id": "S1", "status": established, "defect": "D1"},
                    {"id": "S2", "status": unresolved, "defect": "D1"}],
             defects=[{"id": "D1", "status": established, "sites": ["S1", "S2"]}])
-        self.assertEqual(review_panel._limit_facts(inventory, reading, files_of, findings)
+        self.assertEqual(review_panel._limits_record(inventory, reading, files_of, findings)
                          ["unresolved"], 1)
-        self.assertEqual(review_panel._limit_facts(inventory, reading, files_of, findings)
-                         ["unresolved_in"], (review_panel.SECTION_ESTABLISHED,))
+        self.assertEqual(review_panel._limits_record(inventory, reading, files_of, findings)
+                         ["unresolved_in"], [review_panel.DEFECT_ESTABLISHED])
 
     def test_it_ends_in_the_test_a_reader_can_run(self):
         block = "".join(review_panel._render_limits(
@@ -20470,7 +22414,7 @@ class TheReportSaysWhatItCannotTell(_ReportCase):
     def test_both_paragraphs_render_as_paragraphs_in_the_page(self):
         html = review_panel.render_html("".join(review_panel._render_limits(
             {"files": 4, "unread": 1, "left_out": 1, "unresolved": 1,
-             "unresolved_in": (review_panel.SECTION_UNRESOLVED,)})))
+             "unresolved_in": [review_panel.DEFECT_UNRESOLVED]})))
         html = html[html.index("<h3"):html.index("<script>")]   # the section, not the page's contents
         self.assertNotIn("<li>", html)
         self.assertEqual(html.count("<p>"), 2, html)
@@ -22115,7 +24059,9 @@ class _SitesCase(_FindingsCase):
         reproducible = {c["id"]: any(r["reproduction"] is not None for r in c["raised_by"])
                         for c in routed["candidates"]}
         holder = review_panel.check_routing(routed["candidates"], batches)
-        states = review_panel.read_verification_results(rundir, batches, reproducible)
+        states = review_panel.read_verification_results(
+            rundir, batches, reproducible,
+            asked=review_panel.asked_tests(review_panel._read_job(rundir), routed["candidates"]))
         resolved = review_panel.resolve(routed["candidates"], holder, states)
         cluster_units = [u for u in units_doc["units"] if u["kind"] == "clusterer"]
         cluster_states = review_panel.read_clustering_results(rundir, cluster_units,
@@ -22648,6 +24594,372 @@ class OneMistakeAtFiveSitesIsOneDefect(_FiveSiteCase):
         self.assertNotRegex(described, r"merge round's reply was not used|written before")
 
 
+class ThePowerShellLineCarriesTheArgvUnchanged(unittest.TestCase):
+    """A command as PowerShell must be given it to pass the program this argv. Bash and
+    PowerShell agree on a run of plain words and on single quotes, and on nothing else: an
+    apostrophe, a leading `@`, `--%` and a dash word holding a dot or a colon each read
+    differently."""
+
+    def line(self, *argv):
+        return review_panel._powershell_line(list(argv))
+
+    def test_each_kind_of_argument_is_written_the_way_powershell_reads_it(self):
+        cases = {
+            ("echo", "it's"): "echo 'it''s'",
+            ("echo", "a\u2019b"): "echo 'a\u2019\u2019b'",
+            ("echo", 'say "hi"'): "echo 'say \"hi\"'",
+            ("echo", ""): "echo ''",
+            ("python3", "-c", "a = 1\nprint(a)"): "python3 -c 'a = 1\nprint(a)'",
+            ("echo", "$HOME"): "echo '$HOME'",
+            ("echo", "a`b"): "echo 'a`b'",
+            ("echo", "@x"): "echo '@x'",
+            ("echo", "--%"): "echo @('--%')",
+            ("echo", "a,b"): "echo 'a,b'",
+            ("echo", "a b"): "echo 'a b'",
+            ("echo", "C:\\x\\"): "echo 'C:\\x\\'",
+            ("java", "-Dkey=a.b"): "java '-Dkey=a.b'",
+            ("git", "grep", "--", "-x:y"): "git grep -- '-x:y'",
+            ("echo", "-x:"): "echo '-x:'",
+            ("/opt/my tools/python3", "-V"): "& '/opt/my tools/python3' -V",
+        }
+        for argv, want in cases.items():
+            with self.subTest(argv=argv):
+                self.assertEqual(self.line(*argv), want)
+
+    def test_every_curly_single_quote_is_doubled(self):
+        for quote in "\u2018\u2019\u201a\u201b":
+            with self.subTest(quote=hex(ord(quote))):
+                self.assertEqual(self.line("echo", f"a{quote}b"), f"echo 'a{quote}{quote}b'")
+
+    def test_plain_words_read_the_same_as_in_bash(self):
+        argv = ["python3", "-m", "unittest", "discover", "-s", "tests/unit", "--x=1+2", "a:b.c"]
+        self.assertEqual(review_panel._powershell_line(argv), shlex.join(argv))
+        self.assertTrue(review_panel._written_bare(argv))
+
+    def test_bare_is_false_for_anything_powershell_must_quote(self):
+        for argv in (["echo", "it's"], ["echo", ""], ["echo", "a b"], ["echo", "--%"],
+                     ["echo", "@x"], ["java", "-Dkey=a.b"], ["git", "grep", "--", "-x:y"],
+                     ["echo", 'a"b'], ["echo", "\u00e9"]):
+            with self.subTest(argv=argv):
+                self.assertFalse(review_panel._written_bare(argv))
+
+    def test_a_double_quote_or_an_empty_argument_needs_powershell_7_3(self):
+        self.assertTrue(review_panel._needs_powershell_7_3(["echo", 'say "hi"']))
+        self.assertTrue(review_panel._needs_powershell_7_3(["echo", ""]))
+        self.assertFalse(review_panel._needs_powershell_7_3(["echo", "it's", "a\nb"]))
+
+    def test_every_line_break_but_lf_is_one_no_command_line_can_carry(self):
+        breaks = [chr(c) for c in range(0x110000)
+                  if chr(c) != "\n" and len(f"a{chr(c)}b".splitlines()) == 2]
+        self.assertEqual(sorted(breaks), sorted("\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"))
+        for char in breaks:
+            with self.subTest(char=hex(ord(char))):
+                self.assertTrue(review_panel._breaks_a_command_line(["echo", f"a{char}b"]))
+        self.assertTrue(review_panel._breaks_a_command_line(["echo", "a\r\nb"]))
+        for part in ("a\nb", "a\n", "\n", ""):
+            with self.subTest(part=part):
+                self.assertFalse(review_panel._breaks_a_command_line(["python3", "-c", part]))
+
+
+class TheFixBriefPrintsAPowerShellLineWhereBashWouldMislead(unittest.TestCase):
+    """Under each command the brief prints from an argv, a PowerShell block where its text
+    differs from bash's, the 7.3 note where Windows PowerShell 5.1 would change an
+    argument, and no command at all where a line break cannot be pasted. Rendered from a
+    released run's records, with one argv changed per case."""
+
+    QUOTED = ["python3", "-c", "print('done')"]
+
+    def setUp(self):
+        self.doc = json.loads((_TAG_RUN / "fix-brief.json").read_text(encoding="utf-8"))
+
+    def reproduction(self, argv):
+        site = self.doc["defects"][0]["sites"][1]
+        self.assertIsNotNone(site["reproduction"], "the fixture's S2 has no reproduction")
+        site["reproduction"]["argv"] = argv
+
+    def with_test(self, argv):
+        self.doc["defects"][0]["test"] = {
+            "patch": "fix-brief/D1.patch", "label": "red", "state": review_panel.TEST_RED,
+            "kind": "new", "files": [], "site": "S1", "fails_because": "It raises.",
+            "expected_failure": "IndexError", "apply_argv": ["git", "apply",
+                                                            "<this run>/fix-brief/D1.patch"],
+            "apply_from": ".", "argv": argv, "cwd": ".", "run_from": ".", "exit_status": 1,
+            "output": None, "output_cut": False}
+        self.doc["defects"][0]["no_test"] = None
+
+    def rendered(self):
+        return (review_panel.render_fix_brief(self.doc),
+                review_panel.render_fix_brief_defects(self.doc)["D1"])
+
+    def test_a_quoted_reproduction_gets_a_powershell_block_in_both_files(self):
+        self.reproduction(self.QUOTED)
+        for text in self.rendered():
+            self.assertIn(f"- {review_panel.POWERSHELL_LABEL}\n"
+                          "    ```\n    python3 -c 'print(''done'')'\n    ```\n", text)
+
+    def test_a_plain_brief_prints_no_powershell_and_no_shell_note(self):
+        for text in self.rendered():
+            self.assertNotIn(review_panel.POWERSHELL_LABEL, text)
+            self.assertNotIn(review_panel.POWERSHELL_7_3_NOTE, text)
+            self.assertNotIn(review_panel.FIX_BRIEF_SHELL_NOTE, text)
+
+    def test_the_shell_note_is_in_the_setup_once_where_a_command_is_quoted(self):
+        self.reproduction(["python3", "-c", "print(1)"])
+        brief, d1 = self.rendered()
+        for text in (brief, d1):
+            self.assertEqual(text.count(review_panel.FIX_BRIEF_SHELL_NOTE), 1)
+            setup = text[text.index("## Setup"):text.index("## How to use this")]
+            self.assertIn(review_panel.FIX_BRIEF_SHELL_NOTE, setup)
+        # Same text in both shells, so no PowerShell block: the note is what tells CMD.
+        self.assertNotIn(review_panel.POWERSHELL_LABEL, brief)
+
+    def test_a_probe_command_gets_one_where_it_differs(self):
+        self.doc["setup"]["probe"]["tests"]["argv"] = ["python3", "-m", "pytest", "-k",
+                                                       "it's"]
+        brief, _ = self.rendered()
+        setup = brief[brief.index("## Setup"):brief.index("## How to use this")]
+        self.assertIn(f"  - {review_panel.POWERSHELL_LABEL}\n"
+                      "    ```\n    python3 -m pytest -k 'it''s'\n    ```\n", setup)
+
+    def test_a_test_run_command_gets_one_after_its_bash_block(self):
+        self.with_test(["python3", "-m", "unittest", "-k", "it's"])
+        for text in self.rendered():
+            run = text[text.index("  - Run it from "):]
+            bash = run.index("    python3 -m unittest -k 'it'\"'\"'s'\n")
+            power = run.index(f"    - {review_panel.POWERSHELL_LABEL}\n"
+                              "      ```\n      python3 -m unittest -k 'it''s'\n      ```\n")
+            self.assertLess(bash, power)
+        self.assertIn('git apply "<this run>/fix-brief/D1.patch"', text)
+
+    def test_a_double_quote_or_an_empty_argument_carries_the_7_3_note(self):
+        for argv in (["python3", "-c", 'print("x")'], ["printf", "%s", ""]):
+            with self.subTest(argv=argv):
+                self.setUp()
+                self.reproduction(argv)
+                for text in self.rendered():
+                    self.assertEqual(text.count(review_panel.POWERSHELL_7_3_NOTE), 1)
+                    # The note follows the bash block, never between its label and fence.
+                    fence = text.index(f"  ```\n  {shlex.join(argv)}\n  ```\n")
+                    self.assertGreater(text.index(review_panel.POWERSHELL_7_3_NOTE), fence)
+
+    def test_a_spaced_argument_ending_in_a_backslash_carries_the_7_3_note(self):
+        # 5.1 quotes an argument holding a space, and the trailing backslash then escapes
+        # the closing quote: `a b\` reaches the program as `a b"`.
+        for argv in (["ls", "C:\\Program Files\\"], ["printf", "%s", "a\tb\\"]):
+            with self.subTest(argv=argv):
+                self.setUp()
+                self.reproduction(argv)
+                for text in self.rendered():
+                    self.assertEqual(text.count(review_panel.POWERSHELL_7_3_NOTE), 1)
+
+    def test_a_trailing_backslash_without_a_space_carries_no_7_3_note(self):
+        # Unquoted, the backslash reaches the program as written.
+        self.reproduction(["ls", "C:\\x\\y\\"])
+        for text in self.rendered():
+            self.assertNotIn(review_panel.POWERSHELL_7_3_NOTE, text)
+
+    def test_a_7_3_command_puts_the_5_1_way_out_in_the_setup_once(self):
+        self.reproduction(["python3", "-c", 'print("x")'])
+        brief, d1 = self.rendered()
+        for text, data in ((brief, "`fix-brief.json`"), (d1, "`../fix-brief.json`")):
+            note = review_panel.FIX_BRIEF_5_1_NOTE.format(data=data)
+            self.assertEqual(text.count(note), 1)
+            setup = text[text.index("## Setup"):text.index("## How to use this")]
+            self.assertIn(f"- {note}\n", setup)
+
+    def test_no_7_3_command_means_no_5_1_note(self):
+        self.reproduction(["python3", "-c", "print(1)"])
+        for text in self.rendered():
+            self.assertNotIn("Windows PowerShell 5.1", text)
+
+    def test_a_carriage_return_prints_no_command_and_points_at_the_json(self):
+        self.reproduction(["python3", "-c", "print(1)\rprint(2)"])
+        brief, d1 = self.rendered()
+        for text, data in ((brief, "`fix-brief.json`"), (d1, "`../fix-brief.json`")):
+            self.assertNotIn("print(2)", text)
+            self.assertIn(review_panel.FIX_BRIEF_NO_PASTE.format(data=data), text)
+            # Every command it does print is plain words, so there is no shell to name.
+            self.assertNotIn(review_panel.FIX_BRIEF_SHELL_NOTE, text)
+
+    def test_a_carriage_return_in_a_test_command_prints_none_either(self):
+        self.with_test(["python3", "-c", "a\r\nb"])
+        brief, d1 = self.rendered()
+        for text, data in ((brief, "`fix-brief.json`"), (d1, "`../fix-brief.json`")):
+            run = text[text.index("  - Run it from "):]
+            self.assertNotIn("```\n      a", run)
+            self.assertIn(review_panel.FIX_BRIEF_NO_PASTE.format(data=data), run)
+
+    def test_rendering_leaves_the_records_as_they_were(self):
+        self.reproduction(self.QUOTED)
+        before = copy.deepcopy(self.doc)
+        self.rendered()
+        self.assertEqual(self.doc, before)
+
+
+def _powershells():
+    """Every PowerShell on this host: `PWSH=` first, then `pwsh`, then `powershell`, which on
+    Windows is 5.1 and a different program. It repeats test_skill_content.py's finder so
+    that each module runs on its own, with no shared helper module for ten lines."""
+    seen, found = set(), []
+    for candidate in (os.environ.get("PWSH"), shutil.which("pwsh"), shutil.which("powershell")):
+        if not candidate:
+            continue
+        key = os.path.realpath(candidate).lower()
+        if key not in seen:
+            seen.add(key)
+            found.append(candidate)
+    return found
+
+
+# Writes the arguments it was given as JSON, one file per command. Each is re-encoded with
+# the filesystem encoding: under a C locale Python decodes argv as ASCII, and the bytes
+# PowerShell sent are UTF-8.
+_RECORDER = """\
+import json, os, sys
+path = os.path.join(os.environ["RP_RECORD_DIR"], os.environ["RP_RECORD_ID"] + ".json")
+with open(path, "w", encoding="utf-8") as f:
+    json.dump([os.fsencode(a).decode("utf-8") for a in sys.argv[1:]], f)
+"""
+
+
+def _fenced_command(text, anchor):
+    """The command a reader copies from the first block after ``anchor``, read the way
+    CommonMark reads a fenced block: each line loses up to the fence's own indentation and
+    no more. Where an "In PowerShell" block follows it, that one."""
+    lines = text.split("\n")
+    at = next(i for i, line in enumerate(lines) if anchor in line)
+
+    def block(start):
+        i = next(i for i in range(start, len(lines)) if re.fullmatch(r" *`{3,}", lines[i]))
+        indent = len(lines[i]) - len(lines[i].lstrip(" "))
+        fence = lines[i].strip()
+        end = next(j for j in range(i + 1, len(lines)) if lines[j].strip() == fence)
+        body = [re.sub(rf"^ {{0,{indent}}}", "", line) for line in lines[i + 1:end]]
+        return "\n".join(body), end
+
+    command, end = block(at + 1)
+    if lines[end + 1].strip() == f"- {review_panel.POWERSHELL_LABEL}":
+        command, _ = block(end + 2)
+    return command
+
+
+class ThePowerShellLineInTheFixBriefRoundTrips(unittest.TestCase):
+    """The commands the fix brief prints, copied out of the Markdown and run in each
+    PowerShell this host has, reach the program as the argv the run recorded. Under 7.3 or
+    later every one does; under Windows PowerShell 5.1, and under 7's Legacy argument
+    passing standing in for it, every one the 7.3 note does not mark."""
+
+    # The arguments after the program and the recorder.
+    CORPUS = (
+        ["it's"], ["a\u2019b", "c\u2018d"], ['say "hi"'], ["", "x"], ["line one\nline two"],
+        ["$HOME"], ["a`b"], ["@x"], ["--%", "after"], ["a,b"], ["a b"],
+        # A trailing backslash with no space is unmarked and must arrive intact under 5.1;
+        # with a space it is marked, because 5.1 lets it escape the closing quote.
+        ["C:\\x\\y\\", "two\\\\back"], ["a b\\"], ["-Dkey=a.b"], ["--", "-x:y"],
+        ["plain", "words"],
+    )
+    # Where a command is printed: the probe's tests, a reproduction, and a test's run.
+    PLACES = ("- Tests, as the capability probe ran it", "- Reproduction, run",
+              "  - Run it from ")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.shells = _powershells()
+        if not cls.shells:
+            raise unittest.SkipTest("no PowerShell on this host")
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.tmp = Path(cls._tmp.name).resolve()
+        cls.recorder = cls.tmp / "record.py"
+        cls.recorder.write_text(_RECORDER, encoding="utf-8")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def brief(self, argv):
+        doc = json.loads((_TAG_RUN / "fix-brief.json").read_text(encoding="utf-8"))
+        doc["setup"]["probe"]["tests"]["argv"] = argv
+        doc["defects"][0]["sites"][1]["reproduction"]["argv"] = argv
+        doc["defects"][0]["test"] = {
+            "patch": "fix-brief/D1.patch", "label": "red", "state": review_panel.TEST_RED,
+            "kind": "new", "files": [], "site": "S1", "fails_because": "It raises.",
+            "expected_failure": "", "apply_argv": ["git", "apply", "x.patch"],
+            "apply_from": ".", "argv": argv, "cwd": ".", "run_from": ".", "exit_status": 1,
+            "output": None, "output_cut": False}
+        doc["defects"][0]["no_test"] = None
+        return review_panel.render_fix_brief(doc)
+
+    def version(self, shell):
+        script = self.tmp / "version.ps1"
+        script.write_text("$PSVersionTable.PSVersion.ToString()\n", encoding="utf-8-sig")
+        proc = subprocess.run([shell, "-NoProfile", "-File", str(script)], capture_output=True,
+                              text=True, encoding="utf-8", errors="replace")
+        major, minor = (int(n) for n in proc.stdout.strip().split(".")[:2])
+        return major, minor
+
+    def run_all(self, shell, cases, legacy, label):
+        """Every case's commands in one script, each recording under its own id."""
+        out = self.tmp / label
+        out.mkdir()
+        lines = ["$PSNativeCommandArgumentPassing = 'Legacy'"] if legacy else []
+        expected = {}
+        for n, (argv, command) in enumerate(cases):
+            lines += [f"$env:RP_RECORD_ID = '{n}'", command]
+            expected[str(n)] = (argv, command)
+        script = self.tmp / f"{label}.ps1"
+        with open(script, "w", encoding="utf-8-sig", newline="\n") as f:
+            f.write("\n".join(lines) + "\n")
+        proc = subprocess.run([shell, "-NoProfile", "-File", str(script)], capture_output=True,
+                              text=True, encoding="utf-8", errors="replace",
+                              env={**os.environ, "RP_RECORD_DIR": str(out)})
+        for key, (argv, command) in expected.items():
+            with self.subTest(shell=shell, mode=label, command=command):
+                record = out / f"{key}.json"
+                self.assertTrue(record.exists(), proc.stdout + proc.stderr)
+                self.assertEqual(json.loads(record.read_text(encoding="utf-8")), argv[2:])
+
+    def cases(self):
+        program = [sys.executable, str(self.recorder)]
+        argvs = [[*program, *args] for args in self.CORPUS]
+        spaced = self.tmp / "with space"
+        spaced.mkdir(exist_ok=True)
+        linked = spaced / Path(sys.executable).name
+        try:
+            if not linked.exists():
+                try:
+                    linked.symlink_to(sys.executable)
+                except OSError:
+                    shutil.copy2(sys.executable, linked)
+            runs = subprocess.run([str(linked), "-c", "pass"], capture_output=True).returncode == 0
+        except OSError:
+            runs = False
+        if runs:
+            argvs.append([str(linked), str(self.recorder), "ok"])
+        out = []
+        for argv in argvs:
+            text = self.brief(argv)
+            out += [(argv, _fenced_command(text, place)) for place in self.PLACES]
+        return out, runs
+
+    def test_every_printed_command_reaches_the_program_unchanged(self):
+        cases, spaced = self.cases()
+        if not spaced:
+            # Recorded, not fatal: the rest of the corpus still runs.
+            print("\nThePowerShellLineInTheFixBriefRoundTrips: an interpreter linked or copied"
+                  " under a path with a space does not run here; that case was skipped.",
+                  file=sys.stderr)
+        self.assertTrue(any(c.startswith("& ") for _, c in cases) or not spaced)
+        unmarked = [(argv, c) for argv, c in cases
+                    if not review_panel._needs_powershell_7_3(argv)]
+        self.assertLess(len(unmarked), len(cases), "the corpus marks nothing for 7.3")
+        for n, shell in enumerate(self.shells):
+            if self.version(shell) >= (7, 3):
+                self.run_all(shell, cases, legacy=False, label=f"s{n}-current")
+                self.run_all(shell, unmarked, legacy=True, label=f"s{n}-legacy")
+            else:
+                self.run_all(shell, unmarked, legacy=False, label=f"s{n}-old")
+
+
 def _site_rank(sid):
     return int(sid[1:])
 
@@ -22697,6 +25009,22 @@ class _FixBriefCase(_FiveSiteCase):
             outside_scope=tuple(doc["outside_scope"]), merge=doc["merge"],
             merge_check=doc["merge_check"])
         return findings, review_panel._read_candidates(self.rundir)["probe"]
+
+
+class TheFixBriefDataCarriesNoShellText(_FixBriefCase):
+    """The shell note, the PowerShell label, the 7.3 note and the 5.1 note are rendering:
+    none of them is stored in `fix-brief.json`, whose commands stay argv lists."""
+
+    def test_the_json_holds_none_of_the_new_text(self):
+        self.run_fixture()
+        brief = self.brief()
+        self.assertEqual(brief["guide"], list(review_panel.FIX_BRIEF_GUIDE))
+        text = json.dumps(brief, ensure_ascii=False)
+        for line in (review_panel.FIX_BRIEF_SHELL_NOTE, review_panel.POWERSHELL_LABEL,
+                     review_panel.POWERSHELL_7_3_NOTE,
+                     review_panel.FIX_BRIEF_5_1_NOTE.split("{")[0],
+                     review_panel.FIX_BRIEF_NO_PASTE.split("{")[0]):
+            self.assertNotIn(line, text)
 
 
 class TheFixBriefCarriesWhatAnAgentNeedsToFix(_FixBriefCase):
@@ -23110,6 +25438,774 @@ class TheFixBriefDirectoryIsTheEngines(_FixBriefCase):
         self.assertEqual(self.left_over(), [])
 
 
+class _TestPatchBriefCase(_ReportCase):
+    """A run with test patches on whose two upheld defects each carry a written test, its
+    patch landed as the driver lands it: cand-001's written and not run, cand-003's red."""
+
+    UNIT = "verify-area-01-A"
+    ON = {"mode": "on", "min_severity": "major"}
+    OTHER = {**RED_TEST, "files": ["tests/test_other.py"]}
+    WRITTEN = {"tests/test_empty_input.py": "assert False\n", "tests/test_other.py": "assert 0\n"}
+
+    def verify(self, first=UNRUN_TEST, second=_UNSET):
+        verify = copy.deepcopy(VERIFY_TABLE)
+        verify[self.UNIT]["verdicts"][0]["test"] = first
+        verify[self.UNIT]["verdicts"][1]["test"] = self.OTHER if second is _UNSET else second
+        return verify
+
+    def work(self):
+        """The verifier's copy: the snapshot with the two tests written into it."""
+        work = Path(tempfile.mkdtemp(dir=self.tmp)) / "copy"
+        shutil.copytree(self.rundir / "snapshot", work)
+        for path in [work, *work.rglob("*")]:
+            path.chmod(path.stat().st_mode | stat.S_IWUSR)
+        for rel, text in self.WRITTEN.items():
+            (work / rel).write_bytes(text.encode("utf-8"))
+        return work
+
+    def land(self):
+        """The unit's ``test-patches.json`` as the driver writes it, then the report again."""
+        reply = json.loads((self.rundir / "units" / self.UNIT / "result.json")
+                           .read_text(encoding="utf-8"))
+        record = review_panel.test_patches_record(self.rundir, self.UNIT, reply, self.work())
+        (self.rundir / "units" / self.UNIT / review_panel.TEST_PATCHES_NAME).write_text(
+            json.dumps(record), encoding="utf-8")
+        self.rerender()
+        return record
+
+    def rerender(self):
+        proc = _run("report", str(self.rundir), "--rerender")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def landed(self, test_patches=None, **verify):
+        self.run_all(verify=self.verify(**verify), test_patches=test_patches or self.ON)
+        return self.land()
+
+    def findings_doc(self):
+        return json.loads((self.rundir / "findings.json").read_text(encoding="utf-8"))
+
+    def defect_of(self, cid):
+        return next(r["defect"] for r in self.findings_doc()["candidates"] if r["id"] == cid)
+
+    def brief(self):
+        return json.loads((self.rundir / "fix-brief.json").read_text(encoding="utf-8"))
+
+    def brief_defect(self, cid):
+        did = self.defect_of(cid)
+        return next(d for d in self.brief()["defects"] if d["id"] == did)
+
+    def read(self, name):
+        return (self.rundir / name).read_text(encoding="utf-8")
+
+    def on_disk(self):
+        """The run's findings and probe as :func:`review_panel.fix_brief_document` takes
+        them, so a test can change a record and build the brief again."""
+        doc = self.findings_doc()
+        findings = review_panel.Findings(
+            rung=doc["rung"], commit=doc["commit"],
+            candidates=tuple(doc["candidates"]), sites=tuple(doc["sites"]),
+            defects=tuple(doc["defects"]), clustering=tuple(doc["clustering"]),
+            synthesis=doc["synthesis"], coverage=tuple(doc["coverage"]),
+            coverage_sites=tuple(doc["coverage_sites"]),
+            coverage_defects=tuple(doc["coverage_defects"]),
+            verification=tuple(doc["verification"]),
+            outside_scope=tuple(doc["outside_scope"]), merge=doc["merge"],
+            merge_check=doc["merge_check"])
+        return findings, review_panel._read_candidates(self.rundir)["probe"]
+
+
+class EachDefectInTheFixBriefCarriesItsTestPatch(_TestPatchBriefCase):
+    """With test patches on, each defect in the fix brief names one test: the patch written
+    as ``fix-brief/D<n>.patch``, how to apply it, where to run it and what it showed — or,
+    for a defect the run asked a test of, why it has none."""
+
+    def test_a_red_test_is_carried_with_its_patch_and_its_two_directories(self):
+        record = self.landed()
+        did = self.defect_of("cand-003")
+        test = self.brief_defect("cand-003")["test"]
+        self.assertEqual(test["patch"], f"fix-brief/{did}.patch")
+        self.assertEqual((test["state"], test["kind"], test["label"]),
+                         ("red", review_panel.TEST_NEW_FILE, "red, new test file"))
+        self.assertEqual(test["files"], [{"path": "tests/test_other.py",
+                                          "kind": review_panel.TEST_NEW_FILE}])
+        self.assertEqual((test["argv"], test["cwd"], test["exit_status"]),
+                         (RED_TEST["argv"], ".", 1))
+        self.assertEqual((test["fails_because"], test["expected_failure"]),
+                         (RED_TEST["fails_because"], RED_TEST["expected_failure"]))
+        self.assertIn("AssertionError: None != []", test["output"])
+        # One whole command: the placeholder stands for the folder holding report.md, the
+        # only part the owner supplies.
+        self.assertEqual((test["apply_argv"], test["apply_from"], test["run_from"]),
+                         (["git", "apply", f"<this run>/fix-brief/{did}.patch"], ".", "."))
+        self.assertIsNone(self.brief_defect("cand-003")["no_test"])
+        # The patch is the bytes the engine diffed, written as they are.
+        text = next(t["patch"] for t in record["tests"] if t["candidate"] == "cand-003")
+        self.assertEqual((self.rundir / "fix-brief" / f"{did}.patch").read_bytes(),
+                         text.encode("utf-8"))
+
+    def test_each_label_names_the_state_and_the_kind(self):
+        self.landed()
+        self.assertEqual(self.brief_defect("cand-001")["test"]["label"],
+                         "written, not run, new test file")
+        self.assertIsNone(self.brief_defect("cand-001")["test"]["exit_status"])
+        findings, probe = self.on_disk()
+        patches = {("verify-area-01-A", "cand-003"): "x\n"}
+        edits = [dict(r) for r in findings.candidates]
+        for r in edits:
+            if r["id"] == "cand-003":
+                r["test_patch"] = {**r["test_patch"], "files": [
+                    {"path": "tests/test_other.py", "kind": review_panel.TEST_EDITS_EXISTING}]}
+        doc = review_panel.fix_brief_document(
+            replace(findings, candidates=tuple(edits)), probe,
+            review_panel.FixBriefTests("major", "", patches))
+        did = self.defect_of("cand-003")
+        test = next(d for d in doc["defects"] if d["id"] == did)["test"]
+        self.assertEqual((test["kind"], test["label"]),
+                         (review_panel.TEST_EDITS_EXISTING, "red, edits an existing file"))
+
+    def test_the_markdown_gives_the_label_the_apply_and_run_commands_and_the_output(self):
+        self.landed()
+        did = self.defect_of("cand-003")
+        for text in (self.read("fix-brief.md"), self.read(f"fix-brief/{did}.md")):
+            entry = text.split(f"## {did}. ", 1)[1].split("\n## ", 1)[0]
+            self.assertIn(f"- **Failing test, red, new test file:** `fix-brief/{did}.patch`",
+                          entry)
+            self.assertIn("Apply it from `.`, the repository top. `<this run>` is the folder "
+                          "holding `report.md`:", entry)
+            self.assertIn(f'git apply "<this run>/fix-brief/{did}.patch"', entry)
+            self.assertIn("Run it from `.`, the repository top", entry)
+            self.assertIn(" ".join(RED_TEST["argv"]), entry)
+            self.assertIn("AssertionError: None != []", entry)
+            self.assertIn(RED_TEST["fails_because"], entry)
+        unrun = self.read("fix-brief.md").split(f"## {self.defect_of('cand-001')}. ", 1)[1]
+        self.assertIn("Failing test, written, not run, new test file:", unrun.split("\n## ")[0])
+        self.assertIn("the review did not run it", unrun.split("\n## ")[0])
+
+    def test_the_selection_rule(self):
+        self.landed()
+        findings, probe = self.on_disk()
+        did = self.defect_of("cand-001")
+        site = next(s for s in findings.sites if s["defect"] == did)
+        patches = {(self.UNIT, cid): f"{cid}\n" for cid in ("cand-001", "cand-002", "cand-003")}
+
+        def chosen(one, two, severities=None):
+            """Which of the defect's two members' tests the brief picks, given each one's
+            (state, kind)."""
+            records, sites = [], list(findings.sites)
+            for r in findings.candidates:
+                r = dict(r)
+                spec = {"cand-001": one, "cand-002": two}.get(r["id"])
+                if spec is not None:
+                    state, kind = spec
+                    r["test"] = {**(RED_TEST if state == "red" else UNRUN_TEST),
+                                 "files": [f"tests/{r['id']}.py"]}
+                    r["test_patch"] = {"unit": self.UNIT, "reason": None,
+                                       "files": [{"path": f"tests/{r['id']}.py", "kind": kind}]}
+                records.append(r)
+            defects = list(findings.defects)
+            if severities is not None:
+                # The two members at two sites of one defect, each site its own severity.
+                second = {**site, "id": "S99", "members": ["cand-002"],
+                          "severity": severities[1]}
+                sites = [({**s, "members": ["cand-001"], "severity": severities[0]}
+                          if s["id"] == site["id"] else s) for s in sites] + [second]
+                records = [{**r, "site": "S99"} if r["id"] == "cand-002" else r
+                           for r in records]
+                defects = [{**d, "sites": [*d["sites"], "S99"]} if d["id"] == did else d
+                           for d in defects]
+            doc = review_panel.fix_brief_document(
+                replace(findings, candidates=tuple(records), sites=tuple(sites),
+                        defects=tuple(defects)),
+                probe, review_panel.FixBriefTests("nit", "", patches))
+            out = review_panel.fix_brief_patches(
+                replace(findings, candidates=tuple(records), sites=tuple(sites),
+                        defects=tuple(defects)),
+                review_panel.FixBriefTests("nit", "", patches))
+            test = next(d for d in doc["defects"] if d["id"] == did)["test"]
+            picked = test["files"][0]["path"].split("/")[1][:-3]
+            self.assertEqual(out[did], f"{picked}\n".encode("utf-8"))
+            return picked
+
+        new, edit = review_panel.TEST_NEW_FILE, review_panel.TEST_EDITS_EXISTING
+        unrun = "written_not_run"
+        # Red before written-not-run, whatever the kind and the id.
+        self.assertEqual(chosen((unrun, new), ("red", edit)), "cand-002")
+        # Then a new file before an edit.
+        self.assertEqual(chosen(("red", edit), ("red", new)), "cand-002")
+        self.assertEqual(chosen((unrun, edit), (unrun, new)), "cand-002")
+        # Then the most severe site.
+        self.assertEqual(chosen(("red", new), ("red", new), ("minor", "blocker")), "cand-002")
+        self.assertEqual(chosen(("red", new), ("red", new), ("blocker", "minor")), "cand-001")
+        # Then the lowest candidate id.
+        self.assertEqual(chosen(("red", new), ("red", new)), "cand-001")
+
+    def test_a_defect_with_no_test_is_null_and_says_why_where_one_was_asked(self):
+        # cand-003's test set aside, cand-001's patch refused: neither defect has a test.
+        self.run_all(verify=self.verify(second={**self.OTHER, "expected_failure": "nowhere"}),
+                     test_patches=self.ON)
+        self.WRITTEN = {"tests/test_other.py": "assert 0\n"}
+        self.land()
+        red, unrun = self.brief_defect("cand-003"), self.brief_defect("cand-001")
+        self.assertIsNone(red["test"])
+        self.assertIn(review_panel.NOT_THE_EXPECTED_FAILURE, red["no_test"])
+        self.assertIsNone(unrun["test"])
+        self.assertIn("not a regular file in the copy", unrun["no_test"])
+        md = self.read("fix-brief.md")
+        for did, why in ((red["id"], review_panel.NOT_THE_EXPECTED_FAILURE),
+                         (unrun["id"], "not a regular file in the copy")):
+            entry = md.split(f"## {did}. ", 1)[1].split("\n## ", 1)[0]
+            self.assertIn("- **Failing test:** none, because ", entry)
+            self.assertIn(why, " ".join(entry.split()))
+        self.assertEqual(sorted(p.name for p in (self.rundir / "fix-brief").iterdir()
+                                if p.suffix == ".patch"), [])
+
+    def test_a_defect_below_the_threshold_was_not_asked_and_says_nothing(self):
+        self.run_all(verify=self.verify(first=None, second=None),
+                     test_patches={"mode": "on", "min_severity": "blocker"})
+        self.land()
+        unasked = self.brief_defect("cand-001")
+        self.assertIsNone(unasked["test"])
+        self.assertIsNone(unasked["no_test"])
+        entry = self.read("fix-brief.md").split(f"## {unasked['id']}. ", 1)[1].split("\n## ")[0]
+        self.assertNotIn("Failing test", entry)
+        # Asked (a blocker after the revision), and no test was written.
+        asked = self.brief_defect("cand-003")
+        self.assertIsNone(asked["test"])
+        self.assertEqual(asked["no_test"], review_panel.NO_TEST_WRITTEN)
+
+    # A test that runs anywhere: the interpreter running the suite, the file, and a failure
+    # by assertion.
+    RUNNABLE = {**RED_TEST, "files": ["tests/test_other.py"],
+                "argv": [sys.executable, "tests/test_other.py"],
+                "output": "AssertionError\n", "expected_failure": "AssertionError"}
+
+    def git_top(self, name, prefix):
+        """A repository holding the snapshot at ``prefix`` under its top."""
+        top = self.tmp / name
+        shutil.copytree(self.rundir / "snapshot", top / prefix if prefix else top)
+        for args in (("init", "-q"), ("config", "core.autocrlf", "false"),
+                     ("add", "-A"), ("commit", "-q", "-m", "base")):
+            subprocess.run(["git", "-C", str(top), *args], check=True, capture_output=True)
+        return top
+
+    def follow(self, md, run_folder, top):
+        """Do what a ``D<n>.md`` says, reading nothing but it: put ``run_folder`` where its
+        placeholder is, run the apply command it prints from the directory it names, then
+        the test command from the directory it names. Returns the test's run."""
+        lines = md.splitlines()
+
+        def step(lead):
+            at = next(i for i, line in enumerate(lines) if line.lstrip().startswith(lead))
+            where = re.search(r"`([^`]+)`", lines[at]).group(1)
+            fence = next(i for i in range(at + 1, len(lines))
+                         if lines[i].strip().startswith("```"))
+            close = next(i for i in range(fence + 1, len(lines))
+                         if lines[i].strip() == lines[fence].strip())
+            return lines[at], where, "\n".join(line.strip() for line in lines[fence + 1:close])
+
+        said, apply_dir, apply_cmd = step("- Apply it from ")
+        placeholder = re.search(r"`(<[^`>]+>)` is the folder holding `report\.md`", said)
+        self.assertIsNotNone(placeholder, said)
+        apply_cmd = apply_cmd.replace(placeholder.group(1), str(run_folder))
+        proc = subprocess.run(shlex.split(apply_cmd), cwd=top / apply_dir, capture_output=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn(b"Skipped", proc.stderr)
+        _said, run_dir, run_cmd = step("- Run it from ")
+        return subprocess.run(shlex.split(run_cmd), cwd=top / run_dir, capture_output=True,
+                              text=True)
+
+    def test_d_n_md_followed_as_printed_applies_and_runs_the_test(self):
+        # The root at the repository top: the run as published.
+        self.landed(second=self.RUNNABLE)
+        did = self.defect_of("cand-003")
+        top = self.git_top("repo-top", "")
+        ran = self.follow(self.read(f"fix-brief/{did}.md"), self.rundir, top)
+        self.assertEqual((top / "tests" / "test_other.py").read_bytes(), b"assert 0\n")
+        self.assertNotEqual(ran.returncode, 0)
+        self.assertIn("AssertionError", ran.stderr)
+
+    def test_d_n_md_followed_as_printed_from_a_run_folder_named_with_an_apostrophe(self):
+        # The owner's folder is whatever they named it; the printed command must survive
+        # being given it, in a POSIX shell, PowerShell and CMD alike.
+        self.landed(second=self.RUNNABLE)
+        did = self.defect_of("cand-003")
+        moved = self.tmp / "owner's review run"
+        shutil.copytree(self.rundir, moved)
+        top = self.git_top("repo-apostrophe", "")
+        ran = self.follow((moved / "fix-brief" / f"{did}.md").read_text(encoding="utf-8"),
+                          moved, top)
+        self.assertEqual((top / "tests" / "test_other.py").read_bytes(), b"assert 0\n")
+        self.assertNotEqual(ran.returncode, 0)
+
+    def test_d_n_md_followed_as_printed_with_the_root_in_a_subdirectory(self):
+        self.landed(second=self.RUNNABLE)
+        findings, probe = self.on_disk()
+        prefix = "pkg/sub"
+        did = self.defect_of("cand-003")
+        # Folder names come from ``name``, never ``cwd``: Windows drops a trailing dot
+        # from a folder name, so ``run-.`` would be created as ``run-``.
+        for name, cwd, argv in (("top", ".", [sys.executable, "tests/test_other.py"]),
+                                ("tests", "tests", [sys.executable, "test_other.py"])):
+            with self.subTest(cwd=cwd):
+                test = {**self.RUNNABLE, "cwd": cwd, "argv": argv}
+                verdict = review_panel.Verdict(
+                    candidate="cand-003", status="reproduced", evidence=None, rationale="r",
+                    revision=None, test_first=None, unresolved_reason=None, test=test)
+                patch = review_panel.diff_test_files(self.rundir / "snapshot", self.work(),
+                                                     [verdict], prefix)[0]
+                self.assertIsNone(patch["reason"])
+                found = replace(findings, candidates=tuple(
+                    {**r, "test": test} if r["id"] == "cand-003" else r
+                    for r in findings.candidates))
+                tests = review_panel.FixBriefTests(
+                    "major", prefix, {(self.UNIT, "cand-003"): patch["patch"],
+                                      (self.UNIT, "cand-001"): "unused\n"})
+                doc = review_panel.fix_brief_document(found, probe, tests)
+                run_folder = self.tmp / f"run-{name}"
+                (run_folder / "fix-brief").mkdir(parents=True)
+                (run_folder / "fix-brief" / f"{did}.patch").write_bytes(
+                    review_panel.fix_brief_patches(found, tests)[did])
+                md = review_panel.render_fix_brief_defects(doc)[did]
+                top = self.git_top(f"repo-sub-{name}", prefix)
+                ran = self.follow(md, run_folder, top)
+                self.assertEqual((top / prefix / "tests" / "test_other.py").read_bytes(),
+                                 b"assert 0\n")
+                self.assertNotEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+                self.assertIn("AssertionError", ran.stderr)
+                self.assertIn(f"Run it from `{prefix}{'' if cwd == '.' else '/' + cwd}`, "
+                              f"under the repository top", md)
+
+    def test_a_patch_record_whose_files_lack_a_kind_costs_that_patch_alone(self):
+        record = self.landed()
+        for entry in record["tests"]:
+            if entry["candidate"] == "cand-003":
+                entry["files"] = [{"path": f["path"]} for f in entry["files"]]
+            else:
+                entry["files"] = [{**f, "kind": None} for f in entry["files"]]
+        (self.rundir / "units" / self.UNIT / review_panel.TEST_PATCHES_NAME).write_text(
+            json.dumps(record), encoding="utf-8")
+        self.rerender()
+        for cid in ("cand-003", "cand-001"):
+            with self.subTest(candidate=cid):
+                defect = self.brief_defect(cid)
+                self.assertIsNone(defect["test"])
+                self.assertIn("not a patch record", defect["no_test"])
+
+    def test_a_patch_with_no_utf8_encoding_costs_its_test_the_patch_and_not_the_report(self):
+        record = self.landed()
+        for entry in record["tests"]:
+            if entry["candidate"] == "cand-003":
+                entry["patch"] += "\ud800"
+        (self.rundir / "units" / self.UNIT / review_panel.TEST_PATCHES_NAME).write_text(
+            json.dumps(record), encoding="utf-8")
+        self.rerender()
+        defect = self.brief_defect("cand-003")
+        self.assertIsNone(defect["test"])
+        self.assertIn("not a patch record", defect["no_test"])
+        self.assertFalse((self.rundir / "fix-brief" / f"{defect['id']}.patch").exists())
+
+
+class ADeliveredTestsCommandRunsInTheRepositoryNotTheReviewsCopy(_TestPatchBriefCase):
+    """A verifier runs its test in its own copy of the tree and may name a file there by its
+    absolute path. The fix brief's command runs in the owner's checkout, so a path into the
+    copy is given relative to the directory the test runs from; a command that cannot be
+    given that way is not printed at all, and the brief says why."""
+
+    def landed_with(self, argv_of, cwd="."):
+        """cand-003's red test run by ``argv_of(copy)``, landed from that copy, which sits
+        where the driver puts one: under the run directory's ``work/``."""
+        work = self.rundir / "work" / "tok0001"
+        self.run_all(verify=self.verify(second={**self.OTHER, "argv": argv_of(work),
+                                                "cwd": cwd}),
+                     test_patches=self.ON)
+        shutil.copytree(self.rundir / "snapshot", work)
+        for path in [work, *work.rglob("*")]:
+            path.chmod(path.stat().st_mode | stat.S_IWUSR)
+        for rel, text in self.WRITTEN.items():
+            (work / rel).write_bytes(text.encode("utf-8"))
+        reply = json.loads((self.rundir / "units" / self.UNIT / "result.json")
+                           .read_text(encoding="utf-8"))
+        record = review_panel.test_patches_record(self.rundir, self.UNIT, reply, work)
+        (self.rundir / "units" / self.UNIT / review_panel.TEST_PATCHES_NAME).write_text(
+            json.dumps(record), encoding="utf-8")
+        self.rerender()
+        return work
+
+    def entries(self, did):
+        return [text.split(f"## {did}. ", 1)[1].split("\n## ", 1)[0]
+                for text in (self.read("fix-brief.md"), self.read(f"fix-brief/{did}.md"))]
+
+    def test_a_path_into_the_copy_comes_out_relative_to_where_the_test_runs(self):
+        work = self.landed_with(lambda work: [
+            "python3", "-m", "pytest", str(work / "tests" / "test_other.py"),
+            "--rootdir", str(work)], cwd="tests")
+        did = self.defect_of("cand-003")
+        test = self.brief_defect("cand-003")["test"]
+        self.assertEqual(test["argv"], ["python3", "-m", "pytest", "test_other.py",
+                                        "--rootdir", ".."])
+        self.assertEqual(test["run_from"], "tests")
+        for entry in self.entries(did):
+            self.assertIn("python3 -m pytest test_other.py --rootdir ..", entry)
+            self.assertNotIn(str(work), entry)
+
+    def test_a_path_into_the_copy_inside_a_longer_argument_prints_no_command(self):
+        work = self.landed_with(lambda work: ["python3", "-m", "pytest",
+                                              f"--rootdir={work}", "tests/test_other.py"])
+        did = self.defect_of("cand-003")
+        test = self.brief_defect("cand-003")["test"]
+        self.assertIsNone(test["argv"])
+        # The patch is still delivered: only the command is withheld.
+        self.assertTrue((self.rundir / "fix-brief" / f"{did}.patch").is_file())
+        for entry in self.entries(did):
+            self.assertIn(review_panel.FIX_BRIEF_NO_REPOSITORY_COMMAND, " ".join(entry.split()))
+            self.assertNotIn(str(work), entry)
+            self.assertNotIn("--rootdir", entry)
+
+    def test_a_command_naming_nothing_in_the_copy_is_unchanged(self):
+        record = self.landed()
+        self.assertEqual(self.brief_defect("cand-003")["test"]["argv"], RED_TEST["argv"])
+        self.assertEqual(next(t["argv"] for t in record["tests"]
+                              if t["candidate"] == "cand-003"), RED_TEST["argv"])
+
+    def test_the_rule_for_each_argument(self):
+        run = self.tmp / "rd"
+        work = run / "work" / "tok"
+        work.mkdir(parents=True)
+        same = review_panel._repository_argv
+        file = str(work / "tests" / "t.py")
+        self.assertEqual(same(["py", file], ".", work, run), ["py", "tests/t.py"])
+        self.assertEqual(same(["py", file], "tests", work, run), ["py", "t.py"])
+        self.assertEqual(same(["py", str(work)], ".", work, run), ["py", "."])
+        self.assertEqual(same(["py", str(work)], "a/b", work, run), ["py", "../.."])
+        # Another spelling of the same directory is the same directory.
+        link = self.tmp / "link"
+        try:
+            link.symlink_to(run, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pass
+        else:
+            self.assertEqual(same(["py", str(link / "work" / "tok" / "t.py")], ".",
+                                  link / "work" / "tok", link), ["py", "t.py"])
+            self.assertEqual(same(["py", file], ".", link / "work" / "tok", link),
+                             ["py", "tests/t.py"])
+        # A name that only begins like the run directory's is somewhere else.
+        beside = str(run) + "-old/t.py"
+        self.assertEqual(same(["py", beside], ".", work, run), ["py", beside])
+        self.assertEqual(same(["py", "/usr/bin/env", "-v"], ".", work, run),
+                         ["py", "/usr/bin/env", "-v"])
+        # Another unit's copy is not this one.
+        self.assertIsNone(same(["py", str(work) + "-other/t.py"], ".", work, run))
+        # The run directory's other files are the review's own, and go with it.
+        self.assertIsNone(same(["py", str(run / "snapshot" / "t.py")], ".", work, run))
+        self.assertIsNone(same(["py", f"--root={work}"], ".", work, run))
+        # A copy path escaped inside code, as repr() writes a Windows path, is still the copy.
+        self.assertIsNone(same(["python", "-c", "open('C:\\\\r\\\\work\\\\tok\\\\t.py')"], ".",
+                               work, run))
+        # A program in the checkout keeps the "./" that makes a shell run it from there.
+        self.assertEqual(same([str(work / "gradlew"), "test"], ".", work, run),
+                         ["./gradlew", "test"])
+        self.assertEqual(same([str(work / "a" / "run.sh")], "a", work, run), ["./run.sh"])
+        self.assertEqual(same([str(work / "bin" / "x")], ".", work, run), ["bin/x"])
+        self.assertIsNone(same(["py", str(work / ".." / "other" / "t.py")], ".", work, run))
+
+
+class TheFixBriefDirectoryHoldsTheTestPatches(_TestPatchBriefCase):
+    """``fix-brief/`` takes a ``D<n>.patch`` beside each ``D<n>.md`` and still refuses any
+    other name; every re-render takes the patches back with the rest."""
+
+    def patches(self):
+        return sorted(p.name for p in (self.rundir / "fix-brief").iterdir()
+                      if p.suffix == ".patch")
+
+    def test_a_patch_is_accepted_and_any_other_new_name_refused(self):
+        self.landed()
+        expected = sorted(f"{self.defect_of(cid)}.patch" for cid in ("cand-001", "cand-003"))
+        self.assertEqual(self.patches(), expected)
+        brief = self.brief()
+        self.assertEqual(len(review_panel.fix_brief_entries(self.rundir / "fix-brief")),
+                         len(brief["defects"]) + len(brief["tests_to_write"]) + len(expected))
+        for planted in ("notes.patch", "D1.patch.bak", "D1.diff", "D0.patch"):
+            path = self.rundir / "fix-brief" / planted
+            path.write_text("mine", encoding="utf-8")
+            with self.subTest(planted=planted):
+                with self.assertRaises(review_panel.RunDirError) as caught:
+                    review_panel.fix_brief_entries(self.rundir / "fix-brief")
+                self.assertIn(planted, str(caught.exception))
+            path.unlink()
+
+    def test_a_rerender_leaves_no_stale_patch_behind(self):
+        self.landed()
+        (self.rundir / "fix-brief" / "D99.patch").write_text("stale", encoding="utf-8")
+        (self.rundir / "fix-brief" / "D1.patch.4242.tmp").write_text("half", encoding="utf-8")
+        # The patches record gone: the tests have no patch now, and none may outlive it.
+        (self.rundir / "units" / self.UNIT / review_panel.TEST_PATCHES_NAME).unlink()
+        self.rerender()
+        self.assertEqual(self.patches(), [])
+        brief = self.brief()
+        self.assertEqual(sorted(p.name for p in (self.rundir / "fix-brief").iterdir()),
+                         sorted(f"{d['id']}.md"
+                                for d in brief["defects"] + brief["tests_to_write"]))
+        # Each tested defect says why it has no patch now.
+        self.assertEqual(self.brief_defect("cand-003")["no_test"],
+                         review_panel.NO_PATCH_RECORDED)
+
+    def test_a_rerender_writes_the_same_bytes(self):
+        self.landed()
+        before = _tree_bytes(self.rundir / "fix-brief")
+        self.rerender()
+        self.assertEqual(_tree_bytes(self.rundir / "fix-brief"), before)
+
+
+class TheReportNamesEachDefectsTestPatchInOneLine(_TestPatchBriefCase):
+    """``_render_entry`` adds one line per defect naming its patch and label, written as a
+    code span so ``report.html`` carries it whole: the page makes a link only of an in-page
+    anchor, and the patch is not embedded."""
+
+    @staticmethod
+    def html_text(line):
+        return html.unescape(re.sub(r"<[^>]+>", "", line)).strip()
+
+    @staticmethod
+    def md_text(line):
+        return line.replace("**", "").replace("`", "").lstrip("- ").strip()
+
+    def test_each_defect_with_a_patch_has_one_line_and_report_html_carries_it_whole(self):
+        self.landed()
+        md, page = self.read("report.md"), self.read("report.html")
+        for cid, label in (("cand-003", "red, new test file"),
+                           ("cand-001", "written, not run, new test file")):
+            did = self.defect_of(cid)
+            with self.subTest(defect=did):
+                line = f"- **Failing test.** `fix-brief/{did}.patch`: {label}."
+                self.assertEqual(md.count(f"`fix-brief/{did}.patch`"), 1)
+                self.assertIn(line + "\n", md)
+                found = [ln for ln in page.splitlines()
+                         if f"<code>fix-brief/{did}.patch</code>" in ln]
+                self.assertEqual(len(found), 1)
+                self.assertIn(label, found[0])
+                self.assertEqual(self.html_text(found[0]), self.md_text(line))
+                self.assertNotIn("[", self.html_text(found[0]))
+        self.assertNotIn("+++ b/", md)
+        self.assertNotIn("+++ b/", page)
+
+    def test_a_defect_without_a_patch_has_no_line(self):
+        self.run_all(verify=self.verify(first=None, second=None), test_patches=self.ON)
+        self.land()
+        self.assertNotIn("Failing test", self.read("report.md"))
+
+
+class ARunWithTestPatchesOffWritesNothingNew(_TestPatchBriefCase):
+    """A run planned with the switch off — absent, or ``off`` — writes no ``test`` key, no
+    ``.patch`` and no test line in any output, even where a verifier sent a test."""
+
+    def test_off_writes_no_test_key_no_patch_and_no_line(self):
+        for setting in (None, {"mode": "off"}):
+            with self.subTest(setting=setting):
+                rundir = self.tmp / f"run-{'absent' if setting is None else 'off'}"
+                over = {} if setting is None else {"test_patches": setting}
+                self.run_all(rundir, verify=self.verify(), **over)
+                brief = json.loads((rundir / "fix-brief.json").read_text(encoding="utf-8"))
+                for defect in brief["defects"]:
+                    self.assertNotIn("test", defect)
+                    self.assertNotIn("no_test", defect)
+                findings = json.loads((rundir / "findings.json").read_text(encoding="utf-8"))
+                for record in findings["candidates"]:
+                    for key in ("test", "test_set_aside", "test_patch"):
+                        self.assertNotIn(key, record)
+                names = [p.name for p in (rundir / "fix-brief").iterdir()]
+                self.assertTrue(names)
+                self.assertEqual([n for n in names if not n.endswith(".md")], [])
+                for name in ("report.md", "report.html", "fix-brief.md",
+                             *(f"fix-brief/{n}" for n in names)):
+                    text = (rundir / name).read_text(encoding="utf-8")
+                    self.assertNotIn("Failing test", text)
+                    self.assertNotIn(".patch", text)
+
+
+class TheReportSaysOnceWhereTheTestPatchesAreAndHowToAdoptThem(_TestPatchBriefCase):
+    """Where the run delivered a test patch, the report's description says once how many
+    defects carry one, where they are, how to apply one and the two ways to adopt them; the
+    edit and written-not-run clauses only where some patch is one. No delivered patch, no
+    paragraph."""
+
+    LABEL = "**Failing tests.**"
+    APPLY = 'git apply "<this run>/fix-brief/D<n>.patch"'
+
+    def description(self):
+        """The description section of ``report.md`` and of the text ``report.html`` shows."""
+        md = self.read("report.md")
+        md_part = next(part for part in md.split("\n## ")
+                       if re.match(r"\d+\. Report description\n", part))
+        page = self.read("report.html")
+        start = re.search(r"<h2[^>]*>\d+\. Report description", page).start()
+        end = page.index("<h2", start + 1)
+        return md, md_part, html.unescape(re.sub(r"<[^>]+>", "", page[start:end])), page
+
+    def page_text(self, page):
+        return html.unescape(re.sub(r"<[^>]+>", "", page))
+
+    def test_said_once_in_the_description_of_both_documents(self):
+        self.landed()
+        md, md_part, page_part, page = self.description()
+        self.assertEqual(md.count(self.LABEL), 1)
+        self.assertEqual(md_part.count(self.LABEL), 1)
+        self.assertEqual(md.count(self.APPLY), 1)
+        self.assertEqual(md_part.count(self.APPLY), 1)
+        self.assertEqual(md_part.count("2 defects come with a failing test"), 1)
+        self.assertIn("named after its defect", md_part)
+        # One of the two tests here was written and not run, so nothing says it fails.
+        self.assertIn("adds a new test file and should fail on the reviewed code", md_part)
+        self.assertIn("from the top of the repository", md_part)
+        self.assertIn("one defect at a time alongside its fix", md_part)
+        self.assertIn("marked as expected failures until each fix lands", md_part)
+        text = self.page_text(page)
+        for said in ("Failing tests.", "2 defects come with a failing test", self.APPLY,
+                     "with the folder holding report.md in place of the placeholder"):
+            with self.subTest(said=said):
+                self.assertEqual(text.count(said), 1)
+                self.assertIn(said, page_part)
+
+    def test_the_count_is_the_defects_with_a_delivered_patch(self):
+        self.landed(second=None)
+        _md, md_part, page_part, _page = self.description()
+        self.assertIn("1 defect comes with a failing test, a patch in", md_part)
+        self.assertIn("1 defect comes with a failing test, a patch in", page_part)
+
+    UNRUN = "A test labeled **written, not run** was never run; run it before you trust it."
+
+    def test_the_written_not_run_clause_where_one_is(self):
+        self.landed()
+        self.assertIn(self.UNRUN, self.description()[1])
+        # A test that never ran is not said to fail: the claim is what it should do.
+        self.assertNotIn("and fails on the reviewed code", self.description()[1])
+        self.assertIn("and should fail on the reviewed code", self.description()[1])
+
+    def test_no_written_not_run_clause_where_every_test_ran_red(self):
+        self.landed(first=RED_TEST)
+        self.assertIn(self.LABEL, self.description()[1])
+        self.assertNotIn(self.UNRUN, self.description()[1])
+        self.assertIn("and fails on the reviewed code", self.description()[1])
+
+    def test_the_edit_clause_only_where_a_patch_edits(self):
+        self.landed()
+        self.assertNotIn("edits an existing", self.description()[1])
+        path = self.rundir / "units" / self.UNIT / review_panel.TEST_PATCHES_NAME
+        record = json.loads(path.read_text(encoding="utf-8"))
+        for entry in record["tests"]:
+            if entry["candidate"] == "cand-003":
+                entry["files"] = [{**f, "kind": review_panel.TEST_EDITS_EXISTING}
+                                  for f in entry["files"]]
+        path.write_text(json.dumps(record), encoding="utf-8")
+        self.rerender()
+        md_part = self.description()[1]
+        self.assertIn("adds a new test file or edits an existing one and should fail", md_part)
+
+    def test_no_delivered_patch_or_patches_off_prints_none_of_it(self):
+        self.run_all(verify=self.verify(first=None, second=None), test_patches=self.ON)
+        self.land()
+        runs = {"on, none delivered": self.rundir}
+        off = self.tmp / "run-off"
+        self.run_all(off, verify=self.verify(), test_patches={"mode": "off"})
+        runs["off"] = off
+        for name, rundir in runs.items():
+            for doc in ("report.md", "report.html"):
+                text = (rundir / doc).read_text(encoding="utf-8")
+                with self.subTest(run=name, doc=doc):
+                    self.assertNotIn("Failing tests.", text)
+                    self.assertNotIn("git apply", text)
+                    self.assertNotIn("come with a failing test", text)
+                    self.assertNotIn("comes with a failing test", text)
+
+
+class TwoPublishedPatchesThatTouchOneFileSayHowToTakeBoth(_TestPatchBriefCase):
+    """Each defect's test is chosen on its own, and a batch refuses only its own duplicate
+    files, so two published patches can create or edit the same file. Applying both with
+    ``git apply`` fails on the second, so each defect's brief names the file and the other
+    defect, and the report's advice to take them all at once says which patches clash."""
+
+    SHARED = "tests/test_empty_input.py"
+
+    def collide(self):
+        """The run with cand-003's patch rewritten to create cand-001's file, as a second
+        batch's verifier writing the same helper would leave it."""
+        self.landed()
+        path = self.rundir / "units" / self.UNIT / review_panel.TEST_PATCHES_NAME
+        record = json.loads(path.read_text(encoding="utf-8"))
+        for entry in record["tests"]:
+            if entry["candidate"] == "cand-003":
+                entry["patch"] = entry["patch"].replace("tests/test_other.py", self.SHARED)
+                entry["files"] = [{**f, "path": self.SHARED} for f in entry["files"]]
+        path.write_text(json.dumps(record), encoding="utf-8")
+        result = self.rundir / "units" / self.UNIT / "result.json"
+        reply = json.loads(result.read_text(encoding="utf-8"))
+        reply["verdicts"][1]["test"]["files"] = [self.SHARED]
+        result.write_text(json.dumps(reply), encoding="utf-8")
+        self.rerender()
+        return self.defect_of("cand-001"), self.defect_of("cand-003")
+
+    def entries(self, did):
+        """The defect's entry in ``fix-brief.md`` and in its own ``D<n>.md``."""
+        return [text.split(f"## {did}. ", 1)[1].split("\n## ", 1)[0]
+                for text in (self.read("fix-brief.md"), self.read(f"fix-brief/{did}.md"))]
+
+    def note(self, other):
+        return (f"`{self.SHARED}` is also in {other}'s patch, so applying both with "
+                f"`git apply` fails on the second: apply one, then make the other's change "
+                f"to that file by hand.")
+
+    def test_each_defects_brief_names_the_shared_file_and_the_other_defect(self):
+        first, second = self.collide()
+        for did, other in ((first, second), (second, first)):
+            for entry in self.entries(did):
+                with self.subTest(defect=did):
+                    self.assertIn(self.note(other), " ".join(entry.split()))
+
+    def test_fix_brief_json_records_the_other_defect_and_the_file(self):
+        first, second = self.collide()
+        for did, other in ((first, second), (second, first)):
+            test = next(d for d in self.brief()["defects"] if d["id"] == did)["test"]
+            self.assertEqual(test["shares_files"], [{"defect": other, "files": [self.SHARED]}])
+
+    def test_the_report_qualifies_all_at_once(self):
+        first, second = self.collide()
+        md = " ".join(self.read("report.md").split())
+        ids = ", ".join(sorted((first, second), key=review_panel._id_rank))
+        self.assertIn("or all at once, marked as expected failures until each fix lands, "
+                      f"except that 2 patches, for {ids}, change a file another patch also "
+                      "changes, so `git apply` refuses the second of them; their `.md` files "
+                      f"in `fix-brief/` say how to take both.", md)
+
+    def test_paths_that_differ_only_in_case_are_one_file(self):
+        # Windows and macOS keep one file for both spellings, so the second patch fails there.
+        files = lambda path: {"files": [{"path": path}]}
+        shared = review_panel._shared_test_files(
+            {"D1": files("tests/Helpers.py"), "D2": files("tests/helpers.py")})
+        self.assertEqual(shared, {"D1": [{"defect": "D2", "files": ["tests/Helpers.py"]}],
+                                  "D2": [{"defect": "D1", "files": ["tests/helpers.py"]}]})
+
+    def test_distinct_files_get_none_of_it(self):
+        self.landed()
+        for cid in ("cand-001", "cand-003"):
+            self.assertNotIn("shares_files", self.brief_defect(cid)["test"])
+            for entry in self.entries(self.defect_of(cid)):
+                self.assertNotIn("patch, so applying both", entry)
+        self.assertNotIn("except that", self.read("report.md"))
+        self.assertIn("or all at once, marked as expected failures until each fix lands. ",
+                      " ".join(self.read("report.md").split()))
+
+    @unittest.skipUnless(_have_git(), "git is not installed")
+    def test_git_apply_really_fails_on_the_second(self):
+        first, second = self.collide()
+        top = self.tmp / "adopter"
+        top.mkdir()
+        subprocess.run(["git", "init", "-q", str(top)], check=True, capture_output=True)
+        applied = [subprocess.run(["git", "apply", str(self.rundir / "fix-brief" / f"{did}.patch")],
+                                  cwd=top, capture_output=True) for did in (first, second)]
+        self.assertEqual(applied[0].returncode, 0, applied[0].stderr)
+        self.assertNotEqual(applied[1].returncode, 0)
+        self.assertIn(b"already exists", applied[1].stderr)
+
+
 class EachDegradedLayoutNamesItself(_FindingsCase):
     """Every way the grouping or the narrative falls short of a finished run renders its
     stated fallback and says so at the top, beside the counts it changes."""
@@ -23296,6 +26392,9 @@ def _unit_text(unit, label):
 
 
 _VARIANTS = re.compile(r"^  - ((?:One|\d+) other reports? names? a variant of this test.*)$")
+# An evidence line from before commands were printed as blocks: its command a code span,
+# then the directory where it was not the root, then the bookkeeping.
+_OLD_EVIDENCE = re.compile(r"^(- Evidence[^:]*: .*?) `([^`]+)`(?:, in (.+?))? \((exit .*)\)$")
 
 
 def no_loss_problems(old_md, new_md, site_defect, commit_words):
@@ -23306,9 +26405,10 @@ def no_loss_problems(old_md, new_md, site_defect, commit_words):
     the stated removals and moves, each checked where it went: the consequence and the
     first test and unsettled account in the defect's entry, the quoted source under the site
     in that entry (or a pointer to a site whose entry prints it), the commit at the top, a
-    clustering note in the appendix, and an identical block as a pointer to a site whose
-    evidence prints it. Every refuted defect's reason is in its entry. ``site_defect`` maps
-    each site to its defect in the new report.
+    clustering note in the appendix, an identical block as a pointer to a site whose
+    evidence prints it, and an evidence command once printed as a code span on its line, now
+    a bash block under that line. Every refuted defect's reason is in its entry.
+    ``site_defect`` maps each site to its defect in the new report.
     """
     old = old_md.splitlines()
     new = new_md.splitlines()
@@ -23423,6 +26523,12 @@ def no_loss_problems(old_md, new_md, site_defect, commit_words):
             elif line.startswith("- Kept separate") and not find(line):
                 if line[2:] not in appendix:
                     problems.append((sid, "clustering note neither kept nor moved"))
+            elif _OLD_EVIDENCE.match(line):
+                head, command, where, tail = _OLD_EVIDENCE.match(line).groups()
+                for part in (f"{head} ({f'in {where}, ' if where else ''}{tail})", "  ```bash",
+                             f"  {html.unescape(review_panel._unescape(command))}", "  ```"):
+                    if not find(part):
+                        problems.append((sid, f"line missing: {part}"))
             else:
                 for part in unit:
                     if not find(part):
@@ -23550,10 +26656,11 @@ _REPORT_OUTPUTS = ("report.md", "report.html", "findings.json", "fix-brief.md",
 
 
 class OldRunsReRenderUnchanged(unittest.TestCase):
-    """A run directory an earlier release wrote re-renders exactly as that release
-    re-rendered it. Compared as text, so a checkout that turned line endings into CRLF
-    compares equal, and with the line naming the run directory aside, since the copy is
-    somewhere else."""
+    """A run directory an earlier release wrote re-renders as its stored baseline: what that
+    release rendered, differing only in the lines a later change meant to add or reshape,
+    which the fixture README names. Compared as text, so a checkout that turned line endings
+    into CRLF compares equal, and with the line naming the run directory aside, since the
+    copy is somewhere else."""
 
     def rerender(self, fixture):
         tmp = tempfile.TemporaryDirectory()
@@ -23590,6 +26697,52 @@ class OldRunsReRenderUnchanged(unittest.TestCase):
     def test_the_old_run_rerenders_as_the_tag_rerendered_it(self):
         rundir = self.rerender(_OLD_RUN)
         self.assert_same_outputs(_OLD_RUN_RERENDERED, rundir)
+
+
+class TheReportSaysWhichShellItsCommandsAreFor(unittest.TestCase):
+    """The report prints its evidence commands in bash's quoting and has no PowerShell form
+    of its own, so where one of them quotes an argument it says so, once, and where the fix
+    brief's PowerShell versions are. A report whose commands are plain words says nothing."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.out = {}
+        for name, fixture in (("quoted", _OLD_RUN), ("plain", _TAG_RUN)):
+            rundir = Path(cls._tmp.name).resolve() / name
+            shutil.copytree(fixture, rundir)
+            proc = _run("report", str(rundir), "--rerender")
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+            cls.out[name] = {f: (rundir / f).read_text(encoding="utf-8")
+                             for f in ("report.md", "report.html", "findings.json")}
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def argvs(self, name):
+        doc = json.loads(self.out[name]["findings.json"])
+        return [c["evidence"]["argv"] for c in doc["candidates"] if c.get("evidence")]
+
+    def test_a_report_with_a_quoted_command_says_so_once_in_both_documents(self):
+        self.assertTrue(any(not review_panel._written_bare(a) for a in self.argvs("quoted")),
+                        "the fixture has no quoted evidence command")
+        self.assertEqual(self.out["quoted"]["report.md"].count(
+            f"- {review_panel.REPORT_SHELL_NOTE}\n"), 1)
+        page = re.sub(r"<[^>]+>", "", self.out["quoted"]["report.html"])
+        self.assertEqual(html.unescape(page).count(
+            review_panel.REPORT_SHELL_NOTE.replace("`", "")), 1)
+
+    def test_a_report_of_plain_commands_says_nothing(self):
+        self.assertTrue(self.argvs("plain"), "the fixture has no evidence command")
+        self.assertTrue(all(review_panel._written_bare(a) for a in self.argvs("plain")))
+        self.assertNotIn(review_panel.REPORT_SHELL_NOTE, self.out["plain"]["report.md"])
+
+    def test_no_command_means_no_note(self):
+        self.assertFalse(review_panel._quotes_an_argument([]))
+        self.assertFalse(review_panel._quotes_an_argument([["python3", "run.py"]]))
+        self.assertTrue(review_panel._quotes_an_argument([["python3", "run.py"],
+                                                          ["echo", "a b"]]))
 
 
 class TwoBlocksAreOneOnlyWhereTheyAreTheSameText(unittest.TestCase):
@@ -26074,6 +29227,117 @@ class TheStampSaysWhenItWasResynthesized(_GenerationCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.outputs(), before)
         self.assertEqual(self.stamp(), stamp)
+
+
+class ALaterGenerationCarriesTheTestPatches(_GenerationCase):
+    """A later generation stages, moves in and removes ``fix-brief/D<n>.patch`` with the
+    ``.md`` files: the whole directory is published as one, and a publication killed
+    part-way resumes to the same patches."""
+
+    UNIT = "verify-area-01-A"
+
+    def reported_with_a_patch(self):
+        self.plan_into(self.rundir, test_patches={"mode": "on", "min_severity": "major"})
+        stub_dispatch(self.rundir, READING_TABLE, DISPATCH)
+        self.assertEqual(_run("route", str(self.rundir)).returncode, 0)
+        verify = copy.deepcopy(VERIFY_TABLE)
+        verify[self.UNIT]["verdicts"][1]["test"] = {**RED_TEST, "files": ["tests/test_other.py"]}
+        stub_dispatch(self.rundir, verify)
+        work = self.tmp / "copy"
+        shutil.copytree(self.rundir / "snapshot", work)
+        for path in [work, *work.rglob("*")]:
+            path.chmod(path.stat().st_mode | stat.S_IWUSR)
+        (work / "tests" / "test_other.py").write_bytes(b"assert 0\n")
+        reply = json.loads((self.rundir / "units" / self.UNIT / "result.json")
+                           .read_text(encoding="utf-8"))
+        (self.rundir / "units" / self.UNIT / review_panel.TEST_PATCHES_NAME).write_text(
+            json.dumps(review_panel.test_patches_record(self.rundir, self.UNIT, reply, work)),
+            encoding="utf-8")
+        self.clustered()
+        self.synthesize()
+        stub_dispatch(self.rundir, SYNTH_TABLE)
+        self.finish_rounds()
+        self.report()
+
+    def patches(self, rundir):
+        return {p.name: p.read_bytes() for p in (rundir / "fix-brief").iterdir()
+                if p.suffix == ".patch"}
+
+    def brief_bytes(self, rundir):
+        out = {name: (rundir / name).read_bytes() for name in ("fix-brief.json", "fix-brief.md")}
+        out.update({f"fix-brief/{p.name}": p.read_bytes()
+                    for p in sorted((rundir / "fix-brief").iterdir())})
+        return out
+
+    def test_a_later_generations_brief_is_what_a_rerender_of_it_writes(self):
+        # One build of the brief: the generation's publication and a re-render of the same
+        # run write the same bytes, patches included.
+        self.reported_with_a_patch()
+        self.built_generation()
+        self.report()
+        published = self.brief_bytes(self.rundir)
+        self.assertTrue(any(name.endswith(".patch") for name in published))
+        self.assertIn(b'"patch": "fix-brief/', published["fix-brief.json"])
+        proc = _run("report", str(self.rundir), "--rerender")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.brief_bytes(self.rundir), published)
+
+    def test_one_function_builds_the_fix_brief(self):
+        # A second builder is how an edit to one path is silently undone by the other: every
+        # call that makes the brief's records, its prose or its patches sits in one function.
+        self.assertFalse(hasattr(review_panel, "_fix_brief_test_outputs"))
+        tree = ast.parse(_ENGINE.read_text(encoding="utf-8"))
+        builders = ("fix_brief_tests", "fix_brief_document", "render_fix_brief",
+                    "render_fix_brief_defects", "fix_brief_patches")
+        callers = {name: [] for name in builders}
+        for func in ast.walk(tree):
+            if not isinstance(func, ast.FunctionDef):
+                continue
+            for node in ast.walk(func):
+                if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                        and node.func.id in callers):
+                    callers[node.func.id].append(func.name)
+        for name, where in callers.items():
+            with self.subTest(builder=name):
+                self.assertEqual(where, ["fix_brief_outputs"])
+
+    def test_the_patches_are_published_with_the_generation(self):
+        self.reported_with_a_patch()
+        before = self.patches(self.rundir)
+        self.assertEqual(len(before), 1)
+        self.built_generation()
+        resumed = self.tmp / "resumed"
+        shutil.copytree(self.rundir, resumed)
+        self.report()
+        self.assertEqual(self.patches(self.rundir), before)
+        self.assertEqual(self.stamp()["generation"], 2)
+        # The generation's brief names the patch it published, as generation 1's did.
+        brief = json.loads((self.rundir / "fix-brief.json").read_text(encoding="utf-8"))
+        self.assertEqual([d["test"]["patch"] for d in brief["defects"] if d["test"]],
+                         [f"fix-brief/{name}" for name in before])
+        self.assertIn(f"fix-brief/{next(iter(before))}",
+                      (self.rundir / "fix-brief.md").read_text(encoding="utf-8"))
+        self.assertFalse((self.rundir / "staging-g2").exists())
+        # Killed once the directory is aside, before the new one is moved in.
+        real = review_panel._publication_step
+        ran = []
+
+        def step(*args, **kwargs):
+            if len(ran) == len(review_panel.PUBLISHED_FILES) + 1:
+                raise _Killed()
+            ran.append(1)
+            return real(*args, **kwargs)
+
+        with mock.patch.object(review_panel, "_publication_step", step):
+            with self.assertRaises(_Killed):
+                review_panel._run_report(types.SimpleNamespace(rundir=str(resumed),
+                                                               rerender=False))
+        self.assertEqual(self.patches(resumed / "staging-g2"), before)
+        self.report(resumed)
+        self.assertEqual(self.patches(resumed), before)
+        self.assertEqual(sorted(p.name for p in (resumed / "fix-brief").iterdir()),
+                         sorted(p.name for p in (self.rundir / "fix-brief").iterdir()))
+        self.assertFalse((resumed / "staging-g2").exists())
 
 
 if __name__ == "__main__":

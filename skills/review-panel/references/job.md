@@ -7,7 +7,7 @@ strictly — nothing in the engine fills a field in, so a job file says exactly 
 ## The interview
 
 Ask the clarifying questions in **one message**, and only about what the handed-in text left
-unclear — skip anything it already answered. Five things:
+unclear — skip anything it already answered. Six things:
 
 1. **The problem.** What the owner wants found. It is carried verbatim into every reader's
    payload and the engine never interprets it. It is the one field with no default.
@@ -16,7 +16,8 @@ unclear — skip anything it already answered. Five things:
    classified: the report lists it under *not read*. The snapshot every worker works in
    holds the files under review and nothing else, except that inside a repository every
    lockfile git tracks is copied too, excluded or not, because the probe and the verifiers
-   build there and an install needs it; the run says how many before it starts. Where the owner wants a **subset** of a
+   build there and an install needs it, and so is whatever the job names as `support`
+   (question 6); the run says how many of each before it starts. Where the owner wants a **subset** of a
    large repository, ask for the files by name and write them as `files` rather than asking
    for a directory holding copies of them: a copy is a second tree to keep in step, and
    `plan` records the commit of the tree it actually read.
@@ -33,6 +34,15 @@ unclear — skip anything it already answered. Five things:
    **The job file does not live in it**: the driver creates the directory itself and
    copies `job.json` in, and refuses one already sitting at that path, so write the job
    beside your own work.
+6. **Test patches.** Offer them: for each defect the panel establishes at or above a
+   severity the owner picks, the verifier writes a failing test, handed back as a patch the
+   owner applies later. Say what it costs: the run can take much longer, close to twice as
+   long. Setup also works out how the tree's tests are written, and each test is written and
+   run in turn, so the cost grows with the number of tests and with how slow the suite is; a
+   higher severity means fewer tests. A test needs its suite in the snapshot, so when the
+   tests sit outside the scope — a `files` list, an excluded test directory — ask which to
+   copy in as `support`. The run warns before it starts when the snapshot holds no test at
+   all.
 
 **Restate before writing.** Restate the job as a defect audit — *these files, read for what is
 wrong, answered as findings: a location, a failure and a severity* — and ask the owner to
@@ -66,7 +76,8 @@ into a run directory that does not yet exist.
 
 If operating autonomously (no user available), assume: partition by file; root is the
 repository root, or the working directory outside a repository; no exclusions; the two
-default lenses; a fresh run directory under the host's temporary directory. Note each
+default lenses; test patches off, and no `support`; a fresh run directory under the
+host's temporary directory. Note each
 assumption when writing the job. The problem statement is never assumed: a text with none
 is refused, since nothing can guess what the owner wants found. The confirmation is skipped,
 but the defect-audit test still applies — text that only asks questions, naming nothing to
@@ -81,7 +92,8 @@ too — optional means absent-is-allowed, never absent-is-filled.
 **When the interview applies a default, write `job-notes.json` beside the job as well.**
 Telling the owner in the conversation is a message and not a record: the report states the
 job, and without this file it cannot say which of those values anybody chose. One JSON object,
-mapping any of `root`, `exclude`, `partition`, `lenses`, `files` and `coverage` to `stated`
+mapping any of `root`, `exclude`, `partition`, `lenses`, `files`, `coverage`,
+`test_patches` and `support` to `stated`
 (the handed-in text said so), `defaulted` (nothing said, so this file's default) or
 `interview` (the owner answered) — for example
 `{"root": "defaulted", "partition": "defaulted", "lenses": "defaulted", "files": "stated"}`.
@@ -102,6 +114,8 @@ does not guess, so skipping the file is not self-documenting.
 | `files` | Optional. A non-empty list of files to review in place of everything under `root`. |
 | `coverage` | Optional. `false` takes the coverage question off the table entirely. Absent, the engine decides from the tree. |
 | `questions` | Optional. Non-empty text, carried as written. No reader is shown it; the operator answers it after the run, in `report-notes.json`. |
+| `test_patches` | Optional. `{"mode": "on", "min_severity": "major"}` — any of `blocker`, `major`, `minor`, `nit`, and `nit` means every defect — or `{"mode": "off"}`. Absent is off. |
+| `support` | Optional. A non-empty list of paths and prefixes copied into the snapshot beside the review and read by no reader. |
 
 Each area: `name` (distinct, and distinct ignoring case); `paths`; optionally `also_read`;
 optionally `remainder: true` on at most one area, which may then have empty `paths`;
@@ -125,10 +139,17 @@ and a name that is not in the tree is refused by name rather than quietly skippe
 asked for that file. The rest of the repository is still measured against the list:
 `plan` records every tracked file the list leaves out, so the scope's blind spot is a number
 in the run directory rather than something a reader has to work out. The snapshot holds
-the listed files and the tracked lockfiles, so a build over a small list usually cannot run.
+the listed files and the tracked lockfiles, so a build over a small list usually cannot run
+unless `support` names what it needs.
 Exclusions still apply to the listed set and still have to match something, and `.git` is
 not listable — the
 snapshot holds source, and a reader that can reach refs is not reading it alone.
+
+**`support`.** What a test needs to run beside the review: the test directory, its shared
+helpers, the build file. Entries are normalized and checked as `exclude`'s are and may repeat
+an exclusion; inside a repository they match tracked files, outside one the walked tree. An
+entry naming a file under review, or matching nothing outside the review, is refused by
+name. Any worker may open a support file, so name only what a test needs.
 
 **`coverage`.** A second round asks which inputs no test in scope constructs, and answers
 in missing tests rather than in defects. `false` means no auditor is planned however many

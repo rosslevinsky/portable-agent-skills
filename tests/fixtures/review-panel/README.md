@@ -17,10 +17,19 @@ schemas `units.json` names were left out because nothing that renders reads them
 v2026.10.0, driven by that release's own engine-suite helpers and stub tables: two merge
 units (the merge over its reply ceiling, so batched), one merge check upholding S1 and S2 as
 one defect, one synthesis unit `synth-A` whose reply chose its own two tiers, and the
-`report` that release published. It was generated in a temporary directory, which is the
+`report` that release published, with one difference: its `report.md` and `report.html`
+print each evidence command as a bash code block under the evidence line, where that release
+printed it inline as a code span. It was generated in a temporary directory, which is the
 path its report names. As in `old-run/`, the unit directories hold `result.json` alone.
 
-`old-run-rerendered/` holds the files the v2026.10.0 release's `report --rerender` wrote over
-a copy of `old-run/`. It is what `old-run/` re-renders as, which differs from the `report.md` stored in
-`old-run/` because that one predates sites. Both directories are baselines: a re-render with
-the current engine must produce the same text, the line naming the run directory aside.
+`old-run-rerendered/` is what `old-run/` re-renders as, which differs from the `report.md`
+stored in `old-run/` because that one predates sites. It is not byte for byte what the
+v2026.10.0 release's `report --rerender` wrote over a copy of `old-run/`, in two ways. Its
+`fix-brief.md`, `fix-brief/D2.md`, `report.md` and `report.html` each carry one more line,
+the shell note, which each prints once any command it holds has an argument a shell must
+quote. D2's reproduction is a quoted `python3 -c`. And its `report.md` and `report.html`
+print each evidence command as a bash code block under the evidence line, as
+`v2026.10.0-run/` does. Every other line is as that release wrote it.
+
+Both directories are baselines: a re-render with the current engine must produce the same
+text, the line naming the run directory aside.

@@ -91,9 +91,9 @@ version at startup and exit with the same `Python 3.10+ required` message.
    is `documentary` rather than `executed` — and it is the file the verifier is handed.
 
 No worker is handed the source path, and none is handed a path that spells whose claim it
-holds: planning copies the files under review, and the lockfiles, to a snapshot under the
-run directory, and each attempt gets an opaque token naming its input directory and its
-working directory both.
+holds: planning copies the files under review, the lockfiles and any `support` files to a
+snapshot under the run directory, and each attempt gets an opaque token naming its input
+directory and its working directory both.
 
 **Most files under `references/` are those briefs, not instructions to you.** The engine
 loads one per unit kind at plan time and copies it into that unit's payload — which is what

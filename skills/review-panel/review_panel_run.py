@@ -2436,6 +2436,8 @@ def publish(rundir: Path, unit: str, attempt: Attempt | None, intention: str,
     intuitive one: the publication first, the record second, so the window a crash can land
     in is "published but unrecorded" — which the next pass finishes idempotently — rather
     than "recorded but unpublished", which would read as terminal with no answer on disk.
+
+    A verifier's result is preceded by its test patches; see :func:`_land_test_patches`.
     """
     target = unit_dir(rundir, unit)
     target.mkdir(parents=True, exist_ok=True)
@@ -2454,6 +2456,7 @@ def publish(rundir: Path, unit: str, attempt: Attempt | None, intention: str,
             text = source.read_text(encoding="utf-8")
         except OSError as exc:
             raise DriverError(f"cannot read {source} to land it: {exc}") from exc
+        _land_test_patches(rundir, unit, attempt, text)
         _write_text(result, text)
     else:
         if _present(result):
@@ -2469,6 +2472,32 @@ def publish(rundir: Path, unit: str, attempt: Attempt | None, intention: str,
         "at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
     })
     _progress(rundir, f"{unit} landed {intention}")
+
+
+def _land_test_patches(rundir: Path, unit: str, attempt: Attempt, text: str) -> None:
+    """Write the unit's ``test-patches.json`` from the attempt's working copy, where the
+    engine says the unit asks for one: a verifier's, on a run with test patches on.
+
+    **Before ``result.json``, because the copy goes once the unit is terminal**: landing is
+    the last moment it is sure to exist, and a replay of a landing a kill interrupted finds
+    the same copy and writes the same bytes. The engine reads the reply with the stage's own
+    parser. **Nothing here can fail the landing**: a patch that cannot be made is a test
+    without one, so an extraction that fails is recorded as the reason, and only a fault of
+    the volume stops the run, as every write here does.
+    """
+    token = (attempt.argv or {}).get("token")
+    copy = (rundir / "work" / token
+            if isinstance(token, str) and _TOKEN_RE.fullmatch(token) else None)
+    target = unit_dir(rundir, unit) / engine.TEST_PATCHES_NAME
+    try:
+        record = engine.test_patches_record(rundir, unit, json.loads(text), copy)
+    except (engine.ReviewPanelError, OSError, ValueError, RecursionError) as exc:
+        if _is_storage_exception(exc):
+            raise StorageFault(target, exc, action="built") from exc
+        record = {"unit": unit, "prefix": "", "tests": [],
+                  "reason": f"the test patches could not be extracted: {exc}"}
+    if record is not None:
+        _write_json(target, record)
 
 
 def unit_resolution(rundir: Path, unit: str) -> dict | None:
@@ -5601,9 +5630,10 @@ def _command_run(args: argparse.Namespace, rundir: Path, lock: RunLock) -> int:
         if not args.go:
             sys.stdout.write(_preview(rundir, lanes))
             return EXIT_OK
-        # A run started with `--go` shows no preview, and this is the one line of it that
-        # is about what leaves the machine rather than how long the run takes.
+        # A run started with `--go` shows no preview, and these are the lines of it about
+        # what leaves the machine and what the run can do, rather than how long it takes.
         sys.stdout.write(_copied_outside_scope(rundir))
+        sys.stdout.write(_no_test_warning(rundir))
         sys.stdout.flush()
         return _drive(_run_from(args, rundir, lanes, supervisor, given), args)
 
@@ -5765,15 +5795,31 @@ def _name_digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
-def _copied_outside_scope(rundir: Path) -> str:
-    """The line saying how many lockfiles outside the review the snapshot carries for the
-    build, or nothing where it carries none."""
+def _inventory_paths(rundir: Path, key: str) -> list[str]:
+    """The paths one list of ``inventory.json`` records — entries that are file records or
+    bare paths — or none where it records none."""
     inventory = _read_json(rundir / INVENTORY_NAME)
-    context = inventory.get("context") if isinstance(inventory, dict) else None
-    if not isinstance(context, list) or not context:
-        return ""
-    line = engine.copied_outside_scope_line(
-        [e["path"] for e in context if isinstance(e, dict) and isinstance(e.get("path"), str)])
+    entries = inventory.get(key) if isinstance(inventory, dict) else None
+    paths = [entry.get("path") if isinstance(entry, dict) else entry
+             for entry in (entries if isinstance(entries, list) else [])]
+    return [path for path in paths if isinstance(path, str)]
+
+
+def _copied_outside_scope(rundir: Path) -> str:
+    """The lines saying how many lockfiles and support files outside the review the snapshot
+    carries, or nothing where it carries none."""
+    line = engine.copied_outside_scope_line(_inventory_paths(rundir, "context"),
+                                            _inventory_paths(rundir, "support"))
+    return line + "\n" if line else ""
+
+
+def _no_test_warning(rundir: Path) -> str:
+    """The engine's warning for a run asking for test patches over a snapshot holding no
+    test, off the job and the inventory the run directory keeps, or nothing."""
+    job = _read_json(rundir / engine.JOB_FILE_NAME)
+    line = engine.no_test_warning(
+        engine.test_patch_threshold(job) if isinstance(job, dict) else None,
+        _inventory_paths(rundir, "files") + _inventory_paths(rundir, "context"))
     return line + "\n" if line else ""
 
 
@@ -5801,7 +5847,7 @@ def _preview(rundir: Path, lanes: dict[str, LaneSpec]) -> str:
              + (f"; {done} already landed" if done else "")
              + (f"; {held} more over its lane's hard ceiling, listed and never dispatched"
                 if held else "")]
-    copied = _copied_outside_scope(rundir)
+    copied = _copied_outside_scope(rundir) + _no_test_warning(rundir)
     if copied:
         lines.append(copied.rstrip("\n"))
     for kind, total, _held in sorted(kind_counts(units)):

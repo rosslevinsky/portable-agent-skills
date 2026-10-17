@@ -50,7 +50,7 @@ ran — one answer, one reader.
 
 It runs once. Any of its outputs already present is a refusal, because somebody may have
 annotated what the first run wrote; `--rerender` is how you say you meant it, and it
-replaces only its own outputs — every `D<n>.md` in `fix-brief/` included, so none is left
+replaces only its own outputs — every file in `fix-brief/` included, so none is left
 from an earlier grouping — and refuses anything else in their way. They publish together —
 a failure puts back the state the call found. The exit code says whether
 execution completed — `0` for the documents written, `2` for a refusal — and never whether
@@ -93,6 +93,27 @@ note on a site the merge put in a defect of several, moved to the appendix; and 
 another site already printed, replaced by a pointer to that site. The appendix lists each,
 with the mechanism every defect of several sites was merged on, the sites the check took
 out, the compound sites and their second claims, and the record of the run.
+
+## Test patches
+
+With `test_patches` on, each defect in the fix brief carries `test`: one test a verifier
+wrote for it, written as `fix-brief/D<n>.patch` beside `D<n>.md`. Where several members
+have one, `red` comes before written-not-run, then a new file before an edit, then the most
+severe site, then the lowest candidate id. Its label names both, as in `red, new test file`
+or `written, not run, edits an existing file`; only a test the review ran red is called red.
+A defect the run asked a test of and that has none says why, in `no_test`. The patch's paths
+start at the root's place in its repository, so apply it from the repository top with
+`git apply "<this run>/fix-brief/D<n>.patch"`, `<this run>` being the folder holding
+`report.md`, then check the files it names exist: given
+paths it cannot place, `git apply` writes nothing, says nothing and exits 0. Run the test from
+`run_from`, also relative to the top, where its `argv` names files; an `argv` that named the
+review's own copy of the tree in a way no such path stands for is null, and no command is
+printed. The report gives each such defect one line naming the patch and its label, and where any defect has a patch its description says once how many,
+how to apply one, and how to adopt them: each alongside its fix, or all at once marked as
+expected failures. Where two published patches create or edit one file, the second will not
+apply after the first: each such `test` carries `shares_files`, the other defects and the
+files, its `D<n>.md` says to merge that file by hand, and the description names the
+patches. A run with the switch off writes none of this.
 
 ## A later synthesis generation
 

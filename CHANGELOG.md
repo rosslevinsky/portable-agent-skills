@@ -8,6 +8,59 @@ Versions use [Calendar Versioning](https://calver.org/) in the form
 A MICRO bump in the same month indicates a follow-up release; a new month
 starts from `.0` again.
 
+## [2026.10.3] - 2026-10-17
+
+### Added
+
+- **`/review-panel` can hand back a failing test for each defect.** Ask for test patches
+  when you set up a review, and the agent that checks a finding also writes a test that
+  shows it, runs it in its own copy of the tree, and confirms it fails for the reason it
+  gives. Each such defect whose test can travel as a text patch then comes with
+  `fix-brief/D<n>.patch`, and its `D<n>.md` gives the command to apply it from the top of
+  your repository and the place to run the test. A test that cannot, such as one that needs
+  a binary file or changes a file over 256 KiB, is not handed back, and the defect's
+  `D<n>.md` says why. The report names the patch on each defect, and says once how many
+  defects have a test and how to adopt them. Where two defects' patches change the same
+  file, each defect's `D<n>.md` says so: apply one, then make the other's change to that
+  file by hand. A test that fails for some other reason, such as a broken import, is not
+  handed back. Where the checking agent cannot run the tests, it still writes one, labeled
+  *written, not run*, so you know to run it yourself before trusting it. Turn it on in the
+  job with `test_patches`: a `mode` of `on` and a `min_severity`, the lowest severity worth
+  a test. If your tests live outside the files under review, list them under `support`, so
+  they are copied in for the tests to run against without being reviewed. It can make a
+  review take much longer, close to twice as long: setup also works out how your tests are
+  written, and each test is written and run in turn, so the cost grows with the number of
+  tests and with how slow your suite is. A higher `min_severity` means fewer tests and less
+  added time. With `{"mode": "off"}`, which takes no `min_severity`, or no `test_patches` at
+  all, a review asks for no test conventions and writes no test patches.
+
+### Changed
+
+- **`/review-panel`'s fix brief gives PowerShell users commands they can paste.** Commands
+  are still written for bash. Where PowerShell would read one differently, for example an
+  argument with an apostrophe, a PowerShell version now follows it. A command whose
+  arguments Windows PowerShell 5.1 would change is marked as needing PowerShell 7.3 or
+  later, and the Setup says what to do about it: install PowerShell 7, which sits beside
+  5.1, or take that command's argv from `fix-brief.json`. A command that no shell can take
+  as pasted is not printed; the brief points at its argv in `fix-brief.json` instead. The
+  brief's Setup says once that its commands are written for bash, and tells CMD users to use
+  PowerShell, where one of its commands quotes an argument; the report says once that its
+  commands are written for bash where one of its evidence commands does. The `git apply`
+  command for a test patch adds no such note. PowerShell 7.3 or later still passes arguments
+  to a `.bat` or `.cmd` program by the older rules, so such a program may not receive a
+  quote or an empty argument intact; the Setup says so. The PowerShell lines are not stored
+  in `fix-brief.json`, which keeps every command as an argument list.
+
+### Fixed
+
+- **`/review-panel`'s report prints each command's text exactly.** Each command a check ran
+  now sits in a code block of its own, so copying it from `report.md` or from `report.html`
+  gives the same text. Before, `report.md` showed it with the report's own
+  escapes in it, such as `\_` for `_` and `&amp;` for `&`, and with runs of whitespace
+  squeezed to one space. A command with an argument holding a line break that no pasted
+  command keeps, such as a carriage return, is shown as its argument list instead. A
+  reproduction somebody proposed and nobody ran shows its argument list in a code block too.
+
 ## [2026.10.2] - 2026-10-07
 
 ### Added
@@ -957,6 +1010,7 @@ release](README.md#installing-a-previous-release) to return to it.
 
 Initial release.
 
+[2026.10.3]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.10.3
 [2026.10.2]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.10.2
 [2026.10.1]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.10.1
 [2026.10.0]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.10.0

@@ -81,6 +81,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import difflib
 import errno
 import hashlib
 import tempfile
@@ -94,8 +95,8 @@ import shutil
 import stat
 import subprocess
 import sys
-from dataclasses import asdict, dataclass, replace
-from pathlib import Path
+from dataclasses import asdict, dataclass, field, replace
+from pathlib import Path, PurePath
 from typing import Callable, Iterable, Mapping, Sequence
 
 _PROG = "review_panel.py"
@@ -176,7 +177,13 @@ _JOB_REQUIRED_KEYS = ("problem", "root", "exclude", "partition", "lenses")
 # `questions` is what the owner wants answered beyond the defects: free text, carried as
 # written, and never put in a payload. The readers answer the problem statement with
 # findings; the operator answers the questions afterwards, in `report-notes.json`.
-_JOB_OPTIONAL_KEYS = ("files", "coverage", "questions")
+# `test_patches` asks each verifier for a failing test per defect it establishes at or above a
+# severity. An object with a `mode` rather than a flag, so a later mode is one more value and
+# no job file changes. Absent means off.
+# `support` names files outside the review that the snapshot carries so a test can run there:
+# copied, listed, and read by no reader. The job names them because any worker may open
+# anything in the snapshot, so nothing beyond the review goes in without the job saying so.
+_JOB_OPTIONAL_KEYS = ("files", "coverage", "questions", "test_patches", "support")
 _JOB_KEYS_FILE = frozenset((*_JOB_REQUIRED_KEYS, *_JOB_OPTIONAL_KEYS))
 _JOB_KEYS_SUBJECT = frozenset((*_JOB_REQUIRED_KEYS, *_JOB_OPTIONAL_KEYS, "areas"))
 _AREA_REQUIRED_KEYS = ("name", "paths")
@@ -202,6 +209,21 @@ class Area:
     lenses: tuple[str, ...] | None = None
 
 
+# The modes `test_patches` takes. Only these: a mode the engine does not implement is refused
+# by name rather than read as one it does.
+TEST_PATCH_MODES = ("on", "off")
+_TEST_PATCH_KEYS = frozenset({"mode", "min_severity"})
+
+
+@dataclass(frozen=True)
+class TestPatchSetting:
+    """The job's ``test_patches``: ``on`` with the lowest severity a test is written for, or
+    ``off`` with none."""
+
+    mode: str
+    min_severity: str | None = None
+
+
 @dataclass(frozen=True)
 class Job:
     """A loaded job. ``root`` is absolute as given and resolved; every other path is
@@ -225,6 +247,10 @@ class Job:
     coverage: bool | None = None
     # ``None`` where the job asked none. Never handed to a unit: see :data:`_JOB_OPTIONAL_KEYS`.
     questions: str | None = None
+    # ``None`` where the job said nothing, which reads as off; see :func:`test_patch_threshold`.
+    test_patches: TestPatchSetting | None = None
+    # Paths and prefixes, normalized; copied into the snapshot beside the review, never read.
+    support: tuple[str, ...] = ()
 
 
 def is_prefix(entry: str) -> bool:
@@ -479,6 +505,68 @@ def _parse_file_list(obj: dict) -> tuple[str, ...]:
     return files
 
 
+def _parse_test_patches(raw: object) -> TestPatchSetting:
+    """``{"mode": "on", "min_severity": <level>}`` or ``{"mode": "off"}``, and nothing else.
+
+    The threshold is required with ``on`` and refused with ``off``: a threshold beside
+    ``off`` says the owner meant something the run will not do, and ``on`` without one leaves
+    the engine to pick which defects get a test, which is the owner's call."""
+    obj = _require_object(raw, "test_patches")
+    _check_keys(obj, "test_patches", _TEST_PATCH_KEYS, ("mode",))
+    mode = obj["mode"]
+    if not isinstance(mode, str) or mode not in TEST_PATCH_MODES:
+        raise JobError(
+            f"field 'test_patches.mode' must be one of: {', '.join(TEST_PATCH_MODES)} "
+            f"(found {mode!r})"
+        )
+    if mode == "off":
+        if "min_severity" in obj:
+            raise JobError(
+                "field 'test_patches.min_severity' is refused with mode 'off'; a threshold "
+                "says which defects get a test, and 'off' writes none"
+            )
+        return TestPatchSetting(mode=mode)
+    if "min_severity" not in obj:
+        raise JobError(
+            "'test_patches' is missing required field 'min_severity', which mode 'on' "
+            f"needs: the lowest severity a test is written for ({', '.join(SEVERITIES)})"
+        )
+    level = obj["min_severity"]
+    if not isinstance(level, str) or level not in SEVERITIES:
+        raise JobError(
+            f"field 'test_patches.min_severity' must be one of: {', '.join(SEVERITIES)} "
+            f"(found {level!r})"
+        )
+    return TestPatchSetting(mode=mode, min_severity=level)
+
+
+def test_patch_threshold(job: Job | Mapping[str, object]) -> str | None:
+    """The lowest severity a test is asked for, or ``None`` where test patches are off.
+
+    Takes the loaded job or the ``job.json`` a run directory keeps, which every stage after
+    ``plan`` reads; a copy that does not hold the switch reads as off, as an absent key does."""
+    if isinstance(job, Job):
+        setting = job.test_patches
+        return setting.min_severity if setting is not None and setting.mode == "on" else None
+    raw = job.get("test_patches")
+    if not isinstance(raw, Mapping) or raw.get("mode") != "on":
+        return None
+    level = raw.get("min_severity")
+    return level if isinstance(level, str) and level in SEVERITIES else None
+
+
+def _parse_support(obj: dict) -> tuple[str, ...]:
+    """The optional ``support`` list, normalized as ``exclude`` is. Empty is refused rather
+    than read as nothing, as an empty ``files`` is: a job file says what ran."""
+    support = _parse_paths(obj["support"], "support")
+    if not support:
+        raise JobError(
+            "field 'support' is present and empty; omit it to copy nothing beside the "
+            "review, or list the paths and prefixes to copy"
+        )
+    return support
+
+
 def load_job(path: str | Path) -> Job:
     """Read and strictly validate ``job.json``; raise :class:`JobError` naming the field.
 
@@ -538,6 +626,8 @@ def load_job(path: str | Path) -> Job:
             f"lets the engine decide from the tree"
         )
     questions = _parse_text(obj["questions"], "questions") if "questions" in obj else None
+    test_patches = _parse_test_patches(obj["test_patches"]) if "test_patches" in obj else None
+    support = _parse_support(obj) if "support" in obj else ()
 
     areas: tuple[Area, ...] = ()
     if partition == "subject":
@@ -549,6 +639,7 @@ def load_job(path: str | Path) -> Job:
 
     entries: list[tuple[str, str]] = [(e, f"exclude[{i}]") for i, e in enumerate(exclude)]
     entries += [(e, f"files[{i}]") for i, e in enumerate(files)]
+    entries += [(e, f"support[{i}]") for i, e in enumerate(support)]
     for i, area in enumerate(areas):
         entries += [(e, f"areas[{i}].paths[{j}]") for j, e in enumerate(area.paths)]
         entries += [(e, f"areas[{i}].also_read[{j}]") for j, e in enumerate(area.also_read)]
@@ -557,7 +648,7 @@ def load_job(path: str | Path) -> Job:
     return Job(
         path=job_path, problem=problem, root=root, exclude=exclude,
         partition=partition, lenses=lenses, areas=areas, files=files,
-        coverage=coverage, questions=questions,
+        coverage=coverage, questions=questions, test_patches=test_patches, support=support,
     )
 
 
@@ -587,7 +678,8 @@ JOB_NOTE_ORIGINS = ("stated", "defaulted", "interview")
 # The job fields the notes may speak for, which is every field an owner decides. ``problem``
 # is not among them: it is the one field with no default, so a note about it could only ever
 # say ``stated``.
-JOB_NOTE_FIELDS = ("root", "exclude", "partition", "lenses", "files", "coverage")
+JOB_NOTE_FIELDS = ("root", "exclude", "partition", "lenses", "files", "coverage",
+                   "test_patches", "support")
 # What the operator — whoever ran the panel — wrote after reading the report: answers to the
 # job's questions, corrections to what the panel concluded, and caveats about the run. An
 # INPUT to `report`, written by a person or an agent after the first report exists, and never
@@ -827,13 +919,18 @@ class Listing:
     ones the repository pins, so every build result after that describes a tree nobody has.
     Nothing else outside the review is copied: any worker may open anything in the
     snapshot, so the snapshot holds what the job chose and no more, and a lockfile names
-    package versions and nothing else. Only git supplies them; a walk has no tracked set."""
+    package versions and nothing else. Only git supplies them; a walk has no tracked set.
+
+    The one other way in is the job's ``support``: files it names, outside the review, for a
+    test to run beside. They are in ``context`` too, read by nobody, and ``support`` lists
+    which of ``context`` they are so the run can count them apart from the lockfiles."""
 
     source: str
     files: tuple[str, ...]
     skipped: tuple[Skipped, ...]
     excluded: tuple[str, ...]
     context: tuple[str, ...] = ()
+    support: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -860,6 +957,8 @@ class Inventory:
     # Copied into the snapshot and read by nobody; see :class:`Listing`. Not in
     # ``tree_sha256``, which digests what was reviewed.
     context: tuple[FileEntry, ...] = ()
+    # Which of ``context`` the job named as support, as :class:`Listing` lists them.
+    support: tuple[str, ...] = ()
 
 
 def matches(entry: str, path: str) -> bool:
@@ -1397,6 +1496,10 @@ def enumerate_files(job: Job) -> Listing:
         try:
             tree = _git_entries(job.root, tracked_only=True)
         except InventoryError:
+            # Support is matched against the tracked set, and a walk standing in for it
+            # would copy what git ignores, which is where secrets and build output live.
+            if job.support:
+                raise
             tree = None
     else:
         raw = _git_entries(job.root)
@@ -1458,9 +1561,55 @@ def enumerate_files(job: Job) -> Listing:
             f"root {job.root} holds no files to read ({len(excluded)} excluded, "
             f"{len(skipped)} skipped)"
         )
+    in_scope = set(files)
+    # Outside a repository there is no tracked set, so support is matched against the walk.
+    candidates = tree if tree is not None else (
+        raw if source == "walk" else _walk_entries(job.root) if job.support else [])
+    support = _support_files(job, candidates, in_scope, ancestors)
+    context = _context_files(job.root, tree, in_scope, ancestors)
     return Listing(source=source, files=tuple(files), skipped=tuple(skipped),
                    excluded=tuple(excluded),
-                   context=_context_files(job.root, tree, set(files), ancestors))
+                   context=tuple(sorted({*context, *support})), support=support)
+
+
+def _support_files(job: Job, candidates: Sequence[str], in_scope: set[str],
+                   ancestors: dict[str, bool]) -> tuple[str, ...]:
+    """The files the job's ``support`` entries match outside the review. See :class:`Listing`.
+
+    An entry may overlap ``exclude``, since an exclusion is often what put the tests outside
+    the review. One naming a file under review is refused: a file cannot be both reviewed and
+    read by nobody. A prefix takes what of its directory the review does not already hold, and
+    one that takes nothing is refused by name, as an exclusion matching nothing is. A path
+    that is not a plain regular file is left out, by the classification the lockfiles pass.
+    """
+    out: set[str] = set()
+    copyable: dict[str, bool] = {}
+
+    def can_copy(rel: str) -> bool:
+        if rel not in copyable:
+            try:
+                rel.encode("utf-8")
+                copyable[rel] = (not any(ch < " " or ch == "\x7f" for ch in rel)
+                                 and _classify(job.root, rel, ancestors) is None)
+            except (InventoryError, UnicodeEncodeError):
+                copyable[rel] = False
+        return copyable[rel]
+
+    for i, entry in enumerate(job.support):
+        if not is_prefix(entry) and entry in in_scope:
+            raise InventoryError(
+                f"field 'support[{i}]' {entry!r} names a file under review; support is what "
+                f"the snapshot carries beside the review, so name files outside it"
+            )
+        hits = [rel for rel in candidates
+                if rel not in in_scope and matches(entry, rel) and can_copy(rel)]
+        if not hits:
+            raise InventoryError(
+                f"field 'support[{i}]' {entry!r} matches no file outside the review under "
+                f"root; a prefix must name a directory holding one and a path must name one"
+            )
+        out.update(hits)
+    return tuple(sorted(out))
 
 
 def _context_files(root: Path, tree: list[str] | None, in_scope: set[str],
@@ -1564,6 +1713,7 @@ def measure_files(job: Job, listing: Listing) -> Inventory:
         commit=_git_commit(job.root),
         coverage=_coverage(job.root, listing.files),
         context=_measure_context(job.root, listing.context, listing.files),
+        support=listing.support,
     )
 
 
@@ -1680,6 +1830,23 @@ def write_text(path: Path, text: str) -> None:
         raise InventoryError(f"cannot write {path}: {exc}") from exc
     except BaseException:
         # As in write_json: any failure takes the scratch file with it.
+        _discard(tmp)
+        raise
+
+
+def write_bytes(path: Path, data: bytes) -> None:
+    """``write_text``'s rule for bytes that must land exactly as given, a patch's line
+    endings included."""
+    tmp = _temp_beside(path)
+    fh = _create_scratch(tmp, str(path), binary=True)
+    try:
+        with fh:
+            fh.write(data)
+        os.replace(tmp, path)
+    except OSError as exc:
+        _discard(tmp)
+        raise InventoryError(f"cannot write {path}: {exc}") from exc
+    except BaseException:
         _discard(tmp)
         raise
 
@@ -2107,6 +2274,7 @@ def write_snapshot(job: Job, inventory: Inventory, rundir: str | Path, *,
             raise
         if n >= in_scope:
             kept.append(entry)
+    support = set(inventory.support)
     write_json(rundir / "inventory.json", {
         "source": inventory.source,
         "files": [asdict(entry) for entry in inventory.files],
@@ -2117,6 +2285,10 @@ def write_snapshot(job: Job, inventory: Inventory, rundir: str | Path, *,
         # ``files``, since a changed lockfile changes a build as much as a changed source.
         # Only those actually copied: the check compares the snapshot against this list.
         "context": [asdict(entry) for entry in kept],
+        # Which of ``context`` the job named as support. Only where it named any: a job
+        # without the key has no support files to name, and its record carries no key.
+        **({"support": [entry.path for entry in kept if entry.path in support]}
+           if support else {}),
         # When these bytes were taken. The only field in a run directory that is about the
         # moment rather than about the tree, and the report's subtitle is what it is for.
         "taken": taken or "",
@@ -3003,6 +3175,13 @@ def _derived_subjects(areas: Sequence[PlannedArea]) -> dict[str, tuple[tuple[str
 COPIED_OUTSIDE_SCOPE_LINE = (
     "{n} lockfile(s) outside the review are copied into the snapshot so a build there "
     "installs the versions the repository pins; any worker may open them")
+SUPPORT_COPIED_LINE = (
+    "{n} support file(s) the job names are copied into the snapshot so a test can run there; "
+    "no reader reviews them, and any worker may open them")
+# A warning and never a refusal: a run that can only read is still a run.
+NO_TEST_IN_SNAPSHOT_LINE = (
+    "warning: test patches are on and the snapshot holds no existing test, so a test a "
+    "verifier writes may not be able to run there; name the tests in 'support' to copy them in")
 # The files that pin what a build installs. Copied even when excluded or unlisted: each
 # names package versions and where to fetch them, and a build without it resolves versions
 # the repository never pinned.
@@ -3018,9 +3197,39 @@ def is_lockfile(rel: str) -> bool:
     return rel.rsplit("/", 1)[-1] in LOCKFILE_NAMES
 
 
-def copied_outside_scope_line(context: Sequence[str]) -> str:
-    """The line saying what the snapshot carries beside the review, or ``""`` for nothing."""
-    return COPIED_OUTSIDE_SCOPE_LINE.format(n=len(context)) if context else ""
+def copied_outside_scope_line(context: Sequence[str], support: Iterable[str] = ()) -> str:
+    """The lines saying what the snapshot carries beside the review, lockfiles and support
+    counted apart, or ``""`` for nothing. ``support`` names which of ``context`` the job
+    asked for; every other entry is a lockfile."""
+    named = set(support)
+    lockfiles = sum(1 for path in context if path not in named)
+    supporting = sum(1 for path in context if path in named)
+    lines = [COPIED_OUTSIDE_SCOPE_LINE.format(n=lockfiles)] if lockfiles else []
+    if supporting:
+        lines.append(SUPPORT_COPIED_LINE.format(n=supporting))
+    return "\n".join(lines)
+
+
+def no_test_warning(threshold: str | None, paths: Iterable[str]) -> str:
+    """The warning for a run asking for test patches over a snapshot holding no test, or
+    ``""``. It predicts nothing about what will run, which the probe and the verifiers find
+    out; it says only what the engine's own test-file rule sees, at the one moment the owner
+    can still add the tests."""
+    if threshold is None or any(is_test_path(path) for path in paths):
+        return ""
+    return NO_TEST_IN_SNAPSHOT_LINE
+
+
+def as_written(inventory: Inventory, rundir: str | Path) -> Inventory:
+    """``inventory`` narrowed to the out-of-scope files the snapshot actually holds.
+    :func:`write_snapshot` leaves out one that changed or vanished after it was measured,
+    so a preview counted from the measurement could promise a support test the snapshot
+    does not have, and stay silent about a run with no test in it."""
+    written = json.loads((Path(rundir) / "inventory.json").read_text(encoding="utf-8"))
+    kept = {entry["path"] for entry in written.get("context", [])}
+    return replace(inventory,
+                   context=tuple(e for e in inventory.context if e.path in kept),
+                   support=tuple(path for path in inventory.support if path in kept))
 
 
 def preview(job: Job, inventory: Inventory, areas: Sequence[PlannedArea],
@@ -3036,9 +3245,13 @@ def preview(job: Job, inventory: Inventory, areas: Sequence[PlannedArea],
         f"({inventory.source}); {len(inventory.excluded)} excluded, "
         f"{len(inventory.skipped)} skipped"
     ]
-    copied = copied_outside_scope_line([e.path for e in inventory.context])
+    copied = copied_outside_scope_line([e.path for e in inventory.context], inventory.support)
     if copied:
         out.append(copied)
+    warning = no_test_warning(test_patch_threshold(job),
+                              [e.path for e in (*inventory.files, *inventory.context)])
+    if warning:
+        out.append(warning)
     for area in areas:
         label = area.subject or ""
         if area.part is not None:
@@ -3135,6 +3348,11 @@ PROBE_KIND = "probe"
 PROBES = 1
 PROBE_UNIT_ID = f"probe-{LANES[0]}"
 PROBE_SCHEMA_NAME = "probe-schema.json"
+# The brief section and the result property the probe is handed only on a run that asks for
+# tests, kept apart from the brief and the schema every other run sends unchanged.
+PROBE_CONVENTIONS_BRIEF_NAME = "probe-test-conventions"
+PROBE_CONVENTIONS_SCHEMA_NAME = "probe-conventions-schema.json"
+PROBE_CONVENTIONS_KEY = "conventions"
 UNITS_DIR = "units"
 # The dispatcher's own directory. The engine never READS it — a unit directory holds
 # everything the protocol names — and touches it in exactly one place: a redo removes
@@ -3936,25 +4154,65 @@ def load_reader_schema() -> dict:
     return load_schema(READER_SCHEMA_NAME)
 
 
+def _with_required_property(node: dict, key: str, prop: dict) -> dict:
+    """``node`` with ``key`` added to its properties and last in its ``required``. A new
+    object, so the shipped schema it came from is still what a run with the switch off sends."""
+    return {**node, "properties": {**node["properties"], key: prop},
+            "required": [*node["required"], key]}
+
+
+def with_conventions_property(schema: dict, conventions: dict) -> dict:
+    """The probe schema a run that asks for tests hands its probe: the shipped one with
+    ``conventions`` as one more required property."""
+    try:
+        return _with_required_property(schema, PROBE_CONVENTIONS_KEY, conventions)
+    except (KeyError, TypeError) as exc:
+        raise CompanionError(f"the schema {PROBE_SCHEMA_NAME} has no properties to add "
+                             f"`{PROBE_CONVENTIONS_KEY}` to: {exc!r}") from exc
+
+
 @dataclass(frozen=True)
 class Companions:
     """What the engine ships beside itself and every payload is built from. Loaded before
-    the first write, so a partial copy of the skill refuses with nothing on disk."""
+    the first write, so a partial copy of the skill refuses with nothing on disk.
+
+    On a run that asks for tests the probe also gets ``probe_conventions_brief`` after its
+    brief and ``probe_schema_with_conventions`` in place of its schema. Only there: with the
+    switch off its payload and ``schema.json`` carry the shipped brief and schema byte for
+    byte."""
 
     reader_brief: str
     auditor_brief: str
     probe_brief: str
     reader_schema: dict
     probe_schema: dict
+    probe_conventions_brief: str
+    probe_schema_with_conventions: dict
+
+    def probe_for(self, conventions: bool) -> tuple[str, dict]:
+        """The probe's brief and schema, with or without the ask for conventions."""
+        if not conventions:
+            return self.probe_brief, self.probe_schema
+        return (self.probe_brief.rstrip("\n") + "\n\n" + self.probe_conventions_brief,
+                self.probe_schema_with_conventions)
 
 
 def load_companions() -> Companions:
+    # In this order, so a skill copied without its references is refused for the first brief.
+    reader_brief = load_brief("reader")
+    auditor_brief = load_brief("coverage-auditor")
+    probe_brief = load_brief("probe")
+    reader_schema = load_reader_schema()
+    probe_schema = load_schema(PROBE_SCHEMA_NAME)
     return Companions(
-        reader_brief=load_brief("reader"),
-        auditor_brief=load_brief("coverage-auditor"),
-        probe_brief=load_brief("probe"),
-        reader_schema=load_reader_schema(),
-        probe_schema=load_schema(PROBE_SCHEMA_NAME),
+        reader_brief=reader_brief,
+        auditor_brief=auditor_brief,
+        probe_brief=probe_brief,
+        reader_schema=reader_schema,
+        probe_schema=probe_schema,
+        probe_conventions_brief=load_brief(PROBE_CONVENTIONS_BRIEF_NAME),
+        probe_schema_with_conventions=with_conventions_property(
+            probe_schema, load_schema(PROBE_CONVENTIONS_SCHEMA_NAME)),
     )
 
 
@@ -4059,16 +4317,20 @@ def render_auditor_payload(brief: str, problem: str, area: PlannedArea,
     return text
 
 
-def render_probe_payload(brief: str, problem: str, schema: dict | None = None) -> str:
-    """The whole of the probe's payload, from exactly these two inputs and the run's probe
-    schema: the brief, the problem statement verbatim, and the schema.
+def render_probe_payload(brief: str, problem: str, schema: dict | None = None, *,
+                         conventions: bool) -> str:
+    """The whole of the probe's payload, from exactly these inputs and the run's probe
+    schema: the brief, the problem statement verbatim, whether test conventions are asked
+    for, and the schema.
 
     No area, no file list and no lens — the probe is not reading for defects, and a payload
     that assigned it files would invite it to. The problem statement is there for the same
     reason it is in every other payload: the owner's words are what the run is about, and
-    they travel verbatim."""
+    they travel verbatim. ``conventions`` has no default, so no caller can leave out whether
+    the run asks; a run that asks for none says nothing about them."""
+    asked = [CONVENTIONS_HEADING, "\n", CONVENTIONS_ASKED, "\n"] if conventions else []
     return "".join([brief.rstrip("\n"), "\n", PROBLEM_HEADING, "\n", problem, "\n",
-                    *_schema_section(schema)])
+                    *asked, *_schema_section(schema)])
 
 
 def measure_payload(text: str) -> tuple[int, int]:
@@ -4106,8 +4368,10 @@ def write_units(rundir: Path, job: Job, inventory: Inventory, areas: Sequence[Pl
                                         inventory, schema=companions.reader_schema)
         for area in (auditor_areas(areas) if auditors.dispatch else ())
     }
-    probe_text = render_probe_payload(companions.probe_brief, job.problem,
-                                      schema=companions.probe_schema)
+    conventions = test_patch_threshold(job) is not None
+    probe_brief, probe_schema = companions.probe_for(conventions)
+    probe_text = render_probe_payload(probe_brief, job.problem, schema=probe_schema,
+                                      conventions=conventions)
     listing = []
     for unit in units:
         unit_dir = rundir / UNITS_DIR / unit.id
@@ -4121,7 +4385,7 @@ def write_units(rundir: Path, job: Job, inventory: Inventory, areas: Sequence[Pl
             schema = companions.reader_schema
         elif unit.kind == PROBE_KIND:
             text = probe_text
-            schema = companions.probe_schema
+            schema = probe_schema
         else:
             text = auditor_text[unit.area]
             schema = companions.reader_schema
@@ -4151,6 +4415,10 @@ RESULT_NAME = "result.json"
 ERROR_NAME = "error.txt"
 CANDIDATES_FILE_NAME = "candidates.json"
 VERIFIER_SCHEMA_NAME = "verifier-schema.json"
+# The brief section and the verdict property a defect verifier is handed only on a run that
+# asks for tests, kept apart from the brief and the schema every other run sends unchanged.
+VERIFIER_TEST_BRIEF_NAME = "verifier-failing-test"
+VERIFIER_TEST_SCHEMA_NAME = "verifier-failing-test-schema.json"
 COVERAGE_VERIFIER_SCHEMA_NAME = "coverage-verifier-schema.json"
 VERIFIER_KIND = "verifier"
 # The two questions a batch can put, and the two ladders a finding travels on. A reader
@@ -4246,12 +4514,25 @@ NEEDS_FILES_KEY = "needs_files"
 NEEDS_A_FILE = "needs_a_file_outside_the_scope"
 VERDICT_KEYS = VERDICT_KEYS + (NEEDS_FILES_KEY,)
 COVERAGE_VERDICT_KEYS = VERDICT_KEYS + (COVERED_BY_KEY,)
+# The failing test a defect verifier wrote in its copy, on a run that asks for one. A
+# coverage verdict has none: a gap already IS a test to write. Optional to the parser, like
+# `needs_files`, so a verdict from a run planned before the field existed still reads.
+TEST_KEY = "test"
+VERDICT_KEYS = VERDICT_KEYS + (TEST_KEY,)
+TEST_KEYS = ("files", "argv", "cwd", "exit_status", "output", "truncated", "state",
+             "fails_because", "expected_failure")
+TEST_RED = "red"
+TEST_WRITTEN_NOT_RUN = "written_not_run"
+TEST_STATES = (TEST_RED, TEST_WRITTEN_NOT_RUN)
+# The reason a red test is set aside when its output does not hold the text it promised.
+# The engine checks the message, not a model: an import error or a typo also exits non-zero.
+NOT_THE_EXPECTED_FAILURE = "failed, but not with the expected message"
 # Known to the parser, and NOT required by it — the asymmetry READER_COUNT_KEY states. An
 # enforced runtime always sends it, and a verdict written before the field existed stays
 # readable with no files named. Present and empty is a different thing and is refused
 # below: a verdict claiming a file outside the scope would settle it, and declining to say
 # which, is a claim with its own evidence withheld.
-VERDICT_REQUIRED = tuple(k for k in VERDICT_KEYS if k != NEEDS_FILES_KEY)
+VERDICT_REQUIRED = tuple(k for k in VERDICT_KEYS if k not in (NEEDS_FILES_KEY, TEST_KEY))
 COVERAGE_VERDICT_REQUIRED = tuple(k for k in COVERAGE_VERDICT_KEYS if k != NEEDS_FILES_KEY)
 STATUSES_FOR = {DEFECT_ASKS: VERDICT_STATUSES, COVERAGE_ASKS: COVERAGE_STATUSES}
 ESTABLISHED_FOR = {DEFECT_ASKS: ESTABLISHED_STATUSES, COVERAGE_ASKS: COVERAGE_ESTABLISHED}
@@ -4282,11 +4563,30 @@ EVIDENCE_KEYS = ("argv", "cwd", "exit_status", "output", "truncated", RUN_KIND_K
 EVIDENCE_REQUIRED = ("argv", "cwd", "exit_status", "output", "truncated", "shows")
 REVISION_KEYS = ("severity", "rationale")
 PROBE_ANSWERS = ("yes", "no", "unknown")
-PROBE_RESULT_KEYS = ("build", "tests", "summary")
+PROBE_RESULT_KEYS = ("build", "tests", "summary", "conventions")
+# ``conventions`` is not among them: a probe planned before the key existed still parses.
+PROBE_RESULT_REQUIRED = ("build", "tests", "summary")
 PROBE_ATTEMPT_KEYS = ("answer", "argv", "cwd", "exit_status", "output", "truncated")
 PROBE_ATTEMPTS = ("build", "tests")
+PROBE_CONVENTION_KEYS = ("suite", "runner", "run_one", "location", "naming", "helpers",
+                         "example", "rules")
+# The engine's own key on a parsed note: the paths it named that the snapshot does not hold.
+CONVENTION_DROPPED_KEY = "not_in_snapshot"
 CANDIDATES_HEADING = "\n## Candidates\n"
 PROBE_HEADING = "\n## Execution capability\n"
+CONVENTIONS_HEADING = "\n## Test conventions\n"
+TESTS_ASKED_HEADING = "\n## Tests to write\n"
+CONVENTIONS_ASKED = (
+    "This run asks for test patches. After the two answers, write one note per test suite "
+    "in `conventions`, as the brief's section on test conventions says: a later agent copies "
+    "them to write one failing test per defect.")
+# Why a reply without the key has no notes: a probe planned before the key existed was never
+# asked, so its silence says nothing about whether the tree has a test suite.
+CONVENTIONS_ABSENT = "the probe's reply carries no `conventions` key, so it wrote no notes"
+# The bound on the conventions in a verifier payload, which every batch repeats: characters
+# of one note's text, and how many notes are rendered. The route record keeps every note whole.
+CONVENTION_NOTE_CHARS = 2000
+CONVENTION_NOTES_SHOWN = 6
 PROBE_UNKNOWN_WORD = "unknown"
 # The affirmative answer, named rather than spelled at each use: the report compares against
 # it to notice a capability the work never got to use.
@@ -4451,6 +4751,35 @@ class Verdict:
     # outside the reviewed scope. Empty on every other verdict, and on one written before
     # the field existed.
     needs_files: tuple[str, ...] = ()
+    # The failing test the verifier wrote, as parsed and bounded; ``None`` where it wrote
+    # none or the engine set it aside. A test is read apart from the verdict, so one the
+    # engine cannot accept costs the test and never the judgment beside it.
+    test: dict | None = None
+    # Why a test that came back was set aside, in the engine's words; ``None`` where none was
+    # set aside.
+    test_set_aside: str | None = None
+
+
+@dataclass(frozen=True)
+class AskedTests:
+    """What a run with test patches on asks of its defect verifiers: a test for every
+    candidate established at ``threshold`` or above, judged on the severity the report
+    shows — the verifier's revision where it made one, else ``proposed``, the most severe
+    proposal, by candidate id."""
+
+    threshold: str
+    proposed: Mapping[str, str]
+
+
+def asked_tests(job: Mapping[str, object], candidates: Sequence[dict]) -> AskedTests | None:
+    """The run's ask, from the ``job.json`` its run directory keeps and its routed candidate
+    records; ``None`` where the run asks for no test."""
+    threshold = test_patch_threshold(job)
+    if threshold is None:
+        return None
+    return AskedTests(threshold, {cand["id"]: _most_severe([r["severity"]
+                                                             for r in cand["raised_by"]])
+                                  for cand in candidates})
 
 
 def _utf8(text: str, field: str, error: type[ReviewPanelError] = ResultError) -> str:
@@ -5104,6 +5433,17 @@ def asks_of(cand: dict) -> str:
 # is what a verdict usually costs, and the reply limit holds the headroom.
 VERIFICATION_REPLY_HEAD = 1024
 VERIFICATION_REPLY_PRICES = {"verdict": 2048}
+# The report keeps at most this much of a reproduction's output, the tail: the brief asks
+# the verifier for the same bound, and the parser does not enforce it on evidence. A written
+# test's output is cut to it at parse, after the expected-failure check has read it whole.
+EVIDENCE_OUTPUT_BOUND = 4096
+# A written test beside a verdict: its output at the bound, plus its files, command and the
+# two texts. Priced into every defect verdict when the run asks for tests, so a batch splits
+# rather than overrunning the reply limit; a run that does not ask carries no test, so
+# its verdicts carry no test price.
+VERIFICATION_TEST_PRICE = EVIDENCE_OUTPUT_BOUND + 2048
+VERIFICATION_REPLY_PRICES_WITH_TEST = {
+    "verdict": VERIFICATION_REPLY_PRICES["verdict"] + VERIFICATION_TEST_PRICE}
 # What a part of a split verification batch carries in its id before any coverage suffix.
 VERIFICATION_PART_MARK = "-f"
 
@@ -5118,7 +5458,8 @@ def coverage_scope(area: str, held: Sequence[Candidate]) -> tuple[str, ...]:
 
 
 def route(candidates: Sequence[Candidate], limits: RunLimits | None = None,
-          head_for: Callable[[str, tuple[str, ...]], str] | None = None) -> tuple[Batch, ...]:
+          head_for: Callable[[str, tuple[str, ...]], str] | None = None,
+          threshold: str | None = None) -> tuple[Batch, ...]:
     """One batch per (area, finder, question), the finder being the lane that raised its
     candidates, addressed to the other lane. Every candidate has exactly one raiser, so
     every batch is addressed to a lane that raised none of it, and each candidate is in
@@ -5145,6 +5486,9 @@ def route(candidates: Sequence[Candidate], limits: RunLimits | None = None,
     ``head_for(asks, scope)`` is what every payload of a batch carries besides its
     candidates — brief, problem, probe, test inventory and schema — measured into each part;
     ``scope`` is :func:`coverage_scope` for a coverage batch and empty for a defect one.
+
+    ``threshold`` is the run's test-patch threshold, ``None`` where it asks for no test: a
+    defect verdict is then priced with room for a written test beside it.
     """
     run_limits = limits if limits is not None else default_limits()
     by_id = {cand.id: cand for cand in candidates}
@@ -5176,7 +5520,9 @@ def route(candidates: Sequence[Candidate], limits: RunLimits | None = None,
                  for file, mine in sorted(by_file.items())]
         packs = pack_items(items, head=head_for(question, scope) if head_for else "",
                            reply_head=VERIFICATION_REPLY_HEAD,
-                           per_entry=VERIFICATION_REPLY_PRICES,
+                           per_entry=(VERIFICATION_REPLY_PRICES_WITH_TEST
+                                      if threshold is not None and not coverage
+                                      else VERIFICATION_REPLY_PRICES),
                            limits=run_limits.planning("verification", (lane,)),
                            hard=run_limits.hard_ceiling((lane,)))
         suffix = COVERAGE_BATCH_SUFFIX if coverage else ""
@@ -5246,7 +5592,7 @@ def _candidate_sections(candidates: Sequence[dict]) -> list[str]:
 
 
 def render_verifier_payload(brief: str, problem: str, candidates: Sequence[dict], probe: Probe,
-                            schema: dict | None = None) -> str:
+                            schema: dict | None = None, threshold: str | None = None) -> str:
     """The whole of a verifier's payload from exactly these inputs: the brief, the problem
     statement verbatim, what the capability probe established about the tree, and each
     candidate's id, location, failure, and every distinct proposal its raisers made. Who
@@ -5255,9 +5601,13 @@ def render_verifier_payload(brief: str, problem: str, candidates: Sequence[dict]
 
     ``probe`` is a declared input and has no default. The payload's byte reconstruction from
     its inputs is what makes blindness a property of the file rather than a request, and a
-    fifth input that could be left out would be a fifth input the test does not cover."""
+    fifth input that could be left out would be a fifth input the test does not cover.
+
+    ``threshold`` is the run's test-patch threshold, stated once where it is not ``None``;
+    a run that asks for no test says nothing about one."""
     out = [brief.rstrip("\n"), "\n", PROBLEM_HEADING, "\n", problem, "\n",
-           *_probe_section(probe), CANDIDATES_HEADING, *_candidate_sections(candidates)]
+           *_probe_section(probe), *_tests_asked_section(threshold),
+           CANDIDATES_HEADING, *_candidate_sections(candidates)]
     out += _schema_section(schema)
     return "".join(out)
 
@@ -5433,8 +5783,122 @@ def _fill_determined(raw: dict, field: str, keys: Sequence[str]) -> dict:
     return {**raw, **dict.fromkeys(missing)} if missing else raw
 
 
+def _test_path_parts(raw: object, field: str) -> list[str]:
+    """A path a written test names, as snapshot parts. Repository metadata is never a test's
+    file or its directory: a patch that wrote there, or a command run from there, would act
+    on the owner's repository rather than their suite."""
+    parts = _snapshot_parts(raw, field)
+    if any(part.casefold() == ".git" for part in parts):
+        raise ResultError(f"field '{field}' {raw!r} is under .git")
+    # A ':' names a drive or a stream on Windows, and a drive joined to the copy's path
+    # leaves the copy.
+    if any(":" in part for part in parts):
+        raise ResultError(f"field '{field}' {raw!r} holds a ':', which names a drive or a "
+                          f"stream rather than a file in the tree")
+    return parts
+
+
+def _parse_test_shape(raw: object, field: str) -> dict:
+    """A written test's own rules, raised as :class:`ResultError` by field. Its output is
+    returned as received; the caller checks it and then bounds it."""
+    if not isinstance(raw, dict):
+        raise ResultError(f"field '{field}' must be an object or null (found {type(raw).__name__})")
+    _check_keys(raw, field, frozenset(TEST_KEYS), TEST_KEYS, ResultError)
+    if not isinstance(raw["files"], list) or not raw["files"]:
+        raise ResultError(f"field '{field}.files' must be a non-empty list of paths")
+    files: list[str] = []
+    for i, item in enumerate(raw["files"]):
+        parts = _test_path_parts(item, f"{field}.files[{i}]")
+        if not parts:
+            raise ResultError(f"field '{field}.files[{i}]' {item!r} names no file")
+        path = "/".join(parts)
+        if path not in files:
+            files.append(path)
+    exit_status = raw["exit_status"]
+    if exit_status is not None:
+        exit_status = _integer(exit_status, f"{field}.exit_status")
+    if not isinstance(raw["truncated"], bool):
+        raise ResultError(f"field '{field}.truncated' must be true or false")
+    expected = raw["expected_failure"]
+    if expected is not None:
+        expected = _text(expected, f"{field}.expected_failure", empty_ok=True)
+    out = {
+        "files": files,
+        "argv": _argv(raw["argv"], f"{field}.argv"),
+        "cwd": "/".join(_test_path_parts(raw["cwd"], f"{field}.cwd")) or ".",
+        "exit_status": exit_status,
+        "output": _text(raw["output"], f"{field}.output", empty_ok=True),
+        "truncated": raw["truncated"],
+        "state": _one_of(raw["state"], f"{field}.state", TEST_STATES),
+        "fails_because": _text(raw["fails_because"], f"{field}.fails_because"),
+        # Blank reads as null: the field says what to look for, and blank says nothing.
+        "expected_failure": expected if expected is not None and expected.strip() else None,
+    }
+    if out["state"] == TEST_RED:
+        if out["exit_status"] is None or out["exit_status"] == 0:
+            raise ResultError(
+                f"field '{field}.exit_status' is {out['exit_status']!r} on a {TEST_RED} test; "
+                f"a test that ran and failed exits non-zero")
+        if out["expected_failure"] is None:
+            raise ResultError(
+                f"field '{field}.expected_failure' is empty on a {TEST_RED} test; the engine "
+                f"looks for that text in the output")
+    elif out["exit_status"] is not None:
+        raise ResultError(
+            f"field '{field}.exit_status' is {out['exit_status']} on a {TEST_WRITTEN_NOT_RUN} "
+            f"test; nothing ran, so there is no exit status")
+    return out
+
+
+def _parse_test(raw: object, field: str, candidate: str, status: str,
+                revision: dict | None, asked: AskedTests | None
+                ) -> tuple[dict | None, str | None]:
+    """A verdict's ``test`` and the reason it was set aside, one of them ``None`` or both.
+
+    **Never raises.** The default dispatch does not enforce the reply schema, so a malformed
+    optional field is ordinary, and a bad test costs the test and never the verdict: the
+    judgment beside it was made either way. A test the run did not ask for — test patches
+    off, a verdict not established, or a severity below the threshold — is set aside too.
+
+    A ``red`` test whose output does not hold its ``expected_failure`` is set aside, never
+    relabeled: an import error or a typo also exits non-zero. The check is a substring over
+    the output as received, line endings normalized, before the output is bounded, so the
+    engine's own cut never sets a good test aside."""
+    if raw is None:
+        return None, None
+    if asked is None:
+        return None, "test patches are off in this run, so no test was asked for"
+    if status not in ESTABLISHED_STATUSES:
+        return None, f"the verdict is {status}; a test is kept only beside an established defect"
+    severity = revision["severity"] if revision is not None else asked.proposed.get(candidate)
+    if severity not in _SEVERITY_RANK:
+        return None, "the candidate's severity is not known, so the threshold cannot be applied"
+    if _SEVERITY_RANK[severity] > _SEVERITY_RANK[asked.threshold]:
+        return None, (f"the verdict settles on {severity}, below this run's threshold of "
+                      f"{asked.threshold}")
+    try:
+        test = _parse_test_shape(raw, field)
+    except ResultError as exc:
+        return None, str(exc)
+    # A red test is an executed run of the code, and a reading verdict stands beside a
+    # documentary run only; kept, the report would say "confirmed by reading" next to a test
+    # that ran and failed. The verdict is the verifier's to give, so the test goes.
+    if test["state"] == TEST_RED and status != "reproduced":
+        return None, (f"a {TEST_RED} test is a run of the code, and the verdict is {status}; "
+                      f"a {TEST_RED} test sits only on a reproduced verdict")
+    if test["state"] == TEST_RED:
+        def lf(text: str) -> str:
+            return text.replace("\r\n", "\n")
+        if lf(test["expected_failure"]) not in lf(test["output"]):
+            cut = ("; the captured output was cut, so the text may be in the part not kept"
+                   if test["truncated"] else "")
+            return None, f"{NOT_THE_EXPECTED_FAILURE}{cut}"
+    output, cut = _bounded_output(test["output"])
+    return {**test, "output": output, "truncated": test["truncated"] or cut}, None
+
+
 def _parse_verdict(raw: object, field: str, batch: dict[str, bool],
-                   asks: str = DEFECT_ASKS) -> Verdict:
+                   asks: str = DEFECT_ASKS, asked: AskedTests | None = None) -> Verdict:
     """One verdict, against the vocabulary and the rules of the question its batch put.
 
     ``asks`` chooses both. A defect verdict and a coverage verdict are answers to different
@@ -5442,6 +5906,9 @@ def _parse_verdict(raw: object, field: str, batch: dict[str, bool],
     candidate — or a defect status on a gap — is refused here by name, the same way a
     verdict naming a candidate its batch never held is. Nothing is translated between them:
     a verifier that answered the wrong question did not answer this one.
+
+    ``asked`` is the run's test ask, ``None`` where it asks for none; see :func:`_parse_test`,
+    which reads ``test`` only after every rule of the verdict itself has passed.
     """
     if not isinstance(raw, dict):
         raise ResultError(f"'{field}' must be a JSON object (found {type(raw).__name__})")
@@ -5470,6 +5937,11 @@ def _parse_verdict(raw: object, field: str, batch: dict[str, bool],
             + f"{', '.join(allowed)}"
         )
     raw = _fill_determined(raw, field, keys)
+    # A gap already is a test to write, so a coverage verdict has no `test`. One sent anyway
+    # is dropped here rather than refused as an unknown key: a bad test costs the test.
+    stray_test = asks == COVERAGE_ASKS and raw.get(TEST_KEY) is not None
+    if asks == COVERAGE_ASKS and TEST_KEY in raw:
+        raw = {key: value for key, value in raw.items() if key != TEST_KEY}
     _check_keys(raw, field, frozenset(keys), required, ResultError)
     candidate = _text(raw["candidate"], f"{field}.candidate")
     if candidate not in batch:
@@ -5593,10 +6065,15 @@ def _parse_verdict(raw: object, field: str, batch: dict[str, bool],
             f"'{field}' ({candidate}) names files in '{NEEDS_FILES_KEY}' and its reason is "
             f"{reason!r}; only {NEEDS_A_FILE} is settled by a file this review does not cover"
         )
+    test, test_set_aside = (
+        _parse_test(raw.get(TEST_KEY), f"{field}.{TEST_KEY}", candidate, status, revision,
+                    asked) if asks == DEFECT_ASKS else
+        (None, "a coverage verdict carries no test; the gap itself is the test to write"
+         if stray_test else None))
     return Verdict(candidate=candidate, status=status, evidence=evidence,
                    rationale=rationale, revision=revision, test_first=test_first,
                    unresolved_reason=reason, covered_by=covered_by,
-                   needs_files=needs_files)
+                   needs_files=needs_files, test=test, test_set_aside=test_set_aside)
 
 
 def _candidate_of(raw: object) -> str | None:
@@ -5611,7 +6088,8 @@ def _candidate_of(raw: object) -> str | None:
 
 
 def parse_verifier_result(obj: object, unit_id: str, batch: dict[str, bool],
-                          asks: str = DEFECT_ASKS) -> tuple[tuple[Verdict, ...], tuple[str, ...]]:
+                          asks: str = DEFECT_ASKS, *, asked: AskedTests | None = None
+                          ) -> tuple[tuple[Verdict, ...], tuple[str, ...]]:
     """Strictly parse one verification result, returning its verdicts and the rejections.
 
     ``batch`` maps each candidate id in the unit to whether it carries a proposed
@@ -5634,6 +6112,8 @@ def parse_verifier_result(obj: object, unit_id: str, batch: dict[str, bool],
     ``verdicts`` not a list, an unknown top-level key, a candidate answered twice, or one
     answered that was never in the batch. In each of those the engine cannot say which
     judgment belongs to which candidate, and attributing them would be guesswork.
+
+    ``asked`` is the run's test ask, from :func:`asked_tests`; every stage passes it.
     """
     try:
         if not isinstance(obj, dict):
@@ -5647,7 +6127,7 @@ def parse_verifier_result(obj: object, unit_id: str, batch: dict[str, bool],
         for i, item in enumerate(obj["verdicts"]):
             field = f"verdicts[{i}]"
             try:
-                verdicts.append(_parse_verdict(item, field, batch, asks))
+                verdicts.append(_parse_verdict(item, field, batch, asks, asked))
                 continue
             except ResultError as exc:
                 named = _candidate_of(item)
@@ -5706,6 +6186,22 @@ class Probe:
     build: dict | None
     tests: dict | None
     summary: str | None
+    # One note per test suite, its paths checked against the snapshot. ``None`` where test
+    # patches are off, so nothing about tests reaches a verifier and the route record holds
+    # neither ``conventions`` nor ``conventions_set_aside``; empty where they are on and
+    # nothing came back.
+    conventions: tuple[dict, ...] | None = None
+    # Why the probe's notes, or some of them, were not kept: a malformed note, a value that is
+    # not a list, a reply with no key at all. Kept and written only beside ``conventions``.
+    conventions_set_aside: tuple[str, ...] = ()
+
+
+def probe_record(probe: Probe) -> dict:
+    """The probe as the route record holds it: the conventions only where they were asked for."""
+    record = asdict(probe)
+    if probe.conventions is None:
+        del record["conventions"], record["conventions_set_aside"]
+    return record
 
 
 def _parse_probe_attempt(raw: object, field: str, *, status_decides: bool) -> dict:
@@ -5771,19 +6267,129 @@ def parse_probe_result(obj: object, unit_id: str) -> dict:
     try:
         if not isinstance(obj, dict):
             raise ResultError(f"result must be a JSON object (found {type(obj).__name__})")
-        _check_keys(obj, "result", frozenset(PROBE_RESULT_KEYS), PROBE_RESULT_KEYS, ResultError)
+        _check_keys(obj, "result", frozenset(PROBE_RESULT_KEYS), PROBE_RESULT_REQUIRED,
+                    ResultError)
         out = {name: _parse_probe_attempt(obj[name], name, status_decides=name == "build")
                for name in PROBE_ATTEMPTS}
         out["summary"] = _text(obj["summary"], "summary", empty_ok=True)
+        if "conventions" in obj:
+            out["conventions"], out["conventions_set_aside"] = _parse_conventions(
+                obj["conventions"], "conventions")
+        else:
+            out["conventions"], out["conventions_set_aside"] = [], [CONVENTIONS_ABSENT]
         return out
     except ResultError as exc:
         raise ResultError(f"{unit_id}: {exc}") from None
 
 
-def read_probe_result(rundir: Path, units: Sequence[dict]) -> Probe:
+def _maybe_text(raw: object, field: str) -> str | None:
+    """A nullable text field; a blank string reads as the null it stands for."""
+    if raw is None:
+        return None
+    text = _text(raw, field, empty_ok=True)
+    return text if text.strip() else None
+
+
+def _parse_conventions(raw: object, field: str) -> tuple[list[dict], list[str]]:
+    """The probe's notes on how the tree's tests are written, one per suite, and why any were
+    set aside. **A malformed note costs that note, never the probe**: the dispatch need not
+    hold a reply to its schema, and the build and tests answers beside a bad note are still
+    the run's only record of what it could execute. Which paths exist is a separate question,
+    answered by :func:`check_convention_paths` where the snapshot is at hand."""
+    if not isinstance(raw, list):
+        return [], [f"field '{field}' must be a list (found {type(raw).__name__}); no note kept"]
+    notes, set_aside = [], []
+    for i, note in enumerate(raw):
+        try:
+            notes.append(_parse_convention(note, f"{field}[{i}]"))
+        except ResultError as exc:
+            # Escaped: the reason quotes the reply, and it is rendered into every payload.
+            set_aside.append(_writable(str(exc)))
+    return notes, set_aside
+
+
+def _parse_convention(note: object, where: str) -> dict:
+    if not isinstance(note, dict):
+        raise ResultError(f"field '{where}' must be a JSON object (found {type(note).__name__})")
+    _check_keys(note, where, frozenset(PROBE_CONVENTION_KEYS), PROBE_CONVENTION_KEYS,
+                ResultError)
+    helpers = note["helpers"]
+    if not isinstance(helpers, list):
+        raise ResultError(f"field '{where}.helpers' must be a list of paths "
+                          f"(found {type(helpers).__name__})")
+    return {
+        "suite": _text(note["suite"], f"{where}.suite"),
+        "runner": _maybe_text(note["runner"], f"{where}.runner"),
+        "run_one": None if note["run_one"] is None else _argv(note["run_one"], f"{where}.run_one"),
+        "location": _maybe_text(note["location"], f"{where}.location"),
+        "naming": _maybe_text(note["naming"], f"{where}.naming"),
+        "helpers": [_text(path, f"{where}.helpers[{n}]") for n, path in enumerate(helpers)],
+        "example": _maybe_text(note["example"], f"{where}.example"),
+        "rules": _maybe_text(note["rules"], f"{where}.rules"),
+    }
+
+
+def _snapshot_path(raw: str, files: frozenset[str], *, directory: bool) -> str | None:
+    """``raw`` as the snapshot names it, or ``None`` where the snapshot holds no such path.
+    ``directory`` also accepts a directory some snapshot file is under, and ``.``."""
+    if raw in files:
+        return raw
+    try:
+        parts = _snapshot_parts(raw, "path")
+    except ResultError:
+        return None
+    path = "/".join(parts)
+    if not parts:
+        return "." if directory else None
+    if path in files or (directory and any(f.startswith(path + "/") for f in files)):
+        return path
+    return None
+
+
+def check_convention_paths(notes: Sequence[dict], files: frozenset[str]) -> tuple[dict, ...]:
+    """Each note with every path it names checked against the snapshot's files: one that is
+    not there is dropped, and listed under :data:`CONVENTION_DROPPED_KEY` so the verifier is
+    told rather than left to find the gap. A note is kept whatever it loses, because its
+    runner and its command are still the tree's own."""
+    checked = []
+    for note in notes:
+        dropped = []
+
+        def kept(raw: str | None, *, directory: bool = False) -> str | None:
+            if raw is None:
+                return None
+            path = _snapshot_path(raw, files, directory=directory)
+            if path is None:
+                dropped.append(raw)
+            return path
+
+        suite = kept(note["suite"], directory=True)
+        # A helper may be a directory of fixtures; the example is one file to copy.
+        helpers = [path for path in (kept(raw, directory=True) for raw in note["helpers"])
+                   if path is not None]
+        example = kept(note["example"])
+        checked.append({**note, "suite": suite, "helpers": helpers, "example": example,
+                        CONVENTION_DROPPED_KEY: dropped})
+    return tuple(checked)
+
+
+def read_probe_result(rundir: Path, units: Sequence[dict],
+                      snapshot_files: frozenset[str] | None = None) -> Probe:
     """The probe unit's answer, or the explicit unknown standing for it. Never raises for a
     probe that did not come back: a run whose tree could not be probed still completes, and
-    says so."""
+    says so.
+
+    ``snapshot_files`` is every file in the snapshot where test patches are on, and ``None``
+    where they are off: the conventions are then left out entirely, whatever the probe
+    wrote, since nothing asked for them."""
+    probe = _read_probe_result(rundir, units)
+    if snapshot_files is None:
+        return replace(probe, conventions=None, conventions_set_aside=())
+    return replace(probe, conventions=check_convention_paths(probe.conventions or (),
+                                                             snapshot_files))
+
+
+def _read_probe_result(rundir: Path, units: Sequence[dict]) -> Probe:
     # ``plan`` writes exactly one, so the first is the one. A listing with two is a run
     # directory this engine did not write, and the answer to give there is still an answer
     # rather than a stop: nothing downstream is safer for the report having refused.
@@ -5815,7 +6421,8 @@ def read_probe_result(rundir: Path, units: Sequence[dict]) -> Probe:
         # input — an unknown key, say — and that input can hold a lone surrogate no UTF-8
         # write accepts, which crashed route after the batch directories existed.
         return Probe(unit_id, UNIT_FAILED, _writable(str(exc)), None, None, None)
-    return Probe(unit_id, UNIT_COMPLETE, None, parsed["build"], parsed["tests"], parsed["summary"])
+    return Probe(unit_id, UNIT_COMPLETE, None, parsed["build"], parsed["tests"], parsed["summary"],
+                 tuple(parsed["conventions"]), tuple(parsed["conventions_set_aside"]))
 
 
 def _probe_attempt_lines(label: str, attempt: dict) -> list[str]:
@@ -5852,36 +6459,131 @@ def _probe_section(probe: Probe) -> list[str]:
         out += _payload_field(f"  the probe unit {probe.state}: ", probe.reason or "no reason recorded")
         out.append("\nUnknown is not no. Judge each candidate on its own terms, and where you can "
                    "run something, run it.\n")
+    else:
+        out += _probe_attempt_lines("Whether the tree builds", probe.build)
+        out += _probe_attempt_lines("Whether its tests run", probe.tests)
+        out += _payload_field("- What the probe reported: ", probe.summary or "")
+    return out + _conventions_section(probe)
+
+
+def _tests_asked_section(threshold: str | None) -> list[str]:
+    """The run's ask for a failing test, stated once in a defect payload, or nothing at all
+    where the run asks for none."""
+    if threshold is None:
+        return []
+    return [TESTS_ASKED_HEADING,
+            f"\nThis run asks for a failing test. Write one, as the brief's section on writing "
+            f"the failing test says, for every candidate you establish at `{threshold}` or "
+            f"above, judged on the severity you settle on, your revision included. For every "
+            f"other candidate, `test` is null.\n"]
+
+
+def _convention_text(note: dict) -> str:
+    """One note as the plain text a verifier reads, every field labeled, an unknown one so."""
+    def said(value: str | None) -> str:
+        return PROBE_UNKNOWN_WORD if value is None else value
+
+    lines = [f"suite: {said(note['suite'])}",
+             f"runner: {said(note['runner'])}",
+             f"run one test: {said(None if note['run_one'] is None else json.dumps(note['run_one']))}",
+             f"where a file's tests live: {said(note['location'])}",
+             f"naming: {said(note['naming'])}",
+             f"helpers: {json.dumps(note['helpers']) if note['helpers'] else 'none named'}",
+             f"example to copy: {said(note['example'])}",
+             f"the repository's rules: {said(note['rules'])}"]
+    dropped = note.get(CONVENTION_DROPPED_KEY)
+    if dropped:
+        lines.append(f"named by the probe but not in the snapshot, so left out: {json.dumps(dropped)}")
+    return "\n".join(lines)
+
+
+def _conventions_section(probe: Probe) -> list[str]:
+    """The probe's test conventions as a verifier payload reads them, or nothing at all where
+    test patches are off. Each note is worker text, so it is fenced whole, and bounded: the
+    section is repeated into every batch."""
+    if probe.conventions is None:
+        return []
+    out = [CONVENTIONS_HEADING, "\nHow this tree's tests are written and run, one note per test "
+                                "suite, as the probe found them. A test you write follows them.\n\n"]
+    if probe.state != UNIT_COMPLETE:
+        out.append(f"- {PROBE_UNKNOWN_WORD}: the probe did not answer, so take the conventions "
+                   f"from the tests in your copy.\n")
         return out
-    out += _probe_attempt_lines("Whether the tree builds", probe.build)
-    out += _probe_attempt_lines("Whether its tests run", probe.tests)
-    out += _payload_field("- What the probe reported: ", probe.summary or "")
+    if not probe.conventions and not probe.conventions_set_aside:
+        out.append("- The probe found no test suite in this tree.\n")
+        return out
+    if probe.conventions_set_aside:
+        # Said whatever was kept, so a verifier never reads "no notes" as "no suite".
+        out.append("- Notes not kept, for these reasons; take what they would have said from the "
+                   "tests in your copy:\n")
+        out += _fenced("\n".join(probe.conventions_set_aside)[:CONVENTION_NOTE_CHARS].splitlines())
+    total = len(probe.conventions)
+    for n, note in enumerate(probe.conventions[:CONVENTION_NOTES_SHOWN], 1):
+        text = _convention_text(note)
+        out.append(f"- Note {n} of {total}:\n")
+        out += _fenced(text[:CONVENTION_NOTE_CHARS].splitlines())
+        if len(text) > CONVENTION_NOTE_CHARS:
+            out.append(f"  (cut at {CONVENTION_NOTE_CHARS} characters)\n")
+    if total > CONVENTION_NOTES_SHOWN:
+        out.append(f"- {total - CONVENTION_NOTES_SHOWN} more notes are past the bound of "
+                   f"{CONVENTION_NOTES_SHOWN} and not shown.\n")
     return out
+
+
+def with_test_property(schema: dict, test: dict) -> dict:
+    """``schema`` with ``test`` added to each verdict as one more required property: the
+    verifier schema a run that asks for tests hands its defect verifiers."""
+    try:
+        verdicts = schema["properties"]["verdicts"]
+        items = _with_required_property(verdicts["items"], TEST_KEY, test)
+        return {**schema, "properties": {**schema["properties"],
+                                         "verdicts": {**verdicts, "items": items}}}
+    except (KeyError, TypeError) as exc:
+        raise CompanionError(f"the schema {VERIFIER_SCHEMA_NAME} has no verdict to add "
+                             f"`{TEST_KEY}` to: {exc!r}") from exc
 
 
 @dataclass(frozen=True)
 class RouteCompanions:
     """What ``route`` ships beside the engine and every verification payload is built
-    from. Loaded before the first write, as ``plan``'s are."""
+    from. Loaded before the first write, as ``plan``'s are.
+
+    A defect verifier on a run that asks for tests also gets ``test_brief`` after its brief
+    and ``verifier_schema_with_test`` in place of its schema. Only there: with the switch off
+    a verifier is told nothing about a test, so its payload and ``schema.json`` carry the
+    shipped brief and schema byte for byte."""
 
     verifier_brief: str
     verifier_schema: dict
     coverage_brief: str
     coverage_schema: dict
+    test_brief: str
+    verifier_schema_with_test: dict
 
-    def brief_for(self, asks: str) -> str:
-        return self.coverage_brief if asks == COVERAGE_ASKS else self.verifier_brief
+    def brief_for(self, asks: str, threshold: str | None) -> str:
+        if asks == COVERAGE_ASKS:
+            return self.coverage_brief
+        if threshold is None:
+            return self.verifier_brief
+        return self.verifier_brief.rstrip("\n") + "\n\n" + self.test_brief
 
-    def schema_for(self, asks: str) -> dict:
-        return self.coverage_schema if asks == COVERAGE_ASKS else self.verifier_schema
+    def schema_for(self, asks: str, threshold: str | None) -> dict:
+        if asks == COVERAGE_ASKS:
+            return self.coverage_schema
+        return self.verifier_schema if threshold is None else self.verifier_schema_with_test
 
 
 def load_route_companions() -> RouteCompanions:
+    verifier_brief = load_brief("verifier")
+    verifier_schema = load_schema(VERIFIER_SCHEMA_NAME)
     return RouteCompanions(
-        verifier_brief=load_brief("verifier"),
-        verifier_schema=load_schema(VERIFIER_SCHEMA_NAME),
+        verifier_brief=verifier_brief,
+        verifier_schema=verifier_schema,
         coverage_brief=load_brief("coverage-verifier"),
         coverage_schema=load_schema(COVERAGE_VERIFIER_SCHEMA_NAME),
+        test_brief=load_brief(VERIFIER_TEST_BRIEF_NAME),
+        verifier_schema_with_test=with_test_property(
+            verifier_schema, load_schema(VERIFIER_TEST_SCHEMA_NAME)),
     )
 
 
@@ -5958,7 +6660,14 @@ def _read_job(rundir: Path) -> dict:
             raise TypeError("coverage")
         if "questions" in doc and not isinstance(doc["questions"], str):
             raise TypeError("questions")
-    except (KeyError, TypeError, AttributeError) as exc:
+        if "support" in doc and not isinstance(doc["support"], list):
+            raise TypeError("support")
+        # Every stage after `plan` reads the switch from this copy and carries it into the
+        # verifier payloads, so it is held to the job file's own rules, by the job file's
+        # own parser: a copy `load_job` would refuse is never read as some other setting.
+        if "test_patches" in doc:
+            _parse_test_patches(doc["test_patches"])
+    except (KeyError, TypeError, AttributeError, JobError) as exc:
         raise RunDirError(f"{rundir / JOB_FILE_NAME} is not a job this report can "
                           f"describe: {exc}") from exc
     return doc
@@ -6218,23 +6927,25 @@ def _scope_of(batch: Batch, held: Sequence[dict]) -> tuple[str, ...]:
 
 def render_verification_payload(companions: "RouteCompanions", problem: str, probe: Probe,
                                 tests_of: dict[str, tuple[str, ...]] | None, asks: str,
-                                scope: Sequence[str], held: Sequence[dict]) -> str:
+                                scope: Sequence[str], held: Sequence[dict], *,
+                                threshold: str | None) -> str:
     """One verification unit's payload: the coverage form, with the tests of ``scope``, for
     a coverage unit, the defect form otherwise. With no candidates it is the part every
-    unit of a batch carries, which is what :func:`route` measures each part against."""
-    schema = companions.schema_for(asks)
+    unit of a batch carries, which is what :func:`route` measures each part against.
+    ``threshold`` reaches the defect form only: a coverage verdict carries no test."""
+    brief, schema = companions.brief_for(asks, threshold), companions.schema_for(asks, threshold)
     if asks == COVERAGE_ASKS:
         return render_coverage_verifier_payload(
-            companions.coverage_brief, problem, held, probe, tests_in_scope(scope, tests_of),
-            schema=schema)
-    return render_verifier_payload(companions.verifier_brief, problem, held, probe,
-                                   schema=schema)
+            brief, problem, held, probe, tests_in_scope(scope, tests_of), schema=schema)
+    return render_verifier_payload(brief, problem, held, probe, schema=schema,
+                                   threshold=threshold)
 
 
 def write_route(rundir: Path, units_doc: dict, states: Sequence[UnitState],
                 candidates: Sequence[Candidate], batches: Sequence[Batch],
                 companions: RouteCompanions, problem: str, probe: Probe,
-                tests_of: dict[str, tuple[str, ...]] | None = None) -> None:
+                tests_of: dict[str, tuple[str, ...]] | None = None, *,
+                threshold: str | None) -> None:
     """Claim ``candidates.json``, write one ``units/<id>/`` per batch, then the route record
     into ``candidates.json``, then ``units.json`` at the verification stage listing the
     reading units and the batches. Every file lands by the exclusive-create-then-replace
@@ -6270,9 +6981,10 @@ def write_route(rundir: Path, units_doc: dict, states: Sequence[UnitState],
                 raise InventoryError(f"cannot create {unit_dir}: {exc}") from exc
             created.append(unit_dir)
             held = [by_id[cid] for cid in batch.candidates]
-            schema = companions.schema_for(batch.asks)
+            schema = companions.schema_for(batch.asks, threshold)
             text = render_verification_payload(companions, problem, probe, tests_of,
-                                               batch.asks, _scope_of(batch, held), held)
+                                               batch.asks, _scope_of(batch, held), held,
+                                               threshold=threshold)
             write_text(unit_dir / PAYLOAD_NAME, text)
             write_json(unit_dir / SCHEMA_NAME, schema)
             lines, size = measure_payload(text)
@@ -6293,7 +7005,7 @@ def write_route(rundir: Path, units_doc: dict, states: Sequence[UnitState],
             # Its own record, not a row among the reading units: the probe raises no finding,
             # so counting it as one would move the reading-unit totals the rung sentence is
             # derived from, and a run whose probe failed would read as a run that read less.
-            "probe": asdict(probe),
+            "probe": probe_record(probe),
             "units": [{
                 "id": state.id, "kind": by_unit[state.id]["kind"], "area": by_unit[state.id]["area"],
                 "lane": by_unit[state.id]["lane"], "lens": by_unit[state.id]["lens"],
@@ -10331,6 +11043,10 @@ def apply_synthesis_rounds(synthesis: Synthesis, rounds: SynthesisRounds) -> Syn
 # report — every candidate's one status, and what nobody read
 # --------------------------------------------------------------------------- #
 REPORT_NAME = "report.md"
+# Said once, near the top, where an evidence command the report prints quotes an argument:
+# the report writes commands in bash's quoting only, and the fix brief has the rest.
+REPORT_SHELL_NOTE = ("Commands in this report are written for bash. For the defects to fix, "
+                     "`fix-brief.md` adds a PowerShell version wherever PowerShell needs one.")
 FINDINGS_NAME = "findings.json"
 # Where the stamp lives between the moment it is read and the moment it is published, and
 # **what says this run has been reported**. Its own file, and deliberately NOT one of
@@ -10833,6 +11549,17 @@ UNRESOLVED_GROUPS = {
 }
 MIXED_SETTLING = "More than one thing would settle this"
 UNKNOWN_SETTLING = "No verdict was received"
+# The order the coverage gaps nothing settled are grouped in, as `_settles_record`'s
+# (case, reason): alphabetical by the heading each group prints under. A reason added to
+# UNRESOLVED_GROUPS needs its place here, and a test fails until it has one.
+GAP_SETTLING_ORDER = (
+    ("agreed", "blocked_by_the_environment"),
+    ("mixed", None),
+    ("agreed", "needs_a_file_outside_the_scope"),
+    ("agreed", "needs_a_product_decision"),
+    ("agreed", "needs_a_run"),
+    ("unanswered", None),
+)
 # The three named prose parts a judged defect renders, and the line that carries its
 # surviving cross-references. They replace the `Reported:`, `Direction:` and
 # verdict-rationale bullets, which stay in `findings.json` — the narrative and the
@@ -10926,9 +11653,6 @@ CONTAINMENT_LINE = (
     "snapshot paths, none under the source root. It claims nothing stronger."
 )
 EVERY_UNIT_RETURNED = "Every unit returned a valid result."
-# The report keeps at most this much of a reproduction's output, the tail: the brief asks
-# the verifier for the same bound, and the parser does not enforce it.
-EVIDENCE_OUTPUT_BOUND = 4096
 # What the report says about a quotation that did not match, and about one it could not
 # check. The first is a warning a reader acts on — the lines below may not be the lines the
 # finding is about — and the engine says what it did NOT do, so nobody reads the snippet as
@@ -11016,6 +11740,295 @@ def extract_snippet(snapshot: Path, record_file: str, line_start: int,
             "cites_from": line_start, "cites_to": line_end}
 
 
+# --------------------------------------------------------------------------- #
+# test patches — the verifier's written test, diffed out of its copy
+# --------------------------------------------------------------------------- #
+# Written by the driver into the unit's directory as it lands the reply, the last moment the
+# verifier's copy is sure to exist, and read back here beside the unit's result.
+TEST_PATCHES_NAME = "test-patches.json"
+TEST_NEW_FILE = "new_file"
+TEST_EDITS_EXISTING = "edits_existing"
+# A patch is carried whole in the unit record and in `findings.json`; one larger than this
+# is a fixture, not a test, and costs the test its patch rather than bloating the record.
+TEST_PATCH_BYTES = 256 * 1024
+# The most lines either side of an edit's changed middle may hold for `difflib` to diff it.
+# SequenceMatcher's cost grows faster than quadratically on repetitive lines (a thousand
+# lines can take seconds, two thousand minutes), and it runs before `result.json` lands; a
+# larger middle is written as one hunk replacing it, which is as valid and costs one pass.
+TEST_DIFF_LINES = 300
+_ALL_OR_NOTHING = ("so the test ships no patch: a patch missing one of its files would fail "
+                   "for a reason the review never saw")
+NO_WORKING_COPY = ("the verifier's working copy was not there when its reply landed, so "
+                   "nothing could be diffed")
+LINKED_ROOT = ("the {} is a link or a junction rather than a directory, so nothing under it "
+               "was read")
+# git's C-style escapes for a quoted path name.
+_GIT_ESCAPES = {0x07: "a", 0x08: "b", 0x09: "t", 0x0A: "n", 0x0B: "v", 0x0C: "f",
+                0x0D: "r", 0x22: '"', 0x5C: "\\"}
+
+
+def _git_quoted(name: str) -> str:
+    """``name`` as git writes it in a patch header. A name holding a control character, a
+    quote, a backslash or any byte outside ASCII is quoted and escaped exactly as git's
+    default ``core.quotePath`` does, so ``git apply`` reads the name back byte for byte;
+    every other name is written bare. Quoting rather than refusing keeps a non-ASCII test
+    file deliverable."""
+    raw = name.encode("utf-8", "surrogateescape")
+    if not any(b < 0x20 or b in (0x22, 0x5C) or b >= 0x7F for b in raw):
+        return name
+    out = []
+    for b in raw:
+        if b in _GIT_ESCAPES:
+            out.append("\\" + _GIT_ESCAPES[b])
+        elif b < 0x20 or b >= 0x7F:
+            out.append(f"\\{b:03o}")
+        else:
+            out.append(chr(b))
+    return '"' + "".join(out) + '"'
+
+
+def _patch_lines(text: str) -> list[str]:
+    """Lines split on ``\\n`` alone, each keeping its ending: a ``\\r`` stays part of its
+    line, as git keeps it, and a last line without ``\\n`` stays without one."""
+    parts = text.split("\n")
+    return [part + "\n" for part in parts[:-1]] + ([parts[-1]] if parts[-1] else [])
+
+
+def _hunk_range(start: int, stop: int) -> str:
+    """One side of a hunk header, as git and ``difflib.unified_diff`` both write it."""
+    length = stop - start
+    if length == 1:
+        return f"{start + 1}"
+    return f"{start + 1 if length else start},{length}"
+
+
+def _opcodes(old: list[str], new: list[str]) -> list[tuple[str, int, int, int, int]]:
+    """``difflib``'s opcodes from ``old`` to ``new``, bounded: the common head and tail are
+    matched in one pass, and only a changed middle within :data:`TEST_DIFF_LINES` on both
+    sides is handed to ``SequenceMatcher``. A larger middle is one replacement."""
+    head, shorter = 0, min(len(old), len(new))
+    while head < shorter and old[head] == new[head]:
+        head += 1
+    tail = 0
+    while tail < shorter - head and old[-1 - tail] == new[-1 - tail]:
+        tail += 1
+    old_end, new_end = len(old) - tail, len(new) - tail
+    if max(old_end, new_end) - head <= TEST_DIFF_LINES:
+        middle = [(tag, i1 + head, i2 + head, j1 + head, j2 + head)
+                  for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(
+                      None, old[head:old_end], new[head:new_end], autojunk=False).get_opcodes()]
+    else:
+        middle = [("replace", head, old_end, head, new_end)]
+    middle = [code for code in middle if code[1] != code[2] or code[3] != code[4]]
+    return ([("equal", 0, head, 0, head)] if head else []) + middle + (
+        [("equal", old_end, len(old), new_end, len(new))] if tail else [])
+
+
+def _grouped(codes: list[tuple[str, int, int, int, int]], context: int = 3):
+    """The opcodes cut into hunks with ``context`` lines around each change, as
+    ``SequenceMatcher.get_grouped_opcodes`` cuts its own."""
+    if not codes:
+        return
+    if codes[0][0] == "equal":
+        tag, i1, i2, j1, j2 = codes[0]
+        codes[0] = tag, max(i1, i2 - context), i2, max(j1, j2 - context), j2
+    if codes[-1][0] == "equal":
+        tag, i1, i2, j1, j2 = codes[-1]
+        codes[-1] = tag, i1, min(i2, i1 + context), j1, min(j2, j1 + context)
+    group: list[tuple[str, int, int, int, int]] = []
+    for tag, i1, i2, j1, j2 in codes:
+        if tag == "equal" and i2 - i1 > 2 * context:
+            group.append((tag, i1, min(i2, i1 + context), j1, min(j2, j1 + context)))
+            yield group
+            group = []
+            i1, j1 = max(i1, i2 - context), max(j1, j2 - context)
+        group.append((tag, i1, i2, j1, j2))
+    if group and not (len(group) == 1 and group[0][0] == "equal"):
+        yield group
+
+
+def _hunks(old: list[str], new: list[str]) -> str:
+    """The unified hunks from ``old`` to ``new``, three lines of context, with git's marker
+    after a line that has no final newline."""
+    def line(mark: str, text: str) -> str:
+        return mark + text if text.endswith("\n") else (
+            mark + text + "\n\\ No newline at end of file\n")
+    out: list[str] = []
+    for group in _grouped(_opcodes(old, new)):
+        out.append(f"@@ -{_hunk_range(group[0][1], group[-1][2])} "
+                   f"+{_hunk_range(group[0][3], group[-1][4])} @@\n")
+        for tag, i1, i2, j1, j2 in group:
+            if tag == "equal":
+                out.extend(line(" ", text) for text in old[i1:i2])
+                continue
+            out.extend(line("-", text) for text in old[i1:i2])
+            out.extend(line("+", text) for text in new[j1:j2])
+    return "".join(out)
+
+
+def _under(base: PurePath, parts: Sequence[str]) -> bool:
+    """Whether joining ``parts`` to ``base`` names a path inside it, by ``base``'s own
+    rules: each part one plain name, so no drive, separator, ``..`` or empty part can turn
+    the join into some other place."""
+    if any(part in ("", ".", "..") or ":" in part or "/" in part or "\\" in part
+           for part in parts):
+        return False
+    joined = base.joinpath(*parts)
+    return joined.parts == base.parts + tuple(parts)
+
+
+def _regular_bytes(base: Path, parts: Sequence[str]) -> bytes | None:
+    """The bytes of the regular file at ``parts`` under ``base``, or ``None`` where there is
+    none. Every component is asked with ``lstat``, so a link anywhere on the way — to a file
+    or to a directory outside the tree — is not a file this tree holds. At most one byte
+    past :data:`TEST_PATCH_BYTES` is read, so a file too large to deliver is never held
+    whole; the caller refuses it by its length."""
+    if not _under(base, parts):
+        return None
+    path = base
+    for i, part in enumerate(parts):
+        path = path / part
+        try:
+            info = os.lstat(path)
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        last = i == len(parts) - 1
+        if stat.S_ISLNK(info.st_mode) or _is_junction(path):
+            return None
+        if not (stat.S_ISREG(info.st_mode) if last else stat.S_ISDIR(info.st_mode)):
+            return None
+    with open(path, "rb") as handle:
+        return handle.read(TEST_PATCH_BYTES + 1)
+
+
+def _patch_text(data: bytes, rel: str, where: str) -> str:
+    """A file's bytes as patch text, raising :class:`ValueError` with the reason where git
+    would call it binary or it is not UTF-8."""
+    if b"\0" in data:
+        raise ValueError(f"declared file {rel!r} is binary in the {where}")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError(f"declared file {rel!r} is not UTF-8 text in the {where}") from None
+
+
+def _file_patch(snapshot: Path, copy: Path, rel: str, prefix: str) -> tuple[str, str]:
+    """One declared file's git-style patch and its kind, or :class:`ValueError` with the
+    reason it cannot be delivered."""
+    parts = rel.split("/")
+    if not (_under(copy, parts) and _under(snapshot, parts)):
+        raise ValueError(f"declared file {rel!r} is not a plain path inside the tree")
+    new = _regular_bytes(copy, parts)
+    if new is None:
+        raise ValueError(f"declared file {rel!r} is not a regular file in the copy")
+    try:
+        os.lstat(snapshot.joinpath(*parts))
+        present = True
+    except (FileNotFoundError, NotADirectoryError):
+        present = False
+    old = _regular_bytes(snapshot, parts) if present else b""
+    if old is None:
+        raise ValueError(f"declared file {rel!r} is not a regular file in the snapshot")
+    if max(len(old), len(new)) > TEST_PATCH_BYTES:
+        raise ValueError(f"declared file {rel!r} is over the {TEST_PATCH_BYTES} bytes a "
+                         f"test's patch may be")
+    if present and old == new:
+        raise ValueError(f"declared file {rel!r} is unchanged from the snapshot")
+    old_text = _patch_text(old, rel, "snapshot")
+    new_text = _patch_text(new, rel, "copy")
+    name = f"{prefix}/{rel}" if prefix else rel
+    # git ends a file line with a tab when the name holds a space, so the name has an end.
+    tab = "\t" if " " in name else ""
+    a, b = _git_quoted(f"a/{name}"), _git_quoted(f"b/{name}")
+    hunks = _hunks(_patch_lines(old_text), _patch_lines(new_text))
+    head = [f"diff --git {a} {b}\n"]
+    if not present:
+        executable = os.name != "nt" and os.stat(copy.joinpath(*parts)).st_mode & stat.S_IXUSR
+        head.append(f"new file mode {'100755' if executable else '100644'}\n")
+    if hunks:
+        head += [f"--- {'/dev/null' if not present else a + tab}\n", f"+++ {b}{tab}\n"]
+    return "".join(head) + hunks, TEST_EDITS_EXISTING if present else TEST_NEW_FILE
+
+
+def diff_test_files(snapshot: Path, copy: Path | None, verdicts: Sequence["Verdict"],
+                    prefix: str = "") -> tuple[dict, ...]:
+    """One record per verdict carrying a test: its declared files, each a ``new_file`` or an
+    edit of one the snapshot holds, diffed from ``copy`` against ``snapshot`` into one
+    git-style patch, or the reason there is none.
+
+    Only the declared files are diffed; whatever else the copy holds — a reproduction's
+    scratch, build output — is in no patch. **A test's patch is all of its declared files
+    or nothing**: a file that is binary, not UTF-8, not a regular file in the copy,
+    unchanged, or declared by another test in the same batch costs the whole test its
+    patch, and never the verdict. ``prefix`` is the root's place in its repository
+    (``coverage.root``): paths in the patch start there, so it applies from the
+    repository's top, and from the root itself where the prefix is empty."""
+    tested = [v for v in verdicts if v.test is not None]
+    claims: dict[str, int] = {}
+    for verdict in tested:
+        for rel in verdict.test["files"]:
+            claims[rel] = claims.get(rel, 0) + 1
+    roots = {"working copy": copy, "snapshot": snapshot}
+    linked = next((name for name, root in roots.items()
+                   if root is not None and _linked(root)), None)
+    copy_there = copy is not None and _plain_dir(copy)
+    records: list[dict] = []
+    for verdict in tested:
+        files = list(verdict.test["files"])
+        record = {"candidate": verdict.candidate, "patch": None,
+                  "files": [{"path": rel, "kind": None} for rel in files], "reason": None}
+        try:
+            if linked is not None:
+                raise ValueError(LINKED_ROOT.format(linked))
+            if not copy_there:
+                raise ValueError(NO_WORKING_COPY)
+            shared = [rel for rel in files if claims[rel] > 1]
+            if shared:
+                raise ValueError(f"declared file {shared[0]!r} is also declared by another "
+                                 f"test in this batch, {_ALL_OR_NOTHING}")
+            pieces, kinds = [], []
+            for rel in files:
+                try:
+                    piece, kind = _file_patch(snapshot, copy, rel, prefix)
+                except UnicodeEncodeError:
+                    raise ValueError(f"declared file {rel!r} cannot be spelled in this "
+                                     f"host's file name encoding, {_ALL_OR_NOTHING}") from None
+                except ValueError as exc:
+                    raise ValueError(f"{exc}, {_ALL_OR_NOTHING}") from None
+                pieces.append(piece)
+                kinds.append(kind)
+            patch = "".join(pieces)
+            size = len(patch.encode("utf-8", "surrogateescape"))
+            if size > TEST_PATCH_BYTES:
+                raise ValueError(f"the patch is {size} bytes, over the {TEST_PATCH_BYTES} a "
+                                 f"test's patch may be")
+        except ValueError as exc:
+            record["reason"] = str(exc)
+        except OSError as exc:
+            _stop_on_a_storage_fault("a file in the verifier's working copy", exc)
+            record["reason"] = f"a declared file could not be read: {_os_reason(exc)}"
+        else:
+            record["patch"] = patch
+            record["files"] = [{"path": rel, "kind": kind} for rel, kind in zip(files, kinds)]
+        records.append(record)
+    return tuple(records)
+
+
+def _linked(path: Path) -> bool:
+    """Whether ``path`` is a symlink or a junction: a root whose reads land somewhere else."""
+    try:
+        return stat.S_ISLNK(os.lstat(path).st_mode) or _is_junction(path)
+    except OSError:
+        return False
+
+
+def _plain_dir(path: Path) -> bool:
+    try:
+        return stat.S_ISDIR(os.lstat(path).st_mode) and not _is_junction(path)
+    except OSError:
+        return False
+
+
 class ReportError(ReviewPanelError):
     """The verification results contradict the routing the run directory records. A stop
     naming the unit and the candidate, not a failed unit: a verifier answering for a
@@ -11045,6 +12058,9 @@ class VerificationState:
     verdicts: tuple[Verdict, ...]
     rejected: tuple[str, ...] = ()
     summary: str | None = None
+    # Each tested candidate's patch record, from the unit's ``test-patches.json``; empty
+    # where the run asks for no test or the unit has no such file.
+    patches: Mapping[str, dict] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -11083,6 +12099,13 @@ class Resolved:
     # as well for a candidate whose unit came back and whose verdict could not be read:
     # what stands in for that verdict is the engine's, and nobody answered.
     answered: bool
+    # The verifier's written test and the reason one was set aside, carried like
+    # ``needs_files``: the record a patch and the fix brief are built from needs them.
+    test: dict | None = None
+    test_set_aside: str | None = None
+    # The patch the engine made of that test, or why there is none; ``None`` where the
+    # verdict carries no test or nothing recorded one.
+    test_patch: dict | None = None
 
 
 def _leaked_candidates(obj: object, batch: dict[str, bool]) -> list[str]:
@@ -11096,7 +12119,8 @@ def _leaked_candidates(obj: object, batch: dict[str, bool]) -> list[str]:
 
 
 def read_verification_results(rundir: Path, batches: Sequence[dict],
-                              reproducible: dict[str, bool]) -> tuple[VerificationState, ...]:
+                              reproducible: dict[str, bool], *,
+                              asked: AskedTests | None) -> tuple[VerificationState, ...]:
     """Classify every verification unit as exactly one of complete, failed or missing.
 
     A result whose SHAPE the parser refuses — a missing verdict, a repeated one, a
@@ -11105,7 +12129,8 @@ def read_verification_results(rundir: Path, batches: Sequence[dict],
     batch answered short is not partly right. A single unreadable VERDICT inside an
     otherwise well-formed result costs its own candidate alone; see
     :func:`parse_verifier_result` for why the two are different. ``reproducible`` maps
-    every candidate id to whether it carries a proposed reproduction.
+    every candidate id to whether it carries a proposed reproduction, and ``asked`` is the
+    run's test ask from :func:`asked_tests`, with no default so no stage can forget it.
     """
     states: list[VerificationState] = []
     for unit in batches:
@@ -11126,16 +12151,125 @@ def read_verification_results(rundir: Path, batches: Sequence[dict],
             )
         try:
             verdicts, rejected = parse_verifier_result(payload, unit["id"], batch,
-                                                       unit.get("asks", DEFECT_ASKS))
+                                                       unit.get("asks", DEFECT_ASKS),
+                                                       asked=asked)
         except ResultError as exc:
             states.append(VerificationState(unit["id"], UNIT_FAILED, str(exc), ()))
             continue
         # Read here rather than returned by the parse, whose two-value shape a dozen
         # callers unpack. The parse has already proved the field is text; this normalizes
         # it the way every other worker string is normalized before it is carried.
-        states.append(VerificationState(unit["id"], UNIT_COMPLETE, None, verdicts, rejected,
-                                        _text(payload["summary"], "summary", empty_ok=True)))
+        states.append(VerificationState(
+            unit["id"], UNIT_COMPLETE, None, verdicts, rejected,
+            _text(payload["summary"], "summary", empty_ok=True),
+            read_test_patches(rundir, unit["id"], verdicts) if asked is not None else {}))
     return tuple(states)
+
+
+def _test_patch_entry(entry: dict) -> dict | None:
+    """One ``test-patches.json`` entry as a candidate's patch record, or ``None`` where it
+    is not one."""
+    files = entry.get("files")
+    patch, reason = entry.get("patch"), entry.get("reason")
+    # A delivered patch knows what each of its files is; only one with none may not.
+    kinds = ((TEST_NEW_FILE, TEST_EDITS_EXISTING) if patch is not None
+             else (TEST_NEW_FILE, TEST_EDITS_EXISTING, None))
+    # Every key the driver writes is present, null or not: an entry missing one is not it.
+    if (not {"patch", "files", "reason"} <= entry.keys() or not isinstance(files, list)
+            or not all(isinstance(f, dict) and isinstance(f.get("path"), str)
+                       and "kind" in f and f["kind"] in kinds
+                       for f in files)
+            or (patch is None) == (reason is None)
+            or not isinstance(patch if patch is not None else reason, str)
+            or (patch is not None and not _encodes(patch))):
+        return None
+    out = {"patch": patch, "files": files, "reason": reason}
+    # The command as the owner runs it, where the landing wrote one; ``None`` where it could
+    # not be given relative to their checkout. A record without the key reads as the
+    # verifier's own command.
+    if "argv" in entry:
+        argv = entry["argv"]
+        if argv is not None and not (isinstance(argv, list) and argv
+                                     and all(isinstance(a, str) and _encodes(a) for a in argv)):
+            return None
+        out["argv"] = argv
+    return out
+
+
+def _encodes(text: str) -> bool:
+    """Whether ``text`` has a UTF-8 encoding. A patch is written as exactly those bytes, and
+    a JSON escape can spell a lone surrogate, which has none."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _test_patch_entries(doc: object) -> dict[str, dict | None]:
+    """``test-patches.json``'s entries by candidate, ``None`` for one that is not a patch
+    record, so a malformed entry costs its own test alone. :class:`ValueError` where the
+    file as a whole is not the driver's record."""
+    if not isinstance(doc, dict) or not isinstance(doc.get("tests"), list):
+        raise ValueError("it holds no list of tests")
+    if doc.get("reason") is not None and not isinstance(doc["reason"], str):
+        raise ValueError("its reason is not text")
+    entries: dict[str, dict | None] = {}
+    for entry in doc["tests"]:
+        if not isinstance(entry, dict) or not isinstance(entry.get("candidate"), str):
+            continue
+        cid = entry["candidate"]
+        # Two entries for one test leave nothing to choose between.
+        entries[cid] = None if cid in entries else _test_patch_entry(entry)
+    return entries
+
+
+def read_test_patches(rundir: Path, unit_id: str,
+                      verdicts: Sequence[Verdict]) -> dict[str, dict]:
+    """Each tested candidate's patch record from the unit's ``test-patches.json``. A unit
+    without the file — a run by hand, or one planned before the driver wrote it — reads as
+    no patches. A record that cannot be read, or that answers for a test other than the one
+    the verdict carries, costs each test its patch with the reason, never the verdict."""
+    tested = {v.candidate: v.test for v in verdicts if v.test is not None}
+    if not tested:
+        return {}
+    path = rundir / UNITS_DIR / unit_id / TEST_PATCHES_NAME
+
+    def none(test: dict, reason: str) -> dict:
+        return {"patch": None, "files": [{"path": rel, "kind": None} for rel in test["files"]],
+                "reason": reason}
+    try:
+        if not _is_regular_file(path):
+            return {}
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        _stop_on_a_storage_fault(f"{TEST_PATCHES_NAME} of unit {unit_id}", exc)
+        return {cid: none(test, f"{TEST_PATCHES_NAME} could not be read: {_os_reason(exc)}")
+                for cid, test in tested.items()}
+    except (ValueError, RecursionError):
+        return {cid: none(test, f"{TEST_PATCHES_NAME} is not valid JSON")
+                for cid, test in tested.items()}
+    try:
+        entries = _test_patch_entries(doc)
+    except ValueError as exc:
+        return {cid: none(test, f"{TEST_PATCHES_NAME} is not the driver's record: {exc}")
+                for cid, test in tested.items()}
+    out: dict[str, dict] = {}
+    for cid, test in tested.items():
+        entry = entries.get(cid)
+        if doc.get("reason") is not None:
+            out[cid] = none(test, doc["reason"])
+        elif cid not in entries:
+            out[cid] = none(test, f"{TEST_PATCHES_NAME} holds no record of this test")
+        elif entry is None:
+            out[cid] = none(test, f"this test's entry in {TEST_PATCHES_NAME} is not a "
+                                  f"patch record")
+        elif [f["path"] for f in entry["files"]] != list(test["files"]):
+            out[cid] = none(test, f"the record in {TEST_PATCHES_NAME} does not match the "
+                                  f"files this test declares")
+        else:
+            out[cid] = entry
+    return out
 
 
 def check_routing(candidates: Sequence[dict], batches: Sequence[dict]) -> dict[str, dict]:
@@ -11196,7 +12330,9 @@ def resolve(candidates: Sequence[dict], holder: dict[str, dict],
             out[cid] = Resolved(cid, batch["id"], batch["lane"], verdict.status, verdict.evidence,
                                 verdict.rationale, verdict.revision, verdict.test_first,
                                 verdict.unresolved_reason, verdict.covered_by,
-                                verdict.needs_files, verdict.from_verifier)
+                                verdict.needs_files, verdict.from_verifier,
+                                verdict.test, verdict.test_set_aside,
+                                state.patches.get(cid))
         else:
             why = (f"not verified: verification unit {batch['id']} was never dispatched, "
                    f"because {state.reason}"
@@ -11208,12 +12344,6 @@ def resolve(candidates: Sequence[dict], holder: dict[str, dict],
                 None, None, None, None, (), False,
             )
     return out
-
-
-def _where(cand: dict) -> str:
-    if cand["line_start"] == cand["line_end"]:
-        return f"line {cand['line_start']}"
-    return f"lines {cand['line_start']}-{cand['line_end']}"
 
 
 @dataclass(frozen=True)
@@ -11321,17 +12451,30 @@ def _defect_verification_words(cluster: dict, members: Sequence[dict]) -> str:
     """The same phrase for a whole defect, from the member whose method the defect's own
     `axis_b` came from. Two places print this claim, and a fix to one of them alone is a
     disagreement between the header and the line below it."""
+    return _render_verification(_verification_record(cluster, members))
+
+
+def _verification_record(cluster: dict, members: Sequence[dict]) -> dict:
+    """Which member's run earned the defect's verification claim, as the run's kind:
+    ``matched`` is false where no member has the defect's own method."""
     # Both documentary and executed evidence carry `by running`, so the FIRST member
     # matching the axis is not necessarily the one that earned the defect's claim. An
     # executed member is looked for first and the first matching member only after, so the
     # header never says a grep settled a defect something was run for, whatever the order.
     candidates = [r for r in members if r["axis_b"] == cluster["axis_b"]]
-    for record in candidates:
-        if (record["evidence"] or {}).get(RUN_KIND_KEY) == "executed":
-            return _verification_words(cluster["axis_b"], record["evidence"])
-    for record in candidates:
-        return _verification_words(cluster["axis_b"], record["evidence"])
-    return cluster["axis_b"]
+    chosen = next((r for r in candidates
+                   if (r["evidence"] or {}).get(RUN_KIND_KEY) == "executed"),
+                  candidates[0] if candidates else None)
+    return {"axis_b": cluster["axis_b"], "matched": chosen is not None,
+            "kind": (chosen["evidence"] or {}).get(RUN_KIND_KEY) if chosen else None}
+
+
+def _render_verification(record: dict) -> str:
+    """:func:`_verification_words` for the run :func:`_verification_record` chose, or the
+    method as it is named where no member has it."""
+    if not record["matched"]:
+        return record["axis_b"]
+    return _verification_words(record["axis_b"], {RUN_KIND_KEY: record["kind"]})
 
 
 def _clustering_records(candidates: Sequence[dict], clustering: Clustering,
@@ -11504,6 +12647,16 @@ def _outside_scope_records(records: Sequence[dict]) -> tuple[dict, ...]:
     )
 
 
+def _test_patch_pointer(answer: Resolved) -> dict | None:
+    """What ``findings.json`` says of a candidate's patch: its files, the reason it has
+    none, and the unit whose ``test-patches.json`` holds it. Never the text: a patch lives in
+    the unit's record and in the fix brief's directory, and nowhere else."""
+    if answer.test_patch is None:
+        return None
+    return {"unit": answer.unit, "files": answer.test_patch["files"],
+            "reason": answer.test_patch["reason"]}
+
+
 def build_findings(dispatch: DispatchRecord, candidates: Sequence[dict],
                    resolved: dict[str, Resolved], clustering: Clustering,
                    cluster_states: Sequence[ClusterState], commit: dict,
@@ -11513,7 +12666,8 @@ def build_findings(dispatch: DispatchRecord, candidates: Sequence[dict],
                    batches: Sequence[dict] = (),
                    grouping: Sequence[Sequence[str]] | None = None,
                    merge: dict | None = None,
-                   merge_check: dict | None = None) -> Findings:
+                   merge_check: dict | None = None,
+                   tests_asked: bool = False) -> Findings:
     """Every qualifier a rendering can show, carried as its own field.
 
     The severity rule the report ranks by is applied once, here: the verifier's revision
@@ -11565,6 +12719,10 @@ def build_findings(dispatch: DispatchRecord, candidates: Sequence[dict],
     **A defect of several sites exists only where ``merge_check`` upheld it**: a group with
     exactly its sites, a stated mechanism and one instance per site. Whoever built
     ``grouping``, one that puts sites together without that is refused here.
+
+    ``tests_asked`` is whether the run asked for test patches. Only then does a candidate
+    record carry ``test``, ``test_set_aside`` and ``test_patch``; a run that did not has
+    no test to record, so its records hold none of the three.
     """
     cluster_of = {cid: cluster for cluster in clustering.clusters for cid in cluster.members}
     defects = group_sites(clustering, grouping)
@@ -11619,6 +12777,9 @@ def build_findings(dispatch: DispatchRecord, candidates: Sequence[dict],
             # How many OTHER candidates share this site. The renderer shows a member's own
             # location only where there is another one to tell it apart from.
             "siblings": len(cluster_of[cand["id"]].members) - 1,
+            **({"test": answer.test, "test_set_aside": answer.test_set_aside,
+                "test_patch": _test_patch_pointer(answer)}
+               if tests_asked else {}),
         })
     by_id = {record["id"]: record for record in records}
     sites: list[dict] = []
@@ -12012,39 +13173,88 @@ EVIDENCE_FENCE_LANG = "console"
 # What the folded block is called when it is closed. Says what is inside it, so a
 # reader knows whether to open it.
 EVIDENCE_FOLD_SUMMARY = "Captured output"
+# The language tags on a command the report prints: one for bash, and one written as its argv
+# in JSON. A block carrying either is never replaced by a pointer to another site: a command is
+# what a reader copies, and the pointer would call it output.
+COMMAND_FENCE_LANG = "bash"
+ARGV_FENCE_LANG = "json"
 
 
-def _shell_line(argv: Sequence[str]) -> str:
-    """The command as somebody would type it.
+def _printed_as_bash(argv: Sequence[str]) -> bool:
+    """The report prints this evidence command as a bash block, and as its argv otherwise.
 
-    It rendered as a JSON array, so a command holding a pipe, a backslash or a `>` arrived
-    as `\\\\|` and `&gt;=` -- unreadable, and not a thing anyone could paste. `shlex.quote`
-    quotes only what a shell would need quoted, which is the same rule a person follows.
+    Decided on the argv alone, so the record can decide its shell note without formatting
+    anything, and :func:`_render_evidence` asks the same question, so the two cannot
+    disagree. A fenced block is literal and keeps every space, tab and LF, so only a line
+    break other than LF is refused: the lines of a code block are rejoined with LF.
     """
-    # A newline INSIDE an argument cannot survive: a code span is one line, and collapsing
-    # the whitespace turns `python3 -c 'print(1)\nprint(2)'` into two statements on one
-    # line, which is a syntax error for anyone who copies it. The shell line is offered for
-    # the commands it can represent, and the rest keep the form that preserves them.
-    if any("\n" in part or "\r" in part for part in argv):
-        return ""
-    return " ".join(shlex.quote(part) for part in argv)
+    return not _breaks_a_command_line(argv)
 
 
-def _as_code(text: str) -> str:
-    """Worker text in a code span, or as prose where a span cannot hold it.
+def _argv_json(argv: Sequence[str]) -> str:
+    """``argv`` as a JSON array that one line of prose prints unchanged.
 
-    The content is escaped like every other worker string on an open line, and a code span
-    is NOT an exception to that. :func:`render_html` converts a span with
-    ``<code>{content}</code>`` and undoes only the writer's BACKSLASH escaping -- HTML's is
-    kept, which is what lets non-fenced text pass straight through. So a span whose content
-    skipped the escape puts a raw ``<!--`` into both documents, and worker text that can
-    open an HTML comment can close the page around everything after it.
-
-    A BACKTICK cannot be held either way: the span closes on it and the rest becomes loose
-    text, so that case renders as prose.
+    `json.dumps` escapes every character `str.split` treats as whitespace except the space,
+    and a lone space survives both the collapse and the page. A run of spaces does not, so
+    each space in a run is written as ``\\u0020``, which JSON reads back as a space. A run
+    can only fall inside a string: the separator's one space sits between ``,`` and ``"``.
     """
-    flat = _one_line(text)
-    return flat if "`" in flat else f"`{flat}`"
+    return re.sub(r" {2,}", lambda run: "\\u0020" * len(run.group()), json.dumps(argv))
+
+
+# What PowerShell passes to a program exactly as typed. Narrower than what bash leaves bare:
+# a leading `@` splats, a `,` builds an array, a `~` is the home directory, a `%` is a
+# variable to CMD, and a word that starts with `-` and holds a `.` or a `:` is split there
+# (a parameter name and its value, to PowerShell's parser).
+_POWERSHELL_BARE = re.compile(r"[A-Za-z0-9_./:=+-]+", re.ASCII)
+# Single quotes are literal in PowerShell, and it reads all four curly ones as a single quote.
+_POWERSHELL_QUOTES = "'‘’‚‛"
+
+
+def _powershell_word(part: str) -> str:
+    if _POWERSHELL_BARE.fullmatch(part) and not (part.startswith("-")
+                                                 and ("." in part or ":" in part)):
+        return part
+    # PowerShell drops `--%` even quoted, and passes it through from an array.
+    if part == "--%":
+        return "@('--%')"
+    return "'" + "".join(c + c if c in _POWERSHELL_QUOTES else c for c in part) + "'"
+
+
+def _powershell_line(argv: Sequence[str]) -> str:
+    """The command as PowerShell 7.3 or later must be given it to pass the program ``argv``.
+
+    A quoted program needs `& `: PowerShell reads a line that starts with a string as that
+    string, not as a command to run.
+    """
+    words = [_powershell_word(part) for part in argv]
+    return ("& " if words and words[0] != argv[0] else "") + " ".join(words)
+
+
+def _written_bare(argv: Sequence[str]) -> bool:
+    """Every argument is a plain word, which bash, PowerShell and CMD all read the same."""
+    return all(_powershell_word(part) == part for part in argv)
+
+
+def _quotes_an_argument(argvs: Iterable[Sequence[str]]) -> bool:
+    """Some command quotes an argument: where bash, PowerShell and CMD part ways, and what
+    the fix brief's Setup and the report each say once."""
+    return any(not _written_bare(argv) for argv in argvs)
+
+
+def _needs_powershell_7_3(argv: Sequence[str]) -> bool:
+    """Windows PowerShell 5.1 drops an empty argument and mangles one holding `"`. It also
+    wraps an argument holding whitespace in quotes without doubling a trailing backslash,
+    which then escapes the closing quote: `a b\\` reaches the program as `a b"`."""
+    return any(part == "" or '"' in part
+               or (part.endswith("\\") and any(c.isspace() for c in part))
+               for part in argv)
+
+
+def _breaks_a_command_line(argv: Sequence[str]) -> bool:
+    """An argument holds a line break other than LF, which no pasted command keeps: the
+    lines of a code block are rejoined with LF, whatever separated them."""
+    return any(f"{part}\n".splitlines() != part.split("\n") for part in argv)
 
 
 # Which report a line of evidence speaks for, in words a reader says: a status name with its
@@ -12078,7 +13288,6 @@ def _render_evidence(evidence: dict, seen: set[str] | None = None,
     its own sentence and label and not the output again, because that sentence is the only
     place the report says why the run points its way.
     """
-    command = _shell_line(evidence["argv"])
     kind = evidence.get(RUN_KIND_KEY)
     # The WHOLE run, not its command: argv, cwd, exit status, output and truncation. One
     # command run twice -- before a fix and after it, the ordinary way to show the fix works
@@ -12099,9 +13308,8 @@ def _render_evidence(evidence: dict, seen: set[str] | None = None,
     note = "output truncated by the verifier" if evidence["truncated"] else "output complete"
     if cut:
         note += f"; the report keeps the last {EVIDENCE_OUTPUT_BOUND} bytes"
-    # argv and cwd are JSON strings: one line each, whatever they hold.
-    # argv and cwd are the verifier's, and they land in a prefix the fence below cannot
-    # reach, so they go through _one_line like any other worker string on an open line.
+    # The cwd, and an argv no block can carry, are the verifier's and land on the open line,
+    # so they go through _one_line like any other worker string there.
     # The kind rides in the label rather than the note, because it is what the line is
     # about: a reader scanning evidence blocks is deciding which ones show the code doing
     # something wrong, and that is this word and not the exit status.
@@ -12112,13 +13320,21 @@ def _render_evidence(evidence: dict, seen: set[str] | None = None,
     # The exit status and the truncation TRAIL it, in a parenthetical. They are the
     # supervisor keeping records; a fixer reads the sentence and the command first, and
     # leading with the bookkeeping put two numbers in front of both.
+    #
+    # The command is a bash block under the line: a fence is literal, so what a reader copies
+    # from either document is what ran, with no escape of the report's in it. A command no
+    # block can carry keeps its argv on the line, as prose.
     where = _one_line(evidence["cwd"])
-    place = "" if where in ("", ".") else f", in {where}"
-    shown = _as_code(command) if command else f"argv {_one_line(json.dumps(evidence['argv']))}"
-    out = [f"- Evidence{f' ({kind})' if kind else ''}: "
-           f"{_one_line(evidence['shows'])} "
-           f"{shown}{place} "
-           f"(exit {evidence['exit_status']}, {note})\n"]
+    root = where in ("", ".")
+    lead = f"- Evidence{f' ({kind})' if kind else ''}: {_one_line(evidence['shows'])} "
+    if _printed_as_bash(evidence["argv"]):
+        out = [f"{lead}({'' if root else f'in {where}, '}"
+               f"exit {evidence['exit_status']}, {note})\n",
+               *_fenced(shlex.join(evidence["argv"]).split("\n"), lang=COMMAND_FENCE_LANG)]
+    else:
+        out = [f"{lead}argv {_one_line(_argv_json(evidence['argv']))}"
+               f"{'' if root else f', in {where}'} "
+               f"(exit {evidence['exit_status']}, {note})\n"]
     if output:
         # Labeled, so the page can fold it and the snippets stay open. It is a true label
         # rather than a presentation flag smuggled into the prose -- the block IS captured
@@ -12391,7 +13607,14 @@ class PathNames:
         return sorted((short, full) for full, short in self._names.items())
 
 
-def _at(record: dict, names: PathNames) -> str:
+def _location_record(record: dict, names: PathNames) -> dict:
+    """A location as the report record holds it: the file under its short name, and the
+    line range, which :func:`_render_at` spells."""
+    return {"file": names.short(record["file"]), "line_start": record["line_start"],
+            "line_end": record["line_end"]}
+
+
+def _render_at(location: dict) -> str:
     """``file:line`` or ``file:line-line``, the one spelling of a location the tables use.
 
     The file is its SHORT name, and the path legend at the top of the report decodes every
@@ -12408,7 +13631,7 @@ def _at(record: dict, names: PathNames) -> str:
     line or into an ``_item`` prefix, neither of which a fence reaches. Escaping it here
     instead would escape it twice wherever a caller escapes properly.
     """
-    return f"{names.short(record['file'])}:{_lines(record)}"
+    return f"{location['file']}:{_lines(location)}"
 
 
 def _lines(record: dict) -> str:
@@ -12457,22 +13680,32 @@ def _breadth(cluster: dict, rung: str) -> str:
     return one
 
 
-def _settles(cluster: dict) -> str:
-    """The heading of the group an unresolved defect sits under, and it sits under exactly
-    one.
+def _settles_record(cluster: dict) -> dict:
+    """The group an unresolved defect or gap sits under, and it sits under exactly one: its
+    members ``agreed`` on a reason, which is named, gave ``mixed`` reasons, or
+    ``unanswered``.
 
-    Three cases, not two. Members that agree name their reason. Members that disagree have
-    no single settling question and get the group that says so, rather than being filed
-    twice or filed under a question they only half answer. And a defect whose verifier
-    never answered has no reason at all — a different thing again, and the one a reader
-    can act on by re-running the unit rather than by making a decision.
+    Three cases, not two. Members that disagree have no single settling question and get the
+    group that says so, rather than being filed twice or filed under a question they only
+    half answer. And one whose verifier never answered has no reason at all — a different
+    thing again, and the one a reader can act on by re-running the unit rather than by
+    making a decision.
     """
     reasons = cluster["unresolved_reasons"]
     if reasons == [None]:
-        return UNKNOWN_SETTLING
+        return {"case": "unanswered", "reason": None}
     if len(reasons) != 1:
+        return {"case": "mixed", "reason": None}
+    return {"case": "agreed", "reason": reasons[0]}
+
+
+def _render_settles(record: dict) -> str:
+    """The heading for one of :func:`_settles_record`'s cases."""
+    if record["case"] == "unanswered":
+        return UNKNOWN_SETTLING
+    if record["case"] == "mixed":
         return MIXED_SETTLING
-    return UNRESOLVED_GROUPS[reasons[0]]
+    return UNRESOLVED_GROUPS[record["reason"]]
 
 
 def _settling(reason: str) -> str:
@@ -12574,7 +13807,7 @@ def _render_snippet(snippet: dict, commit: dict, path: str | None = None) -> lis
     return _fenced(body, lang=_fence_language(path))
 
 
-def _where(path: str, lo: int, hi: int, names: PathNames, snippet: dict | None = None) -> str:
+def _render_where(location: dict, snippet: dict | None = None) -> str:
     """One snippet block's own location, spelled the way every other location is.
 
     A defect's metadata names ONE site, and a defect can hold reports of two. The block
@@ -12587,11 +13820,12 @@ def _where(path: str, lo: int, hi: int, names: PathNames, snippet: dict | None =
     directly under each other, with nothing on the page explaining why. The pad is in the
     record already as ``cites_from``/``cites_to``; this is only the renderer saying so.
     """
-    spelled = f"{names.short(path)}:{lo}" if lo == hi else f"{names.short(path)}:{lo}-{hi}"
+    spelled = _render_at(location)
     if snippet is None:
         return spelled
     first, last = snippet.get("cites_from"), snippet.get("cites_to")
-    if first is None or last is None or (first, last) == (lo, hi):
+    if first is None or last is None or (first, last) == (location["line_start"],
+                                                          location["line_end"]):
         return spelled
     cites = first if first == last else f"{first}-{last}"
     return f"{spelled} — {SNIPPET_PAD} lines of context either side; the finding cites {cites}"
@@ -12609,11 +13843,47 @@ def _agrees(member: str, defect: str) -> bool:
     return member == defect
 
 
-def _render_member(record: dict, commit: dict, names: PathNames,
-                   moved: bool = False, verification: bool = True,
-                   settled: str | None = None,
-                   aggregate: str = DEFECT_ESTABLISHED,
-                   ran: set[str] | None = None,
+def _member_record(record: dict, site_status: str, names: PathNames) -> dict:
+    """One report inside a site, as the record holds it: what :func:`_render_member` prints,
+    with the two choices it makes about it already made.
+
+    Two of its paths are not shortened. ``path`` is the file the snippet was read from, and
+    only names the snippet's fence language: a short name can carry a discriminator that is
+    no file's extension. ``needs_files`` is printed as the verifier named it: those are
+    files the run did not gather, so the legend has no row to decode a short name for one.
+    """
+    return {
+        "location": _location_record(record, names),
+        "siblings": bool(record["siblings"]),
+        "path": record.get("file"),
+        "snippet": record["snippet"],
+        "failure": record["failure"],
+        "quote_check": record["quote_check"],
+        "direction": record["direction"],
+        # A PROPOSED reproduction is a reader's suggestion for how to check a claim. Once
+        # something actually ran, the evidence is what the claim rests on and the suggestion
+        # is a superseded guess — it goes to the provenance appendix, where the rest of what
+        # each unit said lives. Where nothing ran it is the most actionable line in the
+        # member: it is how the next person settles the question, so it stays.
+        "reproductions": ([raiser["reproduction"] for raiser in record["raised_by"]
+                           if raiser["reproduction"] is not None]
+                          if record["evidence"] is None else []),
+        "answered": record["answered"],
+        "status": record["status"],
+        "agrees": _agrees(record["status"], site_status),
+        "axis_b": record["axis_b"],
+        "evidence": record["evidence"],
+        "needs_files": list(record.get("needs_files", ())),
+        "rationale": record["rationale"],
+        "revision": record["revision"],
+        "severity_proposed": record["severity_proposed"],
+        "unresolved_reason": record["unresolved_reason"],
+        "test_first": record["test_first"],
+    }
+
+
+def _render_member(record: dict, moved: bool = False, verification: bool = True,
+                   settled: str | None = None, ran: set[str] | None = None,
                    reports: int = 1) -> tuple[list[str], list[str]]:
     """One candidate inside its defect, carrying no run machinery at all.
 
@@ -12655,7 +13925,7 @@ def _render_member(record: dict, commit: dict, names: PathNames,
     # what tells two reports of one site apart — without it, two members whose prose matches
     # and whose line ranges do not render identically, and the dedupe below drops one range
     # out of the document entirely.
-    where = f" ({_one_line(_at(record, names))})" if record["siblings"] else ""
+    where = f" ({_one_line(_render_at(record['location']))})" if record["siblings"] else ""
     # With the `Reported` line gone the verdict line is the member's first, so the location
     # rides with THAT instead — as a lead rather than a trailing parenthesis, which would
     # sit beside the axis's own and read as part of it.
@@ -12663,7 +13933,7 @@ def _render_member(record: dict, commit: dict, names: PathNames,
     # Printed only for siblings, it would be missing in the common case of one report, and
     # the line would shrink to a bare `by reading`, saying what the header field above it
     # had just said.
-    at = f"{_one_line(_at(record, names))} · "
+    at = f"{_one_line(_render_at(record['location']))} · "
     out: list[str] = [] if moved else _item(f"- Reported{where}: ", record["failure"])
     # Where the defect is judged its body has no `Reported` line to hang a quote warning on,
     # so the warning is the defect's to print, once, with how many reports it covers.
@@ -12673,23 +13943,19 @@ def _render_member(record: dict, commit: dict, names: PathNames,
         out.append(f"- {QUOTE_UNCHECKED}\n")
     if not moved and record["direction"].strip():
         out += _item("- Direction: ", record["direction"])
-    # A PROPOSED reproduction is a reader's suggestion for how to check a claim. Once
-    # something actually ran, the evidence below is what the claim rests on and the
-    # suggestion is a superseded guess — it goes to the provenance appendix, where the rest
-    # of what each unit said lives. Where nothing ran it is the most actionable line here:
-    # it is how the next person settles the question, so it stays.
-    if record["evidence"] is None:
-        for raiser in record["raised_by"]:
-            if raiser["reproduction"] is not None:
-                repro = raiser["reproduction"]
-                # Nested under the `Reported` line it elaborates — and at the MARGIN once
-                # that line has moved to the appendix, because the bullet it would nest
-                # under is then the defect's `Fix.` or `Related.`, and a reader takes an
-                # indented bullet as belonging to the one above it.
-                indent = "- " if moved else "  - "
-                out += _item(f"{indent}Proposed reproduction, not run: "
-                             f"argv {_one_line(json.dumps(repro['argv']))}, "
-                             f"cwd {_one_line(repro['cwd'])}, expect: ", repro["expect"])
+    for repro in record["reproductions"]:
+        # Nested under the `Reported` line it elaborates — and at the MARGIN once that line
+        # has moved to the appendix, because the bullet it would nest under is then the
+        # defect's `Fix.` or `Related.`, and a reader takes an indented bullet as belonging
+        # to the one above it.
+        indent = "- " if moved else "  - "
+        nest = " " * len(indent)
+        # The argv in a block, as JSON: literal in both documents, so it reads back exactly.
+        out.append(f"{indent}Proposed reproduction, not run:\n")
+        out += _fenced([json.dumps(repro["argv"])], indent=nest, lang=ARGV_FENCE_LANG)
+        if repro["cwd"] not in ("", "."):
+            out += _item(f"{nest}- In: ", repro["cwd"])
+        out += _item(f"{nest}- Expect: ", repro["expect"])
     # The snippet is NOT rendered here. A defect's evidence belongs under the location that
     # names it, above the prose about it, and de-duplicated across the reports that cite
     # overlapping ranges -- all of which is the defect's to do, not one member's.
@@ -12722,7 +13988,7 @@ def _render_member(record: dict, commit: dict, names: PathNames,
         # Deduplicated, because an unresolved member's axis IS its status and printing both
         # is the doubling this line exists without.
         told: list[str] = []
-        for part in (None if _agrees(record["status"], aggregate) else record["status"],
+        for part in (None if record["agrees"] else record["status"],
                      _verification_words(record["axis_b"], record["evidence"])
                      if verification else None):
             if part and part not in told:
@@ -12740,7 +14006,7 @@ def _render_member(record: dict, commit: dict, names: PathNames,
         # The verifier already named it -- it is where the "one more file would settle"
         # table comes from -- and this is where somebody deciding whether to chase it is
         # reading, rather than an appendix table three sections down.
-        wants = [_one_line(path) for path in record.get("needs_files", ())]
+        wants = [_one_line(path) for path in record["needs_files"]]
         if wants:
             outcome += f" · would be settled by {', '.join(wants)}"
         if moved:
@@ -12833,7 +14099,89 @@ def _short(text: str) -> str:
     return f"{cut}…"
 
 
-def _unsettled(members: Sequence[dict], names: PathNames) -> list[str]:
+def _site_record(site: dict, members: Sequence[dict], names: PathNames, judged: bool,
+                 several: bool, verification: bool, corrected: bool) -> dict:
+    """One site as the record holds it: its own facts, each of its reports as a
+    :func:`_member_record`, and the choices :func:`_render_site_parts` prints from.
+
+    ``path`` is the site's full path, unshortened: the line under its metadata is the one
+    place the entry decodes the short name in place, beside the commit.
+    """
+    unsettled = site["status"] == DEFECT_UNRESOLVED
+    location = _location_record(site, names)
+    # One block per cited RANGE. Two reports of one site routinely cite ranges that overlap
+    # without matching exactly, so ranges are collected per file, sorted, and one is dropped
+    # only where another CONTAINS it: dropping one that merely overlaps would throw away
+    # source the other cited, silently. An ESTABLISHED member's snippet only; the code a
+    # claim nothing upheld was made about is not the code that settles anything.
+    cited: list[tuple[str, int, int, dict, str | None]] = []
+    for record in members:
+        snip = record["snippet"]
+        if snip is None or record["status"] not in ESTABLISHED_STATUSES:
+            continue
+        lo = snip["first_line"]
+        cited.append((record.get("file") or "", lo, lo + len(snip["lines"]) - 1,
+                      snip, record.get("file")))
+    kept: list[tuple[str, int, int, dict, str | None]] = []
+    # Sorted so a container always arrives before what it contains.
+    for entry in sorted(cited, key=lambda e: (e[0], e[1], -e[2])):
+        if kept and kept[-1][0] == entry[0] and entry[2] <= kept[-1][2]:
+            continue
+        kept.append(entry)
+    blocks = [{"location": {"file": names.short(file), "line_start": lo, "line_end": hi},
+               "snippet": snip, "path": path} for file, lo, hi, snip, path in kept]
+    # Each block says which lines it is, unless there is exactly one and the site's own
+    # location already names it: a site can cite two files, and an unlabeled block under
+    # the location would show one file's source under another file's name.
+    labeled = len(blocks) > 1 or any(block["location"] != location for block in blocks)
+    # What stopped each checker, for `_unsettled`. Only members a checker actually
+    # answered: a member whose unit never landed has an engine sentence in this field naming
+    # the unit, which is not a checker's account of anything — `_render_member` says that in
+    # plain words on the member's own line, and printing the engine's sentence here as
+    # though a reader could act on it would be the report's own voice pretending to be a
+    # verdict. Members that were REFUTED are left out for the same reason in reverse: their
+    # rationale says why the claim is wrong, which is a settled answer and not an open
+    # question.
+    #
+    # The location only where the defect holds more than one report, and for the reason
+    # the member blocks carry it: two accounts of two different sites read as one
+    # contradictory account of a single site without it.
+    accounts = [{"location": _location_record(record, names) if record["siblings"] else None,
+                 "rationale": record["rationale"]}
+                for record in members
+                if unsettled and record["answered"] and record["status"] == "unresolved"
+                and record["rationale"] and record["rationale"].strip()]
+    # One test per LOCATION, and an established member's test at that location stands for
+    # it, so established members come first.
+    tests = [{"location": _location_record(record, names) if record["siblings"] else None,
+              "test": record["test_first"]}
+             for record in sorted(members, key=lambda r: r["status"] not in ESTABLISHED_STATUSES)
+             if record["test_first"] is not None]
+    # Where the members do not all share one verification method, each states its own.
+    outcomes = {record["axis_b"] for record in members}
+    return {
+        "id": site["id"], "defect": site["defect"], "status": site["status"],
+        "severity": site["severity"], "fix_size": site["fix_size"],
+        "consequence": site["consequence"], "axis_a": site["axis_a"], "axis_b": site["axis_b"],
+        "location": location, "path": site["file"],
+        "judged": judged, "several": several, "verification": verification,
+        "corrected": corrected,
+        "shared": verification or len(outcomes) > 1,
+        "blocks": blocks, "labeled": labeled,
+        "split_reason": site["split_reason"],
+        "verified": _verification_record(site, members),
+        "quotes": {"total": len(members),
+                   QUOTE_DIFFERS: sum(1 for r in members if r["quote_check"] == QUOTE_DIFFERS),
+                   QUOTE_UNREADABLE: sum(1 for r in members
+                                         if r["quote_check"] == QUOTE_UNREADABLE)},
+        "unsettled": accounts,
+        "tests": tests,
+        "test_first": site["test_first"],
+        "members": [_member_record(record, site["status"], names) for record in members],
+    }
+
+
+def _unsettled(accounts: Sequence[dict]) -> list[str]:
     """What stopped each checker from settling this defect, in the checker's own words.
 
     The verifier schema defines an unresolved rationale as "what was tried and what stopped
@@ -12844,37 +14192,20 @@ def _unsettled(members: Sequence[dict], names: PathNames) -> list[str]:
     carries it; the settling reason is one of four fixed terms and says only which KIND of
     thing is missing.
 
-    Only members a checker actually answered. A member whose unit never landed has an
-    engine sentence in this field naming the unit, which is not a checker's account of
-    anything — :func:`_render_member` says that in plain words on the member's own line, and
-    printing the engine's sentence here as though a reader could act on it would be the
-    report's own voice pretending to be a verdict. Members that were REFUTED are left out
-    for the same reason in reverse: their rationale says why the claim is wrong, which is a
-    settled answer and not an open question.
-
     Deduplicated on the rendered text, like the tests and the member blocks: two lanes that
     could not settle one site for one reason routinely write one account of it.
     """
     out: list[str] = []
-    for record in members:
-        if not record["answered"] or record["status"] != "unresolved":
-            continue
-        rationale = record["rationale"]
-        if not rationale or not rationale.strip():
-            continue
-        # The location only where the defect holds more than one report, and for the reason
-        # the member blocks carry it: two accounts of two different sites read as one
-        # contradictory account of a single site without it.
-        where = f"({_one_line(_at(record, names))}) " if record["siblings"] else ""
-        rendered = "".join(_item(f"- **{UNSETTLED_LABEL}** {where}", rationale))
+    for account in accounts:
+        where = (f"({_one_line(_render_at(account['location']))}) "
+                 if account["location"] is not None else "")
+        rendered = "".join(_item(f"- **{UNSETTLED_LABEL}** {where}", account["rationale"]))
         if rendered not in out:
             out.append(rendered)
     return out
 
 
-def _site_parts(site: dict, members: Sequence[dict], rung: str, commit: dict,
-                names: PathNames, judged: bool, verification: bool = True,
-                corrected: bool = False) -> dict[str, list]:
+def _render_site_parts(record: dict, rung: str, commit: dict) -> dict[str, list]:
     """Everything the report prints about one site, in parts, so the defect entry and the
     site's evidence entry each take their own and no line is written twice.
 
@@ -12902,75 +14233,53 @@ def _site_parts(site: dict, members: Sequence[dict], rung: str, commit: dict,
     Only a judged site's evidence prints them as parts, since an unjudged site's check lines
     already carry them.
     """
-    unsettled = site["status"] == DEFECT_UNRESOLVED
-    located = _one_line(_at(site, names))
+    located = _one_line(_render_at(record["location"]))
     # The location is a NAME of code, so it is set as code — unless the name holds a
     # BACKTICK, which a POSIX file name may: a code span closes on the backtick behind the
     # escape that keeps it out of the prose. Left as prose there, where the escape works.
-    fields = [site["severity"], _breadth(site, rung),
+    # `_breadth` is given the site as a defect of one site, which is what it states.
+    fields = [record["severity"],
+              _breadth({"sites": [record["id"]], "axis_a": record["axis_a"],
+                        "members": record["members"]}, rung),
               located if "`" in located else f"`{located}`",
-              site["fix_size"]]
+              record["fix_size"]]
     labels = list(DEFECT_META_LABELS[:4])
     # `Verification` is stated per site only where the run has more than one answer for it:
     # a field with one value is a property of the run, stated at the top.
-    if verification:
-        fields.append(_defect_verification_words(site, members))
+    if record["verification"]:
+        fields.append(_render_verification(record["verified"]))
         labels.append(DEFECT_META_LABELS[4])
     # `strict`, so a field added without its label, or the other way round, fails here
     # rather than silently shifting every field after it under the wrong label.
     meta = DEFECT_META_SEP.join(f"**{label}** {value}"
                                 for label, value in zip(labels, fields, strict=True))
+    judged = record["judged"]
     parts: dict[str, list] = {
         "meta": [f"- {meta}\n"],
         # The decode, in place: the full path and the commit, spelled as the legend spells it.
-        "in_full": [f"  {_in_full(site, commit)}\n"],
+        "in_full": [f"  {_in_full({**record['location'], 'file': record['path']}, commit)}\n"],
         "corrected": ([f"- **{CORRECTED_MARK}.** See "
                        f"[{SUBSECTION_CORRECTIONS}]({_anchor(SUBSECTION_CORRECTIONS)}).\n"]
-                      if corrected else []),
+                      if record["corrected"] else []),
     }
-    # One block per cited RANGE. Two reports of one site routinely cite ranges that overlap
-    # without matching exactly, so ranges are collected per file, sorted, and one is dropped
-    # only where another CONTAINS it: dropping one that merely overlaps would throw away
-    # source the other cited, silently. An ESTABLISHED member's snippet only; the code a
-    # claim nothing upheld was made about is not the code that settles anything.
-    cited: list[tuple[str, int, int, dict, str | None]] = []
-    for record in members:
-        snip = record["snippet"]
-        if snip is None or record["status"] not in ESTABLISHED_STATUSES:
-            continue
-        lo = snip["first_line"]
-        cited.append((record.get("file") or "", lo, lo + len(snip["lines"]) - 1,
-                      snip, record.get("file")))
-    kept: list[tuple[str, int, int, dict, str | None]] = []
-    # Sorted so a container always arrives before what it contains.
-    for entry in sorted(cited, key=lambda e: (e[0], e[1], -e[2])):
-        if kept and kept[-1][0] == entry[0] and entry[2] <= kept[-1][2]:
-            continue
-        kept.append(entry)
-    # Each block says which lines it is, unless there is exactly one and the site's own
-    # location already names it: a site can cite two files, and an unlabeled block under
-    # the location would show one file's source under another file's name.
-    labeled = len(kept) > 1 or any(
-        _where(path, lo, hi, names) != _at(site, names) for path, lo, hi, _s, _p in kept)
     parts["source"] = [
-        ([f"  {_one_line(_where(_path, lo, hi, names, snip))}\n"] if labeled else [])
-        + _render_snippet(snip, commit, path)
-        for _path, lo, hi, snip, path in kept]
+        ([f"  {_one_line(_render_where(block['location'], block['snippet']))}\n"]
+         if record["labeled"] else [])
+        + _render_snippet(block["snippet"], commit, block["path"])
+        for block in record["blocks"]]
     parts["split"] = (_item("- Kept separate from another report at this location: ",
-                            site["split_reason"]) if site["split_reason"] else [])
-    parts["unsettled"] = _unsettled(members, names) if unsettled else []
+                            record["split_reason"]) if record["split_reason"] else [])
+    parts["unsettled"] = _unsettled(record["unsettled"])
     # One test per LOCATION: an established member's test at that location stands for it,
     # and the members there that worded theirs differently are counted and pointed at
     # rather than reprinted. That is a move and not a loss only because `findings.json`
     # holds every candidate's test under its candidate id, which the provenance appendix
     # traces to this site's defect.
     tests: dict[str, list] = {}
-    for record in sorted(members, key=lambda r: r["status"] not in ESTABLISHED_STATUSES):
-        named = record["test_first"]
-        if named is None:
-            continue
-        where = f"({_one_line(_at(record, names))}) " if record["siblings"] else ""
-        rendered = "".join(_item(f"- **{TEST_FIRST_LABEL}** {where}", named))
+    for named in record["tests"]:
+        where = (f"({_one_line(_render_at(named['location']))}) "
+                 if named["location"] is not None else "")
+        rendered = "".join(_item(f"- **{TEST_FIRST_LABEL}** {where}", named["test"]))
         if where not in tests:
             tests[where] = [rendered, 0]
         elif rendered != tests[where][0]:
@@ -12989,10 +14298,10 @@ def _site_parts(site: dict, members: Sequence[dict], rung: str, commit: dict,
                          f"is in `findings.json` beside this report, under its candidate "
                          f"id. {traced}")
         parts["tests"].append(block)
-    parts["quotes"] = _quote_warnings(members) if judged else []
-    # Where the members do not all share one verification method, each states its own.
-    outcomes = {record["axis_b"] for record in members}
-    shared = verification or len(outcomes) > 1
+    parts["first_test"] = _first_test(parts, record)
+    members = record["members"]
+    parts["quotes"] = _quote_warnings(record["quotes"]) if judged else []
+    shared = record["shared"]
     # Check lines are GROUPED: each distinct set prints once, with how many reports returned
     # it. Every member is counted, including one whose body is dropped below as a duplicate,
     # because dropping a check line would lose a verdict the run actually returned.
@@ -13000,12 +14309,10 @@ def _site_parts(site: dict, members: Sequence[dict], rung: str, commit: dict,
     # The settling reason is not suppressed here, as it was under a heading that stated it:
     # a site's evidence sits away from the group heading its defect is filed under.
     groups: dict[str, list] = {}
-    for record in members:
-        lines, _body = _render_member(record, commit, names, judged, shared, None,
-                                      site["status"])
-        groups.setdefault("".join(lines), [record, 0])[1] += 1
-    checked = ["".join(_render_member(first, commit, names, judged, shared, None,
-                                      site["status"], reports=count)[0])
+    for member in members:
+        lines, _body = _render_member(member, judged, shared, None)
+        groups.setdefault("".join(lines), [member, 0])[1] += 1
+    checked = ["".join(_render_member(first, judged, shared, None, reports=count)[0])
                for first, count in groups.values()]
     # Bodies take TWO passes, and the order is the point: the first drops duplicate bodies
     # with no evidence suppressed, the second renders the survivors sharing one record of the
@@ -13014,18 +14321,16 @@ def _site_parts(site: dict, members: Sequence[dict], rung: str, commit: dict,
     # only in the second lacking its evidence, and both would survive.
     seen: list[str] = []
     survivors: list[dict] = []
-    for record in members:
-        _lines, body = _render_member(record, commit, names, judged, shared, None,
-                                      site["status"])
+    for member in members:
+        _lines, body = _render_member(member, judged, shared, None)
         rendered = "".join(body)
         if rendered not in seen:
             seen.append(rendered)
-            survivors.append(record)
+            survivors.append(member)
     ran: set[str] = set()
     bodies: list[str] = []
-    for record in survivors:
-        _lines, body = _render_member(record, commit, names, judged, shared, None,
-                                      site["status"], ran)
+    for member in survivors:
+        _lines, body = _render_member(member, judged, shared, None, ran)
         if "".join(body) not in bodies:
             bodies.append("".join(body))
     parts["checks"] = ["- **Checks.**\n", *checked] if any(checked) else []
@@ -13033,7 +14338,7 @@ def _site_parts(site: dict, members: Sequence[dict], rung: str, commit: dict,
     return parts
 
 
-def _quote_warnings(members: Sequence[dict]) -> list[str]:
+def _quote_warnings(counts: dict) -> list[str]:
     """A judged defect's quote warnings, each printed once, above its checks.
 
     A judged defect's bodies carry no `Reported` line saying which report each one is, so a
@@ -13043,12 +14348,12 @@ def _quote_warnings(members: Sequence[dict]) -> list[str]:
     it covers, which is the fact a reader can act on: all of them means the cited range is
     suspect, one of eight means one report's quotation is.
     """
-    total = len(members)
+    total = counts["total"]
     out: list[str] = []
     for state, one, several, bold in (
             (QUOTE_DIFFERS, QUOTE_FLAG, _quote_flag_for, "**"),
             (QUOTE_UNREADABLE, QUOTE_UNCHECKED, _quote_unchecked_for, "")):
-        hit = sum(1 for record in members if record["quote_check"] == state)
+        hit = counts[state]
         if not hit:
             continue
         sentence = one if total == 1 else several(hit, total)
@@ -13056,8 +14361,20 @@ def _quote_warnings(members: Sequence[dict]) -> list[str]:
     return out
 
 
-def _render_index(clusters: Sequence[dict], refuted: int, sections: _Sections,
-                  corrected: frozenset[str] = frozenset()) -> list[str]:
+def _index_record(clusters: Sequence[dict], refuted: int,
+                  corrected: frozenset[str] = frozenset()) -> dict:
+    """The ranked list: one row per defect that is work, in the order ``clusters`` ranks
+    them, and how many refuted defects are left out of it."""
+    # Marked in the row as well as on the entry: this is the list a reader works down, and
+    # one who acts from the row never opens the entry that carries the mark.
+    return {"refuted": refuted,
+            "rows": [{"id": cluster["id"], "title": _title(cluster),
+                      "severity": cluster["severity"], "sites": len(cluster["sites"]),
+                      "outcomes": dict(cluster["outcomes"]), "fix_size": cluster["fix_size"],
+                      "corrected": cluster["id"] in corrected} for cluster in clusters]}
+
+
+def _render_index(record: dict, sections: _Sections) -> list[str]:
     """The first way into the defect list: one row per defect that is work, most severe
     first, then cheapest fix first, then fewest sites, so twelve one-line fixes of one
     mistake do not rank as one. This is the only place the list is ranked.
@@ -13068,6 +14385,7 @@ def _render_index(clusters: Sequence[dict], refuted: int, sections: _Sections,
     A defect's row carries its worst site's severity, its sites counted by outcome and its
     largest fix; where each site is, is the by-file view's to say and each entry's.
     """
+    refuted = record["refuted"]
     out = [sections.sub(SUBSECTION_RANKED),
            "Every defect that needs work, most severe first and, within a severity, "
            "cheapest fix first, then fewest sites. So the first rows are the blockers, in the "
@@ -13081,25 +14399,21 @@ def _render_index(clusters: Sequence[dict], refuted: int, sections: _Sections,
                    f"was dismissed.\n")
     out += [f"\n| {DEFECT_COLUMN} | Heading | Severity | Sites | Fix size |\n",
             "|---|---|---|---|---|\n"]
-    for cluster in clusters:
-        # Marked here as well as on the entry: this is the list a reader works down, and
-        # one who acts from the row never opens the entry that carries the mark.
+    for row in record["rows"]:
         mark = (f", [corrected by the operator]({_anchor(SUBSECTION_CORRECTIONS)})"
-                if cluster["id"] in corrected else "")
-        out.append(f"| [{cluster['id']}](#{cluster['id']}) | "
-                   f"{_cell(_short(_title(cluster)))} | "
-                   f"{_term_cell(cluster['severity'])} | "
-                   f"{len(cluster['sites'])} ({_outcome_counts(cluster)}){mark} | "
-                   f"{_term_cell(cluster['fix_size'])} |\n")
+                if row["corrected"] else "")
+        out.append(f"| [{row['id']}](#{row['id']}) | "
+                   f"{_cell(_short(row['title']))} | "
+                   f"{_term_cell(row['severity'])} | "
+                   f"{row['sites']} ({_outcome_counts(row)}){mark} | "
+                   f"{_term_cell(row['fix_size'])} |\n")
     return out
 
 
-def _render_by_file(clusters: Sequence[dict], site_of: dict, by_id: dict, names: PathNames,
-                    sections: _Sections) -> list[str]:
-    """The second way in, and the reason it exists rather than being a sort of the first:
-    one person claims a file and closes what is in it in one change. One row per file, with
-    every live site in it and the defect each belongs to — fixing a file fixes those sites,
-    and a defect is closed only when every one of its sites is."""
+def _by_file_record(clusters: Sequence[dict], site_of: dict, by_id: dict,
+                    names: PathNames) -> dict:
+    """One row per file with every live site in it, in the order the column shows, each
+    site with its defect, and the most severe of them."""
     # Every file a site's REPORTS name, not just the site's own: a site can hold reports in
     # two files, and listing it under one hides the other from the person allocating the
     # work, which is the only thing this table is for.
@@ -13111,24 +14425,37 @@ def _render_by_file(clusters: Sequence[dict], site_of: dict, by_id: dict, names:
                 continue
             for path in dict.fromkeys(by_id[cid]["file"] for cid in site["members"]):
                 by_file.setdefault(path, []).append(site)
+    rows = []
+    # Ordered by the name the column actually shows, so the column is in an order a reader
+    # can see.
+    for path in sorted(by_file, key=lambda p: (names.short(p), p)):
+        held = sorted(by_file[path], key=lambda s: (s["line_start"], _id_rank(s["id"])))
+        rows.append({"file": names.short(path),
+                     "severity": _most_severe([site["severity"] for site in held]),
+                     "sites": [{"id": site["id"], "defect": site["defect"]} for site in held]})
+    return {"rows": rows}
+
+
+def _render_by_file(record: dict, sections: _Sections) -> list[str]:
+    """The second way in, and the reason it exists rather than being a sort of the first:
+    one person claims a file and closes what is in it in one change. One row per file, with
+    every live site in it and the defect each belongs to — fixing a file fixes those sites,
+    and a defect is closed only when every one of its sites is."""
     out = [sections.sub(SUBSECTION_BY_FILE),
            "The same defects by file, so one person can take a file and close every site "
            "listed under it in one change. Fixing a file fixes those sites; a defect is "
            "closed only when all of its sites are.\n\n",
            f"| File | Most severe | Sites ({DEFECT_COLUMN.lower()}) |\n", "|---|---|---|\n"]
-    # Ordered by the name the column actually shows, so the column is in an order a reader
-    # can see.
-    for path in sorted(by_file, key=lambda p: (names.short(p), p)):
-        held = sorted(by_file[path], key=lambda s: (s["line_start"], _id_rank(s["id"])))
+    for row in record["rows"]:
         listed = ", ".join(f"{_site_link(site['id'], SOURCE_ANCHOR)} "
-                           f"([{site['defect']}](#{site['defect']}))" for site in held)
-        out.append(f"| {_cell(names.short(path))} | "
-                   f"{_term_cell(_most_severe([site['severity'] for site in held]))} | "
+                           f"([{site['defect']}](#{site['defect']}))" for site in row["sites"])
+        out.append(f"| {_cell(row['file'])} | {_term_cell(row['severity'])} | "
                    f"{listed} |\n")
     return out
 
 
-def _by_tier(clusters: Sequence[dict], tiers: Sequence[str]) -> list[tuple[str | None, list[dict]]]:
+def _by_tier(clusters: Sequence[dict],
+             tiers: Sequence[str]) -> list[tuple[str | None, bool, list[dict]]]:
     """The defects under their tiers, in the order the round declared them.
 
     The declared order is the rendered order, and it is the round's own: the tier list is
@@ -13141,16 +14468,21 @@ def _by_tier(clusters: Sequence[dict], tiers: Sequence[str]) -> list[tuple[str |
     unnamed group holding everything, which is the flat list this report rendered before
     the round existed. That is what makes the degrade a change of nothing rather than a
     branch each caller has to remember.
+
+    Each group is its tier's name, whether it is the group of defects no declared tier
+    holds, and its defects. That group has no name of its own: its heading is wording, and
+    the renderer writes it.
     """
     if not tiers:
-        return [(None, list(clusters))]
+        return [(None, False, list(clusters))]
     held: dict[str, list[dict]] = {tier: [] for tier in tiers}
     untiered: list[dict] = []
     for cluster in clusters:
         (held[cluster["tier"]] if cluster["tier"] in held else untiered).append(cluster)
-    out: list[tuple[str | None, list[dict]]] = [(tier, held[tier]) for tier in tiers if held[tier]]
+    out: list[tuple[str | None, bool, list[dict]]] = [(tier, False, held[tier])
+                                                      for tier in tiers if held[tier]]
     if untiered:
-        out.append((UNTIERED_GROUP, untiered))
+        out.append((None, True, untiered))
     return out
 
 
@@ -13224,6 +14556,10 @@ class _Printed:
                     break
                 end += 1
             block = lines[n:end + 1]
+            if opening.group(3) in (COMMAND_FENCE_LANG, ARGV_FENCE_LANG):
+                out += block
+                n = end + 1
+                continue
             key = self.key(block)
             first = self.output.setdefault(key, sid)
             pointer = (f"{opening.group(1)}"
@@ -13255,10 +14591,10 @@ def _anchor_tag(ident: str) -> str:
     return f'<a id="{ident}"></a>'
 
 
-def _site_line(site: dict, names: PathNames) -> str:
+def _site_line(site: dict) -> str:
     """A one-site defect's one line about its site: number, location, outcome, severity
     and fix size. It is also where the site's quoted source is anchored."""
-    located = _one_line(_at(site, names))
+    located = _one_line(_render_at(site["location"]))
     return (f"- {_anchor_tag(site['id'] + SOURCE_ANCHOR)}**Site** "
             f"{_site_link(site['id'])}{DEFECT_META_SEP}"
             f"{located if '`' in located else f'`{located}`'}{DEFECT_META_SEP}"
@@ -13266,18 +14602,70 @@ def _site_line(site: dict, names: PathNames) -> str:
             f"{DEFECT_META_SEP}**Fix size** {site['fix_size']}\n")
 
 
-def _first_test(parts: dict, judged: bool, site: dict) -> list[str]:
+def _first_test(parts: dict, record: dict) -> list[str]:
     """The site's first test that should fail first, as its defect entry prints it: the
     judged site's own first test part, or the site's test otherwise."""
-    if judged:
+    if record["judged"]:
         return parts["tests"][0] if parts["tests"] else []
-    if site["test_first"] is None:
+    if record["test_first"] is None:
         return []
-    return _item(f"- **{TEST_FIRST_LABEL}** ", site["test_first"])
+    return _item(f"- **{TEST_FIRST_LABEL}** ", record["test_first"])
 
 
-def _render_entry(defect: dict, site_of: dict, by_id: dict, parts_of: dict, names: PathNames,
-                  level: int, printed: _Printed) -> list[str]:
+def _entry_record(defect: dict, site_of: dict, by_id: dict) -> dict:
+    """One defect's entry as the record holds it: its own account, and for a defect of
+    several sites what each row says of its site. The sites themselves are the site records,
+    named by id; the title is held whole, and the renderer cuts it to a label."""
+    sites = [site_of[sid] for sid in defect["sites"]]
+    work = _is_work(defect)
+    judged = defect["tier"] is not None and work
+    several = len(sites) > 1
+    record = {
+        "id": defect["id"], "title": _title(defect), "consequence": defect["consequence"],
+        "work": work, "judged": judged, "sites": list(defect["sites"]),
+        "cross_references": list(defect["cross_references"]),
+        "site_notes": dict(defect["site_notes"]),
+        "what_goes_wrong": defect["what_goes_wrong"] if judged else None,
+        "fix": defect["fix"] if judged else None,
+        # No account from the round: the mechanism the check upheld is the one account the
+        # run has of the whole defect, and it says whose it is.
+        "mechanism": (defect["mechanism"] or "") if work and not judged and several else None,
+        "test_patch": _test_patch_record(sites, by_id),
+        "refuted": None,
+        "summary": None,
+        "rows": None,
+    }
+    if not work and not several:
+        # A dismissed claim: the reason, and nothing to do. Its evidence is under its site.
+        members = [by_id[cid] for cid in sites[0]["members"]]
+        record["refuted"] = {"reason": _refuted_reason(members),
+                             "flagged": any(r["quote_check"] == QUOTE_DIFFERS for r in members)}
+    if several:
+        record["summary"] = {"outcomes": dict(defect["outcomes"]),
+                             "severity": defect["severity"],
+                             "worst_site": defect["severity_site"],
+                             "fix_size": defect["fix_size"], "areas": list(defect["areas"])}
+        rows = []
+        for site in sites:
+            members = [by_id[cid] for cid in site["members"]]
+            account = None
+            if site["status"] == DEFECT_UNRESOLVED:
+                account = next((member["rationale"] for member in members
+                                if member["answered"] and member["status"] == "unresolved"
+                                and (member["rationale"] or "").strip()), None)
+            rows.append({
+                "id": site["id"], "note": defect["site_notes"].get(site["id"]),
+                "unsettled": account,
+                "refuted": (_refuted_reason(members) if site["status"] == DEFECT_REFUTED
+                            else None),
+                "test": (site["test_first"] or "") if site["status"] != DEFECT_REFUTED else "",
+            })
+        record["rows"] = rows
+    return record
+
+
+def _render_entry(defect: dict, site_records: dict, parts_of: dict, level: int,
+                  printed: _Printed) -> list[str]:
     """One defect, as a person fixing it reads it: one account of the mistake, then every
     site where it has to be fixed with the lines to change there.
 
@@ -13291,9 +14679,9 @@ def _render_entry(defect: dict, site_of: dict, by_id: dict, parts_of: dict, name
     source at each site. Everything else a site's readers and checkers recorded is under
     **Evidence**, by the site's number.
     """
-    sites = [site_of[sid] for sid in defect["sites"]]
-    judged = defect["tier"] is not None and _is_work(defect)
-    label = _one_line(_short(_title(defect)))
+    sites = [site_records[sid] for sid in defect["sites"]]
+    judged = defect["judged"]
+    label = _one_line(_short(defect["title"]))
     # The anchor on a line of its own above the heading, where a Markdown viewer reads it
     # as an element of its own and the heading keeps its text.
     out = [f"\n{_anchor_tag(defect['id'])}\n\n{'#' * level} {defect['id']}. {label}\n\n"]
@@ -13306,23 +14694,20 @@ def _render_entry(defect: dict, site_of: dict, by_id: dict, parts_of: dict, name
     if not several and sentence != label:
         out.append(f"{_no_block_lead(sentence)}\n\n")
     if several:
-        worst = defect["severity_site"]
-        out.append(f"- **{_plural(len(sites), 'site')}**: {_outcome_counts(defect)}"
-                   f"{DEFECT_META_SEP}**Worst severity** {defect['severity']}, at "
-                   f"{_site_link(worst, SOURCE_ANCHOR)}{DEFECT_META_SEP}**Largest fix** "
-                   f"{defect['fix_size']}{DEFECT_META_SEP}**Areas** "
-                   f"{_one_line(', '.join(defect['areas']))}\n")
+        summary = defect["summary"]
+        out.append(f"- **{_plural(len(sites), 'site')}**: {_outcome_counts(summary)}"
+                   f"{DEFECT_META_SEP}**Worst severity** {summary['severity']}, at "
+                   f"{_site_link(summary['worst_site'], SOURCE_ANCHOR)}{DEFECT_META_SEP}"
+                   f"**Largest fix** {summary['fix_size']}{DEFECT_META_SEP}**Areas** "
+                   f"{_one_line(', '.join(summary['areas']))}\n")
     else:
-        out.append(_site_line(sites[0], names))
+        out.append(_site_line(sites[0]))
     out += parts_of[sites[0]["id"]]["corrected"]
-    if not _is_work(defect):
-        # A dismissed claim: the reason, and nothing to do. Its evidence is under its site.
-        if not several:
-            members = [by_id[cid] for cid in sites[0]["members"]]
-            reason = _refuted_reason(members)
-            flag = (f" {QUOTE_FLAG}" if any(r["quote_check"] == QUOTE_DIFFERS for r in members)
-                    else "")
-            out += _item(f"- **{REFUTED_LABEL}** ", reason + flag)
+    if not defect["work"]:
+        if defect["refuted"] is not None:
+            refuted = defect["refuted"]
+            flag = f" {QUOTE_FLAG}" if refuted["flagged"] else ""
+            out += _item(f"- **{REFUTED_LABEL}** ", refuted["reason"] + flag)
     elif judged:
         out += _item(f"- **{WHAT_GOES_WRONG_LABEL}** ", defect["what_goes_wrong"])
         # What stopped the check sits between the claim and the fix: the order somebody
@@ -13331,22 +14716,21 @@ def _render_entry(defect: dict, site_of: dict, by_id: dict, parts_of: dict, name
             out += parts_of[sites[0]["id"]]["unsettled"][:1]
         out += _item(f"- **{FIX_LABEL}** ", defect["fix"])
     elif several:
-        # No account from the round: the mechanism the check upheld is the one account the
-        # run has of the whole defect, and it says whose it is.
         out += _item(f"- **{WHAT_GOES_WRONG_LABEL[:-1]}**, {MECHANISM_UPHELD}: ",
-                     defect["mechanism"] or "")
+                     defect["mechanism"])
     if defect["cross_references"]:
         out.append(f"- **{RELATED_LABEL}** "
                    + ", ".join(f"[{did}](#{did})" for did in defect["cross_references"])
                    + "\n")
+    out += _render_test_patch(defect["id"], defect["test_patch"])
     if not several:
         site = sites[0]
         parts = parts_of[site["id"]]
         note = defect["site_notes"].get(site["id"])
         if note is not None:
             out += _item(f"- **{SITE_NOTE_LABEL}** ", note)
-        if _is_work(defect):
-            out += _first_test(parts, judged, site)
+        if defect["work"]:
+            out += parts["first_test"]
             if not judged:
                 out += parts["unsettled"][:1]
         if parts["source"]:
@@ -13356,36 +14740,30 @@ def _render_entry(defect: dict, site_of: dict, by_id: dict, parts_of: dict, name
         return out
     out += ["\n", f"| Site | Location | Outcome | Severity | {SITE_NOTE_COLUMN} | "
                   f"{TEST_FIRST_LABEL[:-1]} |\n", "|---|---|---|---|---|---|\n"]
-    for site in sites:
-        members = [by_id[cid] for cid in site["members"]]
+    for site, row in zip(sites, defect["rows"], strict=True):
         parts = parts_of[site["id"]]
         particular = []
-        note = defect["site_notes"].get(site["id"])
-        if note is not None:
-            particular.append(_collapse(note))
-        if site["status"] == DEFECT_UNRESOLVED:
-            account = next((record["rationale"] for record in members
-                            if record["answered"] and record["status"] == "unresolved"
-                            and (record["rationale"] or "").strip()), None)
-            if account is not None:
-                particular.append(f"Not settled: {_collapse(account)}")
-        if site["status"] == DEFECT_REFUTED:
-            particular.append(f"Refuted: {_refuted_reason(members)}")
-        test = _collapse(site["test_first"] or "") if site["status"] != DEFECT_REFUTED else ""
+        if row["note"] is not None:
+            particular.append(_collapse(row["note"]))
+        if row["unsettled"] is not None:
+            particular.append(f"Not settled: {_collapse(row['unsettled'])}")
+        if row["refuted"] is not None:
+            particular.append(f"Refuted: {row['refuted']}")
+        test = _collapse(row["test"])
         # The first test's variant note rides with it whole — the count, where each variant
         # is and the link to the ids — as it does under a defect of one site: the evidence
         # prints neither.
         note = (parts["tests"][0][1].strip()[2:]
                 if judged and parts["tests"] and len(parts["tests"][0]) > 1 else "")
         cell = _cell(test) + (f" ({note})" if note and test else "")
-        located = _at(site, names)
+        located = _render_at(site["location"])
         out.append(f"| {_site_link(site['id'], SOURCE_ANCHOR)} | {_cell(located)} | "
                    f"{_term_cell(site['status'])} | {_term_cell(site['severity'])} | "
                    f"{_cell(' '.join(particular))} | {cell} |\n")
     out.append(f"\n**{SITES_LABEL}**\n\n")
     for site in sites:
         parts = parts_of[site["id"]]
-        located = _one_line(_at(site, names))
+        located = _one_line(_render_at(site["location"]))
         out.append(f"- {_anchor_tag(site['id'] + SOURCE_ANCHOR)}**{site['id']}**{DEFECT_META_SEP}"
                    f"{located if '`' in located else f'`{located}`'} — "
                    f"{_one_line(site['consequence'])}{DEFECT_META_SEP}"
@@ -13397,7 +14775,7 @@ def _render_entry(defect: dict, site_of: dict, by_id: dict, parts_of: dict, name
     return out
 
 
-def _evidence_lines(site: dict, defect: dict, parts: dict, printed: _Printed) -> list[str]:
+def _evidence_lines(record: dict, parts: dict, printed: _Printed) -> list[str]:
     """Every line of a site's evidence the defect entry does not print.
 
     Exactly these leave it, and the appendix lists each: the defect's own account, which is
@@ -13408,47 +14786,81 @@ def _evidence_lines(site: dict, defect: dict, parts: dict, printed: _Printed) ->
     pointer to it. Everything else is as a one-site defect's entry renders it, in that
     order.
     """
-    judged = defect["tier"] is not None and _is_work(defect)
-    several = len(defect["sites"]) > 1
     out = [*parts["meta"], *parts["corrected"]]
-    if parts["split"] and several:
-        printed.moved.append((site["id"], parts["split"]))
+    if parts["split"] and record["several"]:
+        printed.moved.append((record["id"], parts["split"]))
     else:
         out += parts["split"]
-    if judged:
+    if record["judged"]:
         out += parts["unsettled"][1:]
         out += [line for block in parts["tests"][1:] for line in block]
         out += parts["quotes"]
     out += parts["checks"]
     out += parts["bodies"]
-    return [printed.output_blocks(site["id"], "".join(out))]
+    return [printed.output_blocks(record["id"], "".join(out))]
 
 
-def _render_evidence_part(findings: Findings, parts_of: dict, names: PathNames,
+def _render_evidence_part(order: Sequence[str], site_records: dict, parts_of: dict,
                           sections: _Sections, printed: _Printed) -> list[str]:
     """The Evidence section: one entry per site, in site order, each headed by the whole of
     its signpost — number, location, outcome and the defect it belongs to."""
-    defect_of = {defect["id"]: defect for defect in findings.defects}
-    sites = sorted(findings.sites, key=lambda site: _id_rank(site["id"]))
-    out = [sections.top(SECTION_EVIDENCE, len(sites))]
-    if not sites:
+    out = [sections.top(SECTION_EVIDENCE, len(order))]
+    if not order:
         out.append("No site was raised.\n")
         return out
     out.append(EVIDENCE_LEAD + "\n")
-    for site in sites:
-        defect = defect_of[site["defect"]]
-        located = _one_line(_at(site, names))
+    for sid in order:
+        site = site_records[sid]
+        located = _one_line(_render_at(site["location"]))
         out.append(f"\n{_anchor_tag(site['id'])}\n\n### {site['id']}{DEFECT_META_SEP}"
                    f"{located if '`' in located else f'`{located}`'}{DEFECT_META_SEP}"
-                   f"{site['status']}{DEFECT_META_SEP}[{defect['id']}](#{defect['id']})\n\n")
-        out += _evidence_lines(site, defect, parts_of[site["id"]], printed)
+                   f"{site['status']}{DEFECT_META_SEP}[{site['defect']}](#{site['defect']})\n\n")
+        out += _evidence_lines(site, parts_of[sid], printed)
     return out
 
 
-def _render_body(clusters: Sequence[dict], by_id: dict, site_of: dict, parts_of: dict,
-                 names: PathNames, sections: _Sections, printed: _Printed,
+def _body_record(clusters: Sequence[dict], site_of: dict, by_id: dict,
                  tiers: Sequence[str] = (), disclaim: bool = False,
-                 headed: bool = False) -> list[str]:
+                 headed: bool = False) -> dict:
+    """The body as the record holds it: each placement section's defects in their groups,
+    in print order, and one entry record per defect."""
+    established = [c for c in clusters if c["status"] == DEFECT_ESTABLISHED]
+    unresolved = [c for c in clusters if c["status"] == DEFECT_UNRESOLVED]
+    # The settling reason stays the PRIMARY grouping: it is a fact the verifiers returned
+    # and it is what a person does next. The tier names the substance inside it.
+    groups: dict[tuple, list[dict]] = {}
+    for cluster in unresolved:
+        settles = _settles_record(cluster)
+        groups.setdefault((settles["case"], settles["reason"],
+                           cluster["tier"] if tiers else None), []).append(cluster)
+    # The order of the headings: each agreed reason in the order the groups are declared,
+    # then mixed reasons, then no answer at all.
+    reasons = list(UNRESOLVED_GROUPS)
+    settling = {"mixed": len(reasons), "unanswered": len(reasons) + 1}
+    rank = {tier: n for n, tier in enumerate(tiers)}
+    ordered = sorted(groups, key=lambda k: (settling.get(k[0]) if k[0] in settling
+                                            else reasons.index(k[1]),
+                                            rank.get(k[2], len(tiers))))
+    # Listed in the order they were raised: nothing ranks what needs no work.
+    refuted = sorted((c for c in clusters if c["status"] == DEFECT_REFUTED),
+                     key=lambda c: _id_rank(c["id"]))
+    return {
+        "disclaim": disclaim, "headed": headed,
+        # The group the round placed nowhere is marked, not named: its heading is wording.
+        "established": [{"tier": name, "untiered": untiered,
+                         "defects": [c["id"] for c in group]}
+                        for name, untiered, group in _by_tier(established, tiers)],
+        "established_count": len(established),
+        "unresolved": [{"settles": {"case": key[0], "reason": key[1]}, "tier": key[2],
+                        "defects": [c["id"] for c in groups[key]]} for key in ordered],
+        "unresolved_count": len(unresolved),
+        "refuted": [c["id"] for c in refuted],
+        "entries": {c["id"]: _entry_record(c, site_of, by_id) for c in clusters},
+    }
+
+
+def _render_body(record: dict, site_records: dict, parts_of: dict, sections: _Sections,
+                 printed: _Printed) -> list[str]:
     """The defects themselves, grouped by where they are placed and then by tier, with
     severity order inside: Established, Unresolved and Refuted. Neither grouping is an
     ordering: the placement is a fact the engine computed, the tier is the name one agent
@@ -13460,40 +14872,42 @@ def _render_body(clusters: Sequence[dict], by_id: dict, site_of: dict, parts_of:
     a reader who loses the second cannot tell a confirmed blocker from a claim nothing
     settled.
     """
-    def entry(cluster: dict, level: int) -> list[str]:
-        return _render_entry(cluster, site_of, by_id, parts_of, names, level, printed)
+    entries = record["entries"]
 
-    def grouped(held: Sequence[dict], level: int) -> list[str]:
+    def entry(defect_id: str, level: int) -> list[str]:
+        return _render_entry(entries[defect_id], site_records, parts_of, level, printed)
+
+    def grouped(groups: Sequence[dict], level: int) -> list[str]:
         """One section's defects, under a tier heading each where the round named any.
         With no tiers the defects sit at the section's own level."""
         out: list[str] = []
-        for name, group in _by_tier(held, tiers):
-            if name is None:
-                for cluster in group:
-                    out += entry(cluster, level)
+        for group in groups:
+            if group["tier"] is None and not group["untiered"]:
+                for defect_id in group["defects"]:
+                    out += entry(defect_id, level)
                 continue
-            out.append(f"\n{'#' * level} {_counted(_one_line(name), len(group))}\n")
-            for cluster in group:
-                out += entry(cluster, level + 1)
+            name = UNTIERED_GROUP if group["untiered"] else group["tier"]
+            out.append(f"\n{'#' * level} "
+                       f"{_counted(_one_line(name), len(group['defects']))}\n")
+            for defect_id in group["defects"]:
+                out += entry(defect_id, level + 1)
         return out
 
     out: list[str] = []
-    established = [c for c in clusters if c["status"] == DEFECT_ESTABLISHED]
-    out.append(sections.top(SECTION_ESTABLISHED, len(established)))
+    out.append(sections.top(SECTION_ESTABLISHED, record["established_count"]))
     # Where the body begins, and said once for the whole document.
-    if disclaim:
-        out.append(f"{SYNTHESIS_DISCLAIMER}{SYNTHESIS_HEADED if headed else ''}\n\n")
-    if not established:
+    if record["disclaim"]:
+        out.append(f"{SYNTHESIS_DISCLAIMER}{SYNTHESIS_HEADED if record['headed'] else ''}\n\n")
+    if not record["established_count"]:
         out.append("Nothing was established.\n")
     else:
         out.append("Each has at least one site a checker that had not raised it confirmed. "
                    "Every site keeps its own outcome, so a site nothing settled, or one a "
                    "check refuted, is shown as that beside the others.\n")
-    out += grouped(established, 3)
+    out += grouped(record["established"], 3)
 
-    unresolved = [c for c in clusters if c["status"] == DEFECT_UNRESOLVED]
-    out.append(sections.top(SECTION_UNRESOLVED, len(unresolved)))
-    if not unresolved:
+    out.append(sections.top(SECTION_UNRESOLVED, record["unresolved_count"]))
+    if not record["unresolved_count"]:
         out.append("Nothing was left unresolved.\n")
     else:
         # It names the part that is a VERDICT: the checker's own account of what stopped
@@ -13507,31 +14921,21 @@ def _render_body(clusters: Sequence[dict], by_id: dict, site_of: dict, parts_of:
                    f"unit that owes one. The defects are grouped by what would settle each, "
                    f"and then by what each breaks. Every defect here sits under exactly one "
                    f"group, so a group's size counts pieces of work, not mentions.\n")
-    # The settling reason stays the PRIMARY grouping: it is a fact the verifiers returned
-    # and it is what a person does next. The tier names the substance inside it.
-    groups: dict[tuple[str, str | None], list[dict]] = {}
-    for cluster in unresolved:
-        groups.setdefault((_settles(cluster), cluster["tier"] if tiers else None), []).append(cluster)
-    settling = [*UNRESOLVED_GROUPS.values(), MIXED_SETTLING, UNKNOWN_SETTLING]
-    rank = {tier: n for n, tier in enumerate(tiers)}
-    for key in sorted(groups, key=lambda k: (settling.index(k[0]), rank.get(k[1], len(tiers)))):
-        held = groups[key]
-        title = key[0] if key[1] is None else f"{key[0]} — {_one_line(key[1])}"
-        out.append(f"\n### {_counted(title, len(held))}\n")
-        for cluster in held:
-            out += entry(cluster, 4)
+    for group in record["unresolved"]:
+        heading = _render_settles(group["settles"])
+        title = heading if group["tier"] is None else f"{heading} — {_one_line(group['tier'])}"
+        out.append(f"\n### {_counted(title, len(group['defects']))}\n")
+        for defect_id in group["defects"]:
+            out += entry(defect_id, 4)
 
-    refuted = sorted((c for c in clusters if c["status"] == DEFECT_REFUTED),
-                     key=lambda c: _id_rank(c["id"]))
-    out.append(sections.top(SECTION_REFUTED, len(refuted)))
-    if not refuted:
+    out.append(sections.top(SECTION_REFUTED, len(record["refuted"])))
+    if not record["refuted"]:
         out.append("Nothing was refuted.\n")
     else:
-        # Listed in the order they were raised: nothing ranks what needs no work.
         out.append("Claims that were checked and dismissed at every site, each with the "
                    "reason, so nobody goes over them again. Nothing here needs work.\n")
-    for cluster in refuted:
-        out += entry(cluster, 3)
+    for defect_id in record["refuted"]:
+        out += entry(defect_id, 3)
     return out
 
 
@@ -13565,8 +14969,15 @@ def _carries_a_reading(cluster: dict) -> bool:
     return bool(cluster["cross_references"])
 
 
-def _render_corroborated(clusters: Sequence[dict], rung: str,
-                         sections: _Sections) -> list[str]:
+def _corroborated_record(clusters: Sequence[dict], rung: str) -> dict:
+    """The defects that are work and were raised by both lanes, in the order they were
+    raised, and the rung, which decides what the section may call the two lanes."""
+    named = sorted((c for c in clusters if _is_work(c) and c["axis_a"] == AXIS_A_BOTH),
+                   key=lambda c: _id_rank(c["id"]))
+    return {"rung": rung, "rows": [{"id": c["id"], "title": _title(c)} for c in named]}
+
+
+def _render_corroborated(record: dict, sections: _Sections) -> list[str]:
     """The defects two independent readers each found, named together.
 
     **This is not a fourth view of the defect list**, and the difference is what keeps the
@@ -13587,9 +14998,8 @@ def _render_corroborated(clusters: Sequence[dict], rung: str,
     they are not work — and the empty case says so in the same words, because a run whose
     one both-lane defect was refuted did not fail to corroborate anything.
     """
-    _, both = RUNG_BREADTH[rung]
-    named = sorted((c for c in clusters if _is_work(c) and c["axis_a"] == AXIS_A_BOTH),
-                   key=lambda c: _id_rank(c["id"]))
+    _, both = RUNG_BREADTH[record["rung"]]
+    named = record["rows"]
     out = [sections.top(f"{SECTION_CORROBORATED}{both}", len(named))]
     if not named:
         # Scoped to the set this section is about, which is the work. Saying "no defect was
@@ -13608,8 +15018,8 @@ def _render_corroborated(clusters: Sequence[dict], rung: str,
     # defect in it is in the ranked index, which already carries both. The test a table has
     # to pass is whether it carries something the index does not.
     out += [f"| {DEFECT_COLUMN} | Consequence |\n", "|---|---|\n"]
-    out += [f"| [{cluster['id']}](#{cluster['id']}) | "
-            f"{_cell(_short(_title(cluster)))} |\n" for cluster in named]
+    out += [f"| [{row['id']}](#{row['id']}) | "
+            f"{_cell(_short(row['title']))} |\n" for row in named]
     return out
 
 
@@ -13731,40 +15141,54 @@ def _gap_anchor(cluster: dict, anchored: set[str]) -> str:
     return _anchor_tag(did)
 
 
-def _gap_entry(cluster: dict, by_id: dict, names: PathNames,
-               anchored: set[str] | None = None) -> list[str]:
+def _gap_entry_record(cluster: dict, by_id: dict, names: PathNames) -> dict:
+    """One gap as its entry states it, read off the member that established it: where it
+    is, the input no test constructs, the test the auditor proposed, and what the check
+    found.
+
+    Read off one member. Two auditors naming one gap is why coverage is clustered at all,
+    and their accounts of it are the same account twice; the second adds nothing a reader
+    about to write the test can use.
+    """
+    primary = _gap_primary(cluster, by_id)
+    return {"id": cluster["id"], "part_of": cluster.get("part_of"),
+            "at": _location_record(cluster, names), "consequence": cluster["consequence"],
+            "unresolved_reasons": list(cluster.get("unresolved_reasons") or ()),
+            "failure": primary["failure"], "direction": primary["direction"],
+            "test_first": primary["test_first"],
+            # Only a checker's words are printed as what the check found. A record nobody
+            # answered carries the engine's own diagnostic in this field -- the stand-in for
+            # a verdict it could not read -- and printed here it reads as a checker's
+            # rationale; the coverage section names that candidate and the parse error, and
+            # is the one place they belong.
+            "rationale": (primary["rationale"] if primary.get("answered", True) else None),
+            "quote_differs": primary["quote_check"] == QUOTE_DIFFERS}
+
+
+def _gap_entry(entry: dict, anchored: set[str] | None = None) -> list[str]:
     """One gap: where it is, the input no test constructs, the test the auditor proposed,
     and what the check found. Four facts and no apparatus — a gap carries no severity
     ranking, no corroboration axis and no snippet, because the thing to do with it is
     write the test, and none of those change that.
-
-    Read off the first member. Two auditors naming one gap is why coverage is clustered at
-    all, and their accounts of it are the same account twice; the second adds nothing a
-    reader about to write the test can use.
     """
-    primary = _gap_primary(cluster, by_id)
-    # `_one_line`, like every other caller of `_at`: the string it returns is RAW by
+    # `_one_line`, like every other caller of `_render_at`: the string it returns is RAW by
     # contract, and a path is a REVIEWED repository's bytes. `<img src=x onerror=...>.py` is
     # a legal POSIX name, and `_one_line` escapes it so it reaches `report.html` as text
     # rather than as a live tag -- the reviewed tree scripting the page its reviewer opens.
     # The escape is the same one the tables and the defect entries use.
-    lead = _gap_anchor(cluster, anchored) if anchored is not None else ""
-    out = [f"- {lead}**{_one_line(_at(cluster, names))}** — "
-           f"{_one_line(_short(cluster['consequence']))}\n"]
-    if cluster.get("part_of"):
-        out.append(f"  - Site {_gap_label(cluster)}, one gap with several sites: each is "
+    lead = _gap_anchor(entry, anchored) if anchored is not None else ""
+    out = [f"- {lead}**{_one_line(_render_at(entry['at']))}** — "
+           f"{_one_line(_short(entry['consequence']))}\n"]
+    if entry["part_of"]:
+        out.append(f"  - Site {_gap_label(entry)}, one gap with several sites: each is "
                    f"its own test to write.\n")
-    out += _item("  - No test constructs: ", primary["failure"])
-    out += _item("  - The auditor proposed: ", primary["direction"])
-    if primary["test_first"]:
-        out += _item(f"  - {TEST_FIRST_LABEL} ", primary["test_first"])
-    # Only a checker's words are printed as what the check found. A record nobody answered
-    # carries the engine's own diagnostic in this field -- the stand-in for a verdict it
-    # could not read -- and printed here it reads as a checker's rationale; the coverage
-    # section names that candidate and the parse error, and is the one place they belong.
-    if primary["rationale"] and primary.get("answered", True):
-        out += _item("  - What the check found: ", primary["rationale"])
-    if primary["quote_check"] == QUOTE_DIFFERS:
+    out += _item("  - No test constructs: ", entry["failure"])
+    out += _item("  - The auditor proposed: ", entry["direction"])
+    if entry["test_first"]:
+        out += _item(f"  - {TEST_FIRST_LABEL} ", entry["test_first"])
+    if entry["rationale"]:
+        out += _item("  - What the check found: ", entry["rationale"])
+    if entry["quote_differs"]:
         out.append(f"  - {QUOTE_FLAG}\n")
     return out
 
@@ -13773,27 +15197,71 @@ def _gap_entry(cluster: dict, by_id: dict, names: PathNames,
 COVERAGE_BATCH_LABEL = "Across the batch"
 
 
-def _batch_notes(clusters: Sequence[dict], by_id: dict,
-                 said: dict[str, str]) -> list[str]:
+def _batch_notes_record(clusters: Sequence[dict], by_id: dict,
+                       said: dict[str, str]) -> list[dict]:
+    """The batch-wide paragraph of every check that answered a gap in this group, once, in
+    the order its gaps are listed. A check that wrote nothing states nothing."""
+    return [{"unit": unit, "summary": said[unit]}
+            for unit in _distinct((by_id[cid]["verified_by"] or {}).get("unit")
+                                  for cluster in clusters for cid in cluster["members"])
+            if unit in said]
+
+
+def _batch_notes(notes: Sequence[dict]) -> list[str]:
     """The batch-wide paragraph of every check that answered a gap in this group, once.
 
     A verifier looking at forty gaps in one class learns things true of all forty — the
     class has no test file at all, the suite never instantiates it — and asked to put them
     in each gap's rationale it writes them forty times. ``summary`` is the field for them,
     and a group heading is the one place it can be stated once: above a single gap it would
-    be a fact about thirty-nine others. A check that wrote nothing states nothing.
+    be a fact about thirty-nine others.
     """
     out: list[str] = []
-    for unit in _distinct(
-            (by_id[cid]["verified_by"] or {}).get("unit")
-            for cluster in clusters for cid in cluster["members"]):
-        if unit in said:
-            out += _item(f"- **{COVERAGE_BATCH_LABEL}** ({unit}): ", said[unit])
+    for note in notes:
+        out += _item(f"- **{COVERAGE_BATCH_LABEL}** ({note['unit']}): ", note["summary"])
     return [*out, "\n"] if out else out
 
 
-def _render_coverage_gaps(findings: Findings, names: PathNames,
-                          sections: _Sections, anchored: set[str]) -> list[str]:
+def _coverage_gaps_record(findings: Findings, names: PathNames) -> dict:
+    """The gaps that stood, grouped by the test class that owes them, most cases first and
+    the ones that name no class last; and the gaps nothing settled, by file then line."""
+    gaps = sorted(_gap_sites(findings), key=_gap_order)
+    by_id = {record["id"]: record for record in findings.coverage}
+    standing = [c for c in gaps if c["status"] == DEFECT_ESTABLISHED]
+    unresolved = [c for c in gaps if c["status"] == DEFECT_UNRESOLVED]
+    said = {row["unit"]: row["summary"] for row in findings.verification if row["summary"]}
+    groups: dict[str, list[dict]] = {}
+    spelling: dict[str, str] = {}
+    for cluster in standing:
+        primary = _gap_primary(cluster, by_id)
+        key, named = _test_named(primary["test_first"] or "")
+        groups.setdefault(key or "", []).append(cluster)
+        if key and key not in spelling:
+            spelling[key] = named
+    # Most cases first, which is the order the section exists to show; the unreadable ones
+    # last, because they are the group nobody can act on as a group.
+    ordered = sorted((key for key in groups if key), key=lambda k: (-len(groups[k]), k))
+    # As the defect section groups them: two checkers naming different settling questions
+    # is a disagreement and goes under the group that says so, and only a gap no checker
+    # answered goes under the one a reader acts on by re-running the unit.
+    unsettled: dict[tuple, list[dict]] = {}
+    for cluster in unresolved:
+        entry = _gap_entry_record(cluster, by_id, names)
+        settles = _settles_record(entry)
+        unsettled.setdefault((settles["case"], settles["reason"]), []).append(entry)
+    return {"standing": len(standing),
+            "groups": [{"test": spelling.get(key),
+                        "notes": _batch_notes_record(groups[key], by_id, said),
+                        "gaps": [_gap_entry_record(c, by_id, names) for c in groups[key]]}
+                       for key in [*ordered, *([""] if "" in groups else [])]],
+            "unresolved_count": len(unresolved),
+            "unresolved": [{"settles": {"case": key[0], "reason": key[1]},
+                            "gaps": unsettled[key]}
+                           for key in sorted(unsettled, key=GAP_SETTLING_ORDER.index)]}
+
+
+def _render_coverage_gaps(record: dict, sections: _Sections,
+                          anchored: set[str]) -> list[str]:
     """The coverage ladder: gaps that stood, and gaps nothing settled.
 
     Its own section, and not a corner of the defect body, because a gap makes no claim that
@@ -13814,66 +15282,56 @@ def _render_coverage_gaps(findings: Findings, names: PathNames,
     proposes, so :func:`_test_named` reads it off rather than asking for it twice. Each
     entry still carries its own location, so nothing is lost by dropping the file heading.
     """
-    gaps = sorted(_gap_sites(findings), key=_gap_order)
-    by_id = {record["id"]: record for record in findings.coverage}
-    standing = [c for c in gaps if c["status"] == DEFECT_ESTABLISHED]
-    unresolved = [c for c in gaps if c["status"] == DEFECT_UNRESOLVED]
-    out = [sections.top(SECTION_COVERAGE_GAPS, len(standing))]
+    unresolved = record["unresolved_count"]
+    out = [sections.top(SECTION_COVERAGE_GAPS, record["standing"])]
     out.append("Inputs the code handles differently that no test in scope constructs. "
                "**None of these says the code is wrong.** A branch can be correct today with "
                "no test guarding it, and a test is what keeps it correct. Each is a test to "
                "write, at the lines that decide the input, under the test class that owes "
                "it.\n")
-    if not standing and not unresolved:
+    if not record["standing"] and not unresolved:
         out.append("\nNo coverage gap stood: every one raised is covered by a test named in "
                    "the appendix.\n")
         return out
-    said = {row["unit"]: row["summary"] for row in findings.verification if row["summary"]}
-    groups: dict[str, list[dict]] = {}
-    spelling: dict[str, str] = {}
-    for cluster in standing:
-        primary = _gap_primary(cluster, by_id)
-        key, named = _test_named(primary["test_first"] or "")
-        groups.setdefault(key or "", []).append(cluster)
-        if key and key not in spelling:
-            spelling[key] = named
-    # Most cases first, which is the order the section exists to show; the unreadable ones
-    # last, because they are the group nobody can act on as a group.
-    ordered = sorted((key for key in groups if key), key=lambda k: (-len(groups[k]), k))
-    for key in [*ordered, *([""] if "" in groups else [])]:
-        held = groups[key]
-        out.append(f"\n#### {_one_line(spelling.get(key, GAPS_NO_TEST_NAMED))}\n\n")
-        out += _batch_notes(held, by_id, said)
-        for cluster in held:
-            out += _gap_entry(cluster, by_id, names, anchored)
+    for group in record["groups"]:
+        test = group["test"]
+        out.append(f"\n#### {_one_line(test if test is not None else GAPS_NO_TEST_NAMED)}\n\n")
+        out += _batch_notes(group["notes"])
+        for entry in group["gaps"]:
+            out += _gap_entry(entry, anchored)
     if unresolved:
-        out.append(f"\n#### {_counted('Gaps nothing settled', len(unresolved))}\n\n")
+        out.append(f"\n#### {_counted('Gaps nothing settled', unresolved)}\n\n")
         out.append("A check could not tell whether a test constructs the input. Grouped by "
                    "what would settle each, as the unresolved defects are.\n")
-        groups: dict[str, list[dict]] = {}
-        # `_settles`, as the defect section: two checkers naming different settling
-        # questions is a disagreement and goes under the group that says so. Only a gap no
-        # checker answered goes under "no verdict was received", the one a reader acts on
-        # by re-running the unit.
-        for cluster in unresolved:
-            groups.setdefault(_settles(cluster), []).append(cluster)
-        for heading in sorted(groups):
-            out.append(f"\n##### {_counted(heading, len(groups[heading]))}\n\n")
-            for cluster in groups[heading]:
-                out += _gap_entry(cluster, by_id, names, anchored)
+        for group in record["unresolved"]:
+            heading = _render_settles(group["settles"])
+            out.append(f"\n##### {_counted(heading, len(group['gaps']))}\n\n")
+            for entry in group["gaps"]:
+                out += _gap_entry(entry, anchored)
     return out
 
 
-def _render_covered(findings: Findings, names: PathNames, anchored: set[str]) -> list[str]:
+def _covered_record(findings: Findings, names: PathNames) -> dict:
+    """The gaps a check answered by naming the test that covers them, by file then line."""
+    covered = [c for c in sorted(_gap_sites(findings), key=_gap_order)
+               if c["status"] == DEFECT_REFUTED]
+    by_id = {record["id"]: record for record in findings.coverage}
+    return {"rows": [{"id": cluster["id"], "part_of": cluster.get("part_of"),
+                      "failure": by_id[cluster["members"][0]]["failure"],
+                      "at": _location_record(cluster, names),
+                      "tests": " ".join(_collapse(by_id[cid]["covered_by"] or "")
+                                        for cid in cluster["members"])}
+                     for cluster in covered]}
+
+
+def _render_covered(record: dict, anchored: set[str]) -> list[str]:
     """The gaps a check answered by naming the test that covers them.
 
     A table, one row per gap, and the test is the column that matters: a refutation of a
     coverage gap that names no test is refused by the engine, so every row here has one.
     In the appendix beside Refuted, because it is settled and is not work.
     """
-    covered = [c for c in sorted(_gap_sites(findings), key=_gap_order)
-               if c["status"] == DEFECT_REFUTED]
-    by_id = {record["id"]: record for record in findings.coverage}
+    covered = record["rows"]
     out = [f"\n### {_counted(SUBSECTION_COVERED, len(covered))}\n\n"]
     if not covered:
         out.append("No coverage gap was answered with a test that covers it.\n")
@@ -13882,13 +15340,10 @@ def _render_covered(findings: Findings, names: PathNames, anchored: set[str]) ->
                "that input. Nothing here needs work.\n\n")
     out.append("\n| Gap | Input | Location | The test that covers it |\n")
     out.append("|---|---|---|---|\n")
-    for cluster in covered:
-        member = by_id[cluster["members"][0]]
-        tests = " ".join(_collapse(by_id[cid]["covered_by"] or "")
-                         for cid in cluster["members"])
-        out.append(f"| {_gap_anchor(cluster, anchored)}{_gap_label(cluster)} | "
-                   f"{_cell(_short(member['failure']))} | "
-                   f"{_cell(_at(cluster, names))} | {_cell(tests)} |\n")
+    for row in covered:
+        out.append(f"| {_gap_anchor(row, anchored)}{_gap_label(row)} | "
+                   f"{_cell(_short(row['failure']))} | "
+                   f"{_cell(_render_at(row['at']))} | {_cell(row['tests'])} |\n")
     return out
 
 
@@ -13898,7 +15353,28 @@ def _render_covered(findings: Findings, names: PathNames, anchored: set[str]) ->
 OUTSIDE_NO_PATH = "named without a path"
 
 
-def _render_outside_scope(findings: Findings, names: PathNames) -> list[str]:
+# **A section is a record and a renderer.** `_<section>_record(...)` decides: it reads the
+# run's data and returns what the section states, as JSON values only — counts, which
+# variant of a sentence applies, what is listed and in what order. `_render_<section>(record)`
+# words it: the sentences, the Markdown, the escaping, `_plural`, `_short` and `_one_line`.
+# It reads nothing but its record. A path enters the record already shortened, through
+# `names.short`, and the legend's record carries the map. What the renderer prints in full or
+# as a pointer depends on what it has already printed, so that stays with the renderer.
+
+
+def _outside_scope_record(findings: Findings, names: PathNames) -> dict:
+    """Every class outside the reviewed set that open work hangs on, most claims first,
+    with every path the run's verdicts guessed it at."""
+    # The class alone is not a spelling of where the file is, so a row whose only entry was
+    # the bare class says so instead of repeating the name into the next column.
+    return {"rows": [{"class": row["class"],
+                      "paths": [names.short(path) for path in row["paths"]
+                                if path != row["class"]],
+                      "defects": list(row["defects"])}
+                     for row in findings.outside_scope]}
+
+
+def _render_outside_scope(record: dict) -> list[str]:
     """Every class outside the reviewed set that open work hangs on, most claims first.
 
     The answer to "widen the scope" is usually no, and it is no for a good reason: a run
@@ -13914,7 +15390,7 @@ def _render_outside_scope(findings: Findings, names: PathNames) -> list[str]:
     Counted in DEFECTS, because that is the unit of work being bought. It is a floor and not
     a promise: a file that would settle nine claims may settle them as refutations.
     """
-    rows = findings.outside_scope
+    rows = record["rows"]
     out = [f"\n### {_counted(SUBSECTION_OUTSIDE, len(rows))}\n\n"]
     if not rows:
         out.append("No unresolved verdict named a file outside the reviewed scope.\n")
@@ -13929,10 +15405,7 @@ def _render_outside_scope(findings: Findings, names: PathNames) -> list[str]:
     out.append("|---|---|---|---|\n")
     for row in rows:
         listed = ", ".join(f"[{did}](#{did})" for did in row["defects"])
-        # The class alone is not a spelling of where the file is, so a row whose only entry
-        # was the bare class says so instead of repeating the name into the next column.
-        guessed = [path for path in row["paths"] if path != row["class"]]
-        where = ", ".join(_cell(names.short(path)) for path in guessed) or OUTSIDE_NO_PATH
+        where = ", ".join(_cell(path) for path in row["paths"]) or OUTSIDE_NO_PATH
         out.append(f"| {_cell(row['class'])} | {where} | {len(row['defects'])} | "
                    f"{listed} |\n")
     return out
@@ -13945,7 +15418,34 @@ SUBSECTION_VERIFIER_NOTES = "What each unit said about its batch"
 VERIFIER_NOTES_NONE = "No verification unit returned a summary."
 
 
-def _render_verifier_variance(findings: Findings) -> list[str]:
+def _verifier_variance_record(findings: Findings) -> dict:
+    """One row per verification unit, ordered by the share it left unresolved, the spread
+    between the first and last unit that answered, and the units that said something."""
+    def share(row):
+        return row["unresolved"] / row["candidates"] if row["candidates"] else 0.0
+    # The unit that answered fewest questions first. No threshold decides what counts as a
+    # wide spread — the order puts the outlier where it is read first.
+    ordered = sorted(findings.verification, key=lambda r: (-share(r), r["unit"]))
+    rows = [{"unit": row["unit"], "finder": row["finder"], "candidates": row["candidates"],
+             "established": row["established"], "unresolved": row["unresolved"],
+             "refuted": row["refuted"], "state": row["state"],
+             "complete": row["state"] == UNIT_COMPLETE,
+             "not_dispatched": row.get("reason") == NOT_DISPATCHED_REASON}
+            for row in ordered]
+    # A unit that failed or never landed also produces a column of unresolved, which is not
+    # a verifier's judgment, so the spread is over the units that answered.
+    answered = [row for row in ordered if row["candidates"] and row["state"] == UNIT_COMPLETE]
+    spread = None
+    if len(answered) > 1 and share(answered[0]) != share(answered[-1]):
+        spread = {end: {"unit": row["unit"], "unresolved": row["unresolved"],
+                        "candidates": row["candidates"], "share": share(row)}
+                  for end, row in (("low", answered[-1]), ("high", answered[0]))}
+    return {"rows": rows, "spread": spread,
+            "notes": [{"unit": row["unit"], "summary": row["summary"]}
+                      for row in ordered if row["summary"]]}
+
+
+def _render_verifier_variance(record: dict) -> list[str]:
     """One row per verification unit: what it was handed and how its answers fell.
 
     The established count over one set of files can swing widely between two runs of one
@@ -13970,7 +15470,7 @@ def _render_verifier_variance(findings: Findings) -> list[str]:
     the coverage section states its verifiers': a field the engine reads and nothing prints
     is a paragraph the worker was asked for and nobody sees.
     """
-    rows = findings.verification
+    rows = record["rows"]
     out = [f"\n### {_counted(SUBSECTION_VERIFIERS, len(rows))}\n\n"]
     if not rows:
         out.append("No verification unit answered for any candidate.\n")
@@ -13982,77 +15482,115 @@ def _render_verifier_variance(findings: Findings) -> list[str]:
                "whose work the row is about.\n\n")
     out.append("\n| Unit | Findings from | Handed | Established | Unresolved | Refuted |\n")
     out.append("|---|---|---|---|---|---|\n")
-    def share(row):
-        return row["unresolved"] / row["candidates"] if row["candidates"] else 0.0
-    ordered = sorted(rows, key=lambda r: (-share(r), r["unit"]))
-    for row in ordered:
+    for row in rows:
         label = row["unit"]
-        if row.get("reason") == NOT_DISPATCHED_REASON:
+        if row["not_dispatched"]:
             label += (" — not dispatched, over its lane's hard ceiling, so these findings "
                       "were not verified")
-        elif row["state"] != UNIT_COMPLETE:
+        elif not row["complete"]:
             # Said in the row, not inferred from a column of unresolved that looks like
             # thirty considered answers.
             label += f" — {row['state']}, so nothing here is a verdict"
         out.append(f"| {label} | {row['finder'] or UNKNOWN_FINDER} | {row['candidates']} | "
                    f"{row['established']} | {row['unresolved']} | {row['refuted']} |\n")
-    answered = [row for row in ordered if row["candidates"] and row["state"] == UNIT_COMPLETE]
-    if len(answered) > 1:
-        top, bottom = answered[0], answered[-1]
-        if share(top) != share(bottom):
-            out.append(f"\nThe share left unresolved ranges from {share(bottom):.0%} "
-                       f"({bottom['unit']}, "
-                       f"{bottom['unresolved']} of {bottom['candidates']}) to "
-                       f"{share(top):.0%} ({top['unit']}, {top['unresolved']} of "
-                       f"{top['candidates']}).\n")
+    spread = record["spread"]
+    if spread is not None:
+        top, bottom = spread["high"], spread["low"]
+        out.append(f"\nThe share left unresolved ranges from {bottom['share']:.0%} "
+                   f"({bottom['unit']}, "
+                   f"{bottom['unresolved']} of {bottom['candidates']}) to "
+                   f"{top['share']:.0%} ({top['unit']}, {top['unresolved']} of "
+                   f"{top['candidates']}).\n")
     out.append(f"\n#### {SUBSECTION_VERIFIER_NOTES}\n\n")
-    said = [row for row in ordered if row["summary"]]
-    if not said:
+    if not record["notes"]:
         out.append(f"{VERIFIER_NOTES_NONE}\n")
-    for row in said:
+    for row in record["notes"]:
         out += _item(f"- {row['unit']}: ", row["summary"])
     return out
 
 
-def _render_clustering_notes(findings: Findings, names: PathNames) -> list[str]:
-    """The report's audit of the merge. The one place candidate ids belong in prose: what is
-    being explained here is a judgment — why two reports of one site were merged or kept
-    apart — and the ids are what make that judgment checkable.
+def _clustering_notes_record(findings: Findings, names: PathNames) -> dict:
+    """What the merge audit states: the totals, the five largest clusters, every cluster
+    kept apart at one location, and each clustering unit's summary.
 
     Read off the SITES, since a cluster is a site, and each is named by its own number."""
     clusters = list(findings.sites)
-    out = [f"\n### {SUBSECTION_NOTES}\n\n",
-           f"Every candidate is in exactly one cluster: {_plural(len(findings.candidates), 'candidate')} "
-           f"in {_plural(len(clusters), 'cluster')}, none dropped and none counted twice.\n"]
     merged = sorted((c for c in clusters if len(c["members"]) > 1),
                     key=lambda c: (-len(c["members"]), _id_rank(c["id"])))
+    # A clustering unit is named beside its area only where it is one part of a split area:
+    # elsewhere the area is the unit.
+    parts = _record_parts(findings.clustering)
+    return {"candidates": len(findings.candidates), "clusters": len(clusters),
+            "largest": [{"id": c["id"], "members": list(c["members"]),
+                         "consequence": c["consequence"]} for c in merged[:5]],
+            "split": [{"id": c["id"], "members": list(c["members"]),
+                       "at": _location_record(c, names), "reason": c["split_reason"]}
+                      for c in clusters if c["split_reason"]],
+            "reported": [{"area": e["area"], "unit": e["unit"] if e["unit"] in parts else None,
+                          "summary": e["summary"]}
+                         for e in findings.clustering if e["summary"]]}
+
+
+def _render_clustering_notes(record: dict) -> list[str]:
+    """The report's audit of the merge. The one place candidate ids belong in prose: what is
+    being explained here is a judgment — why two reports of one site were merged or kept
+    apart — and the ids are what make that judgment checkable."""
+    out = [f"\n### {SUBSECTION_NOTES}\n\n",
+           f"Every candidate is in exactly one cluster: {_plural(record['candidates'], 'candidate')} "
+           f"in {_plural(record['clusters'], 'cluster')}, none dropped and none counted twice.\n"]
     out.append("\n#### The largest clusters\n\n")
-    if not merged:
+    if not record["largest"]:
         out.append("Nothing merged: every cluster holds one candidate.\n")
-    for cluster in merged[:5]:
+    for cluster in record["largest"]:
         out.append(f"- {cluster['id']} — {_plural(len(cluster['members']), 'candidate')} "
                    f"({', '.join(cluster['members'])}): "
                    f"{_one_line(_short(cluster['consequence']))}\n")
-    split = [c for c in clusters if c["split_reason"]]
     out.append("\n#### Kept apart at one location\n\n")
-    if not split:
+    if not record["split"]:
         out.append("No candidates at one location were split.\n")
-    for cluster in split:
+    for cluster in record["split"]:
         out += _item(f"- {cluster['id']} ({', '.join(cluster['members'])}) at "
-                     f"{_one_line(_at(cluster, names))}: ", cluster["split_reason"])
-    reported = [e for e in findings.clustering if e["summary"]]
+                     f"{_one_line(_render_at(cluster['at']))}: ", cluster["reason"])
     out.append("\n#### What each clustering unit reported\n\n")
-    if not reported:
+    if not record["reported"]:
         out.append("No clustering unit returned a summary.\n")
-    parts = _record_parts(findings.clustering)
-    for entry in reported:
+    for entry in record["reported"]:
         out += _item(f"- {entry['area']}"
-                     + (f" ({entry['unit']})" if entry["unit"] in parts else "") + ": ",
+                     + (f" ({entry['unit']})" if entry["unit"] is not None else "") + ": ",
                      entry["summary"])
     return out
 
 
-def _render_provenance(findings: Findings, tags: dict[str, str]) -> list[str]:
+def _provenance_record(findings: Findings, tags: dict[str, str]) -> dict:
+    """One row per raiser of every candidate in a defect or a coverage gap: which defect,
+    which candidate, which unit raised it under which lens tag, the severity it proposed,
+    and which unit answered."""
+    # BOTH ladders. The section is the audit trail — which unit raised what and which
+    # answered it — and a coverage gap raised by an auditor and answered by a coverage
+    # verifier is exactly the kind of thing an audit of the run has to be able to find.
+    raised = (*findings.candidates, *findings.coverage)
+    by_id = {record["id"]: record for record in raised}
+    rows = []
+    for cluster in (*findings.defects, *findings.coverage_defects):
+        for cid in cluster["members"]:
+            record = by_id[cid]
+            for raiser in record["raised_by"]:
+                auditor = raiser["kind"] == AUDITOR_KIND
+                # Looked up on the lens EXACTLY as the record carries it, which is the
+                # string the job declared: the tags are built from the job, so a lookup
+                # against a rendered form of the same text would miss every time.
+                rows.append({"defect": cluster["id"], "candidate": cid,
+                             "unit": raiser["unit"], "lane": raiser["lane"],
+                             "auditor": auditor,
+                             "tag": "" if auditor else tags.get(raiser["lens"] or "", ""),
+                             "severity": raiser["severity"],
+                             "answered_by": {"unit": record["verified_by"]["unit"],
+                                             "lane": record["verified_by"]["lane"]},
+                             "answered": bool(record["answered"])})
+    return {"rows": rows}
+
+
+def _render_provenance(record: dict) -> list[str]:
     """Every candidate id, lane letter, unit id and lens name in the document, in one place
     nobody has to read to fix anything. This is audit data, and keeping it here is what
     lets the body above be written for the person doing the work.
@@ -14083,11 +15621,6 @@ def _render_provenance(findings: Findings, tags: dict[str, str]) -> list[str]:
     place that cites a lens is the same text twice — the tag and its meaning sit in one
     appendix, a screen apart.
     """
-    # BOTH ladders. The section is the audit trail — which unit raised what and which
-    # answered it — and a coverage gap raised by an auditor and answered by a coverage
-    # verifier is exactly the kind of thing an audit of the run has to be able to find.
-    raised = (*findings.candidates, *findings.coverage)
-    by_id = {record["id"]: record for record in raised}
     out = [f"\n### {SUBSECTION_PROVENANCE}\n\n",
            "Which unit raised what, and which answered it. Nothing here is needed to fix a "
            "defect; it is here so the run can be audited. Everything each unit wrote is in "
@@ -14100,28 +15633,52 @@ def _render_provenance(findings: Findings, tags: dict[str, str]) -> list[str]:
     # repeated here: the id is what a reader follows back.
     out.append("\n| Defect | Candidate | Raised by | Proposed | Answered by |\n")
     out.append("|---|---|---|---|---|\n")
-    for cluster in (*findings.defects, *findings.coverage_defects):
-        for cid in cluster["members"]:
-            record = by_id[cid]
-            for raiser in record["raised_by"]:
-                if raiser["kind"] == AUDITOR_KIND:
-                    who = f"{raiser['unit']} (auditor, lane {raiser['lane']})"
-                else:
-                    # Looked up on the lens EXACTLY as the record carries it, which is the
-                    # string the job declared: the tags are built from the job, so a lookup
-                    # against a rendered form of the same text would miss every time.
-                    tag = tags.get(raiser["lens"] or "", "")
-                    who = f"{raiser['unit']} (lane {raiser['lane']}{', ' + tag if tag else ''})"
-                addressed = record["verified_by"]
-                if not record["answered"]:
-                    ans = f"{addressed['unit']} (lane {addressed['lane']}) — nothing usable"
-                else:
-                    ans = f"{addressed['unit']} (lane {addressed['lane']})"
-                out.append(f"| {cluster['id']} | {cid} | {who} | {_term_cell(raiser['severity'])} | {ans} |\n")
+    for row in record["rows"]:
+        if row["auditor"]:
+            who = f"{row['unit']} (auditor, lane {row['lane']})"
+        else:
+            tag = row["tag"]
+            who = f"{row['unit']} (lane {row['lane']}{', ' + tag if tag else ''})"
+        addressed = row["answered_by"]
+        if not row["answered"]:
+            ans = f"{addressed['unit']} (lane {addressed['lane']}) — nothing usable"
+        else:
+            ans = f"{addressed['unit']} (lane {addressed['lane']})"
+        out.append(f"| {row['defect']} | {row['candidate']} | {who} | "
+                   f"{_term_cell(row['severity'])} | {ans} |\n")
     return out
 
 
-def _render_synthesis_notes(findings: Findings) -> list[str]:
+def _dropped_references(findings: Findings) -> list[dict]:
+    """Every cross-reference the synthesis round wrote and the engine dropped, by defect."""
+    return [{"defect": cluster["id"], "cited": dropped["defect"], "reason": dropped["reason"]}
+            for cluster in findings.defects for dropped in cluster["dropped_cross_references"]]
+
+
+def _synthesis_notes_record(findings: Findings) -> dict | None:
+    """What the judgment round returned and every place it fell short; ``None`` for a run
+    with no synthesis round."""
+    record = findings.synthesis
+    if record is None:
+        return None
+    headed = _headed((*findings.defects, *findings.coverage_defects))
+    if "units" in record:
+        return {"shape": "batched", "headed": headed,
+                "batches": _synthesis_batches_record(findings, record),
+                "hint": any(line["state"] != UNIT_COMPLETE
+                            for line in (*record["units"], *_later_unit_lines(record)))}
+    if record["state"] != UNIT_COMPLETE:
+        return {"shape": "degraded", "headed": headed, "unit": record["unit"],
+                "state": record["state"], "reason": record["reason"]}
+    # A record written before the round's defects were recorded was handed every defect.
+    handed = record.get("defects")
+    return {"shape": "complete", "headed": headed, "unit": record["unit"],
+            "tiers": len(record["tiers"]),
+            "named": len(handed) if handed is not None else len(findings.defects),
+            "rejected": list(record["rejected"]), "dropped": _dropped_references(findings)}
+
+
+def _render_synthesis_notes(record: dict | None) -> list[str]:
     """What the judgment round returned, and every place it fell short.
 
     Three things nothing else in the document can say. **The round's own state**, which is
@@ -14135,41 +15692,42 @@ def _render_synthesis_notes(findings: Findings) -> list[str]:
     Nothing here is needed to fix a defect, which is why it is in the appendix — and a run
     with no synthesis round writes none of it, because there is no round to report on.
     """
-    record = findings.synthesis
     if record is None:
         return []
     headed = (f"each defect heading it wrote, the **{SITE_NOTE_LABEL[:-1]}** notes, "
-              if _headed((*findings.defects, *findings.coverage_defects)) else "")
+              if record["headed"] else "")
     out = [f"\n### {SUBSECTION_SYNTHESIS}\n\n",
            f"What the judgment round returned. The tier headings, {headed}"
            f"**{WHAT_GOES_WRONG_LABEL[:-1]}**, **{FIX_LABEL[:-1]}** and "
            f"**{RELATED_LABEL[:-1]}** came from this round, and nothing else in this report "
            f"did.\n\n"]
-    if "units" in record:
-        out += _render_synthesis_batches(findings, record)
-        if any(line["state"] != UNIT_COMPLETE
-               for line in (*record["units"], *_later_unit_lines(record))):
+    if record["shape"] == "batched":
+        out += _render_synthesis_batches(record["batches"])
+        if record["hint"]:
             out.append(f"- {RESYNTHESIZE_HINT}\n")
         return out
-    if record["state"] != UNIT_COMPLETE:
+    if record["shape"] == "degraded":
         out += _item(f"- {record['unit']} — {record['state']}: ",
                      record["reason"] or "no reason was recorded", SYNTHESIS_DEGRADED)
         out.append(f"- {RESYNTHESIZE_HINT}\n")
         return out
-    # A record written before the round's defects were recorded was handed every defect.
-    handed = record.get("defects")
-    named = len(handed) if handed is not None else len(findings.defects)
-    out.append(f"- {record['unit']} — complete: {_plural(len(record['tiers']), 'tier')} "
-               f"named for {_plural(named, 'defect')}.\n")
-    for message in record["rejected"]:
+    out.append(f"- {record['unit']} — complete: {_plural(record['tiers'], 'tier')} "
+               f"named for {_plural(record['named'], 'defect')}.\n")
+    out += _render_refused_and_dropped(record["rejected"], record["dropped"])
+    return out
+
+
+def _render_refused_and_dropped(rejected: Sequence[str], dropped: Sequence[dict]) -> list[str]:
+    """Each synthesis entry the engine refused, and each cross-reference it dropped."""
+    out: list[str] = []
+    for message in rejected:
         out += _item("- an entry could not be read, and only its own defect is affected: ",
                      message, "That defect carries no tier and no account of itself, and "
                      "is grouped by its status instead; a defect of several sites keeps "
                      "the mechanism its sites were merged on.")
-    for cluster in findings.defects:
-        for dropped in cluster["dropped_cross_references"]:
-            out.append(f"- {cluster['id']} cited {_one_line(dropped['defect'])}, which was "
-                       f"dropped: {dropped['reason']}.\n")
+    for entry in dropped:
+        out.append(f"- {entry['defect']} cited {_one_line(entry['cited'])}, which was "
+                   f"dropped: {entry['reason']}.\n")
     return out
 
 
@@ -14204,72 +15762,125 @@ MERGE_BATCHED = ("There were too many sites for one merge unit, so they were spl
                  "batches are never reported as one defect.")
 
 
-def _render_merge_notes(findings: Findings) -> list[str]:
+def _merge_notes_record(findings: Findings) -> dict | None:
+    """What the merge round returned, unit by unit, and the merge check's record beside
+    it; ``None`` for a run with no merge unit."""
+    record = findings.merge
+    if record is None:
+        return None
+    check = findings.merge_check
+    units = []
+    for unit in record["units"]:
+        if unit["state"] != UNIT_COMPLETE:
+            units.append({"unit": unit["unit"], "complete": False, "state": unit["state"],
+                          "reason": unit["reason"]})
+            continue
+        units.append({"unit": unit["unit"], "complete": True,
+                      "groups": sum(1 for group in unit["groups"] if len(group["sites"]) > 1),
+                      "sites": len(unit["sites"]), "summary": unit["summary"],
+                      # A site whose report also asserts a second, independent mistake is
+                      # kept apart, so merging it cannot hide the second claim.
+                      "compound": [{"site": kept["site"], "second_claim": kept["second_claim"]}
+                                   for kept in unit["compound"]]})
+    return {"rung": findings.rung,
+            # Groups were proposed and nothing has checked them.
+            "held": check is not None and not check["units"],
+            "batches": len(record["units"]) if record["batched"] else None,
+            "units": units, "check": _merge_check_notes_record(findings)}
+
+
+def _render_merge_notes(record: dict | None) -> list[str]:
     """What the merge round returned, and every place it fell short: a unit whose reply was
     discarded or never came back, and the batches a run over the ceiling was split into.
     A run with no merge unit writes none of it."""
-    record = findings.merge
     if record is None:
         return []
-    check = findings.merge_check
-    rule = MERGE_CHECK_RULE.format(both=RUNG_BREADTH[findings.rung][1])
-    unchecked = check is not None and not check["units"]
+    rule = MERGE_CHECK_RULE.format(both=RUNG_BREADTH[record["rung"]][1])
     out = [f"\n### {SUBSECTION_MERGE}\n\n",
            f"Which sites the merge round proposed as one mistake. {rule}"
-           + (f" {MERGE_HELD}" if unchecked else "") + "\n\n"]
-    if record["batched"]:
-        out.append(f"{MERGE_BATCHED.format(batches=len(record['units']))}\n\n")
+           + (f" {MERGE_HELD}" if record["held"] else "") + "\n\n"]
+    if record["batches"] is not None:
+        out.append(f"{MERGE_BATCHED.format(batches=record['batches'])}\n\n")
     for unit in record["units"]:
-        if unit["state"] != UNIT_COMPLETE:
+        if not unit["complete"]:
             out += _item(f"- {unit['unit']} — {unit['state']}: ",
                          unit["reason"] or "no reason was recorded", MERGE_DEGRADED)
             continue
-        several = [group for group in unit["groups"] if len(group["sites"]) > 1]
         out.append(f"- {unit['unit']} — complete: "
-                   f"{_plural(len(several), 'group')} of several sites proposed over "
-                   f"{_plural(len(unit['sites']), 'site')}, and "
+                   f"{_plural(unit['groups'], 'group')} of several sites proposed over "
+                   f"{_plural(unit['sites'], 'site')}, and "
                    f"{_plural(len(unit['compound']), 'site')} kept apart for a second "
                    f"claim.\n")
         if unit["summary"]:
             out += _item(f"- {unit['unit']} reported: ", unit["summary"])
-        # A site whose report also asserts a second, independent mistake is kept apart, so
-        # merging it cannot hide the second claim; what that claim is, is said here.
-        for record in unit["compound"]:
-            out += _item(f"  - {record['site']} kept apart; its report also "
-                         f"claims: ", record["second_claim"])
-    return out + _render_merge_check_notes(findings)
+        # What the second claim of a site kept apart is, is said here.
+        for kept in unit["compound"]:
+            out += _item(f"  - {kept['site']} kept apart; its report also "
+                         f"claims: ", kept["second_claim"])
+    return out + _render_merge_check_notes(record["check"])
 
 
-def _render_merge_check_notes(findings: Findings) -> list[str]:
+def _merge_check_notes_record(findings: Findings) -> dict | None:
+    """What the merge check returned and what it decided for every proposed group;
+    ``None`` for a run with no merge check."""
+    check = findings.merge_check
+    if check is None:
+        return None
+    defect_of = {tuple(defect["sites"]): defect["id"]
+                 for defect in (*findings.defects, *findings.coverage_defects)}
+    units = [{"unit": unit["unit"], "complete": False, "state": unit["state"],
+              "reason": unit["reason"]} if unit["state"] != UNIT_COMPLETE else
+             {"unit": unit["unit"], "complete": True, "groups": len(unit["groups"]),
+              "summary": unit["summary"]}
+             for unit in check["units"]]
+    groups = []
+    for group in check["groups"]:
+        entry = {"group": group["group"], "sites": list(group["sites"]),
+                 "checked": bool(group["checked"])}
+        if group["checked"]:
+            touched = group["fix_touches_refuted"]
+            entry.update({
+                "upheld": bool(group["accepted"]),
+                # The defect an upheld group became, found by its sites.
+                "defect": (defect_of.get(tuple(group["accepted"])) if group["accepted"]
+                           else None),
+                "mechanism": group["mechanism"] if group["accepted"] else None,
+                "removed": [{"site": removed["site"], "why": removed["why"],
+                             "reason": removed["reason"]} for removed in group["removed"]],
+                "touches_refuted": (list(touched["sites"]) if touched and touched["value"]
+                                    else None)})
+        groups.append(entry)
+    return {"batches": len(check["units"]) if check["batched"] else None,
+            "units": units, "groups": groups}
+
+
+def _render_merge_check_notes(record: dict | None) -> list[str]:
     """What the merge check returned and what it decided for every proposed group: the
     defect an upheld group became and the mechanism it was merged on, every site the check
     took out and why, and every unit whose reply was discarded or never came back."""
-    check = findings.merge_check
-    if check is None:
+    if record is None:
         return []
     out: list[str] = []
-    if check["batched"]:
-        out.append(f"The groups were checked in {len(check['units'])} batches; no group was "
+    if record["batches"] is not None:
+        out.append(f"The groups were checked in {record['batches']} batches; no group was "
                    f"split between two.\n\n")
-    for unit in check["units"]:
-        if unit["state"] != UNIT_COMPLETE:
+    for unit in record["units"]:
+        if not unit["complete"]:
             out += _item(f"- {unit['unit']} — {unit['state']}: ",
                          unit["reason"] or "no reason was recorded", MERGE_CHECK_DEGRADED)
             continue
         out.append(f"- {unit['unit']} — complete: "
-                   f"{_plural(len(unit['groups']), 'group')} checked.\n")
+                   f"{_plural(unit['groups'], 'group')} checked.\n")
         if unit["summary"]:
             out += _item(f"- {unit['unit']} reported: ", unit["summary"])
-    defect_of = {tuple(defect["sites"]): defect["id"]
-                 for defect in (*findings.defects, *findings.coverage_defects)}
-    for group in check["groups"]:
+    for group in record["groups"]:
         listed = ", ".join(group["sites"])
         if not group["checked"]:
             out.append(f"- {group['group']} ({listed}) was not checked, so each of its sites "
                        f"is its own defect.\n")
             continue
-        if group["accepted"]:
-            did = defect_of.get(tuple(group["accepted"]))
+        if group["upheld"]:
+            did = group["defect"]
             out += _item(f"- {group['group']} ({listed}) is [{did}](#{did}), merged on: ",
                          group["mechanism"])
         else:
@@ -14281,10 +15892,9 @@ def _render_merge_check_notes(findings: Findings) -> list[str]:
                 out.append(f"  - {removed['site']} taken out: {why}.\n")
             else:
                 out += _item(f"  - {removed['site']} taken out, it {why}: ", removed["reason"])
-        touched = group["fix_touches_refuted"]
-        if touched and touched["value"]:
+        if group["touches_refuted"] is not None:
             out.append(f"  - The checker said the shared fix would change code at a refuted "
-                       f"site: {', '.join(touched['sites']) or 'it named none'}.\n")
+                       f"site: {', '.join(group['touches_refuted']) or 'it named none'}.\n")
     return out
 
 
@@ -14333,79 +15943,150 @@ def synthesis_refused_note(lost: Sequence[dict]) -> str:
     return f"{text}; **{SUBSECTION_SYNTHESIS}**, in the appendix, says why."
 
 
-def _grouping_notes(findings: Findings, before_sites: bool) -> list[str]:
-    """One line for each way this report's grouping or narrative falls short of a finished
-    run's, or nothing where it does not."""
-    out: list[str] = []
+def _grouping_notes_record(findings: Findings, before_sites: bool) -> dict:
+    """Each way this report's grouping or narrative falls short of a finished run's."""
+    grouping, check = None, None
+    merge_degraded = False
     if before_sites:
-        out.append(f"- {GROUPING_BEFORE_SITES}\n")
+        grouping = "before_sites"
     elif findings.merge is None:
         if len(findings.sites) + len(findings.coverage_sites) > 1:
-            out.append(f"- {GROUPING_NO_MERGE}\n")
+            grouping = "no_merge"
     else:
-        if any(unit["state"] != UNIT_COMPLETE for unit in findings.merge["units"]):
-            out.append(f"- {GROUPING_MERGE_DEGRADED}\n")
-        check = findings.merge_check
-        if check is not None and not check["units"]:
-            out.append(f"- {GROUPING_HELD}\n")
-        elif check is not None and any(unit["state"] != UNIT_COMPLETE
-                                       for unit in check["units"]):
-            out.append(f"- {GROUPING_CHECK_DEGRADED}\n")
+        merge_degraded = any(unit["state"] != UNIT_COMPLETE
+                             for unit in findings.merge["units"])
+        merge_check = findings.merge_check
+        if merge_check is not None and not merge_check["units"]:
+            check = "held"
+        elif merge_check is not None and any(unit["state"] != UNIT_COMPLETE
+                                             for unit in merge_check["units"]):
+            check = "degraded"
     synthesis = findings.synthesis
     if synthesis is not None and "units" in synthesis:
-        out += _grouping_batch_notes(findings, synthesis)
+        written = {"shape": "batched",
+                   "batches": _grouping_batch_record(findings, synthesis)}
     elif synthesis is not None and synthesis["state"] != UNIT_COMPLETE:
-        out.append(f"- {GROUPING_NO_SYNTHESIS}\n")
+        written = {"shape": "failed"}
     elif synthesis is not None and synthesis["rejected"]:
         # Only what the round was HANDED can be lost by it: a defect left out of it for
         # needing no write-up has no tier either, and is not a refused entry.
         handed = synthesis.get("defects")
-        lost = [d for d in findings.defects if d["tier"] is None
-                and (handed is None or d["id"] in handed)]
-        if lost:
-            out.append(f"- {synthesis_refused_note(lost)}\n")
+        written = {"shape": "refused",
+                   "lost": [{"id": d["id"], "sites": list(d["sites"])}
+                            for d in findings.defects if d["tier"] is None
+                            and (handed is None or d["id"] in handed)]}
+    else:
+        written = None
+    return {"grouping": grouping, "merge_degraded": merge_degraded, "check": check,
+            "synthesis": written}
+
+
+def _grouping_notes(record: dict) -> list[str]:
+    """One line for each way this report's grouping or narrative falls short of a finished
+    run's, or nothing where it does not."""
+    out: list[str] = []
+    if record["grouping"] == "before_sites":
+        out.append(f"- {GROUPING_BEFORE_SITES}\n")
+    elif record["grouping"] == "no_merge":
+        out.append(f"- {GROUPING_NO_MERGE}\n")
+    if record["merge_degraded"]:
+        out.append(f"- {GROUPING_MERGE_DEGRADED}\n")
+    if record["check"] == "held":
+        out.append(f"- {GROUPING_HELD}\n")
+    elif record["check"] == "degraded":
+        out.append(f"- {GROUPING_CHECK_DEGRADED}\n")
+    written = record["synthesis"]
+    if written is None:
+        return out
+    if written["shape"] == "batched":
+        out += _grouping_batch_notes(written["batches"])
+    elif written["shape"] == "failed":
+        out.append(f"- {GROUPING_NO_SYNTHESIS}\n")
+    elif written["lost"]:
+        out.append(f"- {synthesis_refused_note(written['lost'])}\n")
     return out
 
 
-def _render_synthesis_batches(findings: Findings, record: dict) -> list[str]:
+def _synthesis_batches_record(findings: Findings, record: dict) -> dict:
+    """A generation written in batches: each batch's state, each refused entry, each dropped
+    reference, and what the rounds after the batches came to."""
+    batches = []
+    for batch in record["units"]:
+        entry = {"unit": batch["unit"], "complete": batch["state"] == UNIT_COMPLETE,
+                 "state": batch["state"], "defects": list(batch["defects"])}
+        if entry["complete"]:
+            entry["tiers"] = len(batch["tiers"])
+        else:
+            entry["reason"] = batch["reason"]
+        batches.append(entry)
+    # Where no batch landed the whole report is grouped as a run without the round is, and
+    # says so in the words such a round always has.
+    return {"batches": batches, "partial": record["state"] == SYNTHESIS_PARTIAL,
+            "rejected": list(record["rejected"]), "dropped": _dropped_references(findings),
+            "later": _later_rounds_record(record)}
+
+
+def _render_synthesis_batches(record: dict) -> list[str]:
     """The appendix lines for a generation written in batches: each batch's state, what a
     batch that did not come back costs, each refused entry, each dropped reference, and
     that no overview of the run was written."""
     out: list[str] = []
-    for batch in record["units"]:
+    for batch in record["batches"]:
         held = _plural(len(batch["defects"]), "defect")
-        if batch["state"] == UNIT_COMPLETE:
+        if batch["complete"]:
             out.append(f"- {batch['unit']} — complete: "
-                       f"{_plural(len(batch['tiers']), 'tier')} named for {held}.\n")
+                       f"{_plural(batch['tiers'], 'tier')} named for {held}.\n")
             continue
-        # Where no batch landed the whole report is grouped as a run without the round is,
-        # and says so in the words such a round always has.
         out += _item(f"- {batch['unit']} — {batch['state']}: ",
                      batch["reason"] or "no reason was recorded",
-                     SYNTHESIS_DEGRADED if record["state"] != SYNTHESIS_PARTIAL else
+                     SYNTHESIS_DEGRADED if not record["partial"] else
                      f"Its {held} ({', '.join(batch['defects'])}) "
                      f"{'is' if len(batch['defects']) == 1 else 'are'} not written up: no "
                      f"tier, heading, account or fix, each grouped by its status instead.")
-    for message in record["rejected"]:
-        out += _item("- an entry could not be read, and only its own defect is affected: ",
-                     message, "That defect carries no tier and no account of itself, and "
-                     "is grouped by its status instead; a defect of several sites keeps "
-                     "the mechanism its sites were merged on.")
-    for cluster in findings.defects:
-        for dropped in cluster["dropped_cross_references"]:
-            out.append(f"- {cluster['id']} cited {_one_line(dropped['defect'])}, which was "
-                       f"dropped: {dropped['reason']}.\n")
-    return out + _render_later_rounds(record)
+    out += _render_refused_and_dropped(record["rejected"], record["dropped"])
+    return out + _render_later_rounds(record["later"])
+
+
+def _failed_units(lines: Sequence[dict]) -> list[dict]:
+    """The later-round units that did not come back usable."""
+    return [{"unit": line["unit"], "state": line["state"], "reason": line["reason"]}
+            for line in lines if line["state"] != UNIT_COMPLETE]
 
 
 def _unit_lines(lines: Sequence[dict]) -> list[str]:
     """One line for each later-round unit that did not come back usable."""
     out: list[str] = []
     for line in lines:
-        if line["state"] != UNIT_COMPLETE:
-            out += _item(f"- {line['unit']} — {line['state']}: ",
-                         line["reason"] or "no reason was recorded")
+        out += _item(f"- {line['unit']} — {line['state']}: ",
+                     line["reason"] or "no reason was recorded")
     return out
+
+
+def _later_rounds_record(record: dict) -> dict:
+    """What the rounds after the batches came to: the tier names, each tier summary, the
+    overview, and every unit of them that did not come back usable."""
+    names = record.get("tier_names") or {}
+    if names.get("state") == NAMES_RECONCILED:
+        named = {"outcome": "reconciled", "names": len(names.get("names", {})),
+                 "tiers": len(record["tiers"])}
+    elif names.get("state") in (NAMES_NOT_RECONCILED, ROUND_NOT_RUN, ROUND_PENDING):
+        named = {"outcome": "not_reconciled", "reason": names.get("reason")}
+    else:
+        named = {"outcome": None}
+    summary_outcome = {SUMMARY_PARTIAL: "partial", SUMMARY_NONE: "none",
+                       SUMMARY_STOPPED: "stopped"}
+    overview = record.get("overview_round") or {"state": ROUND_NOT_RUN, "units": ()}
+    if overview["state"] in (ROUND_NOT_RUN, ROUND_PENDING):
+        written = "not_run"
+    else:
+        written = {SUMMARY_PARTIAL: "partial", SUMMARY_NONE: "none"}.get(overview["state"])
+    return {"names_failed": _failed_units(names.get("units", ())), "names": named,
+            "tiers": [{"failed": _failed_units(tier["units"]), "tier": tier["tier"],
+                       "outcome": summary_outcome.get(tier["state"])}
+                      for tier in record.get("tier_summaries", ())],
+            "overview_failed": _failed_units(overview.get("units", ())),
+            "overview": written, "overview_reason": overview.get("reason"),
+            "limits_too_small": bool(record.get("limits_too_small"))}
 
 
 def _render_later_rounds(record: dict) -> list[str]:
@@ -14414,36 +16095,35 @@ def _render_later_rounds(record: dict) -> list[str]:
     back usable. A generation whose later rounds have not run says only that there is no
     overview."""
     out: list[str] = []
-    names = record.get("tier_names") or {}
-    out += _unit_lines(names.get("units", ()))
-    if names.get("state") == NAMES_RECONCILED:
+    out += _unit_lines(record["names_failed"])
+    names = record["names"]
+    if names["outcome"] == "reconciled":
         out.append(f"- The tier names were reconciled: "
-                   f"{_plural(len(names.get('names', {})), 'name')} the batches used became "
-                   f"{_plural(len(record['tiers']), 'tier')}.\n")
-    elif names.get("state") in (NAMES_NOT_RECONCILED, ROUND_NOT_RUN, ROUND_PENDING):
+                   f"{_plural(names['names'], 'name')} the batches used became "
+                   f"{_plural(names['tiers'], 'tier')}.\n")
+    elif names["outcome"] == "not_reconciled":
         out.append(f"- {TIER_NAMES_NOT_RECONCILED}: "
-                   f"{names.get('reason') or 'no round has reconciled them'}.\n")
-    for tier in record.get("tier_summaries", ()):
-        out += _unit_lines(tier["units"])
+                   f"{names['reason'] or 'no round has reconciled them'}.\n")
+    for tier in record["tiers"]:
+        out += _unit_lines(tier["failed"])
         named = _one_line(tier["tier"])
-        if tier["state"] == SUMMARY_PARTIAL:
+        if tier["outcome"] == "partial":
             out.append(f"- The summary of the tier {named} was written from the parts of it "
                        f"that came back.\n")
-        elif tier["state"] == SUMMARY_NONE:
+        elif tier["outcome"] == "none":
             out.append(f"- No summary was written for the tier {named}: no unit summarizing "
                        f"it came back usable.\n")
-        elif tier["state"] == SUMMARY_STOPPED:
+        elif tier["outcome"] == "stopped":
             out.append(f"- The tier {named} was not summarized: the limits are too small for "
                        f"two summaries in one unit.\n")
-    overview = record.get("overview_round") or {"state": ROUND_NOT_RUN, "units": ()}
-    out += _unit_lines(overview.get("units", ()))
-    if overview["state"] in (ROUND_NOT_RUN, ROUND_PENDING):
+    out += _unit_lines(record["overview_failed"])
+    if record["overview"] == "not_run":
         out.append(f"- {SYNTHESIS_NO_OVERVIEW}\n")
-    elif overview["state"] == SUMMARY_PARTIAL:
+    elif record["overview"] == "partial":
         out.append("- The overview was written from the parts of it that came back.\n")
-    elif overview["state"] == SUMMARY_NONE:
-        out.append(f"- No overview was written: {overview.get('reason')}.\n")
-    if record.get("limits_too_small"):
+    elif record["overview"] == "none":
+        out.append(f"- No overview was written: {record['overview_reason']}.\n")
+    if record["limits_too_small"]:
         out.append(f"- {OVERVIEW_INCOMPLETE_LIMITS}.\n")
     return out
 
@@ -14475,33 +16155,43 @@ GROUPING_BATCH_UNDISPATCHED = ("was over every lane's hard ceiling and never dis
                                "site's consequence")
 
 
-def _grouping_batch_notes(findings: Findings, record: dict) -> list[str]:
+def _grouping_batch_record(findings: Findings, record: dict) -> dict:
+    """What the top of the report says of a generation written in batches: whether the
+    round failed outright, each batch that did not come back, the defects whose entries
+    were refused inside the batches that did, and what the later rounds left undone."""
+    landed = {did for batch in record["units"] if batch["state"] == UNIT_COMPLETE
+              for did in batch["defects"]}
+    return {"failed": record["state"] in (UNIT_FAILED, UNIT_MISSING),
+            "batches": [{"unit": batch["unit"], "defects": list(batch["defects"]),
+                         "undispatched": batch["reason"] == NOT_DISPATCHED_REASON}
+                        for batch in record["units"] if batch["state"] != UNIT_COMPLETE],
+            "lost": [{"id": d["id"], "sites": list(d["sites"])} for d in findings.defects
+                     if d["tier"] is None and d["id"] in landed],
+            "unreconciled": (record.get("tier_names") or {}).get("state")
+            in (NAMES_NOT_RECONCILED, ROUND_NOT_RUN, ROUND_PENDING),
+            "limits_too_small": bool(record.get("limits_too_small"))}
+
+
+def _grouping_batch_notes(record: dict) -> list[str]:
     """The top-of-report lines for a generation written in batches: one per batch that did
     not come back, naming its defects, and one for the entries refused inside the batches
     that did."""
-    if record["state"] in (UNIT_FAILED, UNIT_MISSING):
+    if record["failed"]:
         return [f"- {GROUPING_NO_SYNTHESIS}\n"]
     out: list[str] = []
-    for batch in record["units"]:
-        if batch["state"] == UNIT_COMPLETE:
-            continue
+    for batch in record["batches"]:
         named = ", ".join(f"[{did}](#{did})" for did in batch["defects"])
         verb = "is" if len(batch["defects"]) == 1 else "are"
-        said = (GROUPING_BATCH_UNDISPATCHED if batch["reason"] == NOT_DISPATCHED_REASON
-                else GROUPING_BATCH_FAILED)
+        said = GROUPING_BATCH_UNDISPATCHED if batch["undispatched"] else GROUPING_BATCH_FAILED
         out.append(f"- The synthesis batch {batch['unit']} "
                    f"{said.format(defects=named, verb=verb)}; "
                    f"**{SUBSECTION_SYNTHESIS}**, in the appendix, says why.\n")
-    landed = {did for batch in record["units"] if batch["state"] == UNIT_COMPLETE
-              for did in batch["defects"]}
-    lost = [d for d in findings.defects if d["tier"] is None and d["id"] in landed]
-    if lost:
-        out.append(f"- {synthesis_refused_note(lost)}\n")
-    if (record.get("tier_names") or {}).get("state") in (NAMES_NOT_RECONCILED, ROUND_NOT_RUN,
-                                                         ROUND_PENDING):
+    if record["lost"]:
+        out.append(f"- {synthesis_refused_note(record['lost'])}\n")
+    if record["unreconciled"]:
         out.append(f"- {TIER_NAMES_NOT_RECONCILED}; **{SUBSECTION_SYNTHESIS}**, in the "
                    f"appendix, says why.\n")
-    if record.get("limits_too_small"):
+    if record["limits_too_small"]:
         out.append(f"- {OVERVIEW_INCOMPLETE_LIMITS}; **{SUBSECTION_SYNTHESIS}**, in the "
                    f"appendix, says which tiers.\n")
     return out
@@ -14551,14 +16241,11 @@ OVERVIEW_LEAD = ("One paragraph the judgment round wrote about the run as a whol
                  "verified, each on its own entry below.")
 
 
-def _render_judgment_overview(findings: Findings) -> list[str]:
-    """The synthesis round's own paragraph, under the counts it is about.
+def _judgment_overview_record(findings: Findings) -> dict:
+    """The synthesis round's own paragraph about the run, or ``None`` for the text where
+    there is nothing to print.
 
-    Written for a person reading the report, and printed nowhere else.
-    It is labeled as a reading because it is one: the round saw the verified defects and
-    wrote about them, and nothing checked what it wrote.
-
-    **Nothing is written unless the round completed and said something.** A round that
+    **Nothing is printed unless the round completed and said something.** A round that
     failed or never landed leaves the document a run without the round would have, and
     the appendix is where its state is said; a heading over an empty paragraph would say
     the round had nothing to say, which is a different claim.
@@ -14568,15 +16255,24 @@ def _render_judgment_overview(findings: Findings) -> list[str]:
         # A generation written in batches: the overview its last round wrote, whatever
         # state the batches beside it came back in.
         said = record.get("overview") or ""
-        if not said.strip():
-            return []
-        return [f"\n### {SUBSECTION_OVERVIEW}\n\n", f"{OVERVIEW_LEAD}\n\n",
-                f"{_paragraph(said)}\n"]
+        return {"text": said if said.strip() else None}
     said = (record.get("summary") or "") if record is not None else ""
     if record is None or record["state"] != UNIT_COMPLETE or not said.strip():
+        return {"text": None}
+    return {"text": said}
+
+
+def _render_judgment_overview(record: dict) -> list[str]:
+    """The synthesis round's own paragraph, under the counts it is about.
+
+    Written for a person reading the report, and printed nowhere else.
+    It is labeled as a reading because it is one: the round saw the verified defects and
+    wrote about them, and nothing checked what it wrote.
+    """
+    if record["text"] is None:
         return []
     return [f"\n### {SUBSECTION_OVERVIEW}\n\n", f"{OVERVIEW_LEAD}\n\n",
-            f"{_paragraph(said)}\n"]
+            f"{_paragraph(record['text'])}\n"]
 
 
 OPERATOR_LEAD = ("Written by whoever ran the panel, after the run, with this report, the "
@@ -14588,8 +16284,32 @@ _BUILD_CHECK_WORDS = {"build": ("whether this tree builds", "build"),
                       "tests": ("whether its tests run", "tests")}
 
 
-def _render_operator_notes(notes: ReportNotes, job: dict, findings: Findings, probe: dict,
-                           sections: _Sections) -> list[str]:
+def _operator_notes_record(notes: ReportNotes, job: dict, findings: Findings,
+                           probe: dict) -> dict:
+    """``report-notes.json`` as the report states it: the job's questions and the
+    operator's answers, each correction with what it disagrees with, and the caveats."""
+    status = {c["id"]: c["status"] for c in findings.defects}
+    corrections = []
+    for entry in notes.corrections:
+        target = entry["target"]
+        if target in _BUILD_CHECK_WORDS:
+            key = _BUILD_CHECK_WORDS[target][1]
+            found = probe.get(key) or {}
+            # The probe's answer only where it came back, and only where it gave one.
+            known = probe.get("state") == UNIT_COMPLETE and "answer" in found
+            corrections.append({"target": target, "check": True, "known": known,
+                                "answer": found["answer"] if known else None,
+                                "reason": entry["reason"]})
+        else:
+            corrections.append({"target": target, "check": False,
+                                "status": status[target], "reason": entry["reason"]})
+    return {"questions": job.get("questions") or None,
+            "answers": [{"question": entry["question"], "answer": entry["answer"],
+                         "defects": list(entry["defects"])} for entry in notes.answers],
+            "corrections": corrections, "caveats": list(notes.caveats)}
+
+
+def _render_operator_notes(record: dict, sections: _Sections) -> list[str]:
     """``report-notes.json``, as its own section, labeled as the operator's reading.
 
     Everything in it is text somebody wrote rather than a fact the engine computed, so each
@@ -14598,41 +16318,40 @@ def _render_operator_notes(notes: ReportNotes, job: dict, findings: Findings, pr
     that defect's anchor.
     """
     out = [sections.top(SECTION_OPERATOR), f"{OPERATOR_LEAD}\n"]
-    asked = job.get("questions")
-    if notes.answers or asked:
+    asked = record["questions"]
+    answers = record["answers"]
+    if answers or asked:
         out.append(sections.sub(SUBSECTION_ANSWERS))
         if asked:
             out.append("The job asked:\n\n")
             out += [f"> {_entities(line)}\n" for line in asked.splitlines()]
             out.append("\n")
-        if not notes.answers:
+        if not answers:
             out.append("The operator recorded no answer.\n")
-        for n, entry in enumerate(notes.answers, 1):
+        for n, entry in enumerate(answers, 1):
             out.append(f"\n#### Q{n}. {_one_line(entry['question'])}\n\n")
             for part in re.split(r"\n\s*\n", entry["answer"].strip()):
                 out.append(f"{_paragraph(part)}\n\n")
             if entry["defects"]:
                 out.append("Cites " + ", ".join(f"[{did}](#{did})" for did in entry["defects"])
                            + ".\n")
-    if notes.corrections:
+    if record["corrections"]:
         out.append(sections.sub(SUBSECTION_CORRECTIONS))
         out.append("Each is the operator's reason for disagreeing with what the panel "
                    "concluded. The entry it names carries a mark pointing here, and is "
                    "otherwise as the panel left it.\n\n")
-        status = {c["id"]: c["status"] for c in findings.defects}
-        for entry in notes.corrections:
+        for entry in record["corrections"]:
             target = entry["target"]
-            if target in _BUILD_CHECK_WORDS:
-                question, key = _BUILD_CHECK_WORDS[target]
-                answer = ((probe.get(key) or {}).get("answer", PROBE_UNKNOWN_WORD)
-                          if probe.get("state") == UNIT_COMPLETE else PROBE_UNKNOWN_WORD)
+            if entry["check"]:
+                question = _BUILD_CHECK_WORDS[target][0]
+                answer = entry["answer"] if entry["known"] else PROBE_UNKNOWN_WORD
                 what = f"To the build check's answer on {question}, which was {answer}"
             else:
-                what = f"To [{target}](#{target}), marked {status[target]} by the panel"
+                what = f"To [{target}](#{target}), marked {entry['status']} by the panel"
             out.append(f"- {what}: {_one_line(entry['reason'])}\n")
-    if notes.caveats:
+    if record["caveats"]:
         out.append(sections.sub(SUBSECTION_CAVEATS))
-        out += [f"- {_one_line(caveat)}\n" for caveat in notes.caveats]
+        out += [f"- {_one_line(caveat)}\n" for caveat in record["caveats"]]
     return out
 
 
@@ -14643,25 +16362,49 @@ def _plural_states(states: Sequence[str]) -> str:
             f"{states.count(UNIT_FAILED)} failed, {states.count(UNIT_MISSING)} missing")
 
 
-def _run_kinds(runs: Sequence[dict]) -> str:
-    """The runs split by what they did, or nothing where there were none.
+def _unit_state_counts(states: Sequence[str]) -> dict:
+    """Units counted by state, for :func:`_render_unit_states`. ``states`` is each unit's
+    state name, so a reading unit as ``candidates.json`` records it and a verification unit
+    as the engine holds it count the same way."""
+    return {"total": len(states), "complete": states.count(UNIT_COMPLETE),
+            "failed": states.count(UNIT_FAILED), "missing": states.count(UNIT_MISSING)}
 
-    A verdict written before the field existed states no kind. It is counted in its own
-    part rather than assumed to be either, so the parts always sum to the number beside
-    them and no run is labeled by a guess.
+
+def _render_unit_states(counts: dict) -> str:
+    """The report's spelling of :func:`_unit_state_counts`.
+
+    Worded BY :func:`_plural_states`, from a list of states standing for the counts, so the
+    report and ``report_summary`` cannot come to word one count two ways. A state the
+    counts do not name stands in as an empty one: it is in the total and in no part."""
+    named = counts["complete"] + counts["failed"] + counts["missing"]
+    return _plural_states([UNIT_COMPLETE] * counts["complete"]
+                          + [UNIT_FAILED] * counts["failed"]
+                          + [UNIT_MISSING] * counts["missing"]
+                          + [""] * (counts["total"] - named))
+
+
+def _run_kinds_record(runs: Sequence[dict]) -> dict:
+    """The runs counted by what they did, in the order the kinds are declared.
+
+    A verdict written before the field existed states no kind. It is counted on its own
+    rather than assumed to be either, so the counts always sum to the number of runs and
+    no run is labeled by a guess.
     """
-    if not runs:
-        return ""
     kinds = [evidence.get(RUN_KIND_KEY) for evidence in runs]
-    parts = [f"{kinds.count(kind)} {kind}" for kind in RUN_KINDS if kinds.count(kind)]
-    unstated = kinds.count(None)
-    if unstated:
-        parts.append(f"{unstated} of a kind the verdict did not state")
+    return {"counts": [[kind, kinds.count(kind)] for kind in RUN_KINDS if kinds.count(kind)],
+            "unstated": kinds.count(None)}
+
+
+def _run_kinds(record: dict) -> str:
+    """The runs split by what they did, or nothing where there were none."""
+    parts = [f"{count} {kind}" for kind, count in record["counts"]]
+    if record["unstated"]:
+        parts.append(f"{record['unstated']} of a kind the verdict did not state")
     return " — " + ", ".join(parts) if parts else ""
 
 
-def _executability(probe: dict, findings: Findings,
-                   corrected: frozenset[str] = frozenset()) -> list[str]:
+def _executability_record(probe: dict, findings: Findings,
+                          corrected: frozenset[str] = frozenset()) -> dict:
     """Executability, as three facts that are never inferred from one another.
 
     CAPABILITY is the probe's: whether this tree builds and whether its tests run. ATTEMPTS
@@ -14686,12 +16429,52 @@ def _executability(probe: dict, findings: Findings,
     runs = [record["evidence"] for record in findings.candidates
             if record["evidence"] is not None]
     ran = len(runs)
-    if probe.get("state") == UNIT_COMPLETE:
-        build = (probe.get("build") or {}).get("answer", PROBE_UNKNOWN_WORD)
-        tests = (probe.get("tests") or {}).get("answer", PROBE_UNKNOWN_WORD)
+    complete = probe.get("state") == UNIT_COMPLETE
+    answers = {}
+    for key in ("build", "tests"):
+        found = probe.get(key) or {}
+        known = complete and "answer" in found
+        answers[key] = {"known": known, "answer": found["answer"] if known else None}
+    build, tests = (answers[key]["answer"] if answers[key]["known"] else PROBE_UNKNOWN_WORD
+                    for key in ("build", "tests"))
+    # Nothing ran, and WHY is read from the two facts that decide it rather than from one
+    # boolean over both. A tree where neither answer came back yes is a tree nothing
+    # established anything could be done in; a tree where one did, with nothing proposed, is
+    # a run the readers gave nothing to try; and a proposal that did not run is neither, and
+    # blaming the readers for it would be false.
+    if ran:
+        nothing = None
+    elif proposed:
+        nothing = "not_run"
+    elif build != "yes" and tests != "yes":
+        nothing = "could_not"
+    else:
+        nothing = "not_tried"
+    return {"probe_complete": complete, "probe_state": probe.get("state"),
+            "build": answers["build"], "tests": answers["tests"],
+            # Where the probe reports a capability and not one proposed reproduction ran.
+            "unused": complete and PROBE_YES_WORD in (build, tests) and bool(proposed)
+                      and not ran,
+            "summary": (probe.get("summary") or None) if complete else None,
+            # Beside the answer it corrects, because the probe's own line and its qualifier
+            # are the panel's and stay as they were.
+            "corrected": [target for target in ("build", "tests") if target in corrected],
+            "proposed": proposed, "ran": ran, "kinds": _run_kinds_record(runs),
+            "documentary": any(evidence.get(RUN_KIND_KEY) == "documentary"
+                               for evidence in runs),
+            "nothing": nothing}
+
+
+def _executability(record: dict) -> list[str]:
+    """Executability, as three facts that are never inferred from one another: what the
+    probe found, how many reproductions were proposed, and how many ran."""
+    proposed, ran = record["proposed"], record["ran"]
+    if record["probe_complete"]:
+        build, tests = (record[key]["answer"] if record[key]["known"] else PROBE_UNKNOWN_WORD
+                        for key in ("build", "tests"))
         out = [f"- Executability, as a separate unit found it in a disposable copy of the "
                f"snapshot: this tree builds — {build}; its tests run — {tests}.\n"]
-        if PROBE_YES_WORD in (build, tests) and proposed and not ran:
+        if record["unused"]:
             out.append(
                 f"  - **That capability reached none of the work.** "
                 f"{_plural(proposed, 'reproduction')} "
@@ -14704,29 +16487,26 @@ def _executability(probe: dict, findings: Findings,
         # which has to stay next to the claim it qualifies. A bare `no` tells a reader the
         # build failed and not why, and the why is what decides whether it was the tree or
         # the environment the probe ran in.
-        if probe.get("summary"):
-            out += _item("  - What the probe reported: ", probe["summary"])
+        if record["summary"]:
+            out += _item("  - What the probe reported: ", record["summary"])
     else:
-        build = tests = PROBE_UNKNOWN_WORD
         out = [f"- Executability: unknown. The capability probe is recorded as "
-               f"{probe.get('state')}, so "
+               f"{record['probe_state']}, so "
                f"nobody found out whether this tree builds or whether its tests run. "
                f"Unknown is not no.\n"]
-    # Beside the answer it corrects and after everything the engine says about that answer,
-    # because the probe's own line and its qualifier are the panel's and stay as they were.
     which = [word for target, word in (("build", "whether it builds"),
                                        ("tests", "whether its tests run"))
-             if target in corrected]
+             if target in record["corrected"]]
     if which:
         out.append(f"  - **{CORRECTED_MARK}**, on {' and '.join(which)}; see "
                    f"[{SUBSECTION_CORRECTIONS}]({_anchor(SUBSECTION_CORRECTIONS)}).\n")
-    out.append(f"- Reproductions: {proposed} proposed, {ran} run{_run_kinds(runs)}. "
+    out.append(f"- Reproductions: {proposed} proposed, {ran} run{_run_kinds(record['kinds'])}. "
                f"Whether this tree builds and its tests run, how many reproductions were "
                f"proposed and how many ran are three separate facts, and each is counted "
                f"on its own.\n")
     # Said once, where the numbers are, because "documentary" is this report's word and a
     # reader meeting it beside a defect has nowhere to look it up.
-    if any(evidence.get(RUN_KIND_KEY) == "documentary" for evidence in runs):
+    if record["documentary"]:
         out.append("  - **Documentary** means the command inspected the tree without "
                    "running the code under review: a search for a string, a listing, a "
                    "checksum. It is evidence, and it is judged by the same standard. It is "
@@ -14739,18 +16519,13 @@ def _executability(probe: dict, findings: Findings,
         out.append(f"  - {_plural(ran - proposed, 'of those runs was', 'of those runs were')} "
                    f"devised by a verifier for a claim whose reader proposed none, which is "
                    f"why the second number can exceed the first.\n")
-    if ran:
+    if record["nothing"] is None:
         return out
-    # Nothing ran, and WHY is read from the two facts that decide it rather than from one
-    # boolean over both. A tree where neither answer came back yes is a tree nothing
-    # established anything could be done in; a tree where one did, with nothing proposed, is
-    # a run the readers gave nothing to try; and a proposal that did not run is neither, and
-    # blaming the readers for it would be false.
-    if proposed:
+    if record["nothing"] == "not_run":
         out.append(f"- **Nothing was executed**: {_plural(proposed, 'reproduction')} "
                    f"proposed and none ran, so what would have settled them is still "
                    f"open.\n")
-    elif build != "yes" and tests != "yes":
+    elif record["nothing"] == "could_not":
         out.append("- **Nothing could be executed**: nothing showed that anything in "
                    "this tree can be built or run, and no candidate proposed a "
                    "reproduction.\n")
@@ -14805,7 +16580,25 @@ def _reachability_dirs(inventory: dict) -> list[tuple[str, int]]:
     return _adjacent(reviewed, coverage["tracked_not_reviewed"], coverage["root"])
 
 
-def _reachability(inventory: dict, names: PathNames) -> list[str]:
+def _reachability_record(inventory: dict, names: PathNames) -> dict:
+    """Whether the reviewed set was compared with what the repository tracks, how many
+    tracked files it left out, and the directories where those sit beside reviewed ones,
+    commonest first, the first :data:`_ADJACENT_CEILING` of them by short name."""
+    coverage = inventory["coverage"]
+    if coverage["state"] != "computed":
+        return {"computed": False}
+    missing = len(coverage["tracked_not_reviewed"])
+    if not missing:
+        return {"computed": True, "missing": 0}
+    adjacent = _reachability_dirs(inventory)
+    return {"computed": True, "missing": missing,
+            "reviewed": len(inventory["files"]), "root": coverage["root"],
+            "dirs": [[names.short(name), count]
+                     for name, count in adjacent[:_ADJACENT_CEILING]],
+            "more": max(len(adjacent) - _ADJACENT_CEILING, 0)}
+
+
+def _reachability(record: dict) -> list[str]:
     """The reachability warning. It fires on ``tracked − reviewed`` being non-empty, not on
     the reviewed set being a strict subset of what is tracked: the listing includes
     non-ignored untracked files, so a run that reviews an untracked file while excluding a
@@ -14832,36 +16625,34 @@ def _reachability(inventory: dict, names: PathNames) -> list[str]:
     halves apart. Where the roots coincide the clause is left out: explaining a difference
     that does not exist is a sentence a reader has to read for nothing.
     """
-    coverage = inventory["coverage"]
-    if coverage["state"] != "computed":
+    if not record["computed"]:
         return ["- Reachability: the reviewed set was not compared with the files the "
                 "repository tracks, so it is unknown whether anything that reaches these "
                 "defects was left out.\n"]
-    missing = coverage["tracked_not_reviewed"]
+    missing = record["missing"]
     if not missing:
         return ["- Reachability: every tracked file was in the reviewed set.\n"]
-    reviewed = [entry["path"] for entry in inventory["files"]]
+    reviewed = record["reviewed"]
     base = (f" The directories below, and their full paths in the legend, are relative to "
             f"the repository root; every other path in this report is relative to the "
-            f"reviewed root, which sits at `{_one_line(coverage['root'])}/` inside it."
-            if coverage["root"] else "")
-    out = [f"- **Reachability**: {_plural(len(missing), 'tracked file')} "
-           f"{'is' if len(missing) == 1 else 'are'} not in the reviewed set, while "
-           f"{_plural(len(reviewed), 'file')} {'is' if len(reviewed) == 1 else 'are'}, "
+            f"reviewed root, which sits at `{_one_line(record['root'])}/` inside it."
+            if record["root"] else "")
+    out = [f"- **Reachability**: {_plural(missing, 'tracked file')} "
+           f"{'is' if missing == 1 else 'are'} not in the reviewed set, while "
+           f"{_plural(reviewed, 'file')} {'is' if reviewed == 1 else 'are'}, "
            f"so nothing below can say whether they reach these defects.{base}\n"]
-    adjacent = _reachability_dirs(inventory)
-    if not adjacent:
+    shown = record["dirs"]
+    if not shown:
         out.append("  - None of them sits in a directory this run read, so any unreviewed "
                    "caller is in a part of the repository the job did not go near at all.\n")
         return out
-    shown = adjacent[:_ADJACENT_CEILING]
     out.append(f"  - Unreviewed files sit beside reviewed ones in "
-               f"{_plural(len(adjacent), 'directory', 'directories')}, which is where an "
-               f"unreviewed caller is most likely to be:\n")
-    out += [f"    - {_one_line(names.short(name) or '.')} — {_plural(count, 'file')}\n"
-            for name, count in shown]
-    if len(adjacent) > len(shown):
-        out.append(f"    - and {len(adjacent) - len(shown)} more.\n")
+               f"{_plural(len(shown) + record['more'], 'directory', 'directories')}, which is "
+               f"where an unreviewed caller is most likely to be:\n")
+    out += [f"    - {_one_line(short or '.')} — {_plural(count, 'file')}\n"
+            for short, count in shown]
+    if record["more"]:
+        out.append(f"    - and {record['more']} more.\n")
     return out
 
 
@@ -14901,8 +16692,8 @@ def _printed_paths(inventory: dict, files_of: dict, reading: Sequence[dict],
     return paths
 
 
-def _limit_facts(inventory: dict, reading: Sequence[dict], files_of: dict,
-                 findings: Findings) -> dict:
+def _limits_record(inventory: dict, reading: Sequence[dict], files_of: dict,
+                   findings: Findings) -> dict:
     """The counts behind this run's own limits: what it read, what it left, what it could
     not settle. Every one is already listed somewhere in the report; these are the totals."""
     # An area is read when ANY of its readers finished: an area has one reader per lens, and
@@ -14922,9 +16713,12 @@ def _limit_facts(inventory: dict, reading: Sequence[dict], files_of: dict,
             "unread": len(unread),
             "left_out": len(inventory["excluded"]) + len(inventory["skipped"]),
             "unresolved": len(open_sites),
-            "unresolved_in": tuple(title for status, title in (
-                (DEFECT_ESTABLISHED, SECTION_ESTABLISHED),
-                (DEFECT_UNRESOLVED, SECTION_UNRESOLVED)) if status in held)}
+            "unresolved_in": [status for status in (DEFECT_ESTABLISHED, DEFECT_UNRESOLVED)
+                              if status in held]}
+
+
+# The section a defect of each status is placed under, by its status.
+_PLACED_UNDER = {DEFECT_ESTABLISHED: SECTION_ESTABLISHED, DEFECT_UNRESOLVED: SECTION_UNRESOLVED}
 
 
 def _render_limits(facts: dict) -> list[str]:
@@ -14953,7 +16747,7 @@ def _render_limits(facts: dict) -> list[str]:
     if facts["unread"] or facts["left_out"]:
         parts.append(f"**{SUBSECTION_COVERAGE}**, in the appendix, names them.")
     if facts["unresolved"]:
-        where = " and ".join(f"**{title}**" for title in facts["unresolved_in"])
+        where = " and ".join(f"**{_PLACED_UNDER[status]}**" for status in facts["unresolved_in"])
         parts.append(f"{_plural(facts['unresolved'], 'site')} "
                      f"{'was' if facts['unresolved'] == 1 else 'were'} checked and not "
                      f"settled either way; see {where}.")
@@ -14970,7 +16764,21 @@ def _render_limits(facts: dict) -> list[str]:
     ]
 
 
-def _render_by_tier(findings: Findings) -> list[str]:
+def _by_tier_record(findings: Findings) -> dict | None:
+    """Each tier the round named, in its declared order, with its defects counted by
+    severity; ``None`` where the round produced no tiers."""
+    tiers = (findings.synthesis or {}).get("tiers") or ()
+    if not tiers:
+        return None
+    # The defects no declared tier holds come last, as one group with no name of its own.
+    return {"rows": [{"tier": tier,
+                      "counts": [sum(1 for c in held if c["severity"] == level)
+                                 for level in SEVERITIES],
+                      "defects": len(held)}
+                     for tier, _untiered, held in _by_tier(findings.defects, tiers)]}
+
+
+def _render_by_tier(record: dict | None) -> list[str]:
     """One row per tier, one column per severity, counts in the cells.
 
     At four hundred defects the ranked index is four hundred rows and the by-file view is a
@@ -14987,32 +16795,35 @@ def _render_by_tier(findings: Findings) -> list[str]:
     unnamed group, and a table of one row is the line of totals the summary states four
     bullets above.
     """
-    tiers = (findings.synthesis or {}).get("tiers") or ()
-    if not tiers:
+    if record is None:
         return []
-    grouped = _by_tier(findings.defects, tiers)
     out = [f"\n### {SUBSECTION_BY_TIER}\n\n",
            "What the run found, grouped by the themes the judgment round named. The table "
            "holds counts only; the three views below are the lists to work from.\n\n",
            "\n| Tier | " + " | ".join(level.capitalize() for level in SEVERITIES)
            + " | Defects |\n",
            "|---|" + "---|" * (len(SEVERITIES) + 1) + "\n"]
-    for tier, held in grouped:
-        counts = [sum(1 for c in held if c["severity"] == level) for level in SEVERITIES]
-        out.append(f"| {_cell(tier or UNTIERED_GROUP)} | "
-                   + " | ".join(str(n) for n in counts)
-                   + f" | {len(held)} |\n")
+    for row in record["rows"]:
+        out.append(f"| {_cell(row['tier'] or UNTIERED_GROUP)} | "
+                   + " | ".join(str(n) for n in row["counts"])
+                   + f" | {row['defects']} |\n")
     return out
 
 
-def _render_legend(names: PathNames) -> list[str]:
+def _legend_record(names: PathNames) -> dict:
+    """Every short name the document uses and the path it stands for, in the order a
+    reader looks one up in."""
+    return {"rows": [[short, full] for short, full in names.rows()]}
+
+
+def _render_legend(record: dict) -> list[str]:
     """The table that decodes every short name in the document.
 
     It is what makes the shortening safe rather than lossy: a reader who cannot place
     `core.py` has one table to look in, and two files of one name are two rows here with
     the suffix that tells them apart already in the name above.
     """
-    rows = names.rows()
+    rows = record["rows"]
     out = [PATH_LEGEND_HEADING]
     if not rows:
         out.append("No file or directory is named in this report.\n")
@@ -15052,9 +16863,14 @@ def _lens_tags(job: dict, areas: Sequence[dict]) -> dict[str, str]:
     return tags
 
 
-def _lens_items(texts: Sequence[str], tags: dict[str, str], indent: str) -> list[str]:
+def _tagged(texts: Sequence[str], tags: dict[str, str]) -> list[dict]:
+    """Each lens with the tag the document names it by."""
+    return [{"tag": tags[text], "text": text} for text in texts]
+
+
+def _lens_items(lenses: Sequence[dict], indent: str) -> list[str]:
     """One bullet per lens, tagged, at the depth the list sits at."""
-    return [f"{indent}- **{tags[text]}** {_one_line(text)}\n" for text in texts]
+    return [f"{indent}- **{lens['tag']}** {_one_line(lens['text'])}\n" for lens in lenses]
 
 
 def _tracked_total(inventory: dict) -> int | None:
@@ -15087,12 +16903,31 @@ def _by_subject(areas: Sequence[dict]) -> list[tuple[str, int, int, tuple[str, .
     return out
 
 
-def _marked(field: str, notes: dict[str, str] | None) -> str:
+# The job fields the interview may have filled in, each marked where it did.
+_MARKABLE = ("root", "files", "exclude", "partition", "lenses", "coverage")
+
+
+def _defaulted(notes: dict[str, str] | None) -> dict[str, bool]:
+    """Which job fields nobody stated and the interview filled in."""
+    return {field: notes is not None and notes.get(field) == "defaulted" for field in _MARKABLE}
+
+
+def _marked(field: str, defaulted: dict[str, bool]) -> str:
     """The mark a defaulted field carries, and nothing for a field somebody chose."""
-    return " (default)" if notes is not None and notes.get(field) == "defaulted" else ""
+    return " (default)" if defaulted[field] else ""
 
 
-def _shape_of_the_run(job: dict, inventory: dict, areas: Sequence[dict]) -> str:
+def _shape_record(job: dict, inventory: dict, areas: Sequence[dict]) -> dict:
+    """What this run read, as how much, cut how, under how many instructions."""
+    by_subject = job["partition"] == "subject"
+    return {"named": len(job["files"]) if job.get("files") else None,
+            "files": len(inventory["files"]), "by_subject": by_subject, "areas": len(areas),
+            # Read only in subject mode, where an area is a declared subject.
+            "subjects": len(_by_subject(areas)) if by_subject else None,
+            "lenses": len(job["lenses"])}
+
+
+def _shape_of_the_run(record: dict) -> str:
     """What this run read, as how much, cut how, under how many instructions — one sentence.
 
     It is the one part of the job that does NOT wait in the appendix, and the reason is that
@@ -15101,18 +16936,24 @@ def _shape_of_the_run(job: dict, inventory: dict, areas: Sequence[dict]) -> str:
     subject somebody named is what those numbers mean, so a reader sent to the appendix to
     find out is reading numbers they cannot interpret where they are printed.
     """
-    read = (f"the {_plural(len(job['files']), 'file')} the job names" if job.get("files")
-            else f"the {_plural(len(inventory['files']), 'file')} under the job's root")
-    cut = (f"{_plural(len(areas), 'area')} from the "
-           f"{_plural(len(_by_subject(areas)), 'subject')} the job named"
-           if job["partition"] == "subject" else
-           f"{_plural(len(areas), 'area')} the engine cut along directory boundaries")
+    read = (f"the {_plural(record['named'], 'file')} the job names"
+            if record["named"] is not None
+            else f"the {_plural(record['files'], 'file')} under the job's root")
+    cut = (f"{_plural(record['areas'], 'area')} from the "
+           f"{_plural(record['subjects'], 'subject')} the job named"
+           if record["by_subject"] else
+           f"{_plural(record['areas'], 'area')} the engine cut along directory boundaries")
     return (f"This run read {read} as {cut}, under the "
-            f"{_plural(len(job['lenses']), 'lens', 'lenses')} the job names.")
+            f"{_plural(record['lenses'], 'lens', 'lenses')} the job names.")
 
 
-def _job_pointer(job: dict, notes: dict[str, str] | None, inventory: dict,
-                 areas: Sequence[dict]) -> list[str]:
+def _job_pointer_record(job: dict, notes: dict[str, str] | None, inventory: dict,
+                        areas: Sequence[dict]) -> dict:
+    """The shape of the run, and whether the interview's record is beside the job."""
+    return {"shape": _shape_record(job, inventory, areas), "notes": notes is not None}
+
+
+def _job_pointer(record: dict) -> list[str]:
     """The paragraph under the problem statement, which is what makes the appendix a
     destination rather than a place a reader never learns about.
 
@@ -15122,14 +16963,14 @@ def _job_pointer(job: dict, notes: dict[str, str] | None, inventory: dict,
     the panel read anything, and a reader who assumes the panel chose its own scope reads every
     coverage claim on the page wrongly.
     """
-    out = [f"\n{_shape_of_the_run(job, inventory, areas)} The rest of the job is in the "
+    out = [f"\n{_shape_of_the_run(record['shape'])} The rest of the job is in the "
            f"appendix, at [this link]({_anchor(SUBSECTION_THE_JOB)}): the root, what was "
            f"excluded and the instruction each reader was handed, together with the job "
            f"itself and what it takes to run the same audit again.\n\n"]
     # Who decided. Said differently according to what the run directory can support: with the
     # interview's record beside the job this is a fact, and without it the honest sentence is
     # that the fields were settled beforehand and nothing says by which route.
-    if notes is not None:
+    if record["notes"]:
         out.append("Those fields were settled before the panel read anything, in an interview "
                    "with whoever asked for the audit. Where nobody answered, the skill applied "
                    "its own default, and that section marks each one.\n")
@@ -15148,7 +16989,7 @@ RERUN_HEADING = "To run this audit again"
 ROOT_PLACEHOLDER = "/absolute/path/to/the/tree"
 
 
-def _printed_job(job: dict) -> list[str]:
+def _printed_job(shown: dict, replaced: str) -> list[str]:
     """The job itself, as JSON, so it survives the run directory.
 
     **A reader will not have `job.json`.** The report is what gets sent on — pasted into a
@@ -15158,10 +16999,11 @@ def _printed_job(job: dict) -> list[str]:
     reproducible from the document alone.
 
     Rendered from the record the run directory keeps, with the key order the author wrote,
-    which is the order the format's own documentation uses. ``root`` is the one substitution:
-    see :data:`ROOT_PLACEHOLDER`.
+    which is the order the format's own documentation uses. ``replaced`` names the one
+    field the record held back, ``root``, which prints as :data:`ROOT_PLACEHOLDER`.
     """
-    shown = {key: (ROOT_PLACEHOLDER if key == "root" else value) for key, value in job.items()}
+    shown = {key: (ROOT_PLACEHOLDER if key == replaced else value)
+             for key, value in shown.items()}
     return [f"\nThe job, to paste back in when you do not have the file itself. `root` is "
             f"the only field replaced: the tree is on your disk, at your path, and the only "
             f"path on this page from the machine the audit ran on is the run directory "
@@ -15170,7 +17012,7 @@ def _printed_job(job: dict) -> list[str]:
                      indent="", lang="json")]
 
 
-def _rerun_instructions(job: dict, rundir_stated: bool) -> list[str]:
+def _rerun_instructions(shown: dict, replaced: str, rundir_stated: bool) -> list[str]:
     """What it takes to run the same audit again, in full, where a reader will look for it.
 
     **Under a heading of its own, and that is structural rather than decorative.** A paragraph
@@ -15190,7 +17032,7 @@ def _rerun_instructions(job: dict, rundir_stated: bool) -> list[str]:
     where = ("the run directory named above" if rundir_stated
              else "the run directory this report was built from")
     return [f"\n#### {RERUN_HEADING}\n",
-            *_printed_job(job),
+            *_printed_job(shown, replaced),
             f"\nIf you still have the run directory, the same job is `{JOB_FILE_NAME}` "
             f"in {where}. "
             f"Copy it out before running: the driver creates the run directory itself and "
@@ -15212,9 +17054,35 @@ def _rerun_instructions(job: dict, rundir_stated: bool) -> list[str]:
             f"changed tree is a different audit.\n"]
 
 
-def _render_the_job(job: dict, notes: dict[str, str] | None, inventory: dict,
+def _the_job_record(job: dict, notes: dict[str, str] | None, inventory: dict,
                     areas: Sequence[dict], tags: dict[str, str],
-                    rundir_stated: bool = False, answered: bool = False) -> list[str]:
+                    rundir_stated: bool = False, answered: bool = False) -> dict:
+    """The job the run answers, field by field, read off ``job.json``, ``job-notes.json``,
+    ``areas.json`` and ``inventory.json`` and nothing a worker wrote; and the job itself,
+    for the rerun instructions."""
+    by_subject = job["partition"] == "subject"
+    # Which list a reader was handed is the area's, not always the job's, so the sentence
+    # cannot claim every area read under the lenses below it. Only a subject-mode job can
+    # override: an area is a declared subject there, and in file mode the engine makes them.
+    overridden = by_subject and any(tuple(lenses) != tuple(job["lenses"])
+                                    for _s, _f, _p, lenses in _by_subject(areas))
+    return {"notes": notes is not None, "defaulted": _defaulted(notes),
+            "named": len(job["files"]) if job.get("files") else None,
+            # Why the reachability line counts so much of the repository as unreviewed: a
+            # list in place of the tree is the fact that explains it.
+            "tracked": _tracked_total(inventory) if job.get("files") else None,
+            "excluded": len(job["exclude"]),
+            "divided": _divided_record(job, areas, tags),
+            "overridden": overridden, "lenses": _tagged(job["lenses"], tags),
+            "coverage": _coverage_choice_record(job, areas),
+            "questions": bool(job.get("questions")), "answered": answered,
+            # The job as the report prints it. `root` is the one field held back: it is
+            # this machine's path to the tree, and the reader's tree is at theirs.
+            "job": {key: (None if key == "root" else value) for key, value in job.items()},
+            "replaced": "root", "rundir_stated": rundir_stated}
+
+
+def _render_the_job(record: dict) -> list[str]:
     """The appendix subsection: the job the run answers, one line per field, and what it takes
     to ask for it again.
 
@@ -15235,13 +17103,14 @@ def _render_the_job(job: dict, notes: dict[str, str] | None, inventory: dict,
     operator's filesystem is otherwise not in a document that is read somewhere else. The
     root is one line away, in the job file this block names.
     """
+    defaulted = record["defaulted"]
     out = [f"\n### {SUBSECTION_THE_JOB}\n\n",
            f"What this run was asked for. The problem statement under the title is one of these "
            f"fields, quoted there because it is the one a reader acts on; the rest are here.\n"]
     # Said here rather than as a line of the list, because it is about the list and not a
     # field in it. A reader scanning the fields would read it as one.
     out.append(f"A field marked (default) is one nobody stated and the interview filled in.\n"
-               if notes is not None else
+               if record["notes"] else
                f"Which fields the owner asked for and which the interview filled in is not "
                f"recorded: there is no `{JOB_NOTES_FILE_NAME}` beside the job, so a job handed "
                f"in ready-made and one the interview wrote look the same here.\n")
@@ -15250,125 +17119,148 @@ def _render_the_job(job: dict, notes: dict[str, str] | None, inventory: dict,
     # The root as a FIELD, not as a path: see the note above.
     out.append(f"- Tree: the root the job names. It is in `{JOB_FILE_NAME}`, not on this "
                f"page: the only path on this page from the machine the audit ran on is the "
-               f"run directory above.{_marked('root', notes)}\n")
-    if job.get("files"):
-        tracked = _tracked_total(inventory)
-        # Why the reachability line below counts so much of the repository as unreviewed. A
-        # list in place of the tree is the fact that explains it, and the report never said
-        # a list had been given.
+               f"run directory above.{_marked('root', defaulted)}\n")
+    if record["named"] is not None:
+        tracked = record["tracked"]
         rest = (f"; the tree tracks {_plural(tracked, 'file')} in all"
                 if tracked is not None else "")
-        out.append(f"- Scope: the {_plural(len(job['files']), 'file')} the job names, in "
+        out.append(f"- Scope: the {_plural(record['named'], 'file')} the job names, in "
                    f"place of everything under its root{rest}."
-                   f"{_marked('files', notes)}\n")
+                   f"{_marked('files', defaulted)}\n")
     else:
-        out.append(f"- Scope: everything under the job's root.{_marked('files', notes)}\n")
-    if job["exclude"]:
-        out.append(f"- Excluded: {_plural(len(job['exclude']), 'path')} the job named; "
+        out.append(f"- Scope: everything under the job's root.{_marked('files', defaulted)}\n")
+    if record["excluded"]:
+        out.append(f"- Excluded: {_plural(record['excluded'], 'path')} the job named; "
                    f"**Not read**, under Coverage below, lists the files they took out."
-                   f"{_marked('exclude', notes)}\n")
+                   f"{_marked('exclude', defaulted)}\n")
     else:
-        out.append(f"- Excluded: nothing.{_marked('exclude', notes)}\n")
-    out += _divided(job, areas, tags, notes)
-    # Which list a reader was handed is the area's, not always the job's, so the sentence
-    # cannot claim every area read under the lenses below it. Only a subject-mode job can
-    # override: an area is a declared subject there, and in file mode the engine makes them.
-    overridden = job["partition"] == "subject" and any(
-        tuple(lenses) != tuple(job["lenses"]) for _s, _f, _p, lenses in _by_subject(areas))
+        out.append(f"- Excluded: nothing.{_marked('exclude', defaulted)}\n")
+    out += _divided(record["divided"], defaulted)
     each = (" of the list that applies to it (the job's, unless the area above names its own)"
-            if overridden else "")
-    out.append(f"- Read with {_plural(len(job['lenses']), 'lens', 'lenses')}. A lens is the "
+            if record["overridden"] else "")
+    out.append(f"- Read with {_plural(len(record['lenses']), 'lens', 'lenses')}. A lens is the "
                f"instruction a reader is handed for how to read its area. Every area was "
                f"read once per lens{each}, and the lenses were assigned to the two model "
-               f"lanes in turn.{_marked('lenses', notes)}\n")
-    out += _lens_items(job["lenses"], tags, "  ")
-    out.append(f"- Coverage: {_coverage_choice(job, areas)}{_marked('coverage', notes)}\n")
-    if job.get("questions"):
-        where = (f"answered under **{SECTION_OPERATOR}**" if answered else
+               f"lanes in turn.{_marked('lenses', defaulted)}\n")
+    out += _lens_items(record["lenses"], "  ")
+    out.append(f"- Coverage: {_coverage_choice(record['coverage'])}"
+               f"{_marked('coverage', defaulted)}\n")
+    if record["questions"]:
+        where = (f"answered under **{SECTION_OPERATOR}**" if record["answered"] else
                  f"and no answer was recorded in `{REPORT_NOTES_FILE_NAME}`")
         out.append(f"- Questions: put to whoever ran the panel rather than to its readers, "
                    f"{where}.\n")
-    out += _rerun_instructions(job, rundir_stated)
+    out += _rerun_instructions(record["job"], record["replaced"], record["rundir_stated"])
     return out
 
 
-def _divided(job: dict, areas: Sequence[dict], tags: dict[str, str],
-             notes: dict[str, str] | None) -> list[str]:
+def _divided_record(job: dict, areas: Sequence[dict], tags: dict[str, str]) -> dict:
+    """How the files in scope became areas: by file, or by subject with each subject's
+    files, whether it was split, and the lenses of any that has its own."""
+    if job["partition"] != "subject":
+        return {"by_subject": False, "areas": len(areas)}
+    subjects = _by_subject(areas)
+    return {"by_subject": True, "areas": len(areas),
+            # SUBJECTS that were split, not the pieces they were split into: a subject cut
+            # in three is one subject split, and counting the pieces claims three were.
+            "split": sum(1 for _s, _f, parts, _l in subjects if parts > 1),
+            "subjects": [{"name": subject, "files": files,
+                          "lenses": (_tagged(lenses, tags)
+                                     if tuple(lenses) != tuple(job["lenses"]) else None)}
+                         for subject, files, _parts, lenses in subjects]}
+
+
+def _divided(record: dict, defaulted: dict[str, bool]) -> list[str]:
     """How the files in scope became areas. The mode decides what an area IS, and so what
     every per-area count in this report is counting — which the report never stated."""
-    mark = _marked("partition", notes)
-    if job["partition"] != "subject":
+    mark = _marked("partition", defaulted)
+    if not record["by_subject"]:
         return [f"- Divided: by file — the engine cut the files in scope into "
-                f"{_plural(len(areas), 'area')} along directory boundaries, under a size "
+                f"{_plural(record['areas'], 'area')} along directory boundaries, under a size "
                 f"ceiling.{mark}\n"]
-    subjects = _by_subject(areas)
-    # SUBJECTS that were split, not the pieces they were split into: a subject cut in three is
-    # one subject split, and counting the pieces claims three of them were.
-    split = sum(1 for _s, _f, parts, _l in subjects if parts > 1)
-    how = (f"the engine split {split} of them for size, giving {_plural(len(areas), 'area')}"
-           if split else "one area each")
+    subjects, split = record["subjects"], record["split"]
+    how = (f"the engine split {split} of them for size, giving "
+           f"{_plural(record['areas'], 'area')}" if split else "one area each")
     out = [f"- Divided: by subject — the job named {_plural(len(subjects), 'subject')}; "
            f"{how}.{mark}\n"]
-    for subject, files, _parts, lenses in subjects:
-        own = tuple(lenses) != tuple(job["lenses"])
+    for subject in subjects:
+        own = subject["lenses"] is not None
         tail = ", read with its own lenses in place of the job's:" if own else ""
-        out.append(f"  - {_one_line(subject)} — {_plural(files, 'file')}{tail}\n")
+        out.append(f"  - {_one_line(subject['name'])} — {_plural(subject['files'], 'file')}"
+                   f"{tail}\n")
         if own:
-            out += _lens_items(lenses, tags, "    ")
+            out += _lens_items(subject["lenses"], "    ")
     return out
 
 
-def _coverage_choice(job: dict, areas: Sequence[dict]) -> str:
+def _coverage_choice_record(job: dict, areas: Sequence[dict]) -> dict:
+    """Whether the job asked for the coverage round, declined it, or left it to the tree,
+    and how many areas earned an auditor."""
+    return {"declined": coverage_declined(job), "asked": bool(job.get("coverage")),
+            "earned": sum(1 for area in areas if area["audited"]), "areas": len(areas)}
+
+
+def _coverage_choice(record: dict) -> str:
     """Whether the job asked for the coverage round, declined it, or left it to the tree —
     and, where it could run, how much of the tree earned an auditor."""
-    if coverage_declined(job):
+    if record["declined"]:
         return ("declined by the job, so no auditor was planned however many tests the tree "
                 "holds.")
-    earned = sum(1 for area in areas if area["audited"])
-    asked = "asked for by the job" if job.get("coverage") else "left to the tree"
-    return f"{asked} — {earned} of {_plural(len(areas), 'area')} earned an auditor."
+    asked = "asked for by the job" if record["asked"] else "left to the tree"
+    return f"{asked} — {record['earned']} of {_plural(record['areas'], 'area')} earned an auditor."
 
 
-def _rung_line(dispatch: DispatchRecord, reading: Sequence[dict], areas: Sequence[dict],
-               findings: Findings) -> str:
-    """The rung and what it lets the report claim, counted from the data. An area counts
-    as read by both lanes only when both its readers completed; a candidate counts as
-    checked by the other lane when a verdict came back, and as left unresolved otherwise —
-    a failed or missing verification unit included. Every candidate carries one raiser, so
-    every one of them has an other lane and there is no third case to count."""
-    units = _plural_states([u["state"] for u in reading])
+def _rung_record(dispatch: DispatchRecord, reading: Sequence[dict], areas: Sequence[dict],
+                 findings: Findings) -> dict:
+    """The rung and the counts it lets the report claim. An area counts as read by both
+    lanes only when both its readers completed; a candidate counts as checked by the other
+    lane when a verdict came back, and as left unresolved otherwise — a failed or missing
+    verification unit included. Every candidate carries one raiser, so every one of them has
+    an other lane and there is no third case to count."""
     readers: dict[str, list[bool]] = {}
     for unit in reading:
         if unit["kind"] == READER_KIND:
             readers.setdefault(unit["area"], []).append(unit["state"] == UNIT_COMPLETE)
-    both_read = sum(1 for area in areas if readers.get(area["id"]) and all(readers[area["id"]]))
     unresolved = sum(1 for record in findings.candidates if record["status"] == "unresolved")
-    other = len(findings.candidates) - unresolved
-    name, coverage = RUNG_NAMES[dispatch.rung], f"{both_read} of {_plural(len(areas), 'area')}"
-    if dispatch.rung == RUNG_TWO_RUNTIMES:
+    return {"rung": dispatch.rung,
+            "units": _unit_state_counts([u["state"] for u in reading]),
+            "both_read": sum(1 for area in areas
+                             if readers.get(area["id"]) and all(readers[area["id"]])),
+            "areas": len(areas), "candidates": len(findings.candidates),
+            "unresolved": unresolved, "other": len(findings.candidates) - unresolved}
+
+
+def _rung_line(record: dict) -> str:
+    """The rung and what it lets the report claim, in the words that rung permits."""
+    rung, unresolved, other = record["rung"], record["unresolved"], record["other"]
+    units = _render_unit_states(record["units"])
+    candidates = record["candidates"]
+    name = RUNG_NAMES[rung]
+    coverage = f"{record['both_read']} of {_plural(record['areas'], 'area')}"
+    if rung == RUNG_TWO_RUNTIMES:
         return (f"{name}. Reading units: {units}; {coverage} read by both models. "
-                f"Candidates: {len(findings.candidates)} — {other} checked by the other model, "
+                f"Candidates: {candidates} — {other} checked by the other model, "
                 f"{unresolved} left unresolved. Where the lanes disagree, the disagreement "
                 f"is between two different models.")
-    if dispatch.rung == RUNG_TWO_MODELS:
+    if rung == RUNG_TWO_MODELS:
         # Every rung has its own branch: a rung falling into the one-runtime sentence would
         # say "the same model" about two.
         return (f"{name}. Reading units: {units}; {coverage} read by both models. "
-                f"Candidates: {len(findings.candidates)} — {other} checked by the other model, "
+                f"Candidates: {candidates} — {other} checked by the other model, "
                 f"{unresolved} left unresolved. Where the lanes disagree, the disagreement "
                 f"is between two different models, which shared one harness: its tools, its "
                 f"system prompt and its permission layer.")
-    if dispatch.rung == RUNG_TWO_RUNTIMES_ONE_MODEL:
+    if rung == RUNG_TWO_RUNTIMES_ONE_MODEL:
         return (f"{name}. Reading units: {units}; {coverage} read by both contexts. "
-                f"Candidates: {len(findings.candidates)} — {other} checked by a separate "
+                f"Candidates: {candidates} — {other} checked by a separate "
                 f"session of the same model in the other runtime, not the one that raised "
                 f"them, {unresolved} left unresolved. Where the lanes disagree, the "
                 f"disagreement is between two sessions of one model run in two different "
                 f"tools, and the report claims no more than that.")
-    if dispatch.rung != RUNG_ONE_RUNTIME:
-        raise DispatchError(f"no sentence states rung {dispatch.rung!r}")
+    if rung != RUNG_ONE_RUNTIME:
+        raise DispatchError(f"no sentence states rung {rung!r}")
     return (f"{name}. Reading units: {units}; {coverage} read by both contexts. "
-            f"Candidates: {len(findings.candidates)} — {other} checked by a fresh context of "
+            f"Candidates: {candidates} — {other} checked by a fresh context of "
             f"the same model, not the one that raised them, {unresolved} left unresolved. "
             f"Where the lanes disagree, the disagreement is between two contexts of one "
             f"model, and the report claims no more than that.")
@@ -15442,7 +17334,25 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
     renderer that called the clock itself would make that untestable — the difference
     between two renderings would no longer be a thing a caller could hold still.
     """
-    problem = job["problem"]
+    return render_report_document(report_document(
+        job, dispatch, inventory, areas, findings, reading, batches, states, probe,
+        rundir=rundir, generated=generated, job_notes=job_notes, report_notes=report_notes,
+        before_sites=before_sites, resynthesized=resynthesized))
+
+
+def report_document(job: dict, dispatch: DispatchRecord, inventory: dict,
+                    areas: Sequence[dict], findings: Findings, reading: Sequence[dict],
+                    batches: Sequence[dict], states: Sequence[VerificationState],
+                    probe: dict, *, rundir: Path | None = None, generated: str | None = None,
+                    job_notes: dict[str, str] | None = None,
+                    report_notes: ReportNotes | None = None,
+                    before_sites: bool = False, resynthesized: str | None = None) -> dict:
+    """Everything the report states, decided: one record per section, as JSON values.
+
+    The arguments are :func:`render_report`'s, which says what each one is. Nothing about
+    a defect is computed here either: every fact comes from ``findings``, and this decides
+    only what the report says of it and in what order.
+    """
     # One map for the whole document: the job block spells each lens out under its tag and the
     # provenance table cites the tag. Built here rather than in either of them, because the
     # two agreeing is the only thing that makes the tag a reference at all.
@@ -15462,9 +17372,6 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
     # Gathered before a line is written, because the legend is printed above the body that
     # decides which paths appear in it.
     names = PathNames(_printed_paths(inventory, files_of, reading, findings, by_id))
-    # Every site's parts, computed once, because two sections print them: its defect's entry
-    # takes the source, the first test and what is not settled, and its evidence entry the
-    # rest.
     site_of = {site["id"]: site for site in findings.sites}
     placed = {defect["id"]: defect for defect in findings.defects}
     corrected = report_notes.corrected() if report_notes is not None else frozenset()
@@ -15472,195 +17379,6 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
     # fact about the run, not about any site, and the top of the report states it.
     verification = len({site["axis_b"] for site in findings.sites
                         if placed[site["defect"]]["status"] == DEFECT_ESTABLISHED}) > 1
-    parts_of = {}
-    for site in findings.sites:
-        defect = placed[site["defect"]]
-        parts_of[site["id"]] = _site_parts(
-            {**site, "sites": [site["id"]]}, [by_id[cid] for cid in site["members"]],
-            dispatch.rung, findings.commit, names,
-            judged=defect["tier"] is not None and _is_work(defect),
-            verification=verification, corrected=defect["id"] in corrected)
-    # The subtitle: what this report is OF, on one line under the title. A report outlives
-    # the session that made it, and a reader holding one has to know which tree it was read
-    # from before a single defect in it means anything. The source facts are deterministic
-    # -- how many files, at which commit -- and are stated whatever the caller passed; the
-    # clock is not, so it is stated only where a caller hands one over. Rendered as an
-    # ordinary paragraph and set smaller by the page's `h1 + p` rule, because Markdown has
-    # no size and a heading would put it in the contents list.
-    # What this report is OF. The commit's DATE rides with it where the record has one:
-    # a sha says which tree and nothing about how old it is, and "eight files from commit
-    # 832123fd" leaves a reader holding the page unable to tell last week's work from last
-    # year's. Only here — every defect and every snippet names the same commit, and a date
-    # repeated on each of them is a date nobody reads.
-    dated = _one_line(_committed_clock(inventory["commit"].get("committed") or ""))
-    said = [f"{_plural(len(inventory['files']), 'file')} from "
-            f"{_commit_words(inventory['commit'], True)}"
-            + (f", committed {dated}" if dated else "")]
-    # WHEN THE READING HAPPENED, which is not when the page was drawn. A report re-rendered
-    # weeks after its run said "Generated <today>" and nothing else about time, so a month
-    # old reading read as this morning's. Stated only where the two differ by a day or
-    # more -- on the run that wrote the report, saying both is one fact twice.
-    taken = _one_line(inventory.get("taken", ""))
-    if taken and (generated is None or taken[:10] != _one_line(generated)[:10]):
-        said.insert(0, f"Read {taken}")
-    if resynthesized is not None:
-        said.insert(0, f"Resynthesized {_one_line(resynthesized)}")
-    if generated is not None:
-        said.insert(0, f"Generated {_one_line(generated)}")
-    out = ["# Review panel report\n", f"\n{' · '.join(said)}\n",
-           f"\n{PROMPT_LEAD_IN}\n\n"]
-    # Verbatim as prose, not as markup: the statement is whatever the job said, and a job
-    # naming an HTML element should read as that name rather than become one.
-    out += [f"> {_entities(line)}\n" for line in problem.splitlines()]
-
-    # Directly under the statement, because that is what it is about. The detail is in the
-    # appendix and this is what keeps the move from trading one obstruction for a dead end:
-    # it carries the shape of the run in one sentence, says who settled the rest, and names
-    # the section. A bare "see the appendix" would put the original defect back.
-    out += _job_pointer(job, job_notes, inventory, areas)
-
-    sections = _Sections()
-    out.append(sections.top(SECTION_DESCRIPTION))
-    # The document explained to somebody who has never seen one. Everything below assumes
-    # the vocabulary — defect, established, unresolved, appendix — and a reader who has to
-    # infer it from the sections reads the first third of the report twice.
-    # The method, never a coverage claim: what was actually read, checked and reached is
-    # the rung line below, and saying any of it twice puts the two out of step. Nor is
-    # blindness claimed here — the rung is what permits that word, and the rung line makes
-    # the claim once.
-    out.append("A panel of agents read this tree in bounded pieces. Whatever one agent "
-               "raised was sent to another agent that had not raised it, to be checked.\n")
-    out.append(DEFECTS_AND_SITES + "\n")
-    out.append("**Established** means a checker that had not raised the claim upheld it. "
-               "**Unresolved** means nothing settled it, and the group it sits under "
-               "says what would. **Refuted** means a check dismissed it, so there is "
-               f"nothing to do about it; it is listed under **{SECTION_REFUTED}** with the "
-               "reason. A defect is placed under Established when any of its sites is, and "
-               "under Refuted only when all of them are.\n")
-    # What the appendix holds is set out at the top of the appendix itself; what a reader
-    # needs here is only that there is one and that skipping it costs them nothing.
-    out.append("The **appendix** at the end is the record of the run rather than the work "
-               "it found. Nothing in it is needed to fix anything.\n\n")
-    out += _grouping_notes(findings, before_sites)
-    counts = {status: sum(1 for c in findings.defects if c["status"] == status)
-              for status in (DEFECT_ESTABLISHED, DEFECT_REFUTED, DEFECT_UNRESOLVED)}
-    out.append(f"- Defects by placement: {counts[DEFECT_ESTABLISHED]} established, "
-               f"{counts[DEFECT_REFUTED]} refuted, "
-               f"{counts[DEFECT_UNRESOLVED]} unresolved.\n")
-    disputed = [c["id"] for c in sorted(findings.defects, key=lambda c: _id_rank(c["id"]))
-                if c["id"] in corrected]
-    if disputed:
-        out.append(f"  - The operator corrected {len(disputed)} of these: "
-                   f"{', '.join(f'[{did}](#{did})' for did in disputed)}. The counts are "
-                   f"the panel's own and stay as they are; the corrections are under "
-                   f"**{SECTION_OPERATOR}**.\n")
-    outcomes = {status: sum(1 for s in findings.sites if s["status"] == status)
-                for status in (DEFECT_ESTABLISHED, DEFECT_REFUTED, DEFECT_UNRESOLVED)}
-    out.append(f"- Sites by outcome: {outcomes[DEFECT_ESTABLISHED]} established, "
-               f"{outcomes[DEFECT_REFUTED]} refuted, "
-               f"{outcomes[DEFECT_UNRESOLVED]} unresolved.\n")
-    verdicts = {status: sum(1 for r in findings.candidates if r["status"] == status)
-                for status in VERDICT_STATUSES}
-    out.append(f"- Candidates behind them: {len(findings.candidates)} — "
-               f"{verdicts['reproduced']} reproduced, "
-               f"{verdicts['confirmed_by_reading']} confirmed by reading, "
-               f"{verdicts['refuted']} refuted, {verdicts['unresolved']} unresolved.\n")
-    # The merge's arithmetic in the report rather than only in the code: a reader counting
-    # defects can check the three numbers against each other.
-    several = [d for d in findings.defects if len(d["sites"]) > 1]
-    out.append(f"- Defects: {len(findings.defects)} at "
-               f"{_plural(len(findings.sites), 'site')} from "
-               f"{_plural(len(findings.candidates), 'candidate')}; every candidate is at "
-               f"exactly one site and every site in exactly one defect"
-               + (f"; {_plural(len(several), 'defect')} "
-                  f"{'has' if len(several) == 1 else 'have'} more than one site" if several
-                  else "") + ".\n")
-    # Counted apart, and never folded into the line above. A coverage gap is not a defect
-    # and adding the two would give a reader one number that means two things. Counted by
-    # SITE, as the coverage sections list them: each site of a gap of several is its own
-    # test to write, placed by its own outcome.
-    if findings.coverage_defects:
-        listed_gaps = _gap_sites(findings)
-        gaps = {status: sum(1 for c in listed_gaps if c["status"] == status)
-                for status in (DEFECT_ESTABLISHED, DEFECT_REFUTED, DEFECT_UNRESOLVED)}
-        parts = [f"{gaps[DEFECT_ESTABLISHED]} standing",
-                 f"{gaps[DEFECT_REFUTED]} covered by a test already",
-                 f"{gaps[DEFECT_UNRESOLVED]} unresolved"]
-        at = ("" if len(listed_gaps) == len(findings.coverage_defects)
-              else f" at {_plural(len(listed_gaps), 'site')}, counted by site")
-        out.append(f"- Coverage gaps: {len(findings.coverage_defects)}{at} from "
-                   f"{_plural(len(findings.coverage), 'finding')} — {', '.join(parts)}. "
-                   f"They are tests to write, not defects, and are counted apart from the "
-                   f"line above.\n")
-    if ungrouped:
-        noun, named = _unclustered(ungrouped, _record_parts(findings.clustering))
-        out.append(f"- {noun} left unclustered, so a defect raised twice there is counted "
-                   f"twice: {named}.\n")
-    # The commit once, for every site: no line number in this report means anything without
-    # it, and it is stated here rather than beside each site.
-    out.append(f"- Every line number in this report refers to "
-               f"{_commit_words(findings.commit, True)}; **{SUBSECTION_HOW_IT_RAN}**, in the "
-               f"appendix, names it in full.\n")
-    out.append(f"- Where things are: the defects, each with its account, its sites and the "
-               f"source at each site, are under **{SECTION_ESTABLISHED}**, "
-               f"**{SECTION_UNRESOLVED}** and **{SECTION_REFUTED}**; everything else the "
-               f"review recorded about each site is under **{SECTION_EVIDENCE}**, by the "
-               f"site's number.\n")
-    out.append(f"- Reading units: {_plural_states([u['state'] for u in reading])}.\n")
-    out.append(f"- Verification units: {_plural_states([s.state for s in states])}.\n")
-    if listed:
-        out.append(f"- Clustering units: {_plural_states([e['state'] for e in listed])}.\n")
-    # The three facts a reader needs before any finding: what this run could execute, what
-    # it could not reach, and at what rung it ran. They sat under "How this ran", above the
-    # first defect and below four lines of adapter strings; the rung is what every claim
-    # below is bounded by, so it belongs with the counts it bounds.
-    out.append(f"- Rung: {_rung_line(dispatch, reading, areas, findings)}\n")
-    out += _executability(probe, findings, corrected)
-    out += _reachability(inventory, names)
-    # The legend itself is in the appendix; this is the pointer to it. One row per file the
-    # report names is hundreds or thousands of lines on a real tree, and sitting here it
-    # stood between the summary a reader came for and the first defect they came to fix.
-    # It is a decoder -- consulted when a short name is unfamiliar and ignored otherwise --
-    # which is what the appendix is for. Moving it without leaving this line would trade
-    # one obstruction for a dead end.
-    out.append(f"- This report names every file by a short name; the **{SUBSECTION_LEGEND}**, "
-               f"in the appendix, gives each one's full path.\n")
-    out += _render_judgment_overview(findings)
-    out += _render_by_tier(findings)
-    # Last under the description, and after the counts rather than before them: it is a
-    # caveat about the numbers a reader has just taken in, and the sentence about volume
-    # lands on the total they are holding.
-    out += _render_limits(_limit_facts(inventory, reading, files_of, findings))
-    if report_notes is not None:
-        out += _render_operator_notes(report_notes, job, findings, probe, sections)
-
-    # One section, two ways in. They were sibling headings, which said they were two
-    # sections of the report rather than one list a reader can enter by rank or by file.
-    out.append(sections.top(SECTION_INDEX))
-    if not findings.candidates:
-        lead, empty = "No candidate was raised.", ("Nothing to rank.", "Nothing to gather.")
-    elif not work:
-        lead = (f"Nothing to do: the {_plural(refuted_count, 'defect')} raised was checked "
-                f"and dismissed. It is under **{SECTION_REFUTED}**, with the reason."
-                if refuted_count == 1 else
-                f"Nothing to do: every one of the {_plural(refuted_count, 'defect')} "
-                f"raised was checked and dismissed. They are under **{SECTION_REFUTED}**, "
-                f"with the reason for each.")
-        empty = (f"Nothing to do; see **{SECTION_REFUTED}**.",) * 2
-    else:
-        # Short, because each way in states its own rule under its own heading; saying it
-        # here as well puts one sentence in two places where an edit touches half of them.
-        lead, empty = "One list of defects, with two ways in: by rank or by file.", None
-    out.append(f"{lead}\n")
-    if empty is None:
-        out += _render_index(work, refuted_count, sections, corrected)
-        out += _render_by_file(work, site_of, by_id, names, sections)
-    else:
-        # Both ways in are WRITTEN even with nothing to put in them. A subsection that
-        # vanishes gives the page's contents list a different skeleton on every run, and
-        # gives a reader no way to tell "no defects" from "this part was dropped".
-        out.append(sections.sub(SUBSECTION_RANKED) + f"{empty[0]}\n")
-        out.append(sections.sub(SUBSECTION_BY_FILE) + f"{empty[1]}\n")
     # The round's vocabulary, in the order it declared it, or nothing where the round was
     # not run or could not be believed. The disclaimer is scoped to what actually renders:
     # a report carrying no synthesized prose has nothing to disclaim, and a sentence that
@@ -15668,21 +17386,143 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
     tiers = tuple(findings.synthesis["tiers"]) if findings.synthesis else ()
     headed = _headed(ordered)
     disclaim = headed or any(_carries_a_reading(cluster) for cluster in ordered)
+    gaps = bool(findings.coverage_defects)
+    if not findings.candidates:
+        lead = "none_raised"
+    elif not work:
+        lead = "nothing_to_do"
+    else:
+        lead = "list"
+    return {
+        "subtitle": _subtitle_record(inventory, generated, resynthesized),
+        "problem": job["problem"],
+        "pointer": _job_pointer_record(job, job_notes, inventory, areas),
+        "grouping": _grouping_notes_record(findings, before_sites),
+        "counts": _counts_record(findings, corrected, ungrouped, listed, reading, states),
+        "rung": _rung_record(dispatch, reading, areas, findings),
+        "executability": _executability_record(probe, findings, corrected),
+        "reachability": _reachability_record(inventory, names),
+        # Only the evidence runs print as commands: a proposed reproduction prints as its
+        # argv, and a run not printed as bash keeps that form too.
+        "shell_note": _quotes_an_argument(
+            c["evidence"]["argv"] for c in findings.candidates
+            if c.get("evidence") and _printed_as_bash(c["evidence"]["argv"])),
+        "test_patches": _test_patches_record(findings.defects, site_of, by_id),
+        "overview": _judgment_overview_record(findings),
+        "by_tier": _by_tier_record(findings),
+        "limits": _limits_record(inventory, reading, files_of, findings),
+        "operator": (_operator_notes_record(report_notes, job, findings, probe)
+                     if report_notes is not None else None),
+        "index": {"lead": lead, "refuted": refuted_count,
+                  "ranked": (_index_record(work, refuted_count, corrected)
+                             if lead == "list" else None),
+                  "by_file": (_by_file_record(work, site_of, by_id, names)
+                              if lead == "list" else None)},
+        "corroborated": _corroborated_record(ordered, dispatch.rung),
+        # Written only where the coverage round produced something: a section that is
+        # always there and usually empty teaches a reader to skip it.
+        "coverage_gaps": _coverage_gaps_record(findings, names) if gaps else None,
+        "covered": _covered_record(findings, names) if gaps else None,
+        "verifier_variance": _verifier_variance_record(findings),
+        "outside_scope": _outside_scope_record(findings, names),
+        "clustering_notes": _clustering_notes_record(findings, names),
+        "merge_notes": _merge_notes_record(findings),
+        "synthesis_notes": _synthesis_notes_record(findings),
+        "legend": _legend_record(names),
+        "how_it_ran": _how_it_ran_record(rundir, dispatch, findings, inventory),
+        "the_job": _the_job_record(job, job_notes, inventory, areas, tags, rundir is not None,
+                                   report_notes is not None and bool(report_notes.answers)),
+        "coverage": _coverage_section_record(job, inventory, reading, batches, states, probe,
+                                             findings, files_of, ungrouped, names),
+        "provenance": _provenance_record(findings, tags),
+        # Every site, in the order findings.json holds them. Two sections print parts of
+        # each: its defect's entry, and its own entry under Evidence.
+        "sites": {"rung": dispatch.rung, "commit": findings.commit,
+                  "each": [_site_record(
+                      site, [by_id[cid] for cid in site["members"]], names,
+                      judged=placed[site["defect"]]["tier"] is not None
+                      and _is_work(placed[site["defect"]]),
+                      several=len(placed[site["defect"]]["sites"]) > 1,
+                      verification=verification, corrected=site["defect"] in corrected)
+                           for site in findings.sites]},
+        "body": _body_record(ordered, site_of, by_id, tiers, disclaim, headed),
+        # Evidence is in site order, whichever defect each site belongs to.
+        "evidence": [site["id"] for site in sorted(findings.sites,
+                                                   key=lambda site: _id_rank(site["id"]))],
+    }
+
+
+def render_report_document(doc: dict) -> str:
+    """``report.md`` from the record :func:`report_document` returns, and from nothing else.
+
+    What depends only on the order the page is written in stays here: the section numbers,
+    which blocks an earlier site already printed, and which entry carries a gap's anchor.
+    """
+    out = _render_subtitle(doc["subtitle"])
+    # Verbatim as prose, not as markup: the statement is whatever the job said, and a job
+    # naming an HTML element should read as that name rather than become one.
+    out += [f"> {_entities(line)}\n" for line in doc["problem"].splitlines()]
+
+    # Directly under the statement, because that is what it is about. The detail is in the
+    # appendix, and this line keeps a reader from reaching a dead end: it carries the shape
+    # of the run in one sentence, says who settled the rest, and names the section. A bare
+    # "see the appendix" would tell a reader neither the run's scope nor where to look.
+    out += _job_pointer(doc["pointer"])
+
+    sections = _Sections()
+    out.append(sections.top(SECTION_DESCRIPTION))
+    out += _render_description(doc)
+    # The three facts a reader needs before any finding: what this run could execute, what
+    # it could not reach, and at what rung it ran. They sit here, beside the counts, and not
+    # under "How this ran" among the adapter strings: the rung is what every claim below is
+    # bounded by, so it belongs with the counts it bounds.
+    out.append(f"- Rung: {_rung_line(doc['rung'])}\n")
+    out += _executability(doc["executability"])
+    out += _reachability(doc["reachability"])
+    if doc["shell_note"]:
+        out.append(f"- {REPORT_SHELL_NOTE}\n")
+    out += _render_test_patches_note(doc["test_patches"])
+    # The legend itself is in the appendix; this is the pointer to it. One row per file the
+    # report names is hundreds or thousands of lines on a real tree, which here would stand
+    # between the summary a reader came for and the first defect they came to fix.
+    # It is a decoder -- consulted when a short name is unfamiliar and ignored otherwise --
+    # which is what the appendix is for. Without this line a reader meeting a short name
+    # would not know the legend exists.
+    out.append(f"- This report names every file by a short name; the **{SUBSECTION_LEGEND}**, "
+               f"in the appendix, gives each one's full path.\n")
+    out += _render_judgment_overview(doc["overview"])
+    out += _render_by_tier(doc["by_tier"])
+    # Last under the description, and after the counts rather than before them: it is a
+    # caveat about the numbers a reader has just taken in, and the sentence about volume
+    # lands on the total they are holding.
+    out += _render_limits(doc["limits"])
+    if doc["operator"] is not None:
+        out += _render_operator_notes(doc["operator"], sections)
+
+    # One section, two ways in. The rank and file views sit under one heading because they
+    # are one list a reader can enter by rank or by file; as sibling headings they would
+    # read as two sections of the report.
+    out.append(sections.top(SECTION_INDEX))
+    out += _render_index_section(doc["index"], sections)
+    # Every site's parts, computed once, because two sections print them: its defect's entry
+    # takes the source, the first test and what is not settled, and its evidence entry the
+    # rest.
+    sites = doc["sites"]
+    site_records = {record["id"]: record for record in sites["each"]}
+    parts_of = {sid: _render_site_parts(record, sites["rung"], sites["commit"])
+                for sid, record in site_records.items()}
     printed = _Printed()
     # A coverage gap's defect is anchored on the first entry of it printed, which may be
     # under Tests to write or in the appendix's covered table.
     gap_anchors: set[str] = set()
-    out += _render_body(ordered, by_id, site_of, parts_of, names, sections, printed, tiers,
-                        disclaim, headed)
-    out += _render_corroborated(ordered, dispatch.rung, sections)
-    # Above the evidence, because a named missing test is work. Written only where the
-    # coverage round produced something: a section that is always there and usually empty
-    # teaches a reader to skip it.
-    if findings.coverage_defects:
-        out += _render_coverage_gaps(findings, names, sections, gap_anchors)
+    out += _render_body(doc["body"], site_records, parts_of, sections, printed)
+    out += _render_corroborated(doc["corroborated"], sections)
+    # Above the evidence, because a named missing test is work.
+    if doc["coverage_gaps"] is not None:
+        out += _render_coverage_gaps(doc["coverage_gaps"], sections, gap_anchors)
     # Last before the appendix: what a person auditing a site reads, one link from the
     # defect a person fixing it reads.
-    out += _render_evidence_part(findings, parts_of, names, sections, printed)
+    out += _render_evidence_part(doc["evidence"], site_records, parts_of, sections, printed)
 
     # Everything below is the record of the run rather than the work it found. The three
     # views and the defects themselves are above; a person fixing something never has
@@ -15695,79 +17535,308 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
                "merged, what the evidence leaves out, what was asked for and what ran where, "
                "what was not read, and which unit raised what. Nothing below is needed to fix "
                "a defect.\n")
-    if findings.coverage_defects:
-        out += _render_covered(findings, names, gap_anchors)
-    out += _render_verifier_variance(findings)
-    out += _render_outside_scope(findings, names)
-    out += _render_clustering_notes(findings, names)
-    out += _render_merge_notes(findings)
-    out += _render_synthesis_notes(findings)
+    if doc["covered"] is not None:
+        out += _render_covered(doc["covered"], gap_anchors)
+    out += _render_verifier_variance(doc["verifier_variance"])
+    out += _render_outside_scope(doc["outside_scope"])
+    out += _render_clustering_notes(doc["clustering_notes"])
+    out += _render_merge_notes(doc["merge_notes"])
+    out += _render_synthesis_notes(doc["synthesis_notes"])
     out += _render_left_out(printed)
-    out += _render_legend(names)
-
-    # The rung is stated ONCE, in the summary, because every claim in the report is bounded
-    # by it. Repeating it here would put the same sentence in two places, where an edit to
-    # one is an edit to half of them.
-    out += [f"\n### {SUBSECTION_HOW_IT_RAN}\n\n"]
-    # Where the evidence for all of the above is. A report outlives the session that made
-    # it, and without this line a reader holding one three weeks later has no way back to
-    # the payloads, the per-unit results or the transcripts it was built from.
-    if rundir is not None:
-        out.append(f"- Run directory, holding every payload, result and transcript this "
-                   f"report was built from: `{_one_line(str(rundir))}`\n")
-    # The job file is NOT a bullet here. It is what **The job**, directly below, is about, and
-    # that subsection carries the whole rerun recipe — naming it twice would put one fact in
-    # two places where an edit to one is an edit to half of them.
-    for lane in LANES:
-        record = dispatch.lanes[lane]
-        out += _recorded(f"- Lane {lane} adapter, as recorded by the dispatcher:", record.adapter)
-        out += _recorded(f"- Lane {lane} permission, as recorded by the dispatcher:",
-                         record.permission)
-    # A later synthesis generation ran on lanes of its own, recorded apart from the run's:
-    # its write-ups are attributed to those, and every other stage to the lanes above.
-    again = findings.synthesis.get("dispatch") if findings.synthesis else None
-    for lane, record in (again or {}).items():
-        where = f"lane {lane} of synthesis generation {findings.synthesis['generation']}"
-        out += _recorded(f"- The {where} adapter, as recorded by the dispatcher:",
-                         record["adapter"])
-        out += _recorded(f"- The {where} permission, as recorded by the dispatcher:",
-                         record["permission"])
-    out.append(f"- {CONTAINMENT_LINE}\n")
-    out.append(f"- Read: {_plural(len(inventory['files']), 'file')} ({inventory['source']}), tree "
-               f"sha256 {inventory['tree_sha256']}; {len(inventory['excluded'])} excluded, "
-               f"{len(inventory['skipped'])} skipped.\n")
-    # The whole sha, once. Every defect and every snippet names the first ten characters,
-    # which is what a person types; this is the line somebody checks the tree out from.
-    out.append(f"- Pinned at: {_commit_words(findings.commit)}.\n")
-
+    out += _render_legend(doc["legend"])
+    out += _render_how_it_ran(doc["how_it_ran"])
     # Directly after the record of what ran it, because the two are halves of one answer —
     # what was asked, and what machinery answered it — and because the rerun instructions
     # below reach back to the run directory, the commit and the adapters named just above.
-    out += _render_the_job(job, job_notes, inventory, areas, tags, rundir is not None,
-                           report_notes is not None and bool(report_notes.answers))
+    out += _render_the_job(doc["the_job"])
+    out += _render_coverage_section(doc["coverage"])
+    out += _render_provenance(doc["provenance"])
+    return "".join(out)
 
-    out.append(f"\n### {SUBSECTION_COVERAGE}\n\n")
-    out.append("Partitioning put every file in scope into exactly one area, so a gap here is "
-               "a unit that failed or returned nothing valid, or a path the job left out.\n")
-    # An auditor that was never dispatched is not a unit that failed, so it is stated here
-    # rather than in the list below — and stated it must be: the round is the one that
-    # answers which inputs the tests never construct, and a report that omitted it reads as
-    # one whose auditors found nothing.
-    #
-    # WHETHER it ran is read off the LISTING; why it did not is read off the snapshot. Every
-    # other claim in this section is a fact about the units that ran, and this one has to be
-    # the same fact, or a tree with no test-named file whose auditors did run prints "No
-    # auditor ran" directly above the line naming what `audit-B` returned.
+
+def _subtitle_record(inventory: dict, generated: str | None,
+                     resynthesized: str | None) -> dict:
+    """What this report is OF, and when: the files and the commit they were read at, the
+    commit's own date, and the clocks a caller handed over.
+
+    A report outlives the session that made it, and a reader holding one has to know which
+    tree it was read from before a single defect in it means anything. The source facts are
+    deterministic -- how many files, at which commit -- and are stated whatever the caller
+    passed; the clock is not, so it is stated only where a caller hands one over.
+    """
+    taken = inventory.get("taken", "")
+    return {"files": len(inventory["files"]), "commit": inventory["commit"],
+            # The commit's DATE rides with it where the record has one: a sha says which
+            # tree and nothing about how old it is. Only here — every defect and every
+            # snippet names the same commit, and a date repeated on each is one nobody reads.
+            "committed": _committed_clock(inventory["commit"].get("committed") or ""),
+            "taken": taken,
+            # WHEN THE READING HAPPENED, which is not when the page was drawn: stated only
+            # where the two differ by a day or more -- on the run that wrote the report,
+            # saying both is one fact twice. Compared as the page spells them.
+            "read": bool(_collapse(taken)) and (
+                generated is None or _one_line(taken)[:10] != _one_line(generated)[:10]),
+            "resynthesized": resynthesized, "generated": generated}
+
+
+def _render_subtitle(record: dict) -> list[str]:
+    """The title and, under it, what this report is of, on one line. Rendered as an ordinary
+    paragraph and set smaller by the page's `h1 + p` rule, because Markdown has no size and
+    a heading would put it in the contents list."""
+    dated = _one_line(record["committed"])
+    said = [f"{_plural(record['files'], 'file')} from "
+            f"{_commit_words(record['commit'], True)}"
+            + (f", committed {dated}" if dated else "")]
+    if record["read"]:
+        said.insert(0, f"Read {_one_line(record['taken'])}")
+    if record["resynthesized"] is not None:
+        said.insert(0, f"Resynthesized {_one_line(record['resynthesized'])}")
+    if record["generated"] is not None:
+        said.insert(0, f"Generated {_one_line(record['generated'])}")
+    return ["# Review panel report\n", f"\n{' · '.join(said)}\n", f"\n{PROMPT_LEAD_IN}\n\n"]
+
+
+def _counts_record(findings: Findings, corrected: frozenset[str], ungrouped: Sequence[dict],
+                   listed: Sequence[dict], reading: Sequence[dict],
+                   states: Sequence[VerificationState]) -> dict:
+    """The counts at the top of the report: defects, sites and candidates by status, the
+    defects the operator corrected, the coverage gaps by site, the areas left unclustered,
+    and the units of each round by state."""
+    three = (DEFECT_ESTABLISHED, DEFECT_REFUTED, DEFECT_UNRESOLVED)
+
+    def by(rows, statuses):
+        return {status: sum(1 for row in rows if row["status"] == status) for status in statuses}
+    gaps = None
+    # Counted apart, and never folded into the defects. A coverage gap is not a defect and
+    # adding the two would give a reader one number that means two things. Counted by SITE,
+    # as the coverage sections list them: each site of a gap of several is its own test to
+    # write, placed by its own outcome.
+    if findings.coverage_defects:
+        listed_gaps = _gap_sites(findings)
+        gaps = {"by_status": by(listed_gaps, three), "sites": len(listed_gaps),
+                "defects": len(findings.coverage_defects),
+                "findings": len(findings.coverage)}
+    parts = _record_parts(findings.clustering)
+    return {"defects": by(findings.defects, three),
+            "corrected": [c["id"] for c in sorted(findings.defects,
+                                                  key=lambda c: _id_rank(c["id"]))
+                          if c["id"] in corrected],
+            "sites": by(findings.sites, three),
+            "candidates": len(findings.candidates),
+            "verdicts": by(findings.candidates, VERDICT_STATUSES),
+            "defect_total": len(findings.defects), "site_total": len(findings.sites),
+            # The merge's arithmetic in the report rather than only in the code: a reader
+            # counting defects can check the three numbers against each other.
+            "several": sum(1 for d in findings.defects if len(d["sites"]) > 1),
+            "gaps": gaps,
+            "unclustered": [{"unit": entry["unit"], "area": entry["area"],
+                             "part": entry["unit"] in parts} for entry in ungrouped],
+            # The commit once, for every site: no line number in this report means anything
+            # without it.
+            "commit": findings.commit,
+            "reading": _unit_state_counts([u["state"] for u in reading]),
+            "verification": _unit_state_counts([s.state for s in states]),
+            "clustering": (_unit_state_counts([e["state"] for e in listed]) if listed
+                           else None)}
+
+
+def _render_description(doc: dict) -> list[str]:
+    """The report explained to somebody who has never seen one, then the counts.
+
+    Everything below assumes the vocabulary — defect, established, unresolved, appendix — and
+    a reader who has to infer it from the sections reads the first third of the report twice.
+    The method, never a coverage claim: what was actually read, checked and reached is the
+    rung line, and saying any of it twice puts the two out of step. Nor is blindness claimed
+    here — the rung is what permits that word, and the rung line makes the claim once.
+    """
+    counts = doc["counts"]
+    out = ["A panel of agents read this tree in bounded pieces. Whatever one agent "
+           "raised was sent to another agent that had not raised it, to be checked.\n"]
+    out.append(DEFECTS_AND_SITES + "\n")
+    out.append("**Established** means a checker that had not raised the claim upheld it. "
+               "**Unresolved** means nothing settled it, and the group it sits under "
+               "says what would. **Refuted** means a check dismissed it, so there is "
+               f"nothing to do about it; it is listed under **{SECTION_REFUTED}** with the "
+               "reason. A defect is placed under Established when any of its sites is, and "
+               "under Refuted only when all of them are.\n")
+    # What the appendix holds is set out at the top of the appendix itself; what a reader
+    # needs here is only that there is one and that skipping it costs them nothing.
+    out.append("The **appendix** at the end is the record of the run rather than the work "
+               "it found. Nothing in it is needed to fix anything.\n\n")
+    out += _grouping_notes(doc["grouping"])
+    placed = counts["defects"]
+    out.append(f"- Defects by placement: {placed[DEFECT_ESTABLISHED]} established, "
+               f"{placed[DEFECT_REFUTED]} refuted, "
+               f"{placed[DEFECT_UNRESOLVED]} unresolved.\n")
+    disputed = counts["corrected"]
+    if disputed:
+        out.append(f"  - The operator corrected {len(disputed)} of these: "
+                   f"{', '.join(f'[{did}](#{did})' for did in disputed)}. The counts are "
+                   f"the panel's own and stay as they are; the corrections are under "
+                   f"**{SECTION_OPERATOR}**.\n")
+    outcomes = counts["sites"]
+    out.append(f"- Sites by outcome: {outcomes[DEFECT_ESTABLISHED]} established, "
+               f"{outcomes[DEFECT_REFUTED]} refuted, "
+               f"{outcomes[DEFECT_UNRESOLVED]} unresolved.\n")
+    verdicts = counts["verdicts"]
+    out.append(f"- Candidates behind them: {counts['candidates']} — "
+               f"{verdicts['reproduced']} reproduced, "
+               f"{verdicts['confirmed_by_reading']} confirmed by reading, "
+               f"{verdicts['refuted']} refuted, {verdicts['unresolved']} unresolved.\n")
+    several = counts["several"]
+    out.append(f"- Defects: {counts['defect_total']} at "
+               f"{_plural(counts['site_total'], 'site')} from "
+               f"{_plural(counts['candidates'], 'candidate')}; every candidate is at "
+               f"exactly one site and every site in exactly one defect"
+               + (f"; {_plural(several, 'defect')} "
+                  f"{'has' if several == 1 else 'have'} more than one site" if several
+                  else "") + ".\n")
+    gaps = counts["gaps"]
+    if gaps is not None:
+        by_status = gaps["by_status"]
+        parts = [f"{by_status[DEFECT_ESTABLISHED]} standing",
+                 f"{by_status[DEFECT_REFUTED]} covered by a test already",
+                 f"{by_status[DEFECT_UNRESOLVED]} unresolved"]
+        at = ("" if gaps["sites"] == gaps["defects"]
+              else f" at {_plural(gaps['sites'], 'site')}, counted by site")
+        out.append(f"- Coverage gaps: {gaps['defects']}{at} from "
+                   f"{_plural(gaps['findings'], 'finding')} — {', '.join(parts)}. "
+                   f"They are tests to write, not defects, and are counted apart from the "
+                   f"line above.\n")
+    if counts["unclustered"]:
+        entries = counts["unclustered"]
+        noun, named = _unclustered(entries, frozenset(e["unit"] for e in entries if e["part"]))
+        out.append(f"- {noun} left unclustered, so a defect raised twice there is counted "
+                   f"twice: {named}.\n")
+    out.append(f"- Every line number in this report refers to "
+               f"{_commit_words(counts['commit'], True)}; **{SUBSECTION_HOW_IT_RAN}**, in the "
+               f"appendix, names it in full.\n")
+    out.append(f"- Where things are: the defects, each with its account, its sites and the "
+               f"source at each site, are under **{SECTION_ESTABLISHED}**, "
+               f"**{SECTION_UNRESOLVED}** and **{SECTION_REFUTED}**; everything else the "
+               f"review recorded about each site is under **{SECTION_EVIDENCE}**, by the "
+               f"site's number.\n")
+    out.append(f"- Reading units: {_render_unit_states(counts['reading'])}.\n")
+    out.append(f"- Verification units: {_render_unit_states(counts['verification'])}.\n")
+    if counts["clustering"] is not None:
+        out.append(f"- Clustering units: {_render_unit_states(counts['clustering'])}.\n")
+    return out
+
+
+def _render_index_section(record: dict, sections: _Sections) -> list[str]:
+    """The lead under the index's heading, and its two ways in — written even with nothing
+    to put in them. A subsection that vanishes gives the page's contents list a different
+    skeleton on every run, and gives a reader no way to tell "no defects" from "this part
+    was dropped"."""
+    refuted_count = record["refuted"]
+    if record["lead"] == "none_raised":
+        lead, empty = "No candidate was raised.", ("Nothing to rank.", "Nothing to gather.")
+    elif record["lead"] == "nothing_to_do":
+        lead = (f"Nothing to do: the {_plural(refuted_count, 'defect')} raised was checked "
+                f"and dismissed. It is under **{SECTION_REFUTED}**, with the reason."
+                if refuted_count == 1 else
+                f"Nothing to do: every one of the {_plural(refuted_count, 'defect')} "
+                f"raised was checked and dismissed. They are under **{SECTION_REFUTED}**, "
+                f"with the reason for each.")
+        empty = (f"Nothing to do; see **{SECTION_REFUTED}**.",) * 2
+    else:
+        # Short, because each way in states its own rule under its own heading; saying it
+        # here as well puts one sentence in two places where an edit touches half of them.
+        lead, empty = "One list of defects, with two ways in: by rank or by file.", None
+    out = [f"{lead}\n"]
+    if empty is None:
+        out += _render_index(record["ranked"], sections)
+        out += _render_by_file(record["by_file"], sections)
+    else:
+        out.append(sections.sub(SUBSECTION_RANKED) + f"{empty[0]}\n")
+        out.append(sections.sub(SUBSECTION_BY_FILE) + f"{empty[1]}\n")
+    return out
+
+
+def _how_it_ran_record(rundir: Path | None, dispatch: DispatchRecord, findings: Findings,
+                       inventory: dict) -> dict:
+    """Where the evidence is, what ran each lane, and what was read at which commit."""
+    # A later synthesis generation ran on lanes of its own, recorded apart from the run's:
+    # its write-ups are attributed to those, and every other stage to the lanes above.
+    again = findings.synthesis.get("dispatch") if findings.synthesis else None
+    return {"rundir": str(rundir) if rundir is not None else None,
+            "lanes": [{"lane": lane, "adapter": dispatch.lanes[lane].adapter,
+                       "permission": dispatch.lanes[lane].permission} for lane in LANES],
+            "again": [{"lane": lane, "adapter": record["adapter"],
+                       "permission": record["permission"]}
+                      for lane, record in (again or {}).items()],
+            "generation": findings.synthesis["generation"] if again else None,
+            "files": len(inventory["files"]), "source": inventory["source"],
+            "tree_sha256": inventory["tree_sha256"], "excluded": len(inventory["excluded"]),
+            "skipped": len(inventory["skipped"]), "commit": findings.commit}
+
+
+def _render_how_it_ran(record: dict) -> list[str]:
+    """The run directory, the lanes as the dispatcher recorded them, what was read and the
+    commit it was pinned at.
+
+    The rung is stated ONCE, in the summary, because every claim in the report is bounded
+    by it. Repeating it here would put the same sentence in two places, where an edit to
+    one is an edit to half of them.
+    """
+    out = [f"\n### {SUBSECTION_HOW_IT_RAN}\n\n"]
+    # Where the evidence for all of the above is. A report outlives the session that made
+    # it, and without this line a reader holding one three weeks later has no way back to
+    # the payloads, the per-unit results or the transcripts it was built from.
+    if record["rundir"] is not None:
+        out.append(f"- Run directory, holding every payload, result and transcript this "
+                   f"report was built from: `{_one_line(record['rundir'])}`\n")
+    # The job file is NOT a bullet here. It is what **The job**, directly below, is about, and
+    # that subsection carries the whole rerun recipe — naming it twice would put one fact in
+    # two places where an edit to one is an edit to half of them.
+    for lane in record["lanes"]:
+        out += _recorded(f"- Lane {lane['lane']} adapter, as recorded by the dispatcher:",
+                         lane["adapter"])
+        out += _recorded(f"- Lane {lane['lane']} permission, as recorded by the dispatcher:",
+                         lane["permission"])
+    for lane in record["again"]:
+        where = f"lane {lane['lane']} of synthesis generation {record['generation']}"
+        out += _recorded(f"- The {where} adapter, as recorded by the dispatcher:",
+                         lane["adapter"])
+        out += _recorded(f"- The {where} permission, as recorded by the dispatcher:",
+                         lane["permission"])
+    out.append(f"- {CONTAINMENT_LINE}\n")
+    out.append(f"- Read: {_plural(record['files'], 'file')} ({record['source']}), tree "
+               f"sha256 {record['tree_sha256']}; {record['excluded']} excluded, "
+               f"{record['skipped']} skipped.\n")
+    # The whole sha, once. Every defect and every snippet names the first ten characters,
+    # which is what a person types; this is the line somebody checks the tree out from.
+    out.append(f"- Pinned at: {_commit_words(record['commit'])}.\n")
+    return out
+
+
+def _labeled(unit: dict) -> dict:
+    """The fields :func:`_unit_label` reads, for each kind of unit."""
+    if unit["kind"] == VERIFIER_KIND:
+        return {"kind": unit["kind"], "id": unit["id"], "area": unit["area"],
+                "lane": unit["lane"]}
+    if unit["kind"] == AUDITOR_KIND:
+        return {"kind": unit["kind"], "id": unit["id"], "lane": unit["lane"]}
+    return {"kind": unit["kind"], "id": unit["id"], "lane": unit["lane"], "lens": unit["lens"]}
+
+
+def _coverage_section_record(job: dict, inventory: dict, reading: Sequence[dict],
+                             batches: Sequence[dict], states: Sequence[VerificationState],
+                             probe: dict, findings: Findings, files_of: dict,
+                             ungrouped: Sequence[dict], names: PathNames) -> dict:
+    """What was not covered: why no auditor ran where none did, whether every unit returned
+    a valid result, every unit, verdict and finding that did not, and what was not read."""
+    # WHETHER an auditor ran is read off the LISTING; why it did not is read off the
+    # snapshot. Every other claim in this section is a fact about the units that ran, and
+    # this one has to be the same fact, or a tree with no test-named file whose auditors did
+    # run prints "No auditor ran" directly above the line naming what `audit-B` returned.
+    absence = None
     if not any(unit["kind"] == AUDITOR_KIND for unit in reading):
-        # Read off the job the renderer already holds, rather than passed in beside it: the
-        # field is the job's, and two paths to one field is a way for the coverage line in
-        # section 1 and this sentence to contradict each other.
-        absence = _auditor_absence(
-            auditor_plan_of_snapshot(inventory, coverage_declined(job)))
-        out.append(f"\nNo auditor ran: {absence}. "
-                   f"The round that asks which inputs the tests never construct did not run, "
-                   f"and nothing below answers that question.\n")
-    out.append("\n#### Units that failed or returned nothing\n\n")
+        # Read off the job, rather than passed in beside it: the field is the job's, and two
+        # paths to one field is a way for the coverage line in section 1 and this sentence
+        # to contradict each other.
+        plan = auditor_plan_of_snapshot(inventory, coverage_declined(job))
+        absence = {"state": plan.state, "elsewhere": list(plan.elsewhere)}
     gaps = [u for u in reading if u["state"] != UNIT_COMPLETE]
     failed_batches = [(b, s) for b, s in zip(batches, states) if s.state != UNIT_COMPLETE]
     probe_state = probe.get("state")
@@ -15781,9 +17850,7 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
                     or any(unit.get("rejected") for unit in reading))
     # The synthesis round is a unit like the others, so a round that never landed, failed or
     # had an entry refused is a unit that did not return a valid result, and so is any unit
-    # of the tier-name, tier-summary or overview rounds after it. Printing the line
-    # above the appendix note naming that round is the same contradiction as printing it
-    # above a list of failed batches.
+    # of the tier-name, tier-summary or overview rounds after it.
     synthesis = findings.synthesis
     synthesis_clean = synthesis is None or (
         synthesis["state"] == UNIT_COMPLETE and not synthesis["rejected"]
@@ -15794,36 +17861,84 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
         unit["state"] == UNIT_COMPLETE
         for record in (findings.merge, findings.merge_check) if record is not None
         for unit in record["units"])
-    if (not gaps and not failed_batches and probe_state == UNIT_COMPLETE
-            and not ungrouped and not rejected_any and synthesis_clean and merge_clean):
+    parts = _record_parts(findings.clustering)
+    return {
+        "absence": absence,
+        "clean": (not gaps and not failed_batches and probe_state == UNIT_COMPLETE
+                  and not ungrouped and not rejected_any and synthesis_clean and merge_clean),
+        "probe": (None if probe_state == UNIT_COMPLETE else
+                  {"unit": probe.get("unit", PROBE_UNIT_ID), "state": probe_state,
+                   "reason": probe.get("reason")}),
+        "unread": [{"unit": _labeled(unit), "state": unit["state"], "reason": unit["reason"],
+                    "area": unit["area"],
+                    "files": ([names.short(path) for path in files_of[unit["area"]]]
+                              if unit["area"] is not None else [])} for unit in gaps],
+        "failed_batches": [{"unit": _labeled(batch), "state": state.state,
+                            "reason": state.reason, "candidates": list(batch["candidates"])}
+                           for batch, state in failed_batches],
+        "rejected_verdicts": [{"unit": _labeled(batch), "message": message}
+                              for batch, state in zip(batches, states)
+                              for message in state.rejected],
+        "rejected_findings": [{"unit": _labeled(unit), "message": message}
+                              for unit in reading for message in unit.get("rejected", ())],
+        "ungrouped": [{"unit": entry["unit"], "area": entry["area"], "state": entry["state"],
+                       "reason": entry["reason"], "part": entry["unit"] in parts}
+                      for entry in ungrouped],
+        "excluded": [names.short(path) for path in inventory["excluded"]],
+        "skipped": [{"path": names.short(entry["path"]), "reason": entry["reason"]}
+                    for entry in inventory["skipped"]],
+        # A count and nothing more: the owner left these files out to hear nothing about
+        # them, and the count is what keeps the dropping from being silent.
+        "dropped": sum(unit.get("dropped", 0) for unit in reading)}
+
+
+def _render_coverage_section(record: dict) -> list[str]:
+    """What was not covered, and why: the units that failed or returned nothing, and the
+    files nobody read."""
+    out = [f"\n### {SUBSECTION_COVERAGE}\n\n",
+           "Partitioning put every file in scope into exactly one area, so a gap here is "
+           "a unit that failed or returned nothing valid, or a path the job left out.\n"]
+    # An auditor that was never dispatched is not a unit that failed, so it is stated here
+    # rather than in the list below — and stated it must be: the round is the one that
+    # answers which inputs the tests never construct, and a report that omitted it reads as
+    # one whose auditors found nothing.
+    if record["absence"] is not None:
+        absence = _auditor_absence(AuditorPlan(record["absence"]["state"],
+                                               tuple(record["absence"]["elsewhere"])))
+        out.append(f"\nNo auditor ran: {absence}. "
+                   f"The round that asks which inputs the tests never construct did not run, "
+                   f"and nothing below answers that question.\n")
+    out.append("\n#### Units that failed or returned nothing\n\n")
+    if record["clean"]:
         out.append(f"{EVERY_UNIT_RETURNED}\n")
-    if probe_state != UNIT_COMPLETE:
-        out += _item(f"- {probe.get('unit', PROBE_UNIT_ID)} (capability probe) — "
-                     f"{probe_state}: ", str(probe.get("reason") or "no reason was recorded"),
+    probe = record["probe"]
+    if probe is not None:
+        out += _item(f"- {probe['unit']} (capability probe) — "
+                     f"{probe['state']}: ", str(probe["reason"] or "no reason was recorded"),
                      "No finding is affected. What is not known is whether this tree builds "
                      "and whether its tests run, so nothing below was executed on the strength "
                      "of that answer.")
     # A reason can carry a worker's text — an unknown key is quoted by name — so it
     # goes through _item like a finding's fields.
-    for unit in gaps:
-        prefix = f"- {_one_line(_unit_label(unit))} — {unit['state']}: "
+    for unit in record["unread"]:
+        prefix = f"- {_one_line(_unit_label(unit['unit']))} — {unit['state']}: "
         if unit["area"] is None:
             out += _item(prefix, unit["reason"], "Read the area manifest and the test inventory, not an area.")
         else:
             out += _item(prefix, unit["reason"], f"Read {unit['area']}:")
-            out += [f"  - {_one_line(names.short(path))}\n" for path in files_of[unit["area"]]]
-    for batch, state in failed_batches:
-        out += _item(f"- {_one_line(_unit_label(batch))} — {state.state}: ", state.reason,
+            out += [f"  - {_one_line(path)}\n" for path in unit["files"]]
+    for batch in record["failed_batches"]:
+        out += _item(f"- {_one_line(_unit_label(batch['unit']))} — {batch['state']}: ",
+                     batch["reason"],
                      f"Its candidates are reported unresolved: {', '.join(batch['candidates'])}.")
     # A verdict the engine could not read inside a unit that otherwise came back. Its
     # candidate is unresolved like any other, and this is what stops that being silent: a
     # reader can tell a candidate nobody checked from one whose answer arrived unreadable,
     # and the verifier's own contract error is on the page where somebody will see it.
-    for batch, state in zip(batches, states):
-        for message in state.rejected:
-            out += _item(f"- {_one_line(_unit_label(batch))} — one verdict could not be "
-                         f"read, and only its own candidate lost its verdict: ", message,
-                         "Every other verdict in that unit stands.")
+    for entry in record["rejected_verdicts"]:
+        out += _item(f"- {_one_line(_unit_label(entry['unit']))} — one verdict could not be "
+                     f"read, and only its own candidate lost its verdict: ", entry["message"],
+                     "Every other verdict in that unit stands.")
     # A finding the engine could not read inside a reading unit that otherwise came back.
     # It raised no candidate, so unlike a rejected verdict there is nothing downstream that
     # mentions it -- this line is the whole of what the reader ever learns about it, which
@@ -15835,39 +17950,34 @@ def render_report(job: dict, dispatch: DispatchRecord, inventory: dict, areas: S
     # resolve something that does not resolve. It falls under the one exemption the
     # one-spelling rule already carries -- a sentence quoted from a worker is reproduced as
     # it was written, paths and all.
-    for unit in reading:
-        for message in unit.get("rejected", ()):
-            out += _item(f"- {_one_line(_unit_label(unit))} — one finding could not be "
-                         f"read, and was not raised: ", message,
-                         "Every other finding in that unit stands.")
+    for entry in record["rejected_findings"]:
+        out += _item(f"- {_one_line(_unit_label(entry['unit']))} — one finding could not be "
+                     f"read, and was not raised: ", entry["message"],
+                     "Every other finding in that unit stands.")
     # A clustering unit that did not come back costs its area the merge and nothing else, so
     # it is a gap of a different kind from the two above: no finding is lost and no verdict
     # changes, and the report says which count is inflated rather than leaving the reader to
     # wonder why one defect appears twice.
-    parts = _record_parts(findings.clustering)
-    for entry in ungrouped:
+    for entry in record["ungrouped"]:
         out += _item(f"- {entry['unit']} (clustering, {entry['area']}) — {entry['state']}: ",
                      entry["reason"],
-                     UNGROUPED_PART_NOTE if entry["unit"] in parts else UNGROUPED_NOTE)
+                     UNGROUPED_PART_NOTE if entry["part"] else UNGROUPED_NOTE)
 
     out.append("\n#### Not read\n\n")
-    if not inventory["excluded"] and not inventory["skipped"]:
+    if not record["excluded"] and not record["skipped"]:
         out.append("Nothing was excluded and nothing was skipped.\n")
-    if inventory["excluded"]:
-        out.append(f"- Excluded by the job ({len(inventory['excluded'])}):\n")
-        out += [f"  - {_one_line(names.short(path))}\n" for path in inventory["excluded"]]
-    if inventory["skipped"]:
-        out.append(f"- Skipped, recorded and never followed ({len(inventory['skipped'])}):\n")
-        out += [f"  - {_one_line(names.short(entry['path']))} — {_one_line(entry['reason'])}\n"
-                for entry in inventory["skipped"]]
-    # A count and nothing more: the owner left these files out to hear nothing about them,
-    # and the count is what keeps the dropping from being silent.
-    dropped = sum(unit.get("dropped", 0) for unit in reading)
+    if record["excluded"]:
+        out.append(f"- Excluded by the job ({len(record['excluded'])}):\n")
+        out += [f"  - {_one_line(path)}\n" for path in record["excluded"]]
+    if record["skipped"]:
+        out.append(f"- Skipped, recorded and never followed ({len(record['skipped'])}):\n")
+        out += [f"  - {_one_line(entry['path'])} — {_one_line(entry['reason'])}\n"
+                for entry in record["skipped"]]
+    dropped = record["dropped"]
     if dropped:
         out.append(f"- {_plural(dropped, 'finding')} located in files outside the review's "
                    f"scope {'was' if dropped == 1 else 'were'} dropped.\n")
-    out += _render_provenance(findings, tags)
-    return "".join(out)
+    return out
 
 
 def _release(lock: Path) -> bool:
@@ -16757,12 +18867,13 @@ def report_summary(states: Sequence[VerificationState], findings: Findings,
 FIX_BRIEF_NAME = "fix-brief.md"
 FIX_BRIEF_DATA_NAME = "fix-brief.json"
 # One file per defect, the setup and that defect alone, so one defect can be handed to one
-# agent. **A directory the engine owns**: every name in it is one this stage writes, so a
+# agent, and beside it the defect's test patch where it has one. **A directory the engine
+# owns**: every name in it is one this stage writes, so a
 # re-render, a redo and a recovery each remove all of them before anything new lands — a
 # file left from a grouping that has since shrunk is a defect an agent would go and fix —
 # and anything else in it is refused rather than deleted.
 FIX_BRIEF_DIR = "fix-brief"
-_FIX_BRIEF_ENTRY = re.compile(rf"{DEFECT_ID_PREFIX}[1-9][0-9]*\.md\Z", re.ASCII)
+_FIX_BRIEF_ENTRY = re.compile(rf"{DEFECT_ID_PREFIX}[1-9][0-9]*\.(?:md|patch)\Z", re.ASCII)
 # How much of a run's output a site carries: the end, where a failure and its message are.
 FIX_BRIEF_OUTPUT_CHARS = 400
 FIX_BRIEF_TITLE = "Fix brief"
@@ -16784,6 +18895,34 @@ FIX_BRIEF_GUIDE = (
     "Established defects come first, then unresolved; within each, most severe first, then "
     "fewest sites. Refuted sites and defects are left out: there is nothing to fix at them.",
 )
+# Said once in the Setup of a brief that prints a command with any argument a shell must
+# quote: those are the commands bash, PowerShell and CMD read differently. Not in
+# `FIX_BRIEF_GUIDE`, which `fix-brief.json` carries: this is about the Markdown alone.
+FIX_BRIEF_SHELL_NOTE = (
+    "Commands are written for bash. Where PowerShell needs one written differently, a "
+    "PowerShell version follows it. From CMD, run them in PowerShell. PowerShell passes "
+    "arguments to a `.bat` or `.cmd` program by older rules, so one may not receive a "
+    "quote or an empty argument intact.")
+POWERSHELL_LABEL = "In PowerShell:"
+POWERSHELL_7_3_NOTE = ("Needs PowerShell 7.3 or later: Windows PowerShell 5.1 changes an "
+                       "argument that holds a `\"`, is empty, or holds whitespace and ends in "
+                       "a backslash.")
+# Said once in the Setup where some command carries that note, so a reader on Windows
+# PowerShell 5.1 has a way to run it rather than a warning alone.
+FIX_BRIEF_5_1_NOTE = ("On Windows PowerShell 5.1, a command marked as needing 7.3 or later "
+                      "does not run as printed. PowerShell 7 installs beside 5.1 and runs it "
+                      "unchanged; if you cannot install it, take that command's argv from "
+                      "{data}.")
+# A line break other than LF cannot be pasted: a code block's lines are rejoined with LF.
+FIX_BRIEF_NO_PASTE = ("This command has an argument holding a line break that no pasted "
+                      "command keeps. Its argv is in {data}.")
+# A test whose command names the review's own copy of the tree in a way no path relative to
+# the repository can stand for; its argv in the data is null.
+FIX_BRIEF_NO_REPOSITORY_COMMAND = ("The review ran this test by a command naming its own "
+                                   "copy of the tree, which cannot be given relative to the "
+                                   "repository, so no command is printed. Run the test this "
+                                   "patch adds with your suite's usual command.")
+
 # What to do first at an unresolved site, by what stopped the review there.
 FIX_BRIEF_WHAT_TO_DO = {
     "blocked_by_the_environment": (
@@ -16920,14 +19059,309 @@ def _fix_tests_to_write(findings: Findings, members: dict[str, list[dict]]) -> l
     return out
 
 
-def fix_brief_document(findings: Findings, probe: dict) -> dict:
+# A defect's test, as the fix brief carries it. The patch applies from the top of the
+# repository the review read (the root itself where it is in none), because its paths start
+# at the root's place there; the test runs from the verifier's directory under that place.
+# Both are written relative to the top, always: a run directory read on another machine
+# names neither.
+FIX_TEST_APPLY_ARGV = ("git", "apply")
+FIX_TEST_TOP = "."
+# Where the run directory is, in the one command that needs it: the brief names no absolute
+# path, so the owner puts the folder holding `report.md` here. The block defines it.
+FIX_TEST_RUN_PLACEHOLDER = "<this run>"
+FIX_TEST_LABEL = "Failing test"
+REPORT_TEST_LABEL = "Failing test."
+# Why a defect the run asked a test of has none, where no reason was recorded for it.
+NO_TEST_WRITTEN = "the verifier wrote no test for it"
+NO_PATCH_RECORDED = "the verifier wrote a test, and no patch of it was recorded"
+_TEST_STATE_WORDS = {TEST_RED: "red", TEST_WRITTEN_NOT_RUN: "written, not run"}
+# The report's one item on the test patches, said once in its description where any defect
+# carries one. The id stands for any defect's: the item is about all of them.
+TEST_PATCHES_NOTE_LABEL = "Failing tests."
+TEST_PATCHES_NOTE_ID = "D<n>"
+TEST_PATCHES_UNRUN_NOTE = (f"A test labeled **{_TEST_STATE_WORDS[TEST_WRITTEN_NOT_RUN]}** "
+                           f"was never run; run it before you trust it.")
+# Under a defect's test, once per other defect whose published patch holds one of its files.
+FIX_TEST_SHARED_NOTE = ("{files} {verb} also in {other}'s patch, so applying both with "
+                        "`git apply` fails on the second: apply one, then make the other's "
+                        "change to {that} by hand.")
+
+
+@dataclass(frozen=True)
+class FixBriefTests:
+    """What the fix brief needs of a run that asked for test patches: the threshold, the
+    root's place in its repository (``coverage.root``), and each patch's text by the unit
+    and the candidate its record names. The text comes from the unit's own record and never
+    from ``findings.json``, which holds a pointer."""
+
+    threshold: str
+    prefix: str
+    patches: Mapping[tuple[str, str], str]
+    # Each test's command as the owner runs it, by the same key, where its record holds
+    # one; ``None`` where it could not be given relative to their checkout.
+    argvs: Mapping[tuple[str, str], list[str] | None] = field(default_factory=dict)
+
+
+def fix_brief_tests(job: Mapping[str, object], inventory: dict,
+                    states: Sequence[VerificationState]) -> FixBriefTests | None:
+    """The run's :class:`FixBriefTests`, ``None`` where it asks for no test: such a run
+    has no test to deliver, and its fix brief holds no test section or patch."""
+    threshold = test_patch_threshold(job)
+    if threshold is None:
+        return None
+    prefix = inventory["coverage"].get("root", "")
+    if not isinstance(prefix, str):
+        raise RunDirError("inventory.json is not the engine's: coverage.root")
+    delivered = [((state.id, cid), entry) for state in states
+                 for cid, entry in state.patches.items() if entry.get("patch") is not None]
+    return FixBriefTests(threshold, prefix,
+                         {key: entry["patch"] for key, entry in delivered},
+                         {key: entry["argv"] for key, entry in delivered if "argv" in entry})
+
+
+def _test_kind(pointer: dict) -> str:
+    """A patch's kind: an edit where any of its files edits one the tree holds."""
+    return (TEST_EDITS_EXISTING if any(f["kind"] == TEST_EDITS_EXISTING for f in pointer["files"])
+            else TEST_NEW_FILE)
+
+
+def _test_label(state: str, pointer: dict) -> str:
+    """What a delivered test is, in words: whether it ran red, and whether it is new."""
+    kind = _test_kind(pointer)
+    what = ("edits an existing file" if kind == TEST_EDITS_EXISTING
+            else "new test file" if len(pointer["files"]) == 1 else "new test files")
+    return f"{_TEST_STATE_WORDS[state]}, {what}"
+
+
+def _chosen_test(sites: Sequence[dict], by_id: Mapping[str, dict]) -> tuple[dict, dict] | None:
+    """The one test a defect hands back, and the site it was written at, from its live
+    sites' members whose test has a patch: ``red`` before ``written_not_run``, then a new
+    file before an edit, then the most severe site, then the lowest candidate id. Fixed, so
+    the report and the fix brief name the same patch."""
+    choices = []
+    for site in sites:
+        if site["status"] == DEFECT_REFUTED:
+            continue
+        for cid in site["members"]:
+            record = by_id[cid]
+            pointer = record.get("test_patch")
+            if record.get("test") is None or pointer is None or pointer["reason"] is not None:
+                continue
+            choices.append(((record["test"]["state"] != TEST_RED,
+                             _test_kind(pointer) != TEST_NEW_FILE,
+                             _SEVERITY_RANK[site["severity"]], _id_rank(cid)), record, site))
+    if not choices:
+        return None
+    _key, record, site = min(choices, key=lambda choice: choice[0])
+    return record, site
+
+
+def _shared_test_files(chosen: Mapping[str, dict]) -> dict[str, list[dict]]:
+    """For each defect whose published patch creates or edits a file another published patch
+    also does, ``[{"defect", "files"}]``, one per other defect in id order. ``chosen`` maps a
+    defect id to its chosen test's patch pointer. Each defect's test is chosen on its own and
+    a verifier batch refuses only its own duplicates, so two batches can both write one
+    helper file, and ``git apply`` of the second patch then fails; this is how the reader is
+    told. A defect sharing nothing is absent. Paths are compared without case, since Windows
+    and macOS keep one file for two spellings; each defect's note names its own spelling."""
+    owners: dict[str, list[str]] = {}
+    for did, pointer in chosen.items():
+        for key in dict.fromkeys(f["path"].casefold() for f in pointer["files"]):
+            owners.setdefault(key, []).append(did)
+    out: dict[str, list[dict]] = {}
+    for did, pointer in chosen.items():
+        others: dict[str, list[str]] = {}
+        for path in dict.fromkeys(f["path"] for f in pointer["files"]):
+            for other in owners[path.casefold()]:
+                if other != did:
+                    others.setdefault(other, []).append(path)
+        if others:
+            out[did] = [{"defect": other, "files": others[other]}
+                        for other in sorted(others, key=_id_rank)]
+    return out
+
+
+def _published_pointers(defects: Sequence[dict], site_of: Mapping[str, dict],
+                        by_id: Mapping[str, dict]) -> dict[str, dict]:
+    """Each defect's chosen test's patch pointer, by defect id: the patches the fix brief
+    publishes, as :func:`fix_brief_patches` picks them."""
+    out: dict[str, dict] = {}
+    for defect in defects:
+        chosen = _chosen_test([site_of[sid] for sid in defect["sites"]], by_id)
+        if chosen is not None:
+            out[defect["id"]] = chosen[0]["test_patch"]
+    return out
+
+
+def _test_patch_record(sites: Sequence[dict], by_id: Mapping[str, dict]) -> dict | None:
+    """The test a defect's patch line names, from the report :func:`_chosen_test` picks:
+    whether it ran red, its patch's kind and how many files it holds. ``None`` where there
+    is none."""
+    chosen = _chosen_test(sites, by_id)
+    if chosen is None:
+        return None
+    record = chosen[0]
+    pointer = record["test_patch"]
+    return {"state": record["test"]["state"], "kind": _test_kind(pointer),
+            "files": len(pointer["files"])}
+
+
+def _render_test_patch(defect_id: str, record: dict | None) -> list[str]:
+    """The report's one line for a defect's test patch: its path as a code span, which the
+    page renders as code, and its label. Never a link — the page makes links of in-page
+    anchors only — and never the patch itself."""
+    if record is None:
+        return []
+    # `_test_label` words the fix brief's line too, so it is called rather than copied: on
+    # a pointer holding the recorded kind and file count, which is all it reads.
+    count = record["files"]
+    pointer = {"files": [{"kind": record["kind"]}][:count]
+               + [{"kind": TEST_NEW_FILE}] * max(count - 1, 0)}
+    return [f"- **{REPORT_TEST_LABEL}** `{FIX_BRIEF_DIR}/{defect_id}.patch`: "
+            f"{_test_label(record['state'], pointer)}.\n"]
+
+
+def _test_patches_record(defects: Sequence[dict], site_of: Mapping[str, dict],
+                         by_id: Mapping[str, dict]) -> dict | None:
+    """What the report says once about the run's test patches: how many defects carry one,
+    and how many of those edit a file the tree holds or were never run. ``None`` where no
+    defect carries one. Counted over the same patches each defect's own line names."""
+    patched = [record for record in (_test_patch_record([site_of[sid] for sid in d["sites"]],
+                                                        by_id) for d in defects)
+               if record is not None]
+    if not patched:
+        return None
+    shared = _shared_test_files(_published_pointers(defects, site_of, by_id))
+    return {"defects": len(patched),
+            "edits": sum(1 for r in patched if r["kind"] == TEST_EDITS_EXISTING),
+            "unrun": sum(1 for r in patched if r["state"] == TEST_WRITTEN_NOT_RUN),
+            "shared": sorted(shared, key=_id_rank)}
+
+
+def _render_test_patches_note(record: dict | None) -> list[str]:
+    """The description's one item on the test patches: how many, where, how to apply one and
+    the two ways to adopt them. The apply command is fenced because it holds angle brackets,
+    which a code span in the prose could not show both here and on the page."""
+    if record is None:
+        return []
+    n, edits = record["defects"], record["edits"]
+    change = ("edits an existing test file" if edits == n
+              else "adds a new test file or edits an existing one" if edits
+              else "adds a new test file")
+    adopt = ("Take it alongside its fix, or apply it now, marked as an expected failure "
+             "until the fix lands." if n == 1 else
+             "Adopt them one defect at a time alongside its fix, or all at once, marked as "
+             "expected failures until each fix lands")
+    shared = record["shared"]
+    if n > 1:
+        adopt += (f", except that {len(shared)} patches, for {', '.join(shared)}, change a file "
+                  f"another patch also changes, so `git apply` refuses the second of them; "
+                  f"their `.md` files in `{FIX_BRIEF_DIR}/` say how to take both."
+                  if shared else ".")
+    unrun = (f" {TEST_PATCHES_UNRUN_NOTE}" if record["unrun"] else "")
+    text = (f"- **{TEST_PATCHES_NOTE_LABEL}** {_plural(n, 'defect')} "
+            f"{'comes' if n == 1 else 'come'} with a failing test, "
+            f"{'a patch' if n == 1 else 'each a patch'} in "
+            f"`{FIX_BRIEF_DIR}/`, named after its defect, that {change} and "
+            f"{'should fail' if record['unrun'] else 'fails'} on the "
+            f"reviewed code. {adopt}{unrun} To apply {'it' if n == 1 else 'one'}, run this "
+            f"from the top of the repository, with the folder holding `{REPORT_NAME}` in "
+            f"place of the placeholder; the defect's own `.md` file in "
+            f"`{FIX_BRIEF_DIR}/` gives the command that runs the test:\n")
+    command = (f'{" ".join(FIX_TEST_APPLY_ARGV)} '
+               f'"{FIX_TEST_RUN_PLACEHOLDER}/{FIX_BRIEF_DIR}/{TEST_PATCHES_NOTE_ID}.patch"')
+    return [text, *_fenced([command])]
+
+
+def _no_test_reason(sites: Sequence[dict], by_id: Mapping[str, dict],
+                    threshold: str) -> str | None:
+    """Why a defect the run asked a test of hands back none, ``None`` where it asked none:
+    no site established at the threshold or above. A recorded reason the patch could not be
+    made comes first, then the reason a test was set aside, then that none was written."""
+    asked = sorted(((site, by_id[cid]) for site in sites if site["status"] != DEFECT_REFUTED
+                    for cid in site["members"]),
+                   key=lambda pair: (_SEVERITY_RANK[pair[0]["severity"]], _id_rank(pair[1]["id"])))
+    asked = [record for _site, record in asked
+             if record["status"] in ESTABLISHED_STATUSES
+             and _SEVERITY_RANK[record["severity_final"]] <= _SEVERITY_RANK[threshold]]
+    if not asked:
+        return None
+    for record in asked:
+        pointer = record.get("test_patch")
+        if pointer is not None and pointer["reason"] is not None:
+            return f"its test has no patch: {pointer['reason']}"
+    for record in asked:
+        if record.get("test_set_aside"):
+            return f"its test was set aside: {record['test_set_aside']}"
+    if any(record.get("test") is not None for record in asked):
+        return NO_PATCH_RECORDED
+    return NO_TEST_WRITTEN
+
+
+def _fix_brief_test(defect_id: str, chosen: tuple[dict, dict], tests: FixBriefTests) -> dict:
+    """The fix brief's record of a defect's chosen test: the patch, how to apply it, where to
+    run it and what it showed."""
+    record, site = chosen
+    test, pointer = record["test"], record["test_patch"]
+    output = (test["output"] or "").strip()
+    cut = len(output) > FIX_BRIEF_OUTPUT_CHARS
+    run_from = "/".join(part for part in (tests.prefix, test["cwd"])
+                        if part not in ("", ".")) or FIX_TEST_TOP
+    key = (pointer["unit"], record["id"])
+    argv = tests.argvs[key] if key in tests.argvs else test["argv"]
+    return {
+        "patch": f"{FIX_BRIEF_DIR}/{defect_id}.patch",
+        "label": _test_label(test["state"], pointer),
+        "state": test["state"],
+        "kind": _test_kind(pointer),
+        "files": [dict(f) for f in pointer["files"]],
+        "site": site["id"],
+        "fails_because": test["fails_because"],
+        "expected_failure": test["expected_failure"],
+        "apply_argv": [*FIX_TEST_APPLY_ARGV,
+                       f"{FIX_TEST_RUN_PLACEHOLDER}/{FIX_BRIEF_DIR}/{defect_id}.patch"],
+        "apply_from": FIX_TEST_TOP,
+        "argv": None if argv is None else list(argv),
+        "cwd": test["cwd"],
+        "run_from": run_from,
+        "exit_status": test["exit_status"],
+        "output": ("…" + output[-FIX_BRIEF_OUTPUT_CHARS:] if cut else output) or None,
+        "output_cut": cut or bool(test["truncated"]),
+    }
+
+
+def fix_brief_patches(findings: Findings, tests: FixBriefTests) -> dict[str, bytes]:
+    """``fix-brief/D<n>.patch`` by defect id: each live defect's chosen test's patch, as the
+    bytes the engine diffed — the text's UTF-8 encoding, so its line endings are kept."""
+    sites = {site["id"]: site for site in findings.sites}
+    by_id = {record["id"]: record for record in findings.candidates}
+    out: dict[str, bytes] = {}
+    for defect in findings.defects:
+        chosen = _chosen_test([sites[sid] for sid in defect["sites"]], by_id)
+        if chosen is None:
+            continue
+        record = chosen[0]
+        text = tests.patches.get((record["test_patch"]["unit"], record["id"]))
+        if text is None:
+            raise ReportError(
+                f"{record['id']}'s test has a patch in findings and none in unit "
+                f"{record['test_patch']['unit']}'s {TEST_PATCHES_NAME}; the run directory "
+                f"records disagree")
+        out[defect["id"]] = text.encode("utf-8")
+    return out
+
+
+def fix_brief_document(findings: Findings, probe: dict, tests: FixBriefTests | None = None
+                       ) -> dict:
     """``fix-brief.json``: the records the fix brief renders, built from the run's findings
     and the capability probe and from nothing else.
 
     Defects first, then the tests to write. A site whose every report was refuted is left
-    out, and so is a defect or a gap with no other site.
+    out, and so is a defect or a gap with no other site. ``tests`` is the run's test ask;
+    only with it does a defect carry ``test`` and ``no_test``.
     """
     sites = {site["id"]: site for site in findings.sites}
+    by_id = {record["id"]: record for record in findings.candidates}
     members: dict[str, list[dict]] = {}
     for record in (*findings.candidates, *findings.coverage):
         members.setdefault(record["site"], []).append(record)
@@ -16971,6 +19405,18 @@ def fix_brief_document(findings: Findings, probe: dict) -> dict:
                 "reproduction": _fix_reproduction(members.get(site["id"], ())),
             } for site in live],
         })
+        if tests is not None:
+            chosen = _chosen_test(live, by_id)
+            defects[-1]["test"] = (None if chosen is None
+                                   else _fix_brief_test(defect["id"], chosen, tests))
+            defects[-1]["no_test"] = (None if chosen is not None
+                                      else _no_test_reason(live, by_id, tests.threshold))
+    if tests is not None:
+        shared = _shared_test_files(_published_pointers(
+            [d for d in findings.defects if d["id"] in live_ids], sites, by_id))
+        for entry in defects:
+            if entry["test"] is not None and entry["id"] in shared:
+                entry["test"]["shares_files"] = shared[entry["id"]]
     defects.sort(key=lambda d: (d["status"] != DEFECT_ESTABLISHED, _SEVERITY_RANK[d["severity"]],
                                 len(d["sites"]), _id_rank(d["id"])))
 
@@ -16992,21 +19438,67 @@ def fix_brief_document(findings: Findings, probe: dict) -> dict:
     }
 
 
-def _command_lines(argv: Sequence[str], cwd: str) -> list[str]:
+def _command_block(argv: Sequence[str], data: str, indent: str = "  ") -> list[str]:
+    """A command as a bash block somebody can paste at ``indent``, then, as items under it,
+    the PowerShell block where PowerShell needs different text and the note where Windows
+    PowerShell 5.1 would change an argument. Where no pasted form can carry an argument,
+    no command at all: ``data`` is the path to `fix-brief.json` from the file being written.
+
+    The bash block comes first, and nothing sits between it and the line that introduces
+    it, so a reader taking the first block after that line takes the bash one.
+    """
+    item = indent[:-2]
+    if _breaks_a_command_line(argv):
+        return [f"{item}  - {FIX_BRIEF_NO_PASTE.format(data=f'`{data}`')}\n"]
+    bash = shlex.join(argv)
+    out = _fenced(bash.splitlines() or [""], indent=indent)
+    power = _powershell_line(argv)
+    if power != bash:
+        out.append(f"{indent}- {POWERSHELL_LABEL}\n")
+        out += _fenced(power.splitlines() or [""], indent=indent + "  ")
+    if _needs_powershell_7_3(argv):
+        out.append(f"{indent}- {POWERSHELL_7_3_NOTE}\n")
+    return out
+
+
+def _command_lines(argv: Sequence[str], cwd: str, data: str) -> list[str]:
     """A command as a block somebody can paste, and the directory it runs in where that is
     not the root."""
-    out = _fenced(shlex.join(argv).splitlines() or [""])
+    out = _command_block(argv, data)
     if cwd not in ("", "."):
         out += _item("  - In: ", cwd)
     return out
 
 
-def _fix_brief_setup(doc: dict) -> list[str]:
+def _fix_brief_argvs(doc: dict, defects: Sequence[dict]) -> list[Sequence[str]]:
+    """Every command a brief holding ``defects`` prints from an argv: the probe's, each
+    site's reproduction and each test's run command."""
+    probe = doc["setup"]["probe"]
+    out: list[Sequence[str]] = []
+    if probe["state"] == UNIT_COMPLETE:
+        out += [probe[step]["argv"] for step in ("build", "tests") if probe[step]["argv"]]
+    for defect in defects:
+        if defect.get("test") and defect["test"]["argv"] is not None:
+            out.append(defect["test"]["argv"])
+        out += [site["reproduction"]["argv"] for site in defect["sites"]
+                if site.get("reproduction")]
+    return out
+
+
+def _fix_brief_setup(doc: dict, defects: Sequence[dict], data: str) -> list[str]:
+    """The Setup of a brief holding ``defects``; ``data`` is the path to `fix-brief.json`
+    from the file being written."""
     setup = doc["setup"]
     probe = setup["probe"]
     out = ["## Setup\n\n",
            f"- The review read {_commit_words(setup['commit'])}. Line numbers below refer to "
            f"that tree; read each file there yourself.\n"]
+    printed = [argv for argv in _fix_brief_argvs(doc, defects)
+               if not _breaks_a_command_line(argv)]
+    if _quotes_an_argument(printed):
+        out.append(f"- {FIX_BRIEF_SHELL_NOTE}\n")
+    if any(_needs_powershell_7_3(argv) for argv in printed):
+        out.append(f"- {FIX_BRIEF_5_1_NOTE.format(data=f'`{data}`')}\n")
     if probe["state"] != UNIT_COMPLETE:
         out += _item(f"- The capability probe is recorded as {_one_line(str(probe['state']))}, "
                      f"so nobody found out how to build this tree or run its tests: ",
@@ -17019,7 +19511,7 @@ def _fix_brief_setup(doc: dict) -> list[str]:
             status = attempt["exit_status"]
             out.append(f"- {label}, as the capability probe ran it: {attempt['answer']}"
                        f"{'' if status is None else f', exit {status}'}.\n")
-            out += _command_lines(attempt["argv"], attempt["cwd"])
+            out += _command_lines(attempt["argv"], attempt["cwd"], data)
         if probe["summary"]:
             out += _item("- What the probe reported: ", probe["summary"])
     out.append("\n## How to use this\n\n")
@@ -17027,7 +19519,7 @@ def _fix_brief_setup(doc: dict) -> list[str]:
     return out
 
 
-def _fix_brief_entry(defect: dict) -> list[str]:
+def _fix_brief_entry(defect: dict, data: str) -> list[str]:
     out = [f"\n## {defect['id']}. {_one_line(defect['heading'])}\n\n"]
     meta = f"- Severity: {defect['severity']} · Sites: {len(defect['sites'])}"
     if defect["related"]:
@@ -17038,6 +19530,8 @@ def _fix_brief_entry(defect: dict) -> list[str]:
     out += _item(f"- **{label}** ", defect["what_goes_wrong"])
     if defect["fix"]:
         out += _item(f"- **{FIX_LABEL}** ", defect["fix"])
+    if "test" in defect:
+        out += _fix_brief_test_lines(defect, data)
     for site in defect["sites"]:
         location = f"{site['file']}:{_lines(site)}"
         shown = (f"`{location}`" if "`" not in location and _collapse(location) == location
@@ -17066,7 +19560,7 @@ def _fix_brief_entry(defect: dict) -> list[str]:
                 out.append("- Reproduction, blocked by the review's environment and not run:\n")
             else:
                 out.append("- Reproduction, proposed and not run:\n")
-            out += _command_lines(repro["argv"], repro["cwd"])
+            out += _command_lines(repro["argv"], repro["cwd"], data)
             if repro["expect"]:
                 out += _item("  - Expect: ", repro["expect"])
             if repro["shows"]:
@@ -17074,6 +19568,51 @@ def _fix_brief_entry(defect: dict) -> list[str]:
             if repro["output"]:
                 out.append(f"  - Output{', the end of it' if repro['output_cut'] else ''}:\n")
                 out += _fenced(repro["output"].splitlines(), indent="    ")
+    return out
+
+
+def _code_span(text: str) -> str:
+    """A path as a code span where it can be one, else as one escaped line."""
+    return f"`{text}`" if "`" not in text and _collapse(text) == text else _one_line(text)
+
+
+def _fix_brief_test_lines(defect: dict, data: str) -> list[str]:
+    """A defect's test: its label and patch, how to apply it, where to run it and, for a red
+    one, the end of what it printed; or, where the run asked a test of it, why there is
+    none."""
+    test = defect["test"]
+    if test is None:
+        if defect["no_test"] is None:
+            return []
+        return _item(f"- **{FIX_TEST_LABEL}:** none, because ", defect["no_test"])
+    out = [f"- **{FIX_TEST_LABEL}, {test['label']}:** `{test['patch']}`, for "
+           f"{test['site']}.\n"]
+    out += _item("  - Why it fails: ", test["fails_because"])
+    for shared in test.get("shares_files", ()):
+        files = shared["files"]
+        out.append("  - " + FIX_TEST_SHARED_NOTE.format(
+            files=", ".join(_code_span(f) for f in files),
+            verb="is" if len(files) == 1 else "are", other=shared["defect"],
+            that="that file" if len(files) == 1 else "those files") + "\n")
+    out.append(f"  - Apply it from `{test['apply_from']}`, the repository top. "
+               f"`{FIX_TEST_RUN_PLACEHOLDER}` is the folder holding `{REPORT_NAME}`:\n")
+    # Double quotes, not shlex's single ones: they read the same in a POSIX shell,
+    # PowerShell and CMD, and they survive an apostrophe in the folder the owner substitutes.
+    *program, patch = test["apply_argv"]
+    out += _fenced([f'{" ".join(program)} "{patch}"'], indent="    ")
+    where = (f"`{FIX_TEST_TOP}`, the repository top" if test["run_from"] == FIX_TEST_TOP
+             else f"{_code_span(test['run_from'])}, under the repository top")
+    status = test["exit_status"]
+    out.append(f"  - Run it from {where}"
+               + ("; the review did not run it:\n" if test["state"] != TEST_RED
+                  else f", where it exited {status}:\n"))
+    if test["argv"] is None:
+        out.append(f"    - {FIX_BRIEF_NO_REPOSITORY_COMMAND}\n")
+    else:
+        out += _command_block(test["argv"], data, indent="    ")
+    if test["state"] == TEST_RED and test["output"]:
+        out.append(f"  - Output{', the end of it' if test['output_cut'] else ''}:\n")
+        out += _fenced(test["output"].splitlines(), indent="    ")
     return out
 
 
@@ -17117,12 +19656,13 @@ def _fix_brief_gaps_head() -> list[str]:
 def render_fix_brief(doc: dict) -> str:
     """``fix-brief.md``: :func:`fix_brief_document`'s records, rendered, and nothing else."""
     lead = FIX_BRIEF_LEAD.format(report=REPORT_NAME)
-    out = [f"# {FIX_BRIEF_TITLE}\n\n{lead}\n\n", *_fix_brief_setup(doc)]
+    out = [f"# {FIX_BRIEF_TITLE}\n\n{lead}\n\n",
+           *_fix_brief_setup(doc, doc["defects"], FIX_BRIEF_DATA_NAME)]
     if not doc["defects"] and not doc["tests_to_write"]:
         out.append("\nThe review established no defect and left none unresolved, and no "
                    "coverage gap stood, so there is nothing here to do.\n")
     for defect in doc["defects"]:
-        out += _fix_brief_entry(defect)
+        out += _fix_brief_entry(defect, FIX_BRIEF_DATA_NAME)
     if doc["tests_to_write"]:
         out += _fix_brief_gaps_head()
     for defect in doc["tests_to_write"]:
@@ -17134,13 +19674,15 @@ def render_fix_brief_defects(doc: dict) -> dict[str, str]:
     """``fix-brief/D<n>.md``: the setup, then exactly one defect's entry, as the whole
     brief renders it."""
     lead = FIX_BRIEF_LEAD.format(report=f"../{REPORT_NAME}")
+    data = f"../{FIX_BRIEF_DATA_NAME}"
 
-    def head(defect_id: str) -> list[str]:
-        return [f"# {FIX_BRIEF_TITLE}: {defect_id}\n\n{lead}\n\n", *_fix_brief_setup(doc)]
+    def head(defect: dict) -> list[str]:
+        return [f"# {FIX_BRIEF_TITLE}: {defect['id']}\n\n{lead}\n\n",
+                *_fix_brief_setup(doc, [defect], data)]
 
-    out = {defect["id"]: "".join([*head(defect["id"]), *_fix_brief_entry(defect)])
+    out = {defect["id"]: "".join([*head(defect), *_fix_brief_entry(defect, data)])
            for defect in doc["defects"]}
-    out.update({defect["id"]: "".join([*head(defect["id"]), *_fix_brief_gaps_head(),
+    out.update({defect["id"]: "".join([*head(defect), *_fix_brief_gaps_head(),
                                        *_fix_brief_gap(defect)])
                 for defect in doc["tests_to_write"]})
     return out
@@ -17150,8 +19692,8 @@ def fix_brief_entries(path: Path) -> list[Path]:
     """What the per-defect directory holds, refused unless the report wrote every entry.
 
     Empty where there is no directory. A link, a junction or a file at the name, and inside
-    it anything but a regular ``D<n>.md`` or the scratch a write of one leaves, is not this
-    stage's, and is refused by name rather than removed.
+    it anything but a regular ``D<n>.md`` or ``D<n>.patch`` or the scratch a write of one
+    leaves, is not this stage's, and is refused by name rather than removed.
     """
     info = _lstat_or_absent(path, "the fix brief directory", RunDirError)
     if info is None:
@@ -17721,6 +20263,142 @@ def _run_grouping(rundir: Path, units_doc: dict, clustering: Clustering | None =
         (site.id for site in clustering.clusters), merge_check)
 
 
+def _listed_unit(rundir: Path, unit_id: str) -> tuple[dict, dict]:
+    """The units listing and ``unit_id``'s one row in it, refused by name where the listing
+    is not the engine's or holds that unit other than once."""
+    units_doc = _read_run_json(rundir, UNITS_FILE_NAME)
+    if not isinstance(units_doc, dict) or not isinstance(units_doc.get("units"), list):
+        raise RunDirError(f"{rundir / UNITS_FILE_NAME} is not a units listing")
+    listed = [u for u in units_doc["units"]
+              if isinstance(u, dict) and u.get("id") == unit_id]
+    if not listed:
+        raise RunDirError(
+            f"{rundir / UNITS_FILE_NAME} lists no unit {unit_id!r}; check names the unit "
+            f"whose payload the worker was given"
+        )
+    if len(listed) > 1:
+        # Refused rather than resolved by picking one. The entries can differ -- a
+        # re-planned unit carries a different batch -- so checking against the wrong one
+        # answers a question nobody asked, and answering it confidently is worse than
+        # saying the listing is not the engine's. A stage reaches the same conclusion two
+        # steps later; this says it here, where it is still actionable.
+        raise RunDirError(
+            f"{rundir / UNITS_FILE_NAME} lists unit {unit_id!r} {len(listed)} times; the "
+            f"listing is not the engine's, so which entry this result answers is unknown"
+        )
+    return units_doc, listed[0]
+
+
+def _verifier_inputs(rundir: Path, unit: dict) -> tuple[dict[str, bool], AskedTests | None]:
+    """A verification unit's batch and the run's test ask, as the stage reads them."""
+    routed = _read_candidates(rundir)
+    reproducible = {c["id"]: any(r["reproduction"] is not None for r in c["raised_by"])
+                    for c in routed["candidates"]}
+    # Indexed, not `.get` with a default, because the stage indexes: a candidate in
+    # this unit that the route record does not hold is a run whose listing and record
+    # disagree, and the stage refuses it. Defaulting here would make `check` accept a
+    # result the stage rejects -- the gap this command exists to close, reopened inside
+    # the command itself.
+    missing = [cid for cid in unit.get("candidates", ()) if cid not in reproducible]
+    if missing:
+        raise RunDirError(
+            f"unit {unit['id']} is listed with {missing[0]!r}, which "
+            f"{CANDIDATES_FILE_NAME} does not hold; the listing and the route record "
+            f"disagree about this run"
+        )
+    batch = {cid: reproducible[cid] for cid in unit["candidates"]}
+    return batch, asked_tests(_read_job(rundir), routed["candidates"])
+
+
+def test_patches_record(rundir: Path, unit_id: str, payload: object,
+                        copy: Path | None) -> dict | None:
+    """What the driver writes as unit ``unit_id``'s ``test-patches.json`` as it lands
+    ``payload``: the patch of every test the stage's own verifier parse keeps, diffed out of
+    the verifier's working ``copy`` (``None`` where it has none). ``None`` where the unit is
+    not a defect verifier or the run asks for no test, so such a run writes nothing new.
+
+    A reply the parse refuses whole is recorded with the reason and no test; nothing here
+    fails the landing."""
+    _units_doc, unit = _listed_unit(rundir, unit_id)
+    if unit.get("kind") != VERIFIER_KIND or unit.get("asks", DEFECT_ASKS) != DEFECT_ASKS:
+        return None
+    # The switch first, from the job alone: a run that asks for no test reads nothing else.
+    if test_patch_threshold(_read_job(rundir)) is None:
+        return None
+    batch, asked = _verifier_inputs(rundir, unit)
+    if asked is None:
+        return None
+    prefix = _read_inventory(rundir)["coverage"].get("root", "")
+    if not isinstance(prefix, str):
+        raise RunDirError(f"inventory.json under {rundir} is not the engine's: coverage.root")
+    record: dict = {"unit": unit_id, "prefix": prefix, "reason": None, "tests": []}
+    try:
+        verdicts, _rejected = parse_verifier_result(payload, unit_id, batch, DEFECT_ASKS,
+                                                    asked=asked)
+    except ResultError as exc:
+        return {**record, "reason": f"the reply could not be read: {exc}"}
+    record["tests"] = list(diff_test_files(rundir / "snapshot", copy, verdicts, prefix))
+    if copy is not None:
+        tested = {v.candidate: v.test for v in verdicts if v.test is not None}
+        for entry in record["tests"]:
+            test = tested[entry["candidate"]]
+            entry["argv"] = _repository_argv(test["argv"], test["cwd"], copy, rundir)
+    return record
+
+
+def _spellings(path: Path) -> list[str]:
+    """``path`` as a command may spell it: as given and with its links resolved, with
+    forward slashes, lowercased where the host's names ignore case."""
+    out: list[str] = []
+    for text in (str(path.absolute()), os.path.realpath(path)):
+        text = text.replace("\\", "/").rstrip("/")
+        text = text.lower() if os.name == "nt" else text
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def _repository_argv(argv: Sequence[str], cwd: str, copy: Path, rundir: Path
+                     ) -> list[str] | None:
+    """A delivered test's command as the owner runs it from ``cwd`` in their own checkout,
+    or ``None`` where it cannot be given there faithfully.
+
+    The verifier ran it in ``copy``, a disposable copy of the tree, so an argument that is a
+    path into the copy names the same file in the checkout once it is relative to ``cwd``.
+    Anything else naming the run directory — a path into the copy inside a longer argument,
+    a path that climbs out of the copy, or another of the run's own files — has no spelling
+    in the checkout, and printing it would run the review's files or fail."""
+    copies, runs = _spellings(copy), _spellings(rundir)
+    here = "/" + "/".join(part for part in cwd.split("/") if part not in ("", "."))
+    # The copy's directory name is opaque and unique to this run, so it standing as a path
+    # component anywhere, however escaped (repr() doubles a Windows path's backslashes),
+    # means the argument still reaches into the copy.
+    token = re.compile(r"(?<![\w.-])" + re.escape(copy.name) + r"(?![\w.-])",
+                       re.IGNORECASE if os.name == "nt" else 0)
+    out: list[str] = []
+    for n, arg in enumerate(argv):
+        slashed = arg.replace("\\", "/")
+        seen = slashed.lower() if os.name == "nt" else slashed
+        root = next((r for r in copies if seen == r or seen.startswith(r + "/")), None)
+        if root is not None:
+            parts = [part for part in slashed[len(root):].split("/") if part not in ("", ".")]
+            if ".." in parts:
+                return None
+            relative = posixpath.relpath("/" + "/".join(parts), here)
+            # A shell runs a bare program name from PATH, not from the checkout.
+            if n == 0 and "/" not in relative:
+                relative = "./" + relative
+            out.append(relative)
+            continue
+        # A root followed by a name character is some other directory beginning the same way.
+        if any(re.search(re.escape(r) + r"(?![\w.-])", seen) for r in (*copies, *runs)):
+            return None
+        if token.search(arg):
+            return None
+        out.append(arg)
+    return out
+
+
 def check_result(rundir: Path, unit_id: str, payload: object) -> CheckOutcome:
     """Run the parse the engine WILL run on ``payload`` as unit ``unit_id``'s result, and
     compare every quotation in it with the tree the run is pinned to.
@@ -17748,27 +20426,7 @@ def check_result(rundir: Path, unit_id: str, payload: object) -> CheckOutcome:
     answers for a candidate in its batch, whether a grouping partitions the ids that unit
     was handed. A checker given the JSON alone could not ask any of them.
     """
-    units_doc = _read_run_json(rundir, UNITS_FILE_NAME)
-    if not isinstance(units_doc, dict) or not isinstance(units_doc.get("units"), list):
-        raise RunDirError(f"{rundir / UNITS_FILE_NAME} is not a units listing")
-    listed = [u for u in units_doc["units"]
-              if isinstance(u, dict) and u.get("id") == unit_id]
-    if not listed:
-        raise RunDirError(
-            f"{rundir / UNITS_FILE_NAME} lists no unit {unit_id!r}; check names the unit "
-            f"whose payload the worker was given"
-        )
-    if len(listed) > 1:
-        # Refused rather than resolved by picking one. The entries can differ -- a
-        # re-planned unit carries a different batch -- so checking against the wrong one
-        # answers a question nobody asked, and answering it confidently is worse than
-        # saying the listing is not the engine's. A stage reaches the same conclusion two
-        # steps later; this says it here, where it is still actionable.
-        raise RunDirError(
-            f"{rundir / UNITS_FILE_NAME} lists unit {unit_id!r} {len(listed)} times; the "
-            f"listing is not the engine's, so which entry this result answers is unknown"
-        )
-    unit = listed[0]
+    units_doc, unit = _listed_unit(rundir, unit_id)
     kind = unit.get("kind")
     if kind in (READER_KIND, AUDITOR_KIND):
         owner = frozenset(_read_owner(rundir))
@@ -17789,28 +20447,13 @@ def check_result(rundir: Path, unit_id: str, payload: object) -> CheckOutcome:
         parse_probe_result(payload, unit_id)
         return CheckOutcome(())
     if kind == VERIFIER_KIND:
-        routed = _read_candidates(rundir)
-        reproducible = {c["id"]: any(r["reproduction"] is not None for r in c["raised_by"])
-                        for c in routed["candidates"]}
-        # Indexed, not `.get` with a default, because the stage indexes: a candidate in
-        # this unit that the route record does not hold is a run whose listing and record
-        # disagree, and the stage refuses it. Defaulting here would make `check` accept a
-        # result the stage rejects -- the gap this command exists to close, reopened inside
-        # the command itself.
-        missing = [cid for cid in unit.get("candidates", ()) if cid not in reproducible]
-        if missing:
-            raise RunDirError(
-                f"unit {unit_id} is listed with {missing[0]!r}, which "
-                f"{CANDIDATES_FILE_NAME} does not hold; the listing and the route record "
-                f"disagree about this run"
-            )
-        batch = {cid: reproducible[cid] for cid in unit["candidates"]}
+        batch, asked = _verifier_inputs(rundir, unit)
         # The listing's own question, defaulting to the defect one for a run routed before
         # coverage batches existed. Read from the row rather than derived from the id: the
         # value the stage will use is the one `check` has to use, or the gap this command
         # closes reopens between the two.
-        _verdicts, rejected = parse_verifier_result(payload, unit_id, batch,
-                                                    unit.get("asks", DEFECT_ASKS))
+        _verdicts, rejected = parse_verifier_result(
+            payload, unit_id, batch, unit.get("asks", DEFECT_ASKS), asked=asked)
         return CheckOutcome(rejected)
     if kind == CLUSTERER_KIND:
         # A part is held to the rule the stage holds it to: a site in it never spans files.
@@ -18019,7 +20662,7 @@ def _run_plan(args: argparse.Namespace) -> int:
     # temporary directory instead is ambiguous the moment two runs are planned close
     # together, and the wrong answer is another run's evidence.
     sys.stdout.write(f"{RUNDIR_LINE}{rundir}\n\n")
-    sys.stdout.write(preview(job, inventory, areas))
+    sys.stdout.write(preview(job, as_written(inventory, rundir), areas))
     return 0
 
 
@@ -18123,7 +20766,10 @@ def _run_route(args: argparse.Namespace) -> int:
             # reader parse: a probe result run through parse_reader_result would fail the
             # unit on every field.
             reading = [u for u in units_doc["units"] if u.get("kind") != PROBE_KIND]
-            probe = read_probe_result(rundir, units_doc["units"])
+            threshold = test_patch_threshold(_read_job(rundir))
+            probe = read_probe_result(
+                rundir, units_doc["units"],
+                frozenset(owner) | _read_context(rundir) if threshold is not None else None)
             states = read_unit_results(rundir, reading, frozenset(owner),
                                        _read_context(rundir))
             candidates = check_quotes(rundir / "snapshot",
@@ -18131,14 +20777,16 @@ def _run_route(args: argparse.Namespace) -> int:
             tests_of = _read_area_tests(rundir)
             batches = route(candidates, read_limits(rundir),
                             lambda asks, scope: render_verification_payload(
-                                companions, problem, probe, tests_of, asks, scope, ()))
+                                companions, problem, probe, tests_of, asks, scope, (),
+                                threshold=threshold),
+                            threshold=threshold)
             # Applied HERE, with the rest, and for the reason the clustering redo gives: a
             # run must not lose its routing to a refusal about a reading result. Everything
             # that can say no has said it by now.
             if taking:
                 apply_redo(rundir, taking, units_doc, ROUTE_REDO_OUTPUTS)
             write_route(rundir, units_doc, states, candidates, batches, companions, problem,
-                        probe, tests_of)
+                        probe, tests_of, threshold=threshold)
         finally:
             _released(lock)
     except ReviewPanelError as exc:
@@ -18181,7 +20829,9 @@ def _run_cluster(args: argparse.Namespace) -> int:
             reproducible = {c["id"]: any(r["reproduction"] is not None for r in c["raised_by"])
                             for c in routed["candidates"]}
             holder = check_routing(routed["candidates"], batches)
-            states = read_verification_results(rundir, batches, reproducible)
+            states = read_verification_results(
+                rundir, batches, reproducible,
+                asked=asked_tests(_read_job(rundir), routed["candidates"]))
             rationales = verified_rationales(routed["candidates"], holder, states)
             units = plan_clusters(
                 routed["candidates"], limits=read_limits(rundir), rationales=rationales,
@@ -18222,7 +20872,9 @@ def _run_merge(args: argparse.Namespace) -> int:
             reproducible = {c["id"]: any(r["reproduction"] is not None for r in c["raised_by"])
                             for c in routed["candidates"]}
             holder = check_routing(routed["candidates"], batches)
-            states = read_verification_results(rundir, batches, reproducible)
+            states = read_verification_results(
+                rundir, batches, reproducible,
+                asked=asked_tests(_read_job(rundir), routed["candidates"]))
             rationales = verified_rationales(routed["candidates"], holder, states)
             clustering = _run_sites(rundir, units_doc)
             material = merge_material(clustering, routed["candidates"], rationales)
@@ -18258,7 +20910,9 @@ def _run_merge_check(args: argparse.Namespace) -> int:
             reproducible = {c["id"]: any(r["reproduction"] is not None for r in c["raised_by"])
                             for c in routed["candidates"]}
             holder = check_routing(routed["candidates"], batches)
-            states = read_verification_results(rundir, batches, reproducible)
+            states = read_verification_results(
+                rundir, batches, reproducible,
+                asked=asked_tests(_read_job(rundir), routed["candidates"]))
             rationales = verified_rationales(routed["candidates"], holder, states)
             resolved = resolve(routed["candidates"], holder, states)
             clustering = _run_sites(rundir, units_doc)
@@ -18299,7 +20953,9 @@ def _synthesis_defects(rundir: Path, units_doc: dict, routed: dict) -> tuple:
     reproducible = {c["id"]: any(r["reproduction"] is not None for r in c["raised_by"])
                     for c in routed["candidates"]}
     holder = check_routing(routed["candidates"], batches)
-    states = read_verification_results(rundir, batches, reproducible)
+    states = read_verification_results(
+        rundir, batches, reproducible,
+        asked=asked_tests(_read_job(rundir), routed["candidates"]))
     rationales = verified_rationales(routed["candidates"], holder, states)
     resolved = resolve(routed["candidates"], holder, states)
     cluster_units = [u for u in units_doc["units"] if u.get("kind") == CLUSTERER_KIND]
@@ -18457,7 +21113,8 @@ def _assemble_report(rundir: Path, units_doc: dict, generation: int | None) -> R
     reproducible = {c["id"]: any(r["reproduction"] is not None for r in c["raised_by"])
                     for c in routed["candidates"]}
     holder = check_routing(routed["candidates"], batches)
-    states = read_verification_results(rundir, batches, reproducible)
+    asked = asked_tests(job, routed["candidates"])
+    states = read_verification_results(rundir, batches, reproducible, asked=asked)
     resolved = resolve(routed["candidates"], holder, states)
     cluster_units = [u for u in units_doc["units"] if u.get("kind") == CLUSTERER_KIND]
     check_clustering(routed["candidates"], cluster_units)
@@ -18493,7 +21150,7 @@ def _assemble_report(rundir: Path, units_doc: dict, generation: int | None) -> R
     findings = build_findings(dispatch, routed["candidates"], resolved, clustering,
                               cluster_states, inventory["commit"], snippets, synthesis,
                               states, batches, grouping=grouping, merge=merge,
-                              merge_check=merge_check)
+                              merge_check=merge_check, tests_asked=asked is not None)
     # Checked against the defects just built, so a note naming a defect this run does
     # not have is refused before anything is published.
     report_notes = _read_report_notes(rundir, [c["id"] for c in findings.defects])
@@ -18513,17 +21170,28 @@ def _render_outputs(rundir: Path, units_doc: dict, material: ReportMaterial, gen
                          before_sites=made_before_sites(units_doc),
                          resynthesized=resynthesized)
     text = text.encode("utf-8", "backslashreplace").decode("utf-8")
-    brief = fix_brief_document(material.findings, material.routed["probe"])
+    return {**fix_brief_outputs(material), FINDINGS_NAME: findings_document(material.findings),
+            REPORT_NAME: text, HTML_NAME: render_html(text)}
+
+
+def fix_brief_outputs(material: ReportMaterial) -> dict[str, object]:
+    """The whole fix brief by its path under the run directory: ``fix-brief.json``,
+    ``fix-brief.md``, and under ``fix-brief/`` each ``D<n>.md`` and, where the run asked for
+    tests, each ``D<n>.patch`` as bytes. **The one place the brief is built**: every
+    publication writes what this returns, so no path can render a brief the others do
+    not."""
+    tests = fix_brief_tests(material.job, material.inventory, material.states)
+    brief = fix_brief_document(material.findings, material.routed["probe"], tests)
     out: dict[str, object] = {
         FIX_BRIEF_DATA_NAME: brief,
         FIX_BRIEF_NAME: render_fix_brief(brief).encode("utf-8", "backslashreplace")
                                                .decode("utf-8"),
-        FINDINGS_NAME: findings_document(material.findings),
-        REPORT_NAME: text,
-        HTML_NAME: render_html(text),
     }
     out.update({f"{FIX_BRIEF_DIR}/{name}.md": body.encode("utf-8", "backslashreplace")
                 .decode("utf-8") for name, body in render_fix_brief_defects(brief).items()})
+    if tests is not None:
+        out.update({f"{FIX_BRIEF_DIR}/{name}.patch": data
+                    for name, data in fix_brief_patches(material.findings, tests).items()})
     return out
 
 
@@ -18572,6 +21240,8 @@ def _publish_generation(rundir: Path, generation: int) -> int:
                 for name, content in rendered.items():
                     if isinstance(content, str):
                         write_text(staging / name, content)
+                    elif isinstance(content, bytes):
+                        write_bytes(staging / name, content)
                     else:
                         write_json(staging / name, content)
             except OSError as exc:
@@ -18820,10 +21490,10 @@ def _run_report(args: argparse.Namespace) -> int:
             # other, because there is only one place either of them is decided. Converted
             # AFTER the escape above, so the page inherits a prose that is already writable.
             page = render_html(text)
-            brief = fix_brief_document(findings, routed["probe"])
-            brief_text = render_fix_brief(brief).encode("utf-8", "backslashreplace").decode("utf-8")
-            per_defect = {name: body.encode("utf-8", "backslashreplace").decode("utf-8")
-                          for name, body in render_fix_brief_defects(brief).items()}
+            # What stays is the per-defect directory: each path under `fix-brief/`.
+            per_defect = fix_brief_outputs(material)
+            brief = per_defect.pop(FIX_BRIEF_DATA_NAME)
+            brief_text = per_defect.pop(FIX_BRIEF_NAME)
             # In the order they land, the report's three LAST: see `written`.
             published = ((brief_data_target, brief), (brief_target, brief_text),
                          (data_target, findings_document(findings)), (target, text),
@@ -18872,8 +21542,11 @@ def _run_report(args: argparse.Namespace) -> int:
             except OSError as exc:
                 raise RunDirError(f"cannot create {fix_dir}: {exc}") from exc
             dir_made = True
-            for defect_id, body in per_defect.items():
-                write_text(fix_dir / f"{defect_id}.md", body)
+            for name, content in per_defect.items():
+                if isinstance(content, bytes):
+                    write_bytes(rundir / name, content)
+                else:
+                    write_text(rundir / name, content)
             for path, content in published:
                 if path in (data_target, brief_data_target):
                     write_json(path, content)

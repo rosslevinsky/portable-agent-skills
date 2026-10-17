@@ -22,12 +22,14 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import unittest
 from pathlib import Path
@@ -61,6 +63,7 @@ import json
 import os
 import pathlib
 import re
+import subprocess
 import sys
 import time
 
@@ -167,6 +170,26 @@ elif props >= {"verdicts"}:
         "unresolved_reason": None,
     } for cid in ids(r"cand-\d+", "\n## Candidates\n")],
         "summary": "checked every candidate by reading"}
+    if control.get("test"):
+        # A verifier that writes `control["test"]["body"]` as one new test file per
+        # candidate into its copy, runs it there, and reports it red with the expected
+        # failure it was told to claim — whatever the run actually printed.
+        for verdict in answer["verdicts"]:
+            name = "test_" + verdict["candidate"].replace("-", "_") + ".py"
+            pathlib.Path("tests").mkdir(exist_ok=True)
+            pathlib.Path("tests", name).write_text(control["test"]["body"], encoding="utf-8")
+            argv = [sys.executable, name]
+            ran = subprocess.run(argv, cwd="tests", capture_output=True, encoding="utf-8",
+                                 errors="replace")
+            output = ran.stdout + ran.stderr
+            verdict.update(status="reproduced", evidence={
+                "argv": argv, "cwd": "tests", "exit_status": ran.returncode,
+                "output": output, "truncated": False, "run_kind": "executed",
+                "shows": "Shows the test the verifier wrote failing on the snapshot."},
+                test={"files": ["tests/" + name], "argv": argv, "cwd": "tests",
+                      "exit_status": ran.returncode, "output": output, "truncated": False,
+                      "state": "red", "fails_because": "core adds one to its input.",
+                      "expected_failure": control["test"]["expected_failure"]})
 elif props >= {"groups", "compound"}:
     # The first two defect sites are proposed as one mistake, so the run has a group for
     # the merge check to uphold; every other site is a group of its own.
@@ -990,6 +1013,43 @@ class ThePreviewOfAResumedRunCountsOnlyWhatIsLeft(_Case):
         self.assertNotIn("already landed", text)
 
 
+class ATestPatchRunWithNoTestIsWarnedBeforeAnythingIsDispatched(_Case):
+    """The driver prints its own preview and discards the engine's, and `--go` prints none,
+    so the warning that the snapshot holds no test has to reach the owner on both paths."""
+
+    def set_job(self, **over):
+        job = json.loads(self.job_path.read_text(encoding="utf-8"))
+        job.update(files=["run.py"], **over)
+        self.job_path.write_text(json.dumps(job), encoding="utf-8")
+
+    ON = {"mode": "on", "min_severity": "major"}
+
+    def test_the_preview_warns(self):
+        self.set_job(test_patches=self.ON)
+        proc = self.drive()
+        self.assertIn(review_panel.NO_TEST_IN_SNAPSHOT_LINE + "\n", proc.stdout)
+        self.assertIn("Nothing was dispatched", proc.stdout)
+
+    def test_a_run_started_with_go_warns_before_it_dispatches(self):
+        self.set_job(test_patches=self.ON)
+        proc = self.drive("--go")
+        self.assertIn(review_panel.NO_TEST_IN_SNAPSHOT_LINE + "\n", proc.stdout)
+        # Said before the run, not after it: the owner's one chance to stop and add the tests.
+        self.assertLess(proc.stdout.index(review_panel.NO_TEST_IN_SNAPSHOT_LINE),
+                        proc.stdout.index("round: "))
+
+    def test_support_naming_the_tests_removes_it_and_is_counted(self):
+        self.set_job(test_patches=self.ON, support=["tests/"])
+        proc = self.drive()
+        self.assertNotIn(review_panel.NO_TEST_IN_SNAPSHOT_LINE, proc.stdout)
+        self.assertIn(review_panel.SUPPORT_COPIED_LINE.format(n=1), proc.stdout)
+
+    def test_with_the_switch_off_neither_path_warns(self):
+        self.set_job(test_patches={"mode": "off"})
+        self.assertNotIn(review_panel.NO_TEST_IN_SNAPSHOT_LINE, self.drive().stdout)
+        self.assertNotIn(review_panel.NO_TEST_IN_SNAPSHOT_LINE, self.drive("--go").stdout)
+
+
 class TheAdapterConfigIsData(_Case):
     """Every spawn's argv arrives as data. The driver names no product anywhere, so the
     only thing it can do about a command line is refuse one it could not run."""
@@ -1077,6 +1137,18 @@ class TheAdapterConfigIsData(_Case):
         self.job_path.write_text(json.dumps(job), encoding="utf-8")
         proc = self.drive("--go")
         self.assertIn(review_panel.COPIED_OUTSIDE_SCOPE_LINE.format(n=1), proc.stdout)
+
+    def test_the_preview_counts_support_files_apart_from_lockfiles(self):
+        self.plan_only()
+        lanes = driver.load_adapter_config(self.adapter_path)
+        path = self.rundir / "inventory.json"
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        doc["context"] = [{"path": "a.lock"}, {"path": "tests/a.py"}, {"path": "tests/b.py"}]
+        doc["support"] = ["tests/a.py", "tests/b.py"]
+        path.write_text(json.dumps(doc), encoding="utf-8")
+        text = driver._preview(self.rundir, lanes)
+        self.assertIn(review_panel.COPIED_OUTSIDE_SCOPE_LINE.format(n=1) + "\n", text)
+        self.assertIn(review_panel.SUPPORT_COPIED_LINE.format(n=2) + "\n", text)
 
     def test_a_resume_with_a_different_configuration_is_refused(self):
         self.plan_only()
@@ -6062,6 +6134,406 @@ class TheCopyIsTheArchive(_Case):
 # --------------------------------------------------------------------------- #
 # the synthesizer is a writer too — the copy is containment, not scratch space
 # --------------------------------------------------------------------------- #
+class PublishingAVerifierReplyKeepsItsTestPatches(_Case):
+    """A verifier's written test is diffed out of its working copy as its reply lands, into
+    ``units/<id>/test-patches.json``, **before** ``result.json``: the copy is released once
+    the unit is terminal, so landing is the last moment it is sure to exist. Nothing about
+    the patch can fail the landing."""
+
+    UNIT = "verify-area-01-A"
+    TOKEN = "00000000000000ab"
+    TEST = {"files": ["tests/test_empty.py"],
+            "argv": ["python3", "-m", "unittest", "tests.test_empty"], "cwd": ".",
+            "exit_status": 1, "output": "AssertionError: None != []\n", "truncated": False,
+            "state": "red", "fails_because": "An empty input returns None.",
+            "expected_failure": "AssertionError: None != []"}
+    ON = {"mode": "on", "min_severity": "major"}
+
+    def setUp(self):
+        super().setUp()
+        self.fake_units((self.UNIT, "B"), stage="verification")
+        doc = json.loads((self.rundir / "units.json").read_text(encoding="utf-8"))
+        doc["units"][0].update(kind=review_panel.VERIFIER_KIND, candidates=["cand-001"],
+                               asks=review_panel.DEFECT_ASKS)
+        (self.rundir / "units.json").write_text(json.dumps(doc), encoding="utf-8")
+        self.write_job(self.ON)
+        (self.rundir / review_panel.CANDIDATES_FILE_NAME).write_text(json.dumps({
+            "stage": review_panel.ROUTED_STAGE, "units": [], "probe": {},
+            "candidates": [{"id": "cand-001",
+                            "raised_by": [{"severity": "major", "reproduction": None}]}]}),
+            encoding="utf-8")
+        snapshot = self.fake_snapshot(**{"engine.py": "def f(x):\n    return x[0]\n"})
+        inventory = json.loads((self.rundir / "inventory.json").read_text(encoding="utf-8"))
+        inventory.update(excluded=[], skipped=[], source="walk", tree_sha256="", commit={},
+                         coverage={"state": "computed", "root": "pkg",
+                                   "tracked_not_reviewed": [], "reviewed_not_tracked": []})
+        (self.rundir / "inventory.json").write_text(json.dumps(inventory), encoding="utf-8")
+        self.work = self.rundir / "work" / self.TOKEN
+        shutil.copytree(snapshot, self.work)
+        (self.work / "tests").mkdir()
+        (self.work / "tests" / "test_empty.py").write_bytes(b"assert f([]) == []\r\n")
+        (self.work / "scratch.txt").write_text("not the test's\n", encoding="utf-8")
+        self.reply()
+
+    def write_job(self, switch):
+        job = {"problem": "p", "root": str(self.root), "partition": "file", "exclude": [],
+               "lenses": ["one lens"], **({"test_patches": switch} if switch else {})}
+        (self.rundir / review_panel.JOB_FILE_NAME).write_text(json.dumps(job), encoding="utf-8")
+
+    def reply(self, status="reproduced", evidence=EXECUTED, test=None):
+        path = self.attempt(self.UNIT, 0, status='{"status": "ok"}', disposition={
+            "attempt": "a0", "unit": self.UNIT, "outcome": driver.ACCEPTED,
+            "intended_publication": "result"},
+            argv={"token": self.TOKEN, "kind": review_panel.VERIFIER_KIND, "lane": "B"})
+        (path / "reply.json").write_text(json.dumps({"summary": "ran it", "verdicts": [{
+            "candidate": "cand-001", "status": status, "evidence": evidence,
+            "rationale": "Line 2 indexes an empty list.", "revision": None,
+            "test_first": "tests/test_empty.py", "unresolved_reason": None,
+            "test": test or self.TEST}]}), encoding="utf-8")
+
+    def the_attempt(self):
+        return driver.read_attempts(self.rundir, self.UNIT, grace=driver.GRACE_DEFAULT)[0]
+
+    def patches_path(self):
+        return self.rundir / "units" / self.UNIT / review_panel.TEST_PATCHES_NAME
+
+    def record(self):
+        return json.loads(self.patches_path().read_text(encoding="utf-8"))
+
+    def test_the_patches_are_written_before_the_result_and_the_landing(self):
+        written = []
+        real_json, real_text = driver._write_json, driver._write_text
+
+        def json_seen(path, obj):
+            written.append(path.name)
+            return real_json(path, obj)
+
+        def text_seen(path, text):
+            written.append(path.name)
+            return real_text(path, text)
+
+        with mock.patch.object(driver, "_write_json", json_seen), \
+                mock.patch.object(driver, "_write_text", text_seen):
+            driver.publish(self.rundir, self.UNIT, self.the_attempt(), "result")
+        self.assertEqual(written, [review_panel.TEST_PATCHES_NAME, review_panel.RESULT_NAME,
+                                   driver.LANDED_NAME])
+        test = self.record()["tests"][0]
+        self.assertIsNone(test["reason"])
+        self.assertEqual(test["patch"],
+                         "diff --git a/pkg/tests/test_empty.py b/pkg/tests/test_empty.py\n"
+                         "new file mode 100644\n--- /dev/null\n+++ b/pkg/tests/test_empty.py\n"
+                         "@@ -0,0 +1 @@\n+assert f([]) == []\r\n")
+
+    def test_a_kill_between_the_two_writes_is_finished_by_the_replay_byte_for_byte(self):
+        real_text = driver._write_text
+
+        def killed(path, text):
+            if path.name == review_panel.RESULT_NAME:
+                raise KeyboardInterrupt
+            return real_text(path, text)
+
+        with mock.patch.object(driver, "_write_text", killed), \
+                self.assertRaises(KeyboardInterrupt):
+            driver.publish(self.rundir, self.UNIT, self.the_attempt(), "result")
+        first = self.patches_path().read_bytes()
+        self.assertFalse((self.rundir / "units" / self.UNIT / review_panel.RESULT_NAME).exists())
+        self.assertIsNone(driver.landed(self.rundir, self.UNIT))
+        self.assertTrue(driver.replay_publication(self.rundir, self.UNIT))
+        self.assertIsNotNone(driver.landed(self.rundir, self.UNIT))
+        self.assertEqual(self.patches_path().read_bytes(), first)
+
+    def test_the_copy_is_released_afterwards_as_before(self):
+        # A reading verdict names no executed run, so its copy is not kept as evidence: the
+        # patch must already be out of it when it goes.
+        self.reply(status="confirmed_by_reading", evidence=None,
+                   test={**self.TEST, "state": "written_not_run", "exit_status": None,
+                         "output": "", "expected_failure": None})
+        self.run_object().adopt()
+        self.assertIsNotNone(driver.landed(self.rundir, self.UNIT))
+        self.assertFalse(self.work.exists(), "the copy outlived its landed unit")
+        self.assertIn("+++ b/pkg/tests/test_empty.py", self.record()["tests"][0]["patch"])
+
+    def test_a_copy_that_is_gone_is_recorded_and_the_reply_still_lands(self):
+        driver.remove_tree(self.work, self.rundir)
+        driver.publish(self.rundir, self.UNIT, self.the_attempt(), "result")
+        self.assertIsNotNone(driver.landed(self.rundir, self.UNIT))
+        test = self.record()["tests"][0]
+        self.assertIsNone(test["patch"])
+        self.assertEqual(test["reason"], review_panel.NO_WORKING_COPY)
+
+    def test_an_extraction_that_fails_is_recorded_and_the_reply_still_lands(self):
+        with mock.patch.object(review_panel, "test_patches_record",
+                               side_effect=review_panel.RunDirError("the listing is odd")):
+            driver.publish(self.rundir, self.UNIT, self.the_attempt(), "result")
+        self.assertIsNotNone(driver.landed(self.rundir, self.UNIT))
+        record = self.record()
+        self.assertEqual(record["tests"], [])
+        self.assertIn("the listing is odd", record["reason"])
+
+    def test_a_run_that_asks_for_no_test_writes_no_record(self):
+        self.write_job(None)
+        driver.publish(self.rundir, self.UNIT, self.the_attempt(), "result")
+        self.assertIsNotNone(driver.landed(self.rundir, self.UNIT))
+        self.assertFalse(self.patches_path().exists())
+
+
+# --------------------------------------------------------------------------- #
+# A verifier's failing test, end to end: written in its copy, handed back as a patch
+# --------------------------------------------------------------------------- #
+# The test a fake verifier writes. It runs from `tests/`, so it puts the repository top on
+# the path itself, as a test the owner's suite collects would. It fails by assertion, with a
+# message no import error or collection error could print.
+TEST_METHOD = "test_core_leaves_its_input_unchanged"
+TEST_MESSAGE = "core must leave its input unchanged"
+# Indented here and dedented on load: a `__main__` guard at column 0 of this file, even inside
+# a string, reads as this suite's own guard to the check that each suite has exactly one.
+TEST_BODY = textwrap.dedent(f"""\
+    import pathlib
+    import sys
+    import unittest
+
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+    from engine.core import ⟪imported⟫ as core  # noqa: E402
+
+
+    class CoreLeavesItsInput(unittest.TestCase):
+        def {TEST_METHOD}(self):
+            self.assertEqual(core(1), 1, "{TEST_MESSAGE}")
+
+
+    if __name__ == "__main__":
+        unittest.main(verbosity=2)
+    """)
+EXPECTED_FAILURE = f"AssertionError: 2 != 1 : {TEST_MESSAGE}"
+# The test as it should be, and the same test with an import that cannot succeed: it still
+# exits non-zero, and its verifier still claims the assertion's message.
+RED_TEST = {"body": TEST_BODY.replace("⟪imported⟫", "core"),
+            "expected_failure": EXPECTED_FAILURE}
+BROKEN_IMPORT_TEST = {"body": TEST_BODY.replace("⟪imported⟫", "adds_one"),
+                      "expected_failure": EXPECTED_FAILURE}
+
+
+def follow(md: str, run_folder: Path, top: Path) -> subprocess.CompletedProcess:
+    """Do what a ``D<n>.md`` says, reading nothing but it: put ``run_folder`` where its
+    placeholder is, run the apply command it prints from the directory it names, then the
+    test command from the directory it names. Returns the test's run, or raises where the
+    apply step fails or applies nothing."""
+    lines = md.splitlines()
+
+    def step(lead):
+        at = next(i for i, line in enumerate(lines) if line.lstrip().startswith(lead))
+        where = re.search(r"`([^`]+)`", lines[at]).group(1)
+        fence = next(i for i in range(at + 1, len(lines)) if lines[i].strip().startswith("```"))
+        close = next(i for i in range(fence + 1, len(lines))
+                     if lines[i].strip() == lines[fence].strip())
+        return lines[at], where, "\n".join(line.strip() for line in lines[fence + 1:close])
+
+    said, apply_dir, apply_cmd = step("- Apply it from ")
+    placeholder = re.search(r"`(<[^`>]+>)` is the folder holding `report\.md`", said)
+    if placeholder is None:
+        raise AssertionError(f"the apply step defines no placeholder: {said}")
+    applied = subprocess.run(shlex.split(apply_cmd.replace(placeholder.group(1), str(run_folder))),
+                             cwd=top / apply_dir, capture_output=True)
+    # From a directory the patch's paths are not under, `git apply` applies nothing and still
+    # exits 0, so a caller also reads the created file back.
+    if applied.returncode != 0 or b"Skipped" in applied.stderr:
+        raise AssertionError(f"the printed apply command failed: {applied.stderr!r}")
+    _said, run_dir, run_cmd = step("- Run it from ")
+    return subprocess.run(shlex.split(run_cmd), cwd=top / run_dir, capture_output=True,
+                          encoding="utf-8", errors="replace")
+
+
+def owner_checkout(where: Path) -> Path:
+    """The fixture tree as the owner's repository: committed, so a patch applies to it."""
+    shutil.copytree(_FIXTURE_TREE, where)
+    for args in (("init", "-q"), ("config", "core.autocrlf", "false"),
+                 ("add", "-A"), ("commit", "-q", "-m", "base")):
+        subprocess.run(["git", "-C", str(where), *args], check=True, capture_output=True)
+    return where
+
+
+class _EndToEnd(unittest.TestCase):
+    """One run of the whole driver with the stub, whose verifiers write the class's ``TEST``
+    into their copies, under the class's ``SWITCH``. The run is the expensive part, so it is
+    made once per class and every assertion reads it."""
+
+    SWITCH: dict | None = {"mode": "on", "min_severity": "nit"}
+    TEST: dict = RED_TEST
+
+    @classmethod
+    def setUpClass(cls):
+        tmp = Path(tempfile.mkdtemp(prefix="rp-driver-e2e-"))
+        # A class cleanup, not tearDownClass: unittest skips tearDownClass when setUpClass
+        # raises, and a failed run would leave its tree behind.
+        cls.addClassCleanup(_discard, tmp)
+        cls._layout = _lay_out(tmp)
+        case = cls("run_it")
+        case.__dict__.update(cls._layout)
+        job = json.loads(case.job_path.read_text(encoding="utf-8"))
+        if cls.SWITCH is not None:
+            job["test_patches"] = cls.SWITCH
+        case.job_path.write_text(json.dumps(job), encoding="utf-8")
+        case.control.write_text(json.dumps({"test": cls.TEST}), encoding="utf-8")
+        _Case.write_adapter(case)
+        _Case.drive(case, "--go")
+
+    def setUp(self):   # deliberately no tree of its own: the run is the class's, made once
+        self.__dict__.update(self._layout)
+
+    def run_it(self):  # pragma: no cover - a name for the setUpClass instance only
+        raise AssertionError("not a test")
+
+    def read(self, name):
+        return (self.rundir / name).read_text(encoding="utf-8")
+
+    def doc(self, name):
+        return json.loads(self.read(name))
+
+    def patches(self):
+        return sorted(p.name for p in (self.rundir / "fix-brief").glob("*.patch"))
+
+    def defect_candidates(self):
+        """Every defect candidate's record in ``findings.json``, which is where a verdict's
+        test, or the reason it was set aside, lands."""
+        return [c for c in self.doc("findings.json")["candidates"] if c.get("defect")]
+
+    def assert_fails_at_the_assertion(self, ran):
+        """The owner-side check: the test was collected, ran, and failed at the assertion it
+        was written for — the output names it and carries its message — and not at an
+        import or a collection error, which also exit non-zero."""
+        out = ran.stdout + ran.stderr
+        self.assertNotEqual(ran.returncode, 0, out)
+        self.assertIn(f"FAIL: {TEST_METHOD} ", out)
+        self.assertIn(EXPECTED_FAILURE, out)
+        self.assertIn("Ran 1 test", out)
+        self.assertNotIn("Error:", out.replace("AssertionError:", ""))
+
+
+class AVerifiersFailingTestComesBackAsAPatchThatFails(_EndToEnd):
+    """The whole path through the driver: a verifier writes a failing test in its copy, the
+    run reports, and ``D1.md`` followed as printed — the patch applied from the directory it
+    names, the test run from the one it names — creates the test in the owner's repository
+    and fails there at the expected assertion."""
+
+    def test_the_run_reports_with_a_red_test_on_every_defect(self):
+        self.assertEqual(self.doc("units.json")["stage"], review_panel.REPORTED_STAGE)
+        defects = self.doc("fix-brief.json")["defects"]
+        self.assertTrue(defects)
+        for defect in defects:
+            with self.subTest(defect=defect["id"]):
+                self.assertEqual(defect["test"]["state"], review_panel.TEST_RED)
+                self.assertEqual(defect["test"]["label"], "red, new test file")
+                self.assertEqual(defect["test"]["patch"], f"fix-brief/{defect['id']}.patch")
+        self.assertEqual(self.patches(), sorted(f"{d['id']}.patch" for d in defects))
+        # A red test sits on a reproduced verdict, and the verdict the report shows is it.
+        for record in self.defect_candidates():
+            self.assertEqual(record["status"], "reproduced", record["id"])
+
+    def test_d1_followed_as_printed_applies_and_fails_at_the_expected_assertion(self):
+        top = owner_checkout(self.tmp / "owner")
+        ran = follow(self.read("fix-brief/D1.md"), self.rundir, top)
+        added = self.doc("fix-brief.json")["defects"][0]["test"]["files"]
+        self.assertEqual([f["kind"] for f in added], [review_panel.TEST_NEW_FILE])
+        # Checked by reading the file back: `git apply` from a directory the patch's paths
+        # are not under applies nothing, silently, and exits 0.
+        created = top / added[0]["path"]
+        self.assertTrue(created.is_file(), "the printed apply command created no test")
+        self.assertEqual(created.read_text(encoding="utf-8"), RED_TEST["body"])
+        self.assert_fails_at_the_assertion(ran)
+
+    def test_the_report_names_the_patch_in_one_line(self):
+        report = self.read("report.md")
+        self.assertIn("`fix-brief/D1.patch`", report)
+        self.assertIn("red, new test file", report)
+        self.assertIn("<code>fix-brief/D1.patch</code>", self.read("report.html"))
+
+
+class ATestThatFailsForAnotherReasonIsCaughtTwice(_EndToEnd):
+    """A verifier whose test cannot import what it tests, and which claims it red with the
+    assertion's message anyway. The engine sets the test aside, so no patch ships; and the
+    same test, its patch built directly and applied by hand, fails the owner-side check. So
+    neither check passes everything put in front of it."""
+
+    TEST = BROKEN_IMPORT_TEST
+
+    def test_the_engine_sets_it_aside_and_ships_no_patch(self):
+        self.assertEqual(self.doc("units.json")["stage"], review_panel.REPORTED_STAGE)
+        self.assertEqual(self.patches(), [])
+        records = self.defect_candidates()
+        self.assertTrue(records)
+        for record in records:
+            with self.subTest(candidate=record["id"]):
+                # The test is gone and the verdict stands.
+                self.assertIsNone(record["test"])
+                self.assertIn(review_panel.NOT_THE_EXPECTED_FAILURE, record["test_set_aside"])
+                self.assertEqual(record["status"], "reproduced")
+        d1 = self.doc("fix-brief.json")["defects"][0]
+        self.assertIsNone(d1["test"])
+        self.assertIn(review_panel.NOT_THE_EXPECTED_FAILURE, d1["no_test"])
+
+    def test_its_patch_applied_by_hand_fails_the_owner_side_check(self):
+        rel = "tests/test_by_hand.py"
+        copy = self.tmp / "verifier-copy"
+        shutil.copytree(self.rundir / "snapshot", copy)
+        for path in [copy, *copy.rglob("*")]:
+            path.chmod(path.stat().st_mode | stat.S_IWUSR)
+        (copy / rel).write_text(BROKEN_IMPORT_TEST["body"], encoding="utf-8")
+        argv = [sys.executable, Path(rel).name]
+        test = {"files": [rel], "argv": argv, "cwd": "tests", "exit_status": 1, "output": "",
+                "truncated": False, "state": "red", "fails_because": "core adds one.",
+                "expected_failure": EXPECTED_FAILURE}
+        verdict = review_panel.Verdict(
+            candidate="cand-001", status="reproduced", evidence=None, rationale="r",
+            revision=None, test_first=None, unresolved_reason=None, test=test)
+        [record] = review_panel.diff_test_files(self.rundir / "snapshot", copy, [verdict])
+        self.assertIsNone(record["reason"])
+        top = owner_checkout(self.tmp / "owner-by-hand")
+        patch = self.tmp / "by-hand.patch"
+        patch.write_bytes(record["patch"].encode("utf-8"))
+        applied = subprocess.run(["git", "apply", str(patch)], cwd=top, capture_output=True)
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.assertTrue((top / rel).is_file())
+        ran = subprocess.run(argv, cwd=top / "tests", capture_output=True, encoding="utf-8",
+                             errors="replace")
+        with self.assertRaises(self.failureException):
+            self.assert_fails_at_the_assertion(ran)
+        self.assertIn("ImportError", ran.stdout + ran.stderr)
+
+
+class ARunWithTestPatchesOffHandsBackNoTest(_EndToEnd):
+    """The same run, its verifiers still writing and sending a red test, with the switch
+    off: no patch, no test record and no test line anywhere it publishes."""
+
+    SWITCH = {"mode": "off"}
+
+    def test_nothing_about_a_test_is_published(self):
+        self.assertEqual(self.doc("units.json")["stage"], review_panel.REPORTED_STAGE)
+        self.assertEqual(self.patches(), [])
+        self.assertEqual(list(self.rundir.glob(f"units/*/{review_panel.TEST_PATCHES_NAME}")), [])
+        defects = self.doc("fix-brief.json")["defects"]
+        self.assertTrue(defects)
+        for defect in defects:
+            self.assertNotIn("test", defect)
+            self.assertNotIn("no_test", defect)
+        for record in self.doc("findings.json")["candidates"]:
+            self.assertNotIn("test", record)
+            self.assertNotIn("test_set_aside", record)
+        published = [self.rundir / name for name in ("report.md", "report.html", "fix-brief.md")]
+        published += sorted((self.rundir / "fix-brief").glob("*.md"))
+        for path in published:
+            with self.subTest(path=path.name):
+                text = path.read_text(encoding="utf-8")
+                self.assertNotIn(review_panel.FIX_TEST_LABEL, text)
+                self.assertNotIn(review_panel.REPORT_TEST_LABEL, text)
+                self.assertNotIn(".patch", text)
+
+
+class ARunWithoutTheKeyHandsBackNoTest(ARunWithTestPatchesOffHandsBackNoTest):
+    """Absent is off."""
+
+    SWITCH = None
+
+
 class TheSynthesizerGetsACopyLikeEveryOtherWriter(_Case):
     """`references/synthesizer.md` hands its worker a working directory and tells it that
     directory is the only place it may write and is thrown away afterwards. That sentence
