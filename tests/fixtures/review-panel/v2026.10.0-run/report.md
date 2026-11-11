@@ -278,6 +278,7 @@ Every file and directory this report names, under the short name the report uses
   ```
   read-only
   ```
+- Lane A verdicts, by the evidence behind them: 0 executed, 0 documentary, 2 with no command evidence.
 - Lane B adapter, as recorded by the dispatcher:
   ```
   runtime-two command line
@@ -286,6 +287,7 @@ Every file and directory this report names, under the short name the report uses
   ```
   read-only sandbox
   ```
+- Lane B verdicts, by the evidence behind them: 1 executed, 0 documentary, 1 with no command evidence.
 - Containment: the adapter and permission for each lane above are as the dispatcher recorded them, and the engine did not verify them. All the engine can state is that it spawned nothing and checked no sandbox, and that the files its payloads list are snapshot paths, none under the source root. It claims nothing stronger.
 - Read: 8 files (walk), tree sha256 492b7665762c6339b35a50b8dffd5be56cc46b47659a258c3edccbaab4aeb8bd; 0 excluded, 0 skipped.
 - Pinned at: a tree that is not a repository.

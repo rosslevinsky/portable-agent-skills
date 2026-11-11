@@ -31,5 +31,9 @@ quote. D2's reproduction is a quoted `python3 -c`. And its `report.md` and `repo
 print each evidence command as a bash code block under the evidence line, as
 `v2026.10.0-run/` does. Every other line is as that release wrote it.
 
+Both directories' `report.md` and `report.html` also carry one line per lane under
+**How this ran**, below its permission, counting that lane's verdicts by the evidence behind
+them, which neither release printed.
+
 Both directories are baselines: a re-render with the current engine must produce the same
 text, the line naming the run directory aside.

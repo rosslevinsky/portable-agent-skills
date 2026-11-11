@@ -31,6 +31,11 @@ on:
 # are first-party GitHub actions, and with a read-only token the most a compromised
 # release could reach is read access to content that is published anyway. Pinning would
 # also mean editing this file on every action bump, for no gain a read-only token can use.
+#
+# The local action under `.github/actions/kit/` is not one of them. It is a vendored copy that
+# must equal the hash in its `kit.lock`, it checks that itself each time it runs, and the
+# third-party actions inside it are pinned by full SHA there. Edit it only by vendoring a new
+# copy, never by hand.
 permissions:
   contents: read
 
@@ -66,7 +71,7 @@ jobs:
   # Has this exact tree already been proved green? A push to `main` is a merge that has just
   # happened, and the pull request behind it tested the same bytes minutes earlier: the commit
   # is new, the TREE is not. Nothing below needs running again for it, and this job is what
-  # establishes that cheaply enough to be worth asking — one checkout and two API reads.
+  # establishes that cheaply enough to be worth asking — a checkout and a few API reads.
   #
   # **Identical tree, and a green run at it.** Tree equality alone is not the claim: a tree
   # equal to some commit nobody ever tested proves nothing. So each candidate commit has to
@@ -118,72 +123,27 @@ jobs:
     outputs:
       already: ${{ steps.proved.outputs.already }}
     steps:
+      # A local action is read from the checkout, so this one only has to put the action's
+      # files on disk. The action checks its own copy against `kit.lock` first, then checks out
+      # this commit and its parents itself, which is what reading a merge's second parent needs.
       - uses: actions/checkout@v4
         with:
-          # This commit and its parents. A merge commit's parents are one generation away, so
-          # two is enough to read the second parent's tree; a depth that came up short would
-          # answer "not proved" and cost a suite run rather than skip one.
-          fetch-depth: 2
+          persist-credentials: false
 
+      # The question above, answered by the vendored action under `.github/actions/kit/`. It
+      # asks for both candidates, requires a green run of this workflow at one with this tree,
+      # and requires that run's receipt to name this tree. Every failure along the way answers
+      # "not proved", so the suite runs.
       - name: Look for a green run of this tree
         id: proved
-        env:
-          GH_TOKEN: ${{ github.token }}
+        uses: ./.github/actions/kit/ci-skip
+        with:
           # This file, by name, so the question is about THIS workflow's history and not about
           # any other workflow that happens to have run against the same commit.
-          WORKFLOW: validate.yml
-          # Shared with the step in `suite` that writes the receipt. Both spell it from here.
-          RECEIPT: tested-tree
-        run: |
-          tree=$(git rev-parse "HEAD^{tree}")
-          echo "this tree: $tree"
-          # The merged branch's tip, where there is one, and the head of the pull request this
-          # commit closed. Either may be empty; both being empty is the direct-push case.
-          second=$(git rev-parse --verify --quiet "HEAD^2" || true)
-          head=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
-                   --jq '.[].head.sha' 2>/dev/null || true)
-          for candidate in $second $head; do
-            candidate_tree=$(gh api "repos/$GITHUB_REPOSITORY/commits/$candidate" \
-                               --jq '.commit.tree.sha' 2>/dev/null) || continue
-            if [ "$candidate_tree" != "$tree" ]; then
-              echo "$candidate: different tree ($candidate_tree)"
-              continue
-            fi
-            run=$(gh api \
-              "repos/$GITHUB_REPOSITORY/actions/workflows/$WORKFLOW/runs?head_sha=$candidate&status=success&per_page=1" \
-              --jq '.workflow_runs[0].id // empty' 2>/dev/null) || continue
-            if [ -z "$run" ]; then
-              echo "$candidate: same tree, no green run of $WORKFLOW"
-              continue
-            fi
-            # THE RECEIPT, and the reason a green run at the candidate is not enough on its
-            # own. On a `pull_request` event the checkout below takes no `ref`, so the run
-            # tests the SYNTHETIC MERGE of head and base — not the head. A run green at this
-            # candidate therefore proves the tree it assembled that day, which is the
-            # candidate's own tree only while base has not moved under it.
-            #
-            # And base moves without re-running anything: retargeting a pull request fires
-            # `edited`, which is not one of the three default activity types, so the green run
-            # against the OLD base still stands. Reparent a branch from a development base
-            # onto `main` and the merge can land a tree equal to the head while the only run
-            # that ever passed tested the head plus whatever that base carried.
-            #
-            # So the run has to say which tree it actually checked out. `suite` writes that as
-            # an artifact named for the tree, and this asks for the one naming THIS tree. No
-            # receipt, or an API that will not answer: either one falls through to running
-            # the suite, which is the safe direction.
-            if gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$run/artifacts" \
-                 --jq '.artifacts[].name' 2>/dev/null | grep -qxF "$RECEIPT-$tree"; then
-              echo "already=true" >> "$GITHUB_OUTPUT"
-              echo "$candidate: run $run checked out this exact tree and was green" \
-                | tee -a "$GITHUB_STEP_SUMMARY"
-              exit 0
-            fi
-            echo "$candidate: green run $run carries no $RECEIPT-$tree receipt"
-          done
-          echo "already=false" >> "$GITHUB_OUTPUT"
-          echo "no commit with this tree has a green run; the suite runs" \
-            | tee -a "$GITHUB_STEP_SUMMARY"
+          workflow: validate.yml
+          # Shared with the step in `suite` that writes the receipt. The action asks for
+          # `tested-tree-<tree>`, the name that step uploads.
+          receipt: tested-tree
 
   suite:
     # Skipped where the tree above was already proved green, and run whenever it was not.
@@ -288,6 +248,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      # The vendored actions under `.github/actions/kit/` check their own copy against
+      # `kit.lock` each time they run, but `tested` runs only on a push, so a pull request
+      # would never run that check. This runs it here, on every event, so a hand edit to the
+      # copy fails the pull request that makes it rather than the push to `main` after it.
+      - name: The vendored actions match their lock
+        if: matrix.shard == 1
+        run: python .github/actions/kit/check_copy.py
 
       # On the first shard only, and BEFORE the suite. The validator takes two seconds, so
       # running it first costs nothing and a broken skill file says so before any shard has

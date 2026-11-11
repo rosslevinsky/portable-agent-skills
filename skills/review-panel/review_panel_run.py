@@ -45,16 +45,18 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import socket
 import stat
+import statistics
 import subprocess
 import sys
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 # The engine lives beside this file. Its directory name carries a hyphen, so it is not a
 # package and cannot be imported as one: the directory goes on ``sys.path`` and the module
@@ -711,6 +713,20 @@ BACKEND_ARGS_MARKER = f"{PLACEHOLDER_OPEN}backend_args{PLACEHOLDER_CLOSE}"
 # failure as an accepted-and-ignored prompt mode, which runs a CLI with no prompt.
 CARRIES_THE_TASK = frozenset({"prompt", "payload"})
 
+
+def markers_missing_from_write_capable(read_only: Sequence[str],
+                                       write_capable: Sequence[str]) -> list[str]:
+    """The markers the read-only command uses and the write-capable one does not, sorted.
+
+    **A warning's input, never a refusal's.** A runtime that confines reads to the
+    directories it is given cannot reach a payload under ``⟪input⟫`` unless the command
+    names it, and exits 0 explaining so in prose; but another runtime's sandbox grants the
+    same read with no flag at all, so argv alone cannot say what a command can read.
+    """
+    def names(command: Sequence[str]) -> set[str]:
+        return {name for arg in command for name in _PLACEHOLDER_RE.findall(arg)}
+    return sorted(names(read_only) - names(write_capable))
+
 READ_ONLY, WRITE_CAPABLE = "read_only", "write_capable"
 MODES = (READ_ONLY, WRITE_CAPABLE)
 RESULT_MODES = frozenset({"external-file", "stream-json-result-event", "stream-transcript"})
@@ -734,11 +750,16 @@ _CARRIED_ENV_PREFIX = "REVIEW_PANEL_SETTING_"
 # long a run takes and the right one is the account's rate limit, so a defaulted lane is
 # SAID to be defaulted in the preview: a default nobody sees is a run length nobody chose.
 SLOTS_DEFAULT = 2
+# How many write-capable units run at once across both lanes when the config does not say.
+# Separate copies still share ports, caches and credentials, so more than one is the
+# operator's claim that their builds and runs do not collide; the preview and the report
+# print it for that reason.
+WRITERS_DEFAULT = 1
 _MODE_KEYS = frozenset({"command", "permission", "result_mode", "idle", "deadline"})
 _MODE_REQUIRED = ("command", "permission")
 
 # The kinds that write, and the ONE place that says so: the working directory, the
-# permission mode, the run-wide serialization, the disk headroom and the copy's retention
+# permission mode, the run-wide `writers` limit, the disk headroom and the copy's retention
 # are all read off this set. The capability probe runs a build and a test suite, a verifier
 # runs the reproductions it is handed as well as any it builds, and a synthesizer is told
 # by its brief that its working directory is its own to write in.
@@ -793,9 +814,13 @@ class LaneSpec:
     adapter: str
     modes: dict[str, ModeSpec]
     # How many of this lane's attempts may run at once. Write-capable units are further
-    # limited to one at a time across both lanes, whatever this says.
+    # limited by the run-wide `writers`, whatever this says.
     slots: int = SLOTS_DEFAULT
     slots_stated: bool = True
+    # The run-wide `writers`, the same on every lane: carried here so the lanes mapping
+    # stays the one value a run is configured by. Read it through `run_writers`.
+    writers: int = WRITERS_DEFAULT
+    writers_stated: bool = False
     # **The wording of a provider's refusal is the provider's to change**, so what counts as
     # one lives in the configuration and never in this file. Compiled at parse time, so a
     # pattern that cannot be compiled is refused before a run is planned rather than raising
@@ -946,9 +971,13 @@ def parse_adapter_config(data: str | dict) -> dict[str, LaneSpec]:
         obj = data
     if not isinstance(obj, dict) or not isinstance(obj.get("lanes"), dict):
         raise DriverError("adapter config must be a JSON object with a 'lanes' object")
-    unknown = sorted(set(obj) - {"lanes"})
+    unknown = sorted(set(obj) - {"lanes", "writers"})
     if unknown:
         raise DriverError(f"adapter config has unknown key(s): {', '.join(unknown)}")
+    writers = obj.get("writers", WRITERS_DEFAULT)
+    if not isinstance(writers, int) or isinstance(writers, bool) or writers < 1:
+        raise DriverError("writers must be a whole number of at least 1: how many "
+                          "write-capable units may run at once across both lanes")
     raw_lanes = obj["lanes"]
     missing = [lane for lane in engine.LANES if lane not in raw_lanes]
     if missing:
@@ -1007,7 +1036,8 @@ def parse_adapter_config(data: str | dict) -> dict[str, LaneSpec]:
         lanes[lane] = LaneSpec(
             runtime=raw["runtime"].strip(), model=raw.get("model", "").strip(),
             account=account.strip(), adapter=raw["adapter"].strip(), slots=slots,
-            slots_stated="slots" in raw, modes=modes,
+            slots_stated="slots" in raw, writers=writers,
+            writers_stated="writers" in obj, modes=modes,
             fault_patterns=_parse_fault_patterns(lane, raw.get("provider_fault_patterns")),
             backend=backend, env=env, env_from_parent=env_from_parent,
             account_stated="account" in raw, limits=raw.get("limits"),
@@ -1016,6 +1046,12 @@ def parse_adapter_config(data: str | dict) -> dict[str, LaneSpec]:
     if all(spec.model for spec in lanes.values()):
         _refuse_two_models_the_commands_do_not_carry(lanes)
     return lanes
+
+
+def run_writers(lanes: dict[str, LaneSpec]) -> tuple[int, bool]:
+    """The run-wide ``writers``, and whether the config stated it."""
+    spec = lanes[engine.LANES[0]]
+    return spec.writers, spec.writers_stated
 
 
 def _parse_lane_env(lane: str, raw: dict, key: str) -> tuple[tuple[str, str], ...]:
@@ -1334,7 +1370,10 @@ def dispatch_record(lanes: dict[str, LaneSpec],
     a run that reached only one of them, and that refusal quotes the descriptions.
     """
     described = lane_descriptions(lanes, executed)
-    return {"rung": _derived_rung(lanes, executed, described), "lanes": described}
+    # The `writers` of the driver that writes this record, which is the one that finished
+    # the run: a resume may change it, and the report says whose value it prints.
+    return {"rung": _derived_rung(lanes, executed, described), "lanes": described,
+            "writers": run_writers(lanes)[0]}
 
 
 def generation_dispatch_record(generation: int, lanes: dict[str, LaneSpec],
@@ -1349,8 +1388,11 @@ def generation_dispatch_record(generation: int, lanes: dict[str, LaneSpec],
     rounds after the batches all run on lane A."""
     described = lane_descriptions(lanes, executed)
     used = {unit.get("lane") for unit in units}
+    # Its own `writers`, as `dispatch.json` records the run's: a resynthesis may run with
+    # another limit, and the report prints each beside the lanes it bounded.
     return {"generation": generation,
-            "lanes": {lane: described[lane] for lane in sorted(used) if lane in described}}
+            "lanes": {lane: described[lane] for lane in sorted(used) if lane in described},
+            "writers": run_writers(lanes)[0]}
 
 
 def no_landing_refusal(stranded: Sequence[str], described: dict[str, dict]) -> str:
@@ -1434,6 +1476,23 @@ def _units(rundir: Path) -> list[dict]:
     return [unit for unit in doc["units"] if isinstance(unit, dict)]
 
 
+def read_only_snapshot_text(rundir: Path, *, windows: bool) -> str:
+    """How to make ``rundir`` removable by hand, given that it holds a snapshot this program
+    hardened. ASCII only, for the same reason as the refusal it is appended to.
+
+    The two platforms are told different things because :func:`harden_snapshot` does
+    different things on them: on POSIX it takes the write bit off every file and directory,
+    and a directory without it gives up no entry; on Windows it sets the read-only attribute,
+    which stops a file being deleted and is cleared with ``attrib``, not ``chmod``.
+    """
+    if windows:
+        return (f"Its {SNAPSHOT_DIR}\\ was made read-only by this program (its files carry "
+                f"the read-only attribute): run attrib -r /s /d \"{rundir}\\*\" before "
+                f"you delete it")
+    return (f"Its {SNAPSHOT_DIR}/ was made read-only by this program: run "
+            f"chmod -R u+w {shlex.quote(str(rundir))} before you delete it")
+
+
 def bootstrap(rundir: Path, job: Path | None, limits: dict | None = None) -> None:
     """Classify the target and, where there is no committed run, plan one, with ``limits``
     written beside it as ``limits.json`` when given.
@@ -1466,11 +1525,14 @@ def bootstrap(rundir: Path, job: Path | None, limits: dict | None = None) -> Non
             remove_tree(partial, partial.parent)
         return
     if _present(rundir):
-        raise DriverError(
-            f"{rundir} exists and holds no {engine.UNITS_FILE_NAME}, so it is an "
-            f"interrupted plan or somebody else's directory; it is refused by name and "
-            f"nothing in it is deleted — move it aside and run again"
-        )
+        # ASCII only: this is read on whatever console the operator has, and a console that
+        # takes only ASCII would print an escape where the command should be.
+        message = (f"{rundir} exists and holds no {engine.UNITS_FILE_NAME}, so it is an "
+                   f"interrupted plan or somebody else's directory; it is refused by name "
+                   f"and nothing in it is deleted - move it aside and run again")
+        if _is_directory(rundir / SNAPSHOT_DIR):
+            message += ". " + read_only_snapshot_text(rundir, windows=os.name == "nt")
+        raise DriverError(message)
     if job is None:
         raise DriverError(
             f"{rundir} does not exist and no --job was given, so there is nothing to plan")
@@ -2072,9 +2134,11 @@ def _stderr_tail(path: Path) -> str:
 
 
 LOG_HINT_CHARS = 400
+# What every line the supervisor writes into a display log of its own begins with.
+SUPERVISOR_LINE_PREFIX = "[review_runner]"
 
 
-def _log_hint(attempt_path: Path | None) -> str:
+def _log_hint(attempt_path: Path | None, lead: str = "The latest of them ended") -> str:
     """The end of one attempt's display log, quoted for a pause message, or ``""``.
 
     **Said, never classified.** A failure that "explained nothing" usually explained itself
@@ -2086,7 +2150,10 @@ def _log_hint(attempt_path: Path | None) -> str:
     if attempt_path is None:
         return ""
     log = attempt_path / DISPLAY_NAME
-    lines = [line.strip() for line in _stderr_tail(log).splitlines() if line.strip()]
+    # The supervisor's own lines are its account of the run, not the worker's, and its
+    # closing line would otherwise take one of the two this quotes.
+    lines = [line.strip() for line in _stderr_tail(log).splitlines()
+             if line.strip() and not line.startswith(SUPERVISOR_LINE_PREFIX)]
     if not lines:
         return ""
     tail = " / ".join(lines[-2:])
@@ -2095,7 +2162,34 @@ def _log_hint(attempt_path: Path | None) -> str:
     # A worker's output is in any script at all, and the console this is said on may only
     # take ASCII; a message that cannot be written would stop the run it is describing.
     tail = tail.encode("ascii", "backslashreplace").decode("ascii")
-    return f" The latest of them ended: {tail} (in {log})."
+    return f" {lead}: {tail} (in {log})."
+
+
+def _reply_hint(attempt_path: Path | None, transcript: str | None,
+                lead: str = "The latest of them replied") -> str:
+    """The end of one attempt's reply, quoted for a pause over what it said, or the end of
+    its display log where it said nothing.
+
+    **A reply that failed is quoted from the reply.** A streaming runtime's display log ends
+    with its accounting record, so its last line is token counts, and the sentence saying
+    why the command could not do the task is in the transcript. ``transcript`` is the path
+    the attempt RECORDED: a unit's reply is collected under its opaque token, not beside
+    its display log."""
+    if attempt_path is None:
+        return ""
+    if not transcript:
+        return _log_hint(attempt_path)
+    transcript = Path(transcript)
+    try:
+        text = " ".join(transcript.read_text(encoding="utf-8", errors="replace").split())
+    except OSError:
+        text = ""
+    if not text:
+        return _log_hint(attempt_path)
+    if len(text) > LOG_HINT_CHARS:
+        text = "..." + text[-LOG_HINT_CHARS:]
+    text = text.encode("ascii", "backslashreplace").decode("ascii")
+    return f" {lead}: {text} (in {transcript})."
 
 
 def _terminal_detail(status: dict) -> str | None:
@@ -2142,6 +2236,90 @@ def _is_provider_fault(status: dict, patterns: Sequence[re.Pattern]) -> bool:
     return detail is not None and any(pattern.search(detail) for pattern in patterns)
 
 
+def _lane_of(ctx: "Run", attempt: Attempt) -> str:
+    """The lane an attempt ran on. A smoke attempt answers for no unit, so its own record
+    is the only place that names it."""
+    if (attempt.argv or {}).get("smoke"):
+        return str((attempt.argv or {}).get("lane", "?"))
+    return ctx.unit_row(attempt.unit).get("lane", "?")
+
+
+def _failed_status_outcome(ctx: "Run", attempt: Attempt, status: dict, record: dict,
+                           act: bool = True) -> None:
+    """Fill ``record`` with the outcome of an attempt whose supervisor did not report
+    ``ok``: the volume's, the supervisor's, the provider's, or else the worker's. With
+    ``act`` false the supervisor's failures are recorded and pause nothing: a smoke a killed
+    driver left ran a command this run may no longer have."""
+    # **The order is the contract, and storage comes first.** A host that ran out of
+    # room is never the provider's fault or the worker's — and a full disk read as a
+    # provider fault would pause that account, spend the run's three probes against
+    # it and drain, all while the thing to fix is the volume. Then the provider,
+    # whose wording the configuration declares; and only what is left is the
+    # worker's. A failure that named nothing at all is the worker's too, but it is
+    # MARKED, so the replay can see that this run has twice been told nothing.
+    if _is_storage_fault(status):
+        record["outcome"] = INFRASTRUCTURE
+        # Read back by the run's own reconciliation, which is where a storage fault
+        # turns into a stop. Kept as a field of the record rather than a fact in
+        # memory, so a resumed run can see which attempts met one.
+        record["storage_fault"] = True
+    elif _is_capture_overflow(status):
+        record["outcome"] = INFRASTRUCTURE
+    elif _is_supervisor_refusal(status):
+        # The supervisor never launched a worker: the lane's command names a program
+        # that is not on PATH, or one that could not be started. That is the
+        # adapter's mistake, not the unit's, so it is filed as infrastructure, not
+        # as a worker failure: it charges nobody and spends none of the unit's
+        # failure allowance, whose exhaustion makes `error.txt` the unit's final
+        # answer. The run pauses where the operator can fix the adapter and run the
+        # same command again.
+        record["outcome"] = INFRASTRUCTURE
+        record["supervisor_refusal"] = True
+        lane = _lane_of(ctx, attempt)
+        reason = str(status.get("reason"))
+        if _BACKEND_CHANGED in reason:
+            advice = ""
+        elif (any(mark in reason for mark in _BACKENDS_FILE_REFUSALS)
+              or _backends_file() in reason):
+            advice = (" Restore or repair the backends file, then run the same "
+                      "command again")
+        else:
+            advice = (" Fix that lane's command in the adapter file, then run the "
+                      "same command again")
+        if act:
+            ctx.request_pause(
+                f"lane {lane}'s supervisor could not start a worker for {attempt.unit}: "
+                f"{reason}. Nothing was charged.{advice}")
+    elif _is_supervisor_exit(status):
+        # The supervisor ended without saying what happened to its worker, which
+        # is nobody's answer: not the worker's, which may have finished or never
+        # started, and not the provider's. Charged to nobody, and the run stops,
+        # because the one way this happens in practice -- a supervisor that
+        # crashes before its status line -- happens to every attempt alike,
+        # and a run that carried on would spend every unit's launches on it. The
+        # stderr tail is the whole account there is, so it is in the reason.
+        record["outcome"] = INFRASTRUCTURE
+        record["supervisor_exit"] = status.get("supervisor_exit")
+        lane = _lane_of(ctx, attempt)
+        tail = str(status.get("stderr_tail") or "").strip()
+        if act:
+            ctx.request_pause(
+                f"lane {lane}'s supervisor exited {status.get('supervisor_exit')} for "
+                f"{attempt.unit} {attempt.name} without reporting a status. Nothing was "
+                f"charged. Its stderr ends: {tail or '(nothing)'}. Fix what it names, "
+                f"then run the same command again")
+    elif _is_provider_fault(status, ctx.fault_patterns(attempt)):
+        record["outcome"] = PROVIDER_UNAVAILABLE
+    else:
+        record["outcome"] = WORKER_FAILED
+        if _explains_nothing(status):
+            record["unexplained"] = True
+    record["reason"] = str(status.get("reason") or status.get("status") or "")
+    detail = _terminal_detail(status)
+    if detail is not None:
+        record["terminal_detail"] = detail
+
+
 def adjudicate(ctx: "Run", attempt: Attempt) -> dict:
     """Decide one attempt's outcome and write ``disposition.json``, once, immutably.
 
@@ -2165,74 +2343,7 @@ def adjudicate(ctx: "Run", attempt: Attempt) -> dict:
     else:
         status = attempt.status or {}
         if status.get("status") != "ok":
-            # **The order is the contract, and storage comes first.** A host that ran out of
-            # room is never the provider's fault or the worker's — and a full disk read as a
-            # provider fault would pause that account, spend the run's three probes against
-            # it and drain, all while the thing to fix is the volume. Then the provider,
-            # whose wording the configuration declares; and only what is left is the
-            # worker's. A failure that named nothing at all is the worker's too, but it is
-            # MARKED, so the replay can see that this run has twice been told nothing.
-            if _is_storage_fault(status):
-                record["outcome"] = INFRASTRUCTURE
-                # Read back by the run's own reconciliation, which is where a storage fault
-                # turns into a stop. Kept as a field of the record rather than a fact in
-                # memory, so a resumed run can see which attempts met one.
-                record["storage_fault"] = True
-            elif _is_capture_overflow(status):
-                record["outcome"] = INFRASTRUCTURE
-            elif _is_supervisor_refusal(status):
-                # The supervisor never launched a worker: the lane's command names a program
-                # that is not on PATH, or one that could not be started. That is the
-                # adapter's mistake, not the unit's, so it is filed as infrastructure, not
-                # as a worker failure: it charges nobody and spends none of the unit's
-                # failure allowance, whose exhaustion makes `error.txt` the unit's final
-                # answer. The run pauses where the operator can fix the adapter and run the
-                # same command again.
-                record["outcome"] = INFRASTRUCTURE
-                record["supervisor_refusal"] = True
-                lane = attempt.lane if getattr(attempt, "lane", None) else \
-                    ctx.unit_row(attempt.unit).get("lane", "?")
-                reason = str(status.get("reason"))
-                if _BACKEND_CHANGED in reason:
-                    advice = ""
-                elif (any(mark in reason for mark in _BACKENDS_FILE_REFUSALS)
-                      or _backends_file() in reason):
-                    advice = (" Restore or repair the backends file, then run the same "
-                              "command again")
-                else:
-                    advice = (" Fix that lane's command in the adapter file, then run the "
-                              "same command again")
-                ctx.request_pause(
-                    f"lane {lane}'s supervisor could not start a worker for {attempt.unit}: "
-                    f"{reason}. Nothing was charged.{advice}")
-            elif _is_supervisor_exit(status):
-                # The supervisor ended without saying what happened to its worker, which
-                # is nobody's answer: not the worker's, which may have finished or never
-                # started, and not the provider's. Charged to nobody, and the run stops,
-                # because the one way this happens in practice -- a supervisor that
-                # crashes before its status line -- happens to every attempt alike,
-                # and a run that carried on would spend every unit's launches on it. The
-                # stderr tail is the whole account there is, so it is in the reason.
-                record["outcome"] = INFRASTRUCTURE
-                record["supervisor_exit"] = status.get("supervisor_exit")
-                lane = attempt.lane if getattr(attempt, "lane", None) else \
-                    ctx.unit_row(attempt.unit).get("lane", "?")
-                tail = str(status.get("stderr_tail") or "").strip()
-                ctx.request_pause(
-                    f"lane {lane}'s supervisor exited {status.get('supervisor_exit')} for "
-                    f"{attempt.unit} {attempt.name} without reporting a status. Nothing was "
-                    f"charged. Its stderr ends: {tail or '(nothing)'}. Fix what it names, "
-                    f"then run the same command again")
-            elif _is_provider_fault(status, ctx.fault_patterns(attempt)):
-                record["outcome"] = PROVIDER_UNAVAILABLE
-            else:
-                record["outcome"] = WORKER_FAILED
-                if _explains_nothing(status):
-                    record["unexplained"] = True
-            record["reason"] = str(status.get("reason") or status.get("status") or "")
-            detail = _terminal_detail(status)
-            if detail is not None:
-                record["terminal_detail"] = detail
+            _failed_status_outcome(ctx, attempt, status, record)
         else:
             # The path this attempt RECORDED, never one rebuilt from the unit's name: the
             # reply is collected under the attempt's opaque token, which is the only place
@@ -2318,7 +2429,8 @@ def adjudicate(ctx: "Run", attempt: Attempt) -> dict:
               if att.disposition is not None and att.index != attempt.index]
     ordered = [record for _index, record
                in sorted([*others, (attempt.index, record)], key=lambda pair: pair[0])]
-    record["intended_publication"] = _intended(ordered, ctx.granted(attempt.unit))
+    record["intended_publication"] = _intended(ordered, ctx.granted(attempt.unit),
+                                               ctx.uncharged(attempt.unit, (attempt, record)))
     _write_json(attempt.path / DISPOSITION_NAME, record)
     _progress(ctx.rundir, f"{attempt.unit} {attempt.name} -> {record['outcome']}")
     if record.get("storage_fault"):
@@ -2355,7 +2467,7 @@ class Budget:
         return self.launches >= self.ceiling
 
 
-def replay(dispositions: Sequence[dict], granted: int = 0) -> Budget:
+def replay(dispositions: Sequence[dict], granted: int = 0, uncharged: int = 0) -> Budget:
     """Count one unit's allowances from the dispositions on disk.
 
     ``provider-unavailable``, ``infrastructure`` and an operator-authorized retry charge
@@ -2363,6 +2475,10 @@ def replay(dispositions: Sequence[dict], granted: int = 0) -> Budget:
     fourth launch must not both charge nothing and exhaust the unit, which is the
     contradiction this shape removes. They still count as launches, which is what the
     separate hard stop bounds.
+
+    ``uncharged`` is how many of this unit's ``no-reply`` attempts charge nothing because
+    their lane and mode has not answered (:meth:`Run.uncharged`). The number is derived from
+    every unit's dispositions, so it is the caller's to pass.
     """
     # **A probe that failed is the run's question to a paused provider, not the unit's
     # answer, so it charges nothing.** The claim pass hands every probe to the first eligible
@@ -2370,7 +2486,8 @@ def replay(dispositions: Sequence[dict], granted: int = 0) -> Budget:
     # no resume undoes. What bounds them is the probe count, not the unit's allowance.
     failed = [d for d in dispositions
               if d.get("outcome") in _CHARGES_FAILURE and not d.get("probe")]
-    reply = sum(1 for d in dispositions if d.get("outcome") in _CHARGES_REPLY)
+    reply = max(0, sum(1 for d in dispositions if d.get("outcome") in _CHARGES_REPLY)
+                - uncharged)
     failure = len(failed)
     charging = reply + failure
     return Budget(launches=len(dispositions), reply_charges=reply,
@@ -2378,17 +2495,18 @@ def replay(dispositions: Sequence[dict], granted: int = 0) -> Budget:
                   ceiling=LAUNCH_CEILING + granted)
 
 
-def _intended(dispositions: Sequence[dict], granted: int) -> str:
+def _intended(dispositions: Sequence[dict], granted: int, uncharged: int = 0) -> str:
     """What the unit should publish given every disposition it holds.
 
     ``result`` where the last one accepted, ``error`` where the unit has spent its
-    allowances, ``none`` while it still has a retry coming.
+    allowances, ``none`` while it still has a retry coming. ``uncharged`` is
+    :func:`replay`'s.
     """
     if dispositions and dispositions[-1].get("outcome") == ACCEPTED:
         return "result"
     if any(d.get("outcome") == OPERATOR_FAILED for d in dispositions):
         return "error"
-    budget = replay(dispositions, granted)
+    budget = replay(dispositions, granted, uncharged)
     # **Exhaustion first, and the order is the whole point.** A unit can reach both at once
     # — six infrastructure faults and then two replies the engine would not take — and the
     # ceiling asked first answers "quarantine" for a unit that has actually spent its
@@ -2674,6 +2792,73 @@ def provider_state(account: str, generation: int,
 def _generation_of(attempt: Attempt) -> int:
     raw = (attempt.argv or {}).get("generation")
     return raw if isinstance(raw, int) and not isinstance(raw, bool) else -1
+
+
+# --------------------------------------------------------------------------- #
+# 6.1 a silent lane — a command that fails on every unit, paused and charged nothing
+# --------------------------------------------------------------------------- #
+# **A `no-reply` charges only once its lane, mode and reply generation has had a unit's
+# answer accepted.** Before that, nothing shows the command works, so the charge may be the
+# command's, and an error it spent would be terminal before anyone could tell: no
+# error is ever written on such a charge. A generation a silent pause ended stays uncharged
+# for good, even if a worker launched into it answers late. Only units count: a smoke that
+# passed was answering its own question, not a unit's.
+#
+# A lane and mode with no answer that ends this many attempts with no closing object — on
+# one unit and its retry, or on several — is failing on every unit: the command is at
+# fault, and the run pauses. That bounds the retries the rule above leaves free.
+NO_REPLY_PAUSES_AT = 2
+# Per lane and mode, the generation a resume over that pause opens, recorded as
+# `{"closed": n}` and stamped into each attempt at spawn as `reply_generation`. Without it the
+# old results pause a corrected command again before anything launches. Apart from the
+# provider's generations on purpose: a command an operator fixed is not a provider that
+# recovered, and advancing the account would read its next outage as a recurrence.
+REPLY_GENERATIONS_PREFIX = "reply-generations-"
+
+
+def _mode_of(attempt: Attempt) -> str:
+    """The mode an attempt was launched in: recorded at spawn, or else read from its kind,
+    which is how a record written before the mode was recorded says it."""
+    argv = attempt.argv or {}
+    if argv.get("mode") in MODES:
+        return str(argv["mode"])
+    return WRITE_CAPABLE if argv.get("kind") in WRITE_CAPABLE_KINDS else READ_ONLY
+
+
+def _reply_generation_of(attempt: Attempt) -> int:
+    # Absent is 0: no reply generation was closed before attempts started carrying one.
+    raw = (attempt.argv or {}).get("reply_generation")
+    return raw if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0 else 0
+
+
+def _reply_key(attempt: Attempt) -> tuple[str, str, int]:
+    """The lane, mode and reply generation an attempt was launched into."""
+    return (str((attempt.argv or {}).get("lane")), _mode_of(attempt),
+            _reply_generation_of(attempt))
+
+
+def silent_lanes(judged: Sequence[tuple[Attempt, str | None]]
+                 ) -> dict[tuple[str, str, int], list[Attempt]]:
+    """Each lane, mode and reply generation whose command is failing on every unit, with
+    the ``no-reply`` attempts behind it, from units' attempts and their outcomes.
+
+    **Counted over the whole generation, in no order.** An answer accepted in the same
+    generation before the pause is committed shows the command works, so that generation is
+    not silent; the order the outcomes arrived in is not on disk, and a rule that needed it
+    would not replay. **A generation the pause closed stays uncharged for good**, even if a
+    worker launched into it answers late (`Run.charges_no_reply`): charging it would turn
+    the paused attempts into the errors the pause exists to prevent.
+    """
+    replies: dict[tuple[str, str, int], list[Attempt]] = {}
+    answered: set[tuple[str, str, int]] = set()
+    for attempt, outcome in judged:
+        key = _reply_key(attempt)
+        if outcome == ACCEPTED:
+            answered.add(key)
+        elif outcome == NO_REPLY:
+            replies.setdefault(key, []).append(attempt)
+    return {key: found for key, found in replies.items()
+            if key not in answered and len(found) >= NO_REPLY_PAUSES_AT}
 
 
 def probe_due(state: ProviderState, now: float, backoff: float) -> bool:
@@ -3301,7 +3486,7 @@ def _execution_ended(attempt: Attempt) -> bool:
     """Whether this attempt's worker can no longer be running.
 
     **One predicate, used by everything that asks the question** — the capacity reservation,
-    the write-capable serialization and the copy cleanup — because two spellings of it can
+    the run-wide `writers` limit and the copy cleanup — because two spellings of it can
     disagree: a lane stays reserved for an operator-failed attempt that a late status has
     since proved finished, while the count of running writers ignores that same attempt and
     lets a second write-capable worker start beside one that might still be live.
@@ -3375,6 +3560,49 @@ def _most_severe_rank(levels: Sequence[str]) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# the smoke test — every lane and mode proves it can read, write and answer
+# --------------------------------------------------------------------------- #
+# A command that cannot read its input is wrong for every unit it is given, and found at the
+# first one it fails the way a unit fails: each unit spends its allowances and publishes an
+# error. So before the first unit of a run, every lane and mode the run can launch is given
+# one task nothing but a working command can do, and Python judges the answer. Every lane
+# and mode, not only those the units planned so far use: a fresh plan's only write-capable
+# unit is the probe on one lane, and the other lane's write-capable command is first launched
+# with the verifiers, after the whole reading round has been paid for.
+SMOKE_DIR = "smoke"                 # under dispatch/, apart from every unit
+SMOKE_NONCE_NAME = "nonce.txt"      # under the worker's input directory
+SMOKE_WRITE_NAME = "smoke.txt"      # in a write-capable worker's empty working directory
+# The task is one read and one line, so the bound is far below a unit's. A smoke that hangs
+# holds the whole run before it has started.
+SMOKE_DEADLINE = 300.0
+SMOKE_SCHEMA = {"type": "object", "additionalProperties": False,
+                "required": ["ok", "nonce"],
+                "properties": {"ok": {"type": "boolean"}, "nonce": {"type": "string"}}}
+
+
+def smoke_id(lane: str, mode: str) -> str:
+    """The name a smoke attempt is recorded under, which no unit id can be."""
+    return f"{SMOKE_DIR}/lane-{lane}-{mode}"
+
+
+def smoke_payload(nonce_path: Path, write_path: Path | None) -> str:
+    """The smoke task. **A read-only smoke never asks for a write**: a correct read-only
+    sandbox refuses one, and the smoke would then fail the commands that are right."""
+    steps = [f"Read the file `{nonce_path}`. It holds one line of text."]
+    if write_path is not None:
+        steps.append(f"Write exactly that text, and nothing else, to the file `{write_path}`.")
+    steps.append('End your reply with this JSON object, with the text from step 1 in place '
+                 'of TEXT, and write nothing after it:\n\n'
+                 '    {"ok": true, "nonce": "TEXT"}')
+    rule = ("" if write_path is not None
+            else "\nDo not write or change any file.\n")
+    return ("# A smoke test\n\nThis checks that this command can read its input and answer "
+            "before any real work is sent to it. Do only what it says.\n\n"
+            + "\n".join(f"{number}. {step}" for number, step in enumerate(steps, start=1))
+            + "\n" + rule)
+
+
+# --------------------------------------------------------------------------- #
 # the run — everything above, wired to one owned run directory
 # --------------------------------------------------------------------------- #
 BUDGET_NAME = "budget.json"
@@ -3399,6 +3627,23 @@ def read_budget(path: Path) -> tuple[float, float]:
     return _number("seconds"), _number("extended")
 
 
+def recorded_capacity(path: Path) -> tuple[int | None, dict[str, int]]:
+    """The ``writers`` and each lane's ``slots`` the last driver of this run claimed with,
+    from its budget file: ``None`` and an empty mapping where none is recorded. Kept there
+    because `status` is usually run without the adapter, and the defaults would misstate a
+    run driven with others."""
+    record = _read_json(path)
+    if not isinstance(record, dict):
+        return None, {}
+    def _count(value: object) -> int | None:
+        return (value if isinstance(value, int) and not isinstance(value, bool)
+                and value >= 1 else None)
+    slots = record.get("slots")
+    lanes = {lane: _count(value) for lane, value in slots.items()
+             if lane in engine.LANES} if isinstance(slots, dict) else {}
+    return _count(record.get("writers")), {lane: n for lane, n in lanes.items() if n}
+
+
 class Run:
     """One owned run directory, its configuration, and the loop over its rounds."""
 
@@ -3410,8 +3655,19 @@ class Run:
                  keep_repro_bytes: int = KEEP_REPRO_BYTES_DEFAULT,
                  disk_floor: int = DISK_FLOOR_DEFAULT,
                  build_margin: int = BUILD_MARGIN_DEFAULT,
-                 budget_name: str = BUDGET_NAME):
+                 budget_name: str = BUDGET_NAME, smoke_first: bool = True,
+                 tolerate_unreadable_budget: bool = False):
         self.rundir = rundir
+        # Whether the smoke test runs before this process's first claim, and whether it has.
+        # Once per process: a resume is a new process and smokes again, because the command
+        # it was started with is the one that has not been tried.
+        self.smoke_first = smoke_first
+        # The lane and mode pairs whose smoke passed in THIS process. No unit is launched,
+        # a probe included, until every pair is in it: a smoke the provider refused said
+        # nothing about the command.
+        self.smoke_passed: set[tuple[str, str]] = set()
+        # The synthesis generation `resynthesize` carries, which decides what it can launch.
+        self._synthesis_generation: int | None = None
         # The run's budget, or a synthesis generation's own: `resynthesize` starts a budget
         # of its own rather than inheriting what the run's stages spent.
         self.budget_path = rundir / budget_name
@@ -3461,13 +3717,29 @@ class Run:
         self._attempt_cache: dict[str, list[Attempt]] = {}
         self._landed_cache: dict[str, dict | None] = {}
         self._provider_cache: dict[str, ProviderState] | None = None
+        self._silent_cache: dict[tuple[str, str, int], list[Attempt]] | None = None
+        self._answered_cache: set[tuple[str, str, int]] | None = None
+        self._reply_generations: dict[tuple[str, str], int] = {}
+        # The lane and mode pairs this process paused as silent. In memory, like the pause:
+        # a restart is what runs them again, and their generation is already closed on disk.
+        self._silenced: set[tuple[str, str]] = set()
         # The snapshot is read-only from the moment the run directory commits, so its size
         # is measured once; the candidate severities come from the route record, which is
         # written once and never edited.
         self._snapshot_bytes: int | None = None
         self._candidate_severities: dict[str, int] | None = None
         self._budget_started = time.monotonic()
-        self._budget_base, self._extended = self._read_budget()
+        # Why the budget could not be read, for `status` alone. Every caller that spends or
+        # extends the budget leaves `tolerate_unreadable_budget` off and gets the refusal:
+        # read as zero, an unreadable budget would hand a run its whole allowance again.
+        self.budget_unreadable = ""
+        try:
+            self._budget_base, self._extended = self._read_budget()
+        except DriverError as exc:
+            if not tolerate_unreadable_budget:
+                raise
+            self.budget_unreadable = str(exc)
+            self._budget_base, self._extended = 0.0, 0.0
         self._budget_written = time.monotonic()
 
     # -- small accessors ---------------------------------------------------- #
@@ -3518,6 +3790,9 @@ class Run:
         # Always, whichever unit changed: the breaker is derived from EVERY unit's attempts,
         # so one unit's new disposition is what pauses a provider for all of them.
         self._provider_cache = None
+        self._silent_cache = None
+        self._answered_cache = None
+        self._reply_generations.clear()
         if unit_id is None:
             self._attempt_cache.clear()
             self._landed_cache.clear()
@@ -3559,7 +3834,9 @@ class Run:
         with contextlib.suppress(engine.ReviewPanelError, OSError):
             _write_json(self.budget_path,
                         {"seconds": round(self.spent(), 3),
-                         "extended": round(self._extended, 3)})
+                         "extended": round(self._extended, 3),
+                         "writers": run_writers(self.lanes)[0],
+                         "slots": {lane: spec.slots for lane, spec in self.lanes.items()}})
 
     def extend(self, hours: float) -> None:
         """Let this run use ``hours`` beyond ``--max-hours``, as an absolute figure.
@@ -3630,8 +3907,7 @@ class Run:
             if attempt.state in (UNCERTAIN, ORPHAN_CLAIM):
                 return (f"{attempt.name} is {attempt.state}: its outcome cannot be proven, "
                         f"so it is never re-spawned and never landed")
-        budget = replay([a.disposition for a in self.attempts(unit_id)
-                         if a.disposition is not None], self.granted(unit_id))
+        budget = self.budget(unit_id)
         # Asked in the same order `_intended` asks it: a unit that has spent its allowances
         # is not quarantined, it is a unit whose answer is the error the next adoption pass
         # publishes. Naming it quarantined would send an operator to `resolve-unit` over a
@@ -3660,7 +3936,7 @@ class Run:
         dispositions = [a.disposition for a in attempts if a.disposition is not None]
         if dispositions and dispositions[-1].get("outcome") == ACCEPTED:
             return False
-        budget = replay(dispositions, self.granted(unit_id))
+        budget = self.budget(unit_id)
         return not budget.exhausted and not budget.at_ceiling
 
     def reserving(self) -> dict[str, int]:
@@ -3676,14 +3952,20 @@ class Run:
             for attempt in self.attempts(unit["id"]):
                 if _reserves_capacity(attempt):
                     counts[lane] = counts.get(lane, 0) + 1
+        # A smoke's worker uses a slot of its lane like a unit's, under the same rule.
+        for attempt in self.smoke_attempts():
+            if _reserves_capacity(attempt):
+                lane = str((attempt.argv or {}).get("lane"))
+                counts[lane] = counts.get(lane, 0) + 1
         return counts
 
     def writers_running(self) -> int:
         """Write-capable attempts in flight, run-wide.
 
-        Serialized across both lanes, not per lane: separate directories are not separate
-        ports, caches or credentials, so two reproductions at once can fail each other for
-        environmental reasons and the verdict would read as the code's fault.
+        Bounded across both lanes by ``writers``, not per lane: separate directories are not
+        separate ports, caches or credentials, so two reproductions at once can fail each
+        other for environmental reasons and the verdict would read as the code's fault. More
+        than one at once is the operator's claim that theirs do not.
         """
         total = 0
         for unit in self.units():
@@ -3697,6 +3979,35 @@ class Run:
                 if _reserves_capacity(attempt):
                     total += 1
         return total
+
+    def supervisor_argv(self, lane: LaneSpec, spec: ModeSpec, values: dict[str, str],
+                        cwd: Path, attempt_path: Path, transcript: Path, *,
+                        idle: float | None = None, deadline: float | None = None
+                        ) -> tuple[list[str], dict[str, str]]:
+        """The supervisor's argv for one attempt of ``spec``, and the settings it carries
+        in its environment. A smoke attempt is built here too, so what it proves is the
+        command a unit is launched with."""
+        rendered: list[str] = []
+        for part in spec.command:
+            if part == BACKEND_ARGS_MARKER:
+                rendered.extend(lane.resolved.args if lane.resolved is not None else ())
+                continue
+            rendered.append(_PLACEHOLDER_RE.sub(lambda m: values[m.group(1)], part))
+        settings, carried = _lane_settings(lane)
+        argv = [sys.executable, str(self.supervisor),
+                "--idle", str(spec.idle if idle is None else idle),
+                "--deadline", str(spec.deadline if deadline is None else deadline),
+                "--cwd", str(cwd), "--display", str(attempt_path / DISPLAY_NAME),
+                "--findings", str(transcript), "--result-mode", spec.result_mode,
+                # **Both opt-in flags, on every spawn, and neither is optional here.**
+                # Without the detail a quota refusal reaches this program as "the reviewer
+                # exited 1" and every pending unit spends its allowance against an account
+                # that is already refusing. Without the cap one worker's runaway output is
+                # held whole in the supervisor's memory, four hundred times over.
+                "--status-detail",
+                "--max-capture-bytes", str(self.max_capture_bytes),
+                *settings, "--", *rendered]
+        return argv, carried
 
     # -- 3.1 spawn ---------------------------------------------------------- #
     def spawn(self, unit: dict, probe: bool = False) -> bool:
@@ -3790,28 +4101,12 @@ class Run:
                        f"it says."),
             "model": lane.model,
         }
-        rendered: list[str] = []
-        for part in spec.command:
-            if part == BACKEND_ARGS_MARKER:
-                rendered.extend(lane.resolved.args if lane.resolved is not None else ())
-                continue
-            rendered.append(_PLACEHOLDER_RE.sub(lambda m: values[m.group(1)], part))
-        settings, carried = _lane_settings(lane)
-        argv = [sys.executable, str(self.supervisor),
-                "--idle", str(spec.idle), "--deadline", str(spec.deadline),
-                "--cwd", str(cwd), "--display", str(attempt_path / DISPLAY_NAME),
-                "--findings", str(transcript), "--result-mode", spec.result_mode,
-                # **Both opt-in flags, on every spawn, and neither is optional here.**
-                # Without the detail a quota refusal reaches this program as "the reviewer
-                # exited 1" and every pending unit spends its allowance against an account
-                # that is already refusing. Without the cap one worker's runaway output is
-                # held whole in the supervisor's memory, four hundred times over.
-                "--status-detail",
-                "--max-capture-bytes", str(self.max_capture_bytes),
-                *settings, "--", *rendered]
+        argv, carried = self.supervisor_argv(lane, spec, values, cwd, attempt_path,
+                                             transcript)
         record = {
             "argv": argv, "adapter": lane.adapter, "lane": unit.get("lane"),
             "account": lane.account, "generation": self.generation(lane.account),
+            "mode": mode, "reply_generation": self.reply_generation(named, mode),
             "permission": spec.permission, "cwd": str(cwd), "kind": unit.get("kind"),
             # The PROVIDER probe of the breaker, which is a different thing from the
             # engine's capability-probe unit kind. Recorded at spawn because an incident is
@@ -3996,7 +4291,8 @@ class Run:
                   if att.disposition is not None and att.index != index]
         ordered = [record for _index, record
                    in sorted([*others, (index, failure)], key=lambda pair: pair[0])]
-        failure["intended_publication"] = _intended(ordered, self.granted(unit_id))
+        failure["intended_publication"] = _intended(ordered, self.granted(unit_id),
+                                                    self.uncharged(unit_id))
         _write_json(attempt_path / DISPOSITION_NAME, failure)
         _progress(self.rundir, f"{unit_id} {attempt_path.name} -> {failure['outcome']}")
         if storage:
@@ -4007,6 +4303,396 @@ class Run:
             self.reconcile_storage()
         self.invalidate(unit_id)
         return True
+
+    # -- 3.0 the smoke test ------------------------------------------------- #
+    def smoke_pairs(self) -> list[tuple[str, str]]:
+        """Every lane and mode this command can launch: all of them for a run, and for
+        `resynthesize` the lanes its synthesis units are on, in the modes those kinds run."""
+        if self._synthesis_generation is None:
+            return [(lane, mode) for lane in sorted(self.lanes) for mode in MODES]
+        lanes = sorted({str(unit.get("lane")) for unit in self.round_units(
+            engine.SYNTHESIS_KINDS)} & set(self.lanes)) or [engine.LANES[0]]
+        modes = {WRITE_CAPABLE if kind in WRITE_CAPABLE_KINDS else READ_ONLY
+                 for kind in engine.SYNTHESIS_KINDS}
+        return [(lane, mode) for lane in lanes for mode in MODES if mode in modes]
+
+    def smoke_attempts(self) -> list[Attempt]:
+        """Every smoke attempt on disk, in name order. Apart from every unit's, so none of
+        them is an answer, a charge, or a lane's execution — but each was launched into
+        its provider's generation, so the breaker reads them."""
+        base = self.rundir / engine.DISPATCH_DIR / SMOKE_DIR
+        try:
+            names = sorted(os.listdir(base))
+        except OSError as exc:
+            if _absent(exc):
+                return []
+            raise _refused(base, exc, action="enumerated") from exc
+        found = []
+        for name in names:
+            unit = f"{SMOKE_DIR}/{name}"
+            found.extend(read_attempts(self.rundir, unit, grace=self.grace))
+        return found
+
+    def smoke_test(self, pairs: Sequence[tuple[str, str]],
+                   probes: frozenset[str] = frozenset()) -> bool:
+        """Smoke-test each of ``pairs`` not yet passed and wait for every answer. True when
+        any was launched.
+
+        A command that fails pauses the run; a provider that refuses pauses its account, as
+        it would at any attempt, and the pair stays unpassed. A smoke on an account in
+        ``probes`` is that account's probe. Nothing here is a unit's, so nothing is charged
+        either way.
+
+        **Each lane's slots hold the smokes too, counted with what already holds them** — a
+        unit or a smoke a previous driver left running. A pair whose lane has no slot free
+        is left unpassed rather than waited on, and is smoked at the claim that finds one."""
+        self.reconcile_smokes()
+        held = self.reserving()
+        pending = [pair for pair in pairs if pair not in self.smoke_passed]
+        if not pending:
+            return False
+        self.say(f"smoke test: {len(pending)} lane command(s), before any of their units "
+                 f"is launched")
+        _progress(self.rundir, "smoke test: " + ", ".join(
+            f"{lane} {mode}" for lane, mode in pending))
+        running: list[dict] = []
+        failures: list[str] = []
+        launched = False
+        while pending or running:
+            if not self.stop_requested():
+                for lane, mode in list(pending):
+                    busy = sum(1 for item in running if item["lane"] == lane)
+                    if held.get(lane, 0) + busy >= self.lanes[lane].slots:
+                        if not busy:
+                            pending.remove((lane, mode))
+                            _progress(self.rundir, f"{smoke_id(lane, mode)} deferred: every "
+                                                   f"slot of lane {lane} is held")
+                        continue
+                    pending.remove((lane, mode))
+                    item = self._launch_smoke(lane, mode, failures,
+                                              self.lanes[lane].account in probes)
+                    launched = True
+                    if item is not None:
+                        running.append(item)
+            else:
+                pending.clear()
+            still = []
+            for item in running:
+                code = item["child"].poll()
+                if code is None:
+                    still.append(item)
+                    continue
+                self._finish_smoke(item, code, failures)
+            running = still
+            if running:
+                time.sleep(min(self.poll, 0.5))
+        self.invalidate()
+        if failures:
+            self.request_pause(
+                " ".join(failures) + " No unit was launched and nothing was charged. Correct "
+                "the command in the adapter file, then run the same command again")
+        self.reconcile_providers()
+        self.reconcile_storage()
+        return launched
+
+    def smoke_blocking(self, providers: dict[str, ProviderState]) -> list[tuple[str, str]]:
+        """The pairs not yet passed whose account is working. Any of them holds back every
+        unit of every lane: a lane's reading paid for before the other lane's commands are
+        shown to work is what the smoke test exists to save.
+
+        **A pair whose account is paused or stopped by its provider holds back only its own
+        lane.** A provider refusing a smoke says nothing about the command, and an outage
+        holds its own lane and no other at any attempt; held here, the healthy lane waits
+        on a probe of an account the round may have no unit for."""
+        blocking = []
+        for lane, mode in self.smoke_pairs():
+            if (lane, mode) in self.smoke_passed:
+                continue
+            state = providers.get(self.lanes[lane].account)
+            if state is not None and (state.paused or state.drain):
+                continue
+            blocking.append((lane, mode))
+        return blocking
+
+    def smoke_clears(self, unit: dict, providers: dict[str, ProviderState]) -> bool:
+        """Whether ``unit`` may launch as far as the smoke test is concerned: its own lane
+        and mode have passed in this process, and no pair on a working account is still
+        unpassed."""
+        lane = unit.get("lane", engine.LANES[0])
+        mode = WRITE_CAPABLE if unit.get("kind") in WRITE_CAPABLE_KINDS else READ_ONLY
+        return (lane, mode) in self.smoke_passed and not self.smoke_blocking(providers)
+
+    def smoke_for_claim(self, providers: dict[str, ProviderState], probed: set,
+                        claimed_lane: str) -> bool:
+        """Smoke what a claim is waiting on: every unpassed pair whose account is working,
+        and, for the claimed unit's own account where it is paused and its probe is due,
+        one of its pairs as that probe — so the question "is it back?" is asked by a smoke,
+        never by a unit of a pair that has not passed. True when anything was launched.
+
+        **Only the claimed unit's account is probed.** A refused probe drains the run, and
+        a claim on another lane has nothing to ask a paused account; probed for it, a round
+        with no unit on that lane would stop before the healthy lane launched anything."""
+        own = self.lanes[claimed_lane].account if claimed_lane in self.lanes else None
+        pairs, probes = [], set()
+        for lane, mode in self.smoke_pairs():
+            if (lane, mode) in self.smoke_passed:
+                continue
+            account = self.lanes[lane].account
+            state = providers.get(account)
+            if state is not None and state.paused:
+                if account != own or account in probed or account in probes or not probe_due(
+                        state, _now(), self.probe_backoff):
+                    continue
+                probes.add(account)
+            elif state is not None and state.drain:
+                continue
+            pairs.append((lane, mode))
+        if not pairs:
+            return False
+        probed.update(probes)
+        return self.smoke_test(pairs, frozenset(probes))
+
+    def smoke_in_flight(self) -> bool:
+        """Whether a smoke a previous driver left may still be running, which keeps a round
+        open as a unit's attempt would."""
+        return any(attempt.disposition is None and attempt.state in (RUNNING, DECIDED)
+                   for attempt in self.smoke_attempts())
+
+    def reconcile_smokes(self) -> None:
+        """Judge the smokes a killed driver left with a status and no disposition, and
+        release their directories. Recorded as interrupted: what they found is the
+        provider's answer for the breaker and never this process's pass or pause."""
+        for attempt in self.smoke_attempts():
+            if attempt.disposition is not None or attempt.status is None:
+                continue
+            argv = attempt.argv or {}
+            token = str(argv.get("token") or "")
+            mode = argv.get("mode")
+            if not token or mode not in MODES:
+                continue
+            item = {"lane": str(argv.get("lane")), "mode": mode, "path": attempt.path,
+                    "nonce": argv.get("nonce"), "inbox": self.rundir / "in" / token,
+                    "work": self.rundir / "work" / token if mode == WRITE_CAPABLE else None}
+            self._finish_smoke(item, 0, [], interrupted=True)
+
+    def _launch_smoke(self, lane_name: str, mode: str, failures: list[str],
+                      probe: bool = False) -> dict | None:
+        lane = self.lanes[lane_name]
+        spec = lane.modes[mode]
+        unit = smoke_id(lane_name, mode)
+        base = self.rundir / engine.DISPATCH_DIR / unit
+        token = reserve_token(self.rundir)
+        inbox = self.rundir / "in" / token
+        # **An empty working directory, never a copy of the snapshot**: the smoke asks for
+        # one file, and a copy would cost the whole snapshot's bytes and time to prove it.
+        work = self.rundir / "work" / token if mode == WRITE_CAPABLE else None
+        nonce = secrets.token_hex(16)
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            if work is not None:
+                work.mkdir(parents=True, exist_ok=True)
+            _write_text(inbox / SMOKE_NONCE_NAME, nonce + "\n")
+            _write_text(inbox / engine.PAYLOAD_NAME, smoke_payload(
+                inbox / SMOKE_NONCE_NAME, work / SMOKE_WRITE_NAME if work else None))
+            _write_json(inbox / engine.SCHEMA_NAME, SMOKE_SCHEMA)
+        except OSError as exc:
+            if _is_storage_exception(exc):
+                raise StorageFault(inbox, exc) from exc
+            raise _spawn_refused(inbox, exc, "prepared",
+                                 f"cannot prepare the smoke test for lane {lane_name}: "
+                                 f"{exc}") from exc
+        cwd = work if work is not None else self.rundir / SNAPSHOT_DIR
+        index = len(attempt_dirs(self.rundir, unit))
+        attempt_path = None
+        while attempt_path is None:
+            candidate = base / f"a{index}"
+            try:
+                candidate.mkdir()
+            except FileExistsError:
+                index += 1
+                continue
+            except OSError as exc:
+                raise _spawn_refused(candidate, exc, "claimed",
+                                     f"cannot claim {candidate}: {exc}") from exc
+            attempt_path = candidate
+        # In the attempt's own directory: a smoke answers for no unit, so there is nothing
+        # its paths could tell the worker.
+        transcript = attempt_path / TRANSCRIPT_NAME
+        values = {
+            "input": str(inbox), "payload": str(inbox / engine.PAYLOAD_NAME),
+            "schema": str(inbox / engine.SCHEMA_NAME), "cwd": str(cwd),
+            "transcript": str(transcript),
+            "prompt": (f"Read {inbox / engine.PAYLOAD_NAME} in full and do exactly what "
+                       f"it says."),
+            "model": lane.model,
+        }
+        deadline = min(spec.deadline, SMOKE_DEADLINE)
+        argv, carried = self.supervisor_argv(lane, spec, values, cwd, attempt_path,
+                                             transcript, idle=min(spec.idle, deadline),
+                                             deadline=deadline)
+        record = {
+            "argv": argv, "adapter": lane.adapter, "lane": lane_name,
+            "account": lane.account, "generation": self.generation(lane.account),
+            "permission": spec.permission, "cwd": str(cwd), "kind": SMOKE_DIR,
+            "mode": mode, "smoke": True, "probe": bool(probe), "spawn_time": _now(),
+            "deadline": deadline, "token": token, "nonce": nonce,
+            "transcript": str(transcript),
+            "unit": unit, "attempt": attempt_path.name,
+        }
+        _write_json(attempt_path / ARGV_NAME, record)
+        _progress(self.rundir, f"{unit} {attempt_path.name} spawning (lane {lane_name}, "
+                               f"{mode})")
+        item = {"lane": lane_name, "mode": mode, "path": attempt_path, "nonce": nonce,
+                "cwd": cwd, "inbox": inbox, "work": work}
+        extra = {"env": {**os.environ, **carried}} if carried else {}
+        try:
+            with open(attempt_path / STATUS_NAME, "wb") as handle, \
+                    open(attempt_path / STDERR_NAME, "wb") as errors:
+                item["child"] = subprocess.Popen(
+                    argv, stdout=handle, stderr=errors, stdin=subprocess.DEVNULL,
+                    cwd=str(self.rundir), **extra, **_own_process_group())
+        except (OSError, ValueError) as exc:
+            if isinstance(exc, OSError) and _is_storage_exception(exc):
+                raise StorageFault(attempt_path, exc) from exc
+            if any(not _encodable(value) for value in carried.values()):
+                exc = ValueError("a setting could not be passed in this platform's encoding")
+            _write_json(attempt_path / DISPOSITION_NAME, {
+                "attempt": attempt_path.name, "unit": unit, "smoke": True,
+                "outcome": LAUNCH_FAILED, "passed": False, "launched": False,
+                "reason": f"the supervisor could not be started: {exc}",
+                "judged_at": _now()})
+            failures.append(f"Lane {lane_name}'s {mode} smoke test could not start its "
+                            f"supervisor: {exc}.")
+            for path in (inbox, work):
+                if path is not None:
+                    remove_tree(path, self.rundir)
+            return None
+        return item
+
+    def _finish_smoke(self, item: dict, code: int, failures: list[str],
+                      interrupted: bool = False) -> None:
+        """Judge one smoke attempt whose supervisor has exited, and release its input and
+        working directories."""
+        path: Path = item["path"]
+        lane, mode = item["lane"], item["mode"]
+        status = read_status(path / STATUS_NAME)
+        if status is None and (os.name != "posix" or code < 0):
+            # **Killed from outside, and its worker may still be running**, as a unit's may
+            # (see `reap_children`): left with no disposition, so it keeps its lane's slot
+            # and its directories until its deadline passes and `resolve-attempt` can
+            # record it stopped. A disposition here would release both under a live worker.
+            _progress(self.rundir, f"{smoke_id(lane, mode)} {path.name} supervisor exited "
+                                   f"{code} without a status; its worker may still be "
+                                   f"running")
+            failures.append(
+                f"Lane {lane}'s {mode} smoke test's supervisor exited {code} without a "
+                f"status, and its worker may still be running, so it keeps a slot of lane "
+                f"{lane} until its deadline passes or `resolve-attempt` records it stopped.")
+            return
+        if status is None:
+            status = {"status": "error",
+                      "reason": f"the supervisor exited {code} without reporting a status",
+                      "supervisor_exit": code,
+                      "stderr_tail": _stderr_tail(path / STDERR_NAME)}
+            # **Written to disk, not only judged**, as `reap_children` writes a unit's: the
+            # status is what says the execution ended, so without it a later driver reads
+            # this attempt as running and its slot stays held, and `resolve-attempt`
+            # refuses an attempt already judged. A refused write is left unjudged, so the
+            # attempt reaches its deadline and `resolve-attempt` can record it.
+            try:
+                with open(path / STATUS_NAME, "ab") as handle:
+                    handle.write(b"\n" + json.dumps(status).encode("utf-8") + b"\n")
+            except OSError as exc:
+                failures.append(
+                    f"Lane {lane}'s {mode} smoke test's supervisor exited {code} without a "
+                    f"status, and the record could not be written ({exc}), so it keeps a "
+                    f"slot of lane {lane} until its deadline passes and `resolve-attempt` "
+                    f"records it.")
+                return
+        attempt = replace(read_attempt(self.rundir, smoke_id(lane, mode), path,
+                                       grace=self.grace), status=status)
+        record: dict = {"attempt": attempt.name, "unit": attempt.unit, "smoke": True,
+                        "lane": lane, "mode": mode}
+        if (attempt.argv or {}).get("probe"):
+            record["probe"] = True
+        if interrupted:
+            record["interrupted"] = True
+        failure = ""
+        if status.get("status") != "ok":
+            _failed_status_outcome(self, attempt, status, record, act=not interrupted)
+            # The volume's, the supervisor's and the provider's are said where they are
+            # decided; what is left is this command failing, which is the smoke's to say.
+            if record["outcome"] == WORKER_FAILED or (
+                    record["outcome"] == INFRASTRUCTURE and not record.get("storage_fault")
+                    and not record.get("supervisor_refusal")
+                    and "supervisor_exit" not in record):
+                failure = f"its worker failed: {record['reason']}"
+        else:
+            failure = self._smoke_reply_fails(item, record)
+        record["passed"] = record["outcome"] == ACCEPTED
+        record["judged_at"] = _now()
+        if record["passed"] and not interrupted:
+            self.smoke_passed.add((lane, mode))
+        _write_json(path / DISPOSITION_NAME, record)
+        _progress(self.rundir, f"{attempt.unit} {attempt.name} -> {record['outcome']}")
+        if record.get("storage_fault"):
+            self.note_storage_fault(f"{attempt.unit} {attempt.name}: "
+                                    f"{record.get('terminal_detail') or record['reason']}")
+        if failure:
+            # A worker that failed said so on stderr, in the display log; one that replied
+            # without doing the task said why in its reply.
+            hint = (_log_hint(path, "Its display log ended") if status.get("status") != "ok"
+                    else _reply_hint(path, (attempt.argv or {}).get("transcript"),
+                                     "Its reply ended"))
+            line = f"Lane {lane}'s {mode} command failed its smoke test: {failure}.{hint}"
+            failures.append(line)
+        for where in (item["inbox"], item["work"]):
+            if where is not None:
+                remove_tree(where, self.rundir)
+
+    def _smoke_reply_fails(self, item: dict, record: dict) -> str:
+        """Judge a smoke reply the supervisor reported ``ok``: why it fails, or ``""``."""
+        transcript = item["path"] / TRANSCRIPT_NAME
+        try:
+            text = transcript.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            if _is_storage_exception(exc):
+                record.update(outcome=INFRASTRUCTURE, storage_fault=True,
+                              reason=f"the transcript could not be read: {exc}")
+                return ""
+            if not _absent(exc):
+                raise _refused(transcript, exc) from exc
+            text = ""
+        found = closing_object(text)
+        try:
+            answer = json.loads(found) if found is not None else None
+        except (ValueError, RecursionError):
+            answer = None
+        if not isinstance(answer, dict):
+            record.update(outcome=NO_REPLY, reason="the transcript does not end with a JSON "
+                                                   "object")
+            return ("its reply does not end with a JSON object, so it did not do the task; "
+                    "a command that cannot read the worker's input directory ends this way")
+        if answer.get("ok") is not True or answer.get("nonce") != item["nonce"]:
+            record.update(outcome=REFUSED, reason="the reply does not carry the string "
+                                                  "the driver wrote")
+            return ("its reply does not carry the string the driver wrote under its input "
+                    "directory, so it did not read it")
+        if item["mode"] == WRITE_CAPABLE:
+            written = item["work"] / SMOKE_WRITE_NAME
+            try:
+                held = written.read_text(encoding="utf-8", errors="replace").strip()
+            except OSError as exc:
+                if not _absent(exc):
+                    raise _refused(written, exc) from exc
+                held = None
+            if held != item["nonce"]:
+                record.update(outcome=REFUSED, reason="the file in the working directory "
+                                                      "does not hold the string")
+                return ("it did not write the string to a file in its working directory, so "
+                        "it cannot write where a write-capable unit must")
+        record.update(outcome=ACCEPTED, reason="read, wrote where asked, and answered")
+        return ""
 
     def generation(self, account: str) -> int:
         """Which generation of ``account`` a spawn belongs to.
@@ -4038,15 +4724,122 @@ class Run:
         """Every account's breaker, derived from the attempts, cached for one pass."""
         if self._provider_cache is None:
             by_account: dict[str, list[Attempt]] = {a: [] for a in self.accounts()}
-            for unit in self.units():
-                for attempt in self.attempts(unit["id"]):
-                    account = (attempt.argv or {}).get("account")
-                    if account in by_account:
-                        by_account[account].append(attempt)
+            # A smoke attempt is no unit's, and the provider refusing it is still the
+            # provider refusing: it pauses the account the way any attempt would.
+            for attempt in [*(attempt for unit in self.units()
+                              for attempt in self.attempts(unit["id"])),
+                            *self.smoke_attempts()]:
+                account = (attempt.argv or {}).get("account")
+                if account in by_account:
+                    by_account[account].append(attempt)
             self._provider_cache = {
                 account: provider_state(account, self.generation(account), attempts)
                 for account, attempts in by_account.items()}
         return self._provider_cache
+
+    # -- 6.1 a silent lane --------------------------------------------------- #
+    def silent(self) -> dict[tuple[str, str, int], list[Attempt]]:
+        """:func:`silent_lanes` over every unit's judged attempts, cached for one pass."""
+        if self._silent_cache is None:
+            self._silent_cache = silent_lanes([
+                (attempt, attempt.disposition.get("outcome"))
+                for unit in self.units() for attempt in self.attempts(unit["id"])
+                if attempt.disposition is not None])
+        return self._silent_cache
+
+    def charges_no_reply(self, attempt: Attempt) -> bool:
+        """Whether a ``no-reply`` in this attempt's lane, mode and reply generation charges:
+        the generation is still open and a unit has had an answer accepted in it. A closed
+        one was closed by a silent pause, so it never charges."""
+        lane, mode, generation = _reply_key(attempt)
+        return (generation == self.reply_generation(lane, mode)
+                and (lane, mode, generation) in self.answered())
+
+    def uncharged(self, unit_id: str, pending: tuple[Attempt, dict] | None = None) -> int:
+        """How many of this unit's ``no-reply`` attempts charge nothing. ``pending`` is an
+        attempt and the disposition about to be written for it, counted in place of what
+        is on disk, so its own intention is decided with it."""
+        judged = [(a, a.disposition) for a in self.attempts(unit_id)
+                  if pending is None or a.index != pending[0].index]
+        if pending is not None:
+            judged.append(pending)
+        return sum(1 for attempt, record in judged
+                   if (record or {}).get("outcome") == NO_REPLY
+                   and not self.charges_no_reply(attempt))
+
+    def answered(self) -> set[tuple[str, str, int]]:
+        """Every lane, mode and reply generation a unit has had an answer accepted in."""
+        if self._answered_cache is None:
+            self._answered_cache = {
+                _reply_key(attempt) for unit in self.units()
+                for attempt in self.attempts(unit["id"])
+                if (attempt.disposition or {}).get("outcome") == ACCEPTED}
+        return self._answered_cache
+
+    def budget(self, unit_id: str) -> Budget:
+        """One unit's allowances, replayed from its dispositions on disk."""
+        return replay([a.disposition for a in self.attempts(unit_id)
+                       if a.disposition is not None],
+                      self.granted(unit_id), self.uncharged(unit_id))
+
+    def reply_generation(self, lane: str, mode: str) -> int:
+        """The open reply generation of one lane and mode, cached for one pass."""
+        if (lane, mode) not in self._reply_generations:
+            record = _read_json(self.rundir / engine.DISPATCH_DIR
+                                / f"{REPLY_GENERATIONS_PREFIX}{lane}-{mode}.json")
+            self._reply_generations[(lane, mode)] = (
+                max(0, record["closed"]) if isinstance(record, dict)
+                and isinstance(record.get("closed"), int) else 0)
+        return self._reply_generations[(lane, mode)]
+
+    def silent_pairs(self) -> dict[tuple[str, str], list[Attempt]]:
+        """The lane and mode pairs silent in their current reply generation: paused."""
+        return {(lane, mode): found for (lane, mode, generation), found
+                in sorted(self.silent().items())
+                if lane in self.lanes and generation == self.reply_generation(lane, mode)}
+
+    def reconcile_silence(self) -> None:
+        """Pause the run over a silent lane. Its units wait uncharged for a corrected
+        command, which only an operator can give and a restart picks up.
+
+        **The generation is closed in the same step that commits the pause.** A worker
+        still running would otherwise answer while the driver drains, make the paused
+        no-replies charge and publish an error, and stop the restart closing it."""
+        said = []
+        for (lane, mode), found in self.silent_pairs().items():
+            self._close_reply_generation(lane, mode, "the lane paused as silent")
+            self._silenced.add((lane, mode))
+            latest = max(found, key=lambda a: float((a.argv or {}).get("spawn_time") or 0.0))
+            said.append(f"lane {lane}'s {mode} command ended {len(found)} attempts with no "
+                        f"JSON object closing the reply, and no unit on it has had an "
+                        f"answer accepted, so the command is failing, not the units."
+                        f"{_reply_hint(latest.path, (latest.argv or {}).get('transcript'))}")
+        if said:
+            self.request_pause(" ".join(said) + " Those attempts charged nothing. Correct "
+                               "the command in the adapter file, then run the same command "
+                               "again")
+
+    def reset_silent_lanes(self) -> None:
+        """Open a new reply generation for each lane and mode the last run paused as
+        silent. Called at startup only: a restart is the operator saying the command is
+        corrected, and the old results must not pause it again before anything launches.
+        Those results stay uncharged, because their own generation is still silent."""
+        for (lane, mode), _found in self.silent_pairs().items():
+            # Only where a kill came between the silent disposition and the pause's own
+            # closure: the pause closes its generation itself.
+            self._close_reply_generation(lane, mode,
+                                         "this run was started again over a silent lane")
+            self.say(f"lane {lane}'s {mode} command: this run was started again, so its "
+                     f"units are eligible again and charged nothing for the pause")
+
+    def _close_reply_generation(self, lane: str, mode: str, by: str) -> None:
+        generation = self.reply_generation(lane, mode)
+        _write_json(self.rundir / engine.DISPATCH_DIR
+                    / f"{REPLY_GENERATIONS_PREFIX}{lane}-{mode}.json",
+                    {"closed": generation + 1, "closed_by": by,
+                     "at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())})
+        _progress(self.rundir, f"lane {lane} {mode} reply generation {generation} closed: {by}")
+        self.invalidate()
 
     def request_drain(self, reason: str) -> None:
         """Stop claiming, run-wide, and say why. Running attempts finish and the run exits
@@ -4117,16 +4910,45 @@ class Run:
         Below the floor the units are **not claimed**, never failed: a volume with no room
         is not a unit's answer, and a unit that was never claimed charges nothing and is
         still there when there is room again.
+
+        **Under ``writers`` above one, every writer still running is owed its room too**:
+        free space shows only what its copy holds so far, so its build margin — and its
+        copy, where that is not made yet — is counted before another is admitted. At one,
+        this is asked only while no writer runs, and the arithmetic is the single copy's.
         """
         free = free_bytes(self.rundir)
         if free is None:
             return ""
         needed = self.snapshot_bytes() + self.build_margin
-        available = free - self.disk_floor
+        owed, running = self.owed_to_running_writers()
+        available = free - self.disk_floor - owed
         if needed <= available:
             return ""
         return (f"a working copy needs about {needed} bytes and {free} are free, of which "
-                f"{self.disk_floor} are held back as a floor")
+                f"{self.disk_floor} are held back as a floor"
+                + (f" and {owed} are owed to {running} write-capable unit(s) still running"
+                   if running else ""))
+
+    def owed_to_running_writers(self) -> tuple[int, int]:
+        """``(bytes, count)``: what the write-capable attempts still running may yet take —
+        a build margin each, and a copy each whose copy is not made — or nothing at
+        ``writers`` 1, where no writer runs beside another."""
+        if run_writers(self.lanes)[0] <= 1:
+            return 0, 0
+        owed = running = 0
+        for unit in self.units():
+            if unit.get("kind") not in WRITE_CAPABLE_KINDS:
+                continue
+            for attempt in self.attempts(unit["id"]):
+                if not _reserves_capacity(attempt):
+                    continue
+                running += 1
+                owed += self.build_margin
+                token = (attempt.argv or {}).get("token")
+                if not (isinstance(token, str) and token
+                        and _is_directory(self.rundir / "work" / token)):
+                    owed += self.snapshot_bytes()
+        return owed, running
 
     # -- 5.4 copies ---------------------------------------------------------- #
     def candidate_severities(self) -> dict[str, int]:
@@ -4374,6 +5196,14 @@ class Run:
                     known.add(token)
                 elif not _record_absent(attempt.path / ARGV_NAME):
                     unreadable.append(f"{unit['id']} {attempt.name}")
+        # A smoke releases its own directories once it is judged, and is left unjudged
+        # while its worker may still be running, so only an unjudged one can be using them.
+        for attempt in self.smoke_attempts():
+            token = (attempt.argv or {}).get("token")
+            if isinstance(token, str) and attempt.disposition is None:
+                known.add(token)
+            elif not isinstance(token, str) and not _record_absent(attempt.path / ARGV_NAME):
+                unreadable.append(f"{attempt.unit} {attempt.name}")
         if unreadable:
             for name in unreadable:
                 if name in self._unreadable_said:
@@ -4512,6 +5342,18 @@ class Run:
             return
         if replay_publication(self.rundir, unit_id, self.grace):
             self.invalidate(unit_id)
+            return
+        # **A lane's first accepted answer makes its earlier no-replies charge.** They were
+        # judged uncharged, so none of them carries an error intention, and the unit may now
+        # have spent its allowances with nothing to publish them.
+        attempts = self.attempts(unit_id)
+        dispositions = [a.disposition for a in attempts if a.disposition is not None]
+        if (attempts and len(dispositions) == len(attempts)
+                and _intended(dispositions, self.granted(unit_id),
+                              self.uncharged(unit_id)) == "error"):
+            publish(self.rundir, unit_id, attempts[-1], "error",
+                    _exhaustion_reason(dispositions))
+            self.invalidate(unit_id)
 
     def adopt(self, only: Sequence[dict] | None = None) -> None:
         """Bring the run directory up to date without spawning anything.
@@ -4525,6 +5367,7 @@ class Run:
         # rather than the next: the record it gets is what step 2 reads.
         self.reap_children()
         self.invalidate()
+        answered_before = set(self.answered())
         for unit in (self.units() if only is None else only):
             unit_id = unit["id"]
             # 1. Replay unfinished publications. Never re-adjudicated: the disposition
@@ -4546,10 +5389,26 @@ class Run:
                     if _execution_ended(attempt):
                         _release_worker_paths(self.rundir, attempt,
                                               landed=attempt.name == answered)
+        # 3b. **An answer accepted in this pass can spend a unit it already passed over**:
+        #     the lane's first answer makes its no-replies charge. Every unit with a
+        #     no-reply in a lane, mode and generation that has just answered is asked again,
+        #     or the run stops with "no answer landed" over a unit whose error is due.
+        newly = self.answered() - answered_before
+        if newly:
+            for unit in self.units():
+                if any(_reply_key(attempt) in newly
+                       and (attempt.disposition or {}).get("outcome") == NO_REPLY
+                       for attempt in self.attempts(unit["id"])):
+                    self._finish_publication(unit["id"])
+        # 4b. A smoke a killed driver left is judged here once its status arrives, on every
+        #     pass a round polls with, so the breakers below read what it found.
+        self.reconcile_smokes()
         # 5. Recompute the breakers from what step 2 just wrote, and act on them. Last,
         #    because everything they are derived from is a disposition, and a pause read
         #    before this pass adjudicated would be one round out of date.
         self.reconcile_providers()
+        # 5b. A silent lane, from the same dispositions: a command failing on every unit.
+        self.reconcile_silence()
         # 6. A storage fault charged nothing and answered no unit; this is the half that
         #    stops the run. Beside the breakers because it is the same kind of step —
         #    derived state turning into a decision about the run rather than about a unit.
@@ -4592,6 +5451,7 @@ class Run:
             self.adopt(mine)
             self.save_budget()
             claimed = 0
+            smoked = False
             self._blocked_on_disk = ""
             if not (self.stop_requested() or self.over_budget()):
                 reserved = self.reserving()
@@ -4608,6 +5468,24 @@ class Run:
                     lane = unit.get("lane", engine.LANES[0])
                     claim, probe = self.claim_decision(unit, reserved, writers,
                                                        providers, probed)
+                    if claim and self.smoke_first and not self.smoke_clears(unit,
+                                                                            providers):
+                        # Here, at a claim, so a run with nothing left to launch spends
+                        # nothing on it. What the smoke decided is on disk, so the claim is
+                        # asked again of breakers that may now be paused or closed.
+                        smoked = self.smoke_for_claim(providers, probed,
+                                                      lane) or smoked
+                        if self.stop_requested():
+                            break
+                        providers = self.providers()
+                        if self.smoke_blocking(providers):
+                            break
+                        if not self.smoke_clears(unit, providers):
+                            # Its own lane's account is out; another lane's unit may go.
+                            continue
+                        reserved = self.reserving()
+                        claim, probe = self.claim_decision(unit, reserved, writers,
+                                                           providers, probed)
                     if not claim:
                         continue
                     if not self.spawn(unit, probe=probe):
@@ -4627,7 +5505,10 @@ class Run:
             # alive, which is a reservation nothing releases without an operator. Asking
             # about eligibility instead spins here forever on a run that should have
             # stopped and named the attempt nobody can account for.
-            if claimed == 0 and not self._in_flight(mine) and not self._waiting_to_probe(mine):
+            # A pass that ran a smoke has changed what is claimable, and a smoke a previous
+            # driver left still holds its lane's slot, so neither is a round that is over.
+            if claimed == 0 and not smoked and not self._in_flight(mine) \
+                    and not self._waiting_to_probe(mine) and not self.smoke_in_flight():
                 # **Nothing can run, and the reason may be the volume rather than the
                 # work.** A round that ends here with units held back for room would
                 # otherwise report them as units with no answer, which sends an operator to
@@ -4658,7 +5539,11 @@ class Run:
         lane = unit.get("lane", engine.LANES[0])
         if reserved.get(lane, 0) >= self.lanes[lane].slots:
             return False, False
-        if unit.get("kind") in WRITE_CAPABLE_KINDS and writers > 0:
+        if (unit.get("kind") in WRITE_CAPABLE_KINDS
+                and writers >= run_writers(self.lanes)[0]):
+            return False, False
+        mode = WRITE_CAPABLE if unit.get("kind") in WRITE_CAPABLE_KINDS else READ_ONLY
+        if (lane, mode) in self._silenced or (lane, mode) in self.silent_pairs():
             return False, False
         if not self.eligible(unit["id"]):
             return False, False
@@ -4808,6 +5693,8 @@ class Run:
             # restarted it. Inside the loop this would undo a recurrence as fast as the
             # breaker could find one.
             self.reset_drained_providers()
+            self.reset_silent_lanes()
+            self._synthesis_generation = generation
             return (self._run_rounds() if generation is None
                     else self._resynthesis_rounds(generation))
         except RunPaused as exc:
@@ -4897,7 +5784,9 @@ class Run:
         # them as quarantined would send an operator to `resolve-attempt` over a run
         # that needs nothing but to be started again.
         if self.stop_requested() or self.over_budget():
-            self.say((f"paused: {self.pause_reason}; the run is resumable"
+            # The pause printed its reason in full when it happened; repeating it here
+            # prints a long quote of the worker's reply twice.
+            self.say(("paused, for the reason above; the run is resumable"
                       if self.pause_reason else
                       (f"drained: {self.drain_reason}; the run is resumable"
                        if self.drain_reason else
@@ -5259,67 +6148,249 @@ def _generation_lines(run: Run) -> list[str]:
     return lines
 
 
-def status_report(run: Run) -> str:
-    """What the run directory says, and nothing else. Read-only by construction."""
-    lines = [f"run directory: {run.rundir}",
-             f"stage: {_marker(run.rundir)}",
-             f"budget spent: {run.spent() / 3600.0:.2f} h",
-             # Named here as well as at startup: an operator reaching for `status` is
-             # usually deciding whether to stop the run, and this is the path that does it.
-             f"to stop a run in this directory: create {run.drain_flag}"]
-    lines += _generation_lines(run)
-    lines.append("units planned, by kind:")
-    lines += [f"  {kind}: {total} unit(s)"
-              + (f", {held} of them over its lane's hard ceiling and never dispatched"
-                 if held else "")
-              for kind, total, held in kind_counts(run.units())]
+_SUMMARY_COLUMNS = ("landed", "running", "waiting", "failed")
+ENDED_UNJUDGED = "ended, awaiting adjudication"
+
+
+def _unit_progress(run: Run, unit: dict) -> str:
+    """Where one unit stands, as one word of the summary. A landed result is ``landed`` and
+    a landed error ``failed``; an unfinished unit with a worker out is ``running``, one
+    whose worker exited and is not yet judged is :data:`ENDED_UNJUDGED`, one an
+    operator has to release is ``held``, and the rest are ``waiting``. A record the host
+    would not give up is ``unreadable``, never a guess."""
+    unit_id = unit["id"]
+    try:
+        if unit_id in run.undispatched():
+            return "not dispatched"
+        record = landed(run.rundir, unit_id)
+        if record is not None:
+            return "landed" if record.get("publication") == "result" else "failed"
+        states = {attempt.state for attempt in run.attempts(unit_id)}
+        if RUNNING in states:
+            return "running"
+        # A status on disk and no disposition yet: the worker has exited and the next
+        # adoption pass judges it. Not running, and not yet anything else.
+        if DECIDED in states:
+            return ENDED_UNJUDGED
+        return "held" if run.quarantined(unit_id) else "waiting"
+    except DriverError:
+        return "unreadable"
+
+
+def _minutes(seconds: float) -> str:
+    return (f"{seconds / 3600.0:.1f} h" if seconds >= 7200.0
+            else f"{seconds / 60.0:.1f} min")
+
+
+def _summary_lines(run: Run, units: Sequence[dict]) -> list[str]:
+    """Per kind and lane, how many units landed, are running, are waiting and failed; then
+    the verifiers and an estimate of the time they still need.
+
+    **The estimate is a median and nothing more.** It is drawn from the supervisor's own
+    elapsed time for each verifier whose result landed, and says how many that is. It
+    multiplies by the waves the verifiers still to land need: a verifier is write-capable,
+    so at most ``writers`` run across both lanes and at most the smaller of that and its
+    lane's ``slots`` on one lane, and the slowest of those bounds sets the count. The
+    capacities are the ones the run's last driver recorded, else the adapter's, and the line
+    names them. It is printed as an estimate, never a promise."""
+    counts: dict[tuple[str, str], dict[str, int]] = {}
+    progress: dict[str, str] = {}
+    for unit in units:
+        where = progress[unit["id"]] = _unit_progress(run, unit)
+        row = counts.setdefault((str(unit.get("kind", "?")), str(unit.get("lane", "?"))), {})
+        row[where] = row.get(where, 0) + 1
+    lines = [f"summary, by kind and lane ({', '.join(_SUMMARY_COLUMNS)}):"]
+    for (kind, lane), row in counts.items():
+        extra = [f"{row[name]} {name}"
+                 for name in (ENDED_UNJUDGED, "held", "not dispatched", "unreadable")
+                 if row.get(name)]
+        lines.append(f"  {kind} {lane}: "
+                     + ", ".join(f"{row.get(name, 0)} {name}" for name in _SUMMARY_COLUMNS)
+                     + (f" ({', '.join(extra)})" if extra else ""))
+    if any(row.get("held") for row in counts.values()):
+        lines.append("  a held unit waits for resolve-unit or resolve-attempt; its line "
+                     "below says why")
+    verifiers = [unit for unit in units if unit.get("kind") == engine.VERIFIER_KIND]
+    if not verifiers:
+        lines.append("verifiers: not planned until route runs, so there is no estimate"
+                     if _marker(run.rundir) == engine.READING_STAGE
+                     else "verifiers: none planned")
+        return lines
+    done = [unit for unit in verifiers if progress[unit["id"]] == "landed"]
+    left = sum(1 for unit in verifiers
+               if progress[unit["id"]] in ("running", ENDED_UNJUDGED, "waiting", "held"))
+    if not done:
+        lines.append(f"verifiers: {len(verifiers)} planned, none landed yet, so there is "
+                     f"no estimate")
+        return lines
+    durations = []
+    for unit in done:
+        with contextlib.suppress(DriverError):
+            record = landed(run.rundir, unit["id"]) or {}
+            for attempt in run.attempts(unit["id"]):
+                elapsed = (attempt.status or {}).get("elapsed_s")
+                if (attempt.name == record.get("attempt")
+                        and isinstance(elapsed, (int, float))
+                        and not isinstance(elapsed, bool) and elapsed >= 0):
+                    durations.append(float(elapsed))
+    unknown = sum(1 for unit in verifiers if progress[unit["id"]] == "unreadable")
+    head = (f"verifiers: {len(verifiers)} planned, {len(done)} landed, {left} still to "
+            f"land" + (f", {unknown} could not be read and are not counted" if unknown
+                       else ""))
+    # A verifier whose records cannot be read may still be to land, so "nothing left"
+    # is only said when every verifier's state is known.
+    if not left and unknown:
+        lines.append(f"{head}, so whether any is still to land is unknown")
+        return lines
+    if not left:
+        lines.append(f"{head}, so there is nothing to estimate")
+        return lines
+    if not durations:
+        lines.append(f"{head}; none of the landed verifiers recorded how long it took, so "
+                     f"there is no estimate")
+        return lines
+    median = statistics.median(durations)
+    # The budget file of the run's own stages; a resynthesis generation runs no verifier.
+    # Unreadable, it falls back to the adapter's value rather than losing the estimate.
+    writers, slots = None, {}
+    with contextlib.suppress(DriverError):
+        writers, slots = recorded_capacity(run.rundir / BUDGET_NAME)
+    writers = writers or run_writers(run.lanes)[0]
+    on_lane: dict[str, int] = {}
+    for unit in verifiers:
+        if progress[unit["id"]] in ("running", ENDED_UNJUDGED, "waiting", "held"):
+            lane = str(unit.get("lane"))
+            on_lane[lane] = on_lane.get(lane, 0) + 1
+    per_lane = {lane: min(writers, slots.get(lane) or (run.lanes[lane].slots
+                                                        if lane in run.lanes else 1))
+                for lane in sorted(set(engine.LANES) | set(on_lane))}
+    waves = max([-(-left // writers)]
+                + [-(-count // per_lane[lane]) for lane, count in on_lane.items()])
+    at_once = ("one at a time across both lanes" if writers == 1
+               else f"up to {writers} at a time across both lanes, assuming "
+                    + " and ".join(f"lane {lane} up to {n}" for lane, n in per_lane.items())
+                    + " at a time")
+    lines.append(f"{head}; estimate, not a promise: about {_minutes(median * waves)} "
+                 f"({waves} x {_minutes(median)}, the median of {len(durations)} landed "
+                 f"verifier(s)), because verifiers run {at_once}")
+    return lines
+
+
+def _readable(lines: list[str], what: str, section: Callable[[], list[str]]) -> None:
+    """Append one section of `status`, or one line saying ``what`` could not be read.
+
+    **Each section stands alone**, because `status` is what an operator reaches for when a
+    run looks wrong, and the record that is wrong is the likeliest one to refuse a read.
+    One refusal ending the whole report would hide every part that could be read."""
+    try:
+        lines += section()
+    except (DriverError, engine.ReviewPanelError) as exc:
+        lines.append(f"{what} could not be read: {exc}")
+
+
+def _unit_lines(run: Run, unit: dict, protected: list[str],
+                evidence: list[str]) -> list[str]:
+    """One unit's line and one line per attempt; ``protected`` and ``evidence`` collect
+    the working directories it keeps."""
+    unit_id = unit["id"]
+    attempts = run.attempts(unit_id)
+    record = landed(run.rundir, unit_id)
+    where = (f"landed {record['publication']} from {record['attempt']}" if record
+             else UNDISPATCHED_STATUS if unit_id in run.undispatched()
+             else (run.quarantined(unit_id) or "open"))
+    lines = [f"  {unit_id} [{unit.get('kind')}/{unit.get('lane')}] {where}"]
+    for attempt in attempts:
+        outcome = (attempt.disposition or {}).get("outcome", "")
+        lines.append(f"    {attempt.name}: {attempt.state}"
+                     + (f" ({outcome})" if outcome else ""))
+        if record is not None and not _execution_ended(attempt):
+            protected.append(f"{unit_id} {attempt.name}")
+        token = (attempt.argv or {}).get("token")
+        if (record is not None and record.get("attempt") == attempt.name
+                and isinstance(token, str) and token
+                and _is_directory(run.rundir / "work" / token)
+                and keeps_evidence(attempt)):
+            evidence.append(f"{unit_id} {attempt.name} -> work/{token}")
+    return lines
+
+
+def _pause_lines(run: Run) -> list[str]:
+    lines = []
     for account, state in sorted(run.providers().items()):
         if state.paused:
             lines.append(f"provider {account} is paused at generation {state.generation}: "
                          f"{state.paused}")
         if state.drain:
             lines.append(f"provider {account} stops this run: {state.drain}")
+    return lines
+
+
+def _silent_lines(run: Run) -> list[str]:
+    """The pauses a restart has not yet launched past. An attempt in the generation the pause
+    reopened shows a corrected command is running, so naming the pause then would send an
+    operator to stop a healthy run."""
+    launched_since = {_reply_key(attempt) for unit in run.units()
+                      for attempt in run.attempts(unit["id"])}
+    return [f"lane {lane}'s {mode} command paused in reply generation {generation}: "
+            f"{len(found)} attempts with no reply and no answer accepted, charged nothing"
+            for (lane, mode, generation), found in sorted(run.silent().items())
+            if generation == run.reply_generation(lane, mode) - 1
+            and (lane, mode, generation + 1) not in launched_since]
+
+
+def _dropped_lines(run: Run) -> list[str]:
+    """What the retention cap removed. Read from the run's own record rather than derived,
+    because a deleted copy leaves nothing to derive it from — which is the whole reason the
+    record exists."""
+    record = _read_json(run.rundir / engine.DISPATCH_DIR / COPIES_RECORD_NAME)
+    dropped = record.get("dropped") if isinstance(record, dict) else None
+    return [f"dropped over the retention cap: {entry.get('unit')} {entry.get('attempt')} "
+            f"({entry.get('severity')}, {entry.get('bytes')} bytes) at {entry.get('at')}"
+            for entry in (dropped if isinstance(dropped, list) else [])
+            if isinstance(entry, dict)]
+
+
+def status_report(run: Run) -> str:
+    """What the run directory says, and nothing else. Read-only by construction."""
+    lines = [f"run directory: {run.rundir}"]
+    _readable(lines, "the stage", lambda: [f"stage: {_marker(run.rundir)}"])
+    lines.append("budget spent: unknown, " + run.budget_unreadable if run.budget_unreadable
+                 else f"budget spent: {run.spent() / 3600.0:.2f} h")
+    # Named here as well as at startup: an operator reaching for `status` is usually
+    # deciding whether to stop the run, and this is the path that does it.
+    lines.append(f"to stop a run in this directory: create {run.drain_flag}")
+    try:
+        units = run.units()
+    except DriverError as exc:
+        lines.append(f"the unit listing could not be read, so unit counts are unknown: "
+                     f"{exc}")
+        units = None
+    if units is not None:
+        lines += _summary_lines(run, units)
+    _readable(lines, "the synthesis generations", lambda: _generation_lines(run))
+    if units is not None:
+        lines.append("units planned, by kind:")
+        lines += [f"  {kind}: {total} unit(s)"
+                  + (f", {held} of them over its lane's hard ceiling and never dispatched"
+                     if held else "")
+                  for kind, total, held in kind_counts(units)]
+        _readable(lines, "provider pauses", lambda: _pause_lines(run))
+        _readable(lines, "lane pauses", lambda: _silent_lines(run))
     protected: list[str] = []
     evidence: list[str] = []
-    for unit in run.units():
-        unit_id = unit["id"]
-        attempts = run.attempts(unit_id)
-        record = landed(run.rundir, unit_id)
-        where = (f"landed {record['publication']} from {record['attempt']}" if record
-                 else UNDISPATCHED_STATUS if unit_id in run.undispatched()
-                 else (run.quarantined(unit_id) or "open"))
-        lines.append(f"  {unit_id} [{unit.get('kind')}/{unit.get('lane')}] {where}")
-        for attempt in attempts:
-            outcome = (attempt.disposition or {}).get("outcome", "")
-            lines.append(f"    {attempt.name}: {attempt.state}"
-                         + (f" ({outcome})" if outcome else ""))
-            if record is not None and not _execution_ended(attempt):
-                protected.append(f"{unit_id} {attempt.name}")
-            token = (attempt.argv or {}).get("token")
-            if (record is not None and record.get("attempt") == attempt.name
-                    and isinstance(token, str) and token
-                    and _is_directory(run.rundir / "work" / token)
-                    and keeps_evidence(attempt)):
-                evidence.append(f"{unit_id} {attempt.name} -> work/{token}")
+    for unit in units or ():
+        _readable(lines, f"  {unit['id']} [{unit.get('kind')}/{unit.get('lane')}]",
+                  lambda unit=unit: _unit_lines(run, unit, protected, evidence))
     if protected:
         lines.append("protected working directories, kept because their execution cannot "
                      "be shown to have ended: " + ", ".join(protected))
     if evidence:
         lines.append("working copies kept because the verdict they landed names a run that "
                      "was executed: " + ", ".join(evidence))
-    # What the retention cap removed. Read from the run's own record rather than derived,
-    # because a deleted copy leaves nothing to derive it from — which is the whole reason
-    # the record exists.
-    record = _read_json(run.rundir / engine.DISPATCH_DIR / COPIES_RECORD_NAME)
-    dropped = record.get("dropped") if isinstance(record, dict) else None
-    for entry in dropped if isinstance(dropped, list) else []:
-        if isinstance(entry, dict):
-            lines.append(f"dropped over the retention cap: {entry.get('unit')} "
-                         f"{entry.get('attempt')} ({entry.get('severity')}, "
-                         f"{entry.get('bytes')} bytes) at {entry.get('at')}")
-    short = run.headroom()
-    if short:
-        lines.append(f"no write-capable unit can be claimed: {short}")
+    _readable(lines, "the retention record", lambda: _dropped_lines(run))
+    _readable(lines, "the disk headroom",
+              lambda: [f"no write-capable unit can be claimed: {short}"
+                       for short in [run.headroom()] if short])
     return "\n".join(lines) + "\n"
 
 
@@ -5525,8 +6596,8 @@ def _dispatch(args: argparse.Namespace) -> int:
         # driver is writing into it, so a line or two may be a moment stale; every other
         # command here takes the lock, because every other command writes.
         run = Run(rundir, load_adapter_config(args.adapter) if args.adapter
-                  else _placeholder_lanes(), default_supervisor(), grace=args.grace,
-                  given=Path(args.rundir).absolute())
+                  else _placeholder_lanes(rundir), default_supervisor(), grace=args.grace,
+                  given=Path(args.rundir).absolute(), tolerate_unreadable_budget=True)
         sys.stdout.write(status_report(run))
         return EXIT_OK
     with lock:
@@ -5543,13 +6614,34 @@ def _dispatch(args: argparse.Namespace) -> int:
         return EXIT_OK
 
 
-def _placeholder_lanes() -> dict[str, LaneSpec]:
+def _placeholder_lanes(rundir: Path | None = None) -> dict[str, LaneSpec]:
     """A configuration `status` can be constructed with. It reads the run directory and
-    spawns nothing, so the commands it would have rendered are not its business."""
+    spawns nothing, so the commands it would have rendered are not its business.
+
+    **The `writers` the run was driven with, where its budget file records one**: the disk
+    headroom check owes room to every writer still running only above one, and a default
+    of one would leave out the warning the driver itself acts on. The newest resynthesis
+    generation's budget file wins, because a resynthesis runs only once the run is over."""
+    writers = None
+    if rundir is not None:
+        generations = []
+        with contextlib.suppress(OSError):
+            for path in rundir.glob("budget-g*.json"):
+                match = re.fullmatch(r"budget-g(\d+)\.json", path.name)
+                if match:
+                    generations.append(int(match.group(1)))
+        for name in [generation_budget_name(n) for n in sorted(generations, reverse=True)]\
+                + [BUDGET_NAME]:
+            with contextlib.suppress(DriverError):
+                writers, _slots = recorded_capacity(rundir / name)
+            if writers:
+                break
     mode = ModeSpec(command=("⟪prompt⟫",), permission="not read here",
                     result_mode="stream-transcript", idle=900.0, deadline=3600.0)
     return {lane: LaneSpec(runtime="", model="", account="", adapter="",
-                           modes={READ_ONLY: mode, WRITE_CAPABLE: mode})
+                           modes={READ_ONLY: mode, WRITE_CAPABLE: mode},
+                           **({"writers": writers, "writers_stated": True} if writers
+                              else {}))
             for lane in engine.LANES}
 
 
@@ -5850,9 +6942,18 @@ def _preview(rundir: Path, lanes: dict[str, LaneSpec]) -> str:
     copied = _copied_outside_scope(rundir) + _no_test_warning(rundir)
     if copied:
         lines.append(copied.rstrip("\n"))
+    for lane, spec in lanes.items():
+        missing = markers_missing_from_write_capable(spec.modes[READ_ONLY].command,
+                                                     spec.modes[WRITE_CAPABLE].command)
+        if missing:
+            shown = ", ".join(f"{PLACEHOLDER_OPEN}{m}{PLACEHOLDER_CLOSE}" for m in missing)
+            lines.append(f"warning: lane {lane}'s write-capable command lacks {shown}, which "
+                         f"its read-only command uses; a runtime that reads only the "
+                         f"directories it is given will not reach what it names")
     for kind, total, _held in sorted(kind_counts(units)):
         lines.append(f"  {kind}: {total}")
     lines.append("")
+    writers, writers_stated = run_writers(lanes)
     for lane, spec in lanes.items():
         mine = [u for u in units if u.get("lane", engine.LANES[0]) == lane]
         shared = sum(1 for u in mine if u.get("kind") in WRITE_CAPABLE_KINDS)
@@ -5861,17 +6962,26 @@ def _preview(rundir: Path, lanes: dict[str, LaneSpec]) -> str:
                      f"{'' if spec.slots_stated else ' (the default; set slots to change it)'}; "
                      f"{free} unit(s) run up to "
                      f"{spec.slots} at a time, in about {-(-free // spec.slots)} "
-                     f"wave(s)" + (f"; {shared} write-capable unit(s) run one at a time"
-                                   if shared else ""))
+                     f"wave(s)" + (f"; {shared} write-capable unit(s) share the run-wide "
+                                   f"writers limit" if shared else ""))
         # Which lanes pause together: an outage pauses every lane on its account.
         together = [other for other, theirs in lanes.items()
                     if other != lane and theirs.account == spec.account]
         lines.append(f"  account {spec.account!r}"
                      + (f", shared with lane {', '.join(together)}: an outage pauses both"
                         if together else ""))
-    lines.append(f"Write-capable units ({', '.join(sorted(WRITE_CAPABLE_KINDS))}) run one at "
-                 f"a time across both lanes, whatever the slots say: they build and run the "
-                 f"tree, and separate copies still share ports, caches and credentials.")
+    kinds = ", ".join(sorted(WRITE_CAPABLE_KINDS))
+    if writers > 1:
+        lines.append(f"Write-capable units ({kinds}) run up to {writers} at a time across "
+                     f"both lanes (writers: {writers}, as the adapter sets it), each lane "
+                     f"within its slots. They build and run the tree, and separate copies "
+                     f"still share ports, caches and credentials, so this is the operator's "
+                     f"claim that those do not collide; the report prints it.")
+    else:
+        stated = "" if writers_stated else ", the default; set writers to change it"
+        lines.append(f"Write-capable units ({kinds}) run one at a time across both lanes "
+                     f"(writers: 1{stated}), whatever the slots say: they build and run the "
+                     f"tree, and separate copies still share ports, caches and credentials.")
     lines.append("")
     lines.append("Nothing was dispatched: pass --go to run it.")
     return "\n".join(lines) + "\n"

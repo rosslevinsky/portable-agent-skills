@@ -1,0 +1,6 @@
+# A vendored copy of a kit folder: the kit tag it was copied from, that tag's
+# commit, and a hash of the copy. Written by the sync; the drift check compares the
+# copy with it.
+tag = "v2026.11.0"
+commit = "69d7462ba7da88e324693a78417ee7683dc08cbe"
+hash = "sha256:a045d30238e9dae9e861f09ea6e3759ed4b0b98cd95f2f15201110b64bdbf1d9"

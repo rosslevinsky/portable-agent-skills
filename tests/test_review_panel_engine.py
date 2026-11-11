@@ -9543,6 +9543,119 @@ class TheAdapterLinesRenderAlikeWhateverTheDispatcherTyped(_ReportCase):
         self.assertEqual(lines[at + 2].strip(), "workspace-write under <copy>")
 
 
+class TheReportPrintsWritersBesideThePermissions(_ReportCase):
+    """`writers` is the operator's claim that write-capable units running at once do not
+    collide, so the report prints it beside the permission text, as the dispatcher
+    recorded it. A record written before it existed prints no such line."""
+
+    def how(self, **extra):
+        self.setUp()
+        self.run_all(dispatch={**DISPATCH, **extra})
+        return " ".join(_section(self.text(), "How this ran").split())
+
+    def test_the_adapter_section_shows_writers(self):
+        how = self.how(writers=3)
+        self.assertIn("Write-capable units at once, across both lanes: up to 3 (writers, "
+                      "as set for the driver that finished the run)", how)
+        self.assertLess(how.index("Lane B permission"), how.index("Write-capable units at"))
+
+    def test_one_writer_is_said_as_one_at_a_time(self):
+        self.assertIn("Write-capable units at once, across both lanes: one at a time",
+                      self.how(writers=1))
+
+    def test_a_record_without_writers_prints_no_line(self):
+        self.assertNotIn("Write-capable units at once", self.how())
+
+    def test_an_invalid_writers_is_refused_by_name(self):
+        for bad in (0, -2, 1.5, True, "2", None):
+            with self.subTest(writers=bad):
+                with self.assertRaises(review_panel.DispatchError) as ctx:
+                    review_panel.parse_dispatch({**DISPATCH, "writers": bad})
+                self.assertIn("'writers'", str(ctx.exception))
+        self.assertEqual(review_panel.parse_dispatch({**DISPATCH, "writers": 2}).writers, 2)
+
+
+class TheReportCountsEachLanesVerdictsByEvidence(unittest.TestCase):
+    """Each lane's verdicts, counted by the kind of evidence behind them, beside that
+    lane's permission: a lane that could not run a command shows it in the counts. A
+    verdict belongs to the lane whose verifier issued it, and only an answered verdict is
+    counted, so the counts sum to the verdicts that lane returned."""
+
+    INVENTORY = {"files": ["a.py"], "source": "files", "tree_sha256": "0" * 64,
+                 "excluded": [], "skipped": []}
+
+    @staticmethod
+    def verdict(lane, status, kind=..., answered=True):
+        """``kind`` ``...`` is no evidence at all; ``None`` is evidence stating no kind."""
+        evidence = None
+        if kind is not ...:
+            evidence = {"argv": ["true"], "cwd": ".", "exit_code": 0, "output": ""}
+            if kind is not None:
+                evidence[review_panel.RUN_KIND_KEY] = kind
+        return {"status": status, "evidence": evidence, "answered": answered,
+                "verified_by": {"lane": lane, "unit": f"verify-{lane}"}}
+
+    def record(self, candidates, coverage=()):
+        findings = review_panel.Findings(
+            rung="two-runtimes", synthesis=None, commit={}, candidates=tuple(candidates),
+            sites=(), defects=(), clustering=(), coverage=tuple(coverage))
+        return review_panel._how_it_ran_record(
+            None, review_panel.parse_dispatch(DISPATCH), findings, self.INVENTORY)
+
+    def lane(self, record, name):
+        return next(entry for entry in record["lanes"] if entry["lane"] == name)
+
+    def how(self, record):
+        return " ".join("".join(review_panel._render_how_it_ran(record)).split())
+
+    def test_a_lane_that_ran_nothing_shows_its_verdicts_as_no_command_evidence(self):
+        record = self.record([self.verdict("A", "confirmed_by_reading"),
+                              self.verdict("A", "unresolved"),
+                              self.verdict("A", "confirmed_by_reading"),
+                              self.verdict("B", "reproduced", "executed")])
+        self.assertEqual(self.lane(record, "A")["verdicts"],
+                         {"counts": [["executed", 0], ["documentary", 0]], "unstated": 0,
+                          "none": 3})
+        how = self.how(record)
+        self.assertIn("Lane A verdicts, by the evidence behind them: 0 executed, "
+                      "0 documentary, 3 with no command evidence.", how)
+        self.assertLess(how.index("Lane A permission"), how.index("Lane A verdicts"))
+        self.assertLess(how.index("Lane A verdicts"), how.index("Lane B adapter"))
+
+    def test_mixed_evidence_sums_to_the_lanes_verdicts(self):
+        verdicts = [self.verdict("B", "reproduced", "executed"),
+                    self.verdict("B", "reproduced", "executed"),
+                    self.verdict("B", "confirmed_by_reading", "documentary"),
+                    self.verdict("B", "refuted"),
+                    # Evidence with no run_kind: counted as unstated, not as no evidence.
+                    self.verdict("B", "reproduced", None),
+                    # Never answered: the stand-in is the engine's, not a verdict.
+                    self.verdict("B", "unresolved", answered=False),
+                    self.verdict("A", "reproduced", "executed")]
+        coverage = [self.verdict("B", "gap_confirmed", "documentary")]
+        record = self.record(verdicts, coverage)
+        counts = self.lane(record, "B")["verdicts"]
+        # The verdict whose evidence states no kind still ran a command: it is counted as
+        # unstated, as the Runs line counts it, never as no command evidence.
+        self.assertEqual(counts, {"counts": [["executed", 2], ["documentary", 2]],
+                                  "unstated": 1, "none": 1})
+        answered = [v for v in (*verdicts, *coverage)
+                    if v["answered"] and v["verified_by"]["lane"] == "B"]
+        self.assertEqual(sum(n for _, n in counts["counts"]) + counts["unstated"]
+                         + counts["none"], len(answered))
+        self.assertIn("Lane B verdicts, by the evidence behind them: 2 executed, "
+                      "2 documentary, 1 of a kind the verdict did not state, "
+                      "1 with no command evidence.", self.how(record))
+        self.assertEqual(self.lane(record, "A")["verdicts"],
+                         {"counts": [["executed", 1], ["documentary", 0]], "unstated": 0,
+                          "none": 0})
+
+    def test_a_lane_with_no_verdicts_says_none_were_returned(self):
+        how = self.how(self.record([self.verdict("A", "refuted")]))
+        self.assertIn("Lane B verdicts, by the evidence behind them: none returned.", how)
+        self.assertIsNone(review_panel.parse_dispatch(DISPATCH).writers)
+
+
 class DispatchJsonIsParsedStrictly(_ReportCase):
     """``dispatch.json`` is the dispatcher's record of what ran each lane; the report states
     it and nothing stronger, so it is parsed by name like the job."""

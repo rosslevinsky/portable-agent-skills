@@ -837,3 +837,64 @@ every command as an argv list, so a consumer can build any shell's form from it.
 runner showing that 5.1 changes an argument the note does not mark moves the mark, not the
 form. The mark already covers an argument holding whitespace and ending in a backslash: 5.1
 quotes it without doubling the backslash, which then escapes the closing quote.
+
+## A unit that published an error is not reopened
+
+**Proposed.** A lane command that failed on every unit could publish an error for each before
+anyone corrected it, and a resolution is written once, so those units cannot run again. A
+reader expects a `resolve-unit --reopen` that undoes the error and lets the corrected command
+retry.
+
+**Declined, as a scope decision.** Two guards stop the commonest such command, one that
+cannot reach its directories or never closes its answer, before it exhausts every unit: the
+smoke test stops a command that cannot read its input or write its output before
+any unit launches, and a lane and mode that has never had an answer accepted charges nothing
+for a `no-reply` and pauses after two. They do not cover every command that fails on every
+unit. One that closes each reply with an object the unit's schema refuses is `refused`,
+which charges, and so is one that fails on some units only — a wrapper that cuts long
+output short passes the smoke test and lands short answers, so its lane has an accepted
+answer, and a long answer that loses its closing object then charges and can exhaust its
+unit. Both are rarer than a command that cannot reach its directories. The recovery is
+`route --redo` for a verifier or a later unit, and a new run for a reader, whose error
+`route --redo` keeps.
+
+**What would change it.** Either case occurring in practice. The fix is then `--reopen`
+written as a resolution of its own, recorded beside the error it supersedes, so the rule that
+a resolution is written once still holds.
+
+## `writers` is the operator's claim, not something the driver checks
+
+**Proposed.** Running more than one write-capable unit at once is safe only when their work
+does not collide: separate copies of the tree still share ports, caches, credentials and
+anything the build writes outside the copy. A reader expects the driver to detect that, or
+to isolate the units further, before it lets `writers` rise above one.
+
+**Declined.** Nothing the driver can see answers it. Whether two builds of this tree can run
+side by side depends on the tree and the machine, which the operator knows and the driver
+does not. So the default is one at a time, a higher value is the operator saying the units
+do not collide, and the preview, `dispatch.json` and the report print the value that ran, so
+the claim travels with every verdict it covers. The driver enforces what it can measure: the
+count, each lane's `slots`, and disk headroom for every writer still running.
+
+**What would change it.** A way to run a write-capable unit that isolates it from the others
+by construction, such as a container per unit, which would make the claim unnecessary rather
+than checked.
+
+## The driver has no runtime-specific checks; the smoke test is the check
+
+**Proposed.** A runtime can refuse to read outside the directories its command grants, so a
+reader expects the driver to recognize that runtime's command and require the flag that grants
+the input directory, or to read its refusal text.
+
+**Declined.** A lane's commands are data, and the driver names no product. A rule keyed on one
+runtime's flags or wording breaks the day that runtime changes either, says nothing about the
+next runtime, and makes the driver the place a runtime's behavior is tracked. The smoke test
+asks the question every runtime has to answer — can this command read what the unit is
+given and write where it is told — by having the worker do exactly that, and Python judges
+the result. The preview's warning compares a lane's two commands against each other, which
+holds for any runtime. A runtime's own wording stays in the adapter, as
+`provider_fault_patterns` already does.
+
+**What would change it.** A failure the smoke test cannot reach because it is specific to one
+runtime and invisible in a small task. Even then, the fix is a better generic check, not a
+named one.

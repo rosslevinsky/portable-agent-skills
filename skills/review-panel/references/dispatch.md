@@ -44,7 +44,8 @@ builds and reproductions and write — so each lane declares two commands.
         "permission": "edit tools blocked; an incidental write by a command judged read-only can still land"
       },
       "write_capable": {
-        "command": ["runtime-b", "--print", "⟪prompt⟫", "--add-dir", "⟪cwd⟫", "--allow-edits"],
+        "command": ["runtime-b", "--print", "⟪prompt⟫", "--add-dir", "⟪input⟫",
+                    "--add-dir", "⟪cwd⟫", "--allow-edits"],
         "permission": "writes confined to the disposable copy it is given"
       }
     }
@@ -58,7 +59,10 @@ Lane B above takes every default.
 the run directory, which must be outside every repository. A runtime that refuses to start
 outside a repository or a folder it trusts has to be told to skip that check in both of the
 lane's commands — Codex's `exec` takes `--skip-git-repo-check` — or every attempt fails in
-seconds and the lane pauses having read nothing.
+seconds and the lane pauses having read nothing. A runtime that reads only the directories
+it is given needs `⟪input⟫` named in **both** commands: Claude Code refuses a read outside
+them and exits 0, so each of its commands carries `--add-dir ⟪input⟫`. The preview warns
+when a write-capable command lacks a marker its read-only command uses.
 
 - `lanes` holds exactly `A` and `B`. `runtime`, `adapter` and both mode objects are
   required, and `model` unless a `backend` states it; `slots` defaults to 2, `account` to the
@@ -66,9 +70,14 @@ seconds and the lane pauses having read nothing.
 - `slots` is how many of the lane's workers run at once, and it decides how long the run
   takes. The right number is the account's rate limit, so tell the owner the default and ask
   whether they want another; the preview marks a defaulted lane. A resume may change it.
-  **Write-capable units run one at a time across both lanes whatever it says**, because
-  separate copies still share ports, caches and credentials; the slots speed up the reading,
-  auditing and clustering rounds. The preview prints each lane's share of the work.
+  **Write-capable units run one at a time across both lanes whatever it says, unless
+  `writers` says more**; the slots speed up the reading, auditing and clustering rounds.
+  The preview prints each lane's share of the work.
+- `writers`, beside `lanes`, is how many write-capable units run at once across both lanes,
+  each lane still within its `slots`. It defaults to 1, because separate copies still share
+  ports, caches and credentials; more is the operator's claim that their builds and runs do
+  not collide, and the preview and the report print it. A resume may change it, and the
+  report prints the value of the driver that finished the run.
 - `adapter` is free text and is rendered verbatim in the report, so write what a reader
   months later needs: the mechanism, not just the product.
 - `account` is what an outage is counted against. Two lanes on one subscription share an
@@ -102,7 +111,8 @@ seconds and the lane pauses having read nothing.
   the report says the overview is incomplete.
 - Each mode object takes `command` and `permission`, and optionally `result_mode`
   (default `stream-transcript`), `idle` (900 s) and `deadline` (3600 s). An hour is not
-  generous: a reader on a slower model can take more than half of one.
+  generous: a reader on a slower model can take more than half of one. A resume may change
+  a lane's commands whether or not the run paused; attempts launched after it use them.
 - `permission` is free text too, and the report prints both modes side by side. The engine
   cannot verify a sandbox, so it renders the claim rather than a vocabulary it could not
   check — which means an inaccurate one is a false statement in the report.
@@ -214,6 +224,16 @@ restore the permission, restart the provider, and run the same command again. A 
 provider's message quotes the end of the latest failing attempt's `display.log`, which is
 where a runtime that would not start says why; a lane's commands may be corrected before
 the same command is run again.
+
+Before its first unit, every `--go`, a resume included, smoke-tests each lane and mode, and
+`resynthesize` those it can launch: the worker reads a string the driver wrote under
+`⟪input⟫` and ends its reply with it, and a write-capable worker also writes it into an
+empty `⟪cwd⟫`. A command that fails pauses the run with nothing charged, quoting the end of
+its reply, or of its `display.log` where it never replied, under `dispatch/smoke/`. A provider refusal pauses the account and holds only that lane's
+units; the other lane's go on. Past the
+smoke, a lane and mode that has had no answer accepted and ends two attempts without a
+closing object pauses the run the same way: those attempts charge nothing, and a restart
+gives the corrected command a fresh count.
 
 One ending is neither, and it names a lane: *lane B landed no unit*. That lane answered
 none of the units it was given, so nothing it was asked to read reached the run and every

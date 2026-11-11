@@ -8,6 +8,73 @@ Versions use [Calendar Versioning](https://calver.org/) in the form
 A MICRO bump in the same month indicates a follow-up release; a new month
 starts from `.0` again.
 
+## [2026.11.0] - 2026-11-11
+
+### Changed
+
+- **Action needed if a lane of your `/review-panel` adapter file runs Claude Code:** add
+  `"--add-dir", "⟪input⟫"` to **both** of that lane's commands, read-only and
+  write-capable. Type `⟪input⟫` exactly as shown: like `⟪prompt⟫` and `⟪cwd⟫`, it is a
+  marker the driver replaces with the worker's input directory. Keep any `⟪cwd⟫` your
+  write-capable command already names. Claude Code 2.1.322 and later will not read outside
+  the directories it is given, and still exits as if it had succeeded, so without the flag
+  no worker on that lane can read its task. The run now stops at its start-up test, below,
+  until you add it. The example adapter in `skills/review-panel/references/dispatch.md`
+  shows where the flag goes. Other runtimes need no change unless they, too, read only the
+  directories they are named. If a run under the previous release already recorded units
+  as errors because that lane could not read its tasks, fixing the command and resuming
+  does not retry them. For verifiers and later units, run `review_panel.py route <run
+  directory> --redo`, which discards every round after reading, then run the same `--go`
+  command again. Errors in the reading round, which includes coverage auditors and the
+  capability probe, are kept even then, so a run with any of those needs a new run.
+- **`/review-panel` tests each lane's commands before it starts any real work.** At the
+  start of every `--go` that has work to launch, a resumed run included, each lane runs one
+  small task in each of its two modes: read a file the driver wrote, and in
+  write-capable mode also write a file. A `resynthesize` tests only the lanes and modes its
+  synthesis will use. That is up to four short model calls per start. If
+  a command fails the test, the run pauses before any unit starts and uses none of any
+  unit's retries. It names the lane and mode and quotes what the worker replied. Fix the
+  command in your adapter file and run the same command again. If a lane's provider is down
+  instead, that lane's units wait while the other lane's go on, unless both lanes use the
+  same account, in which case both wait. If the provider is still down when the driver
+  next tries it, the run stops, and you run the same command again once the provider is
+  back. The preview, which a run prints before `--go`, also warns when
+  a lane's write-capable command lacks a marker, such as `⟪input⟫`, that its read-only
+  command uses.
+- **A lane whose worker never ends its reply with an answer now pauses the run instead of
+  failing every unit.** This is a reply that finishes without the closing JSON object the
+  worker was asked for, usually because the command is wrong. Before, each such reply used
+  one of the unit's retries, and once the retries ran out the unit was recorded as an error.
+  Now, if a lane and mode has never produced an accepted answer, two such replies pause the
+  run, and neither uses a retry. Fix the command and run the same command again; the
+  corrected command gets a fresh count. Once a lane and mode has produced an accepted
+  answer, such a reply uses a retry as before.
+- **`/review-panel status` opens with a summary.** For each kind of unit (readers,
+  verifiers, and so on) and each lane, it shows how many have finished, are running, are
+  waiting, and have failed. Once verification is planned, it also shows how many verifiers
+  there are, with an estimate of the time they still need, based on the ones already
+  finished. If it cannot read part of the run's records, it still prints what it can.
+- **When `--go` refuses a run directory that holds part of an earlier run but no plan,**
+  and that part includes the earlier run's read-only copy of your files, the message now
+  gives the command that makes the directory removable on your platform.
+
+### Added
+
+- **`/review-panel` can run more than one write-capable unit at once.** Write-capable units
+  are the ones that may build or run code in their own copy of your files: verifiers, the
+  synthesis, and the capability probe. Set `writers` in the adapter file, beside `lanes`,
+  to a whole number of 1 or more, for example `"writers": 2`. The default is still 1, because
+  separate copies of your files still share ports, caches and credentials. A higher number
+  is your statement that your builds and test runs do not collide; if they do, verifiers
+  can fail or reach wrong verdicts. Each lane still runs no more than its `slots` at once.
+  The preview and the report show the value the run used, and a `resynthesize` records the
+  value it ran with.
+- **The report counts each lane's verdicts by the command evidence behind them**: how many
+  rest on a command that ran the code under review, how many on a command that only looked,
+  such as a search, how many on a command whose kind the verdict did not state, and how many
+  on no command at all, which includes a verdict confirmed by reading alone. A lane that
+  could not run commands stands out at a glance.
+
 ## [2026.10.3] - 2026-10-17
 
 ### Added
@@ -1010,6 +1077,7 @@ release](README.md#installing-a-previous-release) to return to it.
 
 Initial release.
 
+[2026.11.0]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.11.0
 [2026.10.3]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.10.3
 [2026.10.2]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.10.2
 [2026.10.1]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.10.1

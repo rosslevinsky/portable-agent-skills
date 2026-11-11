@@ -1,0 +1,52 @@
+name: Already tested
+description: >-
+  Answers whether a green run of the named workflow already checked out this exact tree, so a
+  push to main that merges a tested pull request can skip its test jobs. The caller keeps the
+  `if:` on each test job, and uploads the receipt artifact (RECEIPT-<tree>) from a test job.
+
+# This action runs only from a vendored copy, as a local action under .github/actions/kit/, which
+# the calling job checks out first. Its first step checks the copy against kit.lock.
+#
+# The job that calls this needs `contents: read`, `pull-requests: read` and `actions: read`, and
+# should run it only on a push: a pull request's merge tree can equal its head while the head is
+# exactly what hasn't been tested.
+inputs:
+  workflow:
+    description: The calling workflow's file name, such as `verify.yml`.
+    required: true
+  receipt:
+    description: >-
+      The receipt artifact's name without the tree: a green run proves this tree only if it
+      uploaded `<receipt>-<tree>`. The caller builds it, so it can name more than the tree.
+    required: true
+  token:
+    description: The token gh reads the API with.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  already:
+    description: "`true` when a green run already checked out this tree; otherwise `false`."
+    value: ${{ steps.proved.outputs.already }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check the vendored copy against its lock
+      shell: bash
+      run: python3 "$GITHUB_ACTION_PATH/../check_copy.py"
+
+    # This commit and its parents: two is enough to read a merge's second parent.
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: 2
+        persist-credentials: false
+
+    - name: Look for a green run of this tree
+      id: proved
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        WORKFLOW: ${{ inputs.workflow }}
+        RECEIPT: ${{ inputs.receipt }}
+      run: python3 "$GITHUB_ACTION_PATH/ci_skip.py"

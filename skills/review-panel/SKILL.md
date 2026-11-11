@@ -170,9 +170,9 @@ somebody changing them, and no step of a run sends you there.
 Every worker is a fresh process that was supplied no peer's answer, and nothing it is
 handed names the unit that raised what it is checking. Workers are **not** prevented from
 reading the run directory: blindness is a property of what each one is given, not of what it
-could reach. Reproductions are serialized, one at a time across both lanes, because separate
-directories are not separate ports, caches or credentials — and a failure that is the
-environment's stays `unresolved` rather than becoming a verdict.
+could reach. Reproductions run one at a time across both lanes unless the operator set
+`writers`, because separate directories are not separate ports, caches or credentials — and
+a failure that is the environment's stays `unresolved` rather than becoming a verdict.
 
 The rung the report names follows **the configuration, which is pinned for the life of the
 run**: a resume naming a different runtime, model or backend is refused by name, so no lane quietly
