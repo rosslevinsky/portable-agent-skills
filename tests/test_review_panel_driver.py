@@ -32,7 +32,7 @@ import tempfile
 import textwrap
 import time
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _git_env  # noqa: E402,F401  every git command a test starts runs under the suite's config
 from unittest import mock
@@ -73,14 +73,91 @@ CAPACITY_PAYLOAD_BYTES = ⟪payload capacity⟫
 CAPACITY_REPLY_BYTES = ⟪reply capacity⟫
 
 args = dict(zip(sys.argv[1::2], sys.argv[2::2]))
-payload = pathlib.Path(args["--payload"]).read_text(encoding="utf-8")
-schema = json.loads(pathlib.Path(args["--schema"]).read_text(encoding="utf-8"))
 transcript = pathlib.Path(args["--transcript"])
 control_path = pathlib.Path(args["--control"])
 try:
     control = json.loads(control_path.read_text(encoding="utf-8"))
 except (OSError, ValueError):
     control = {}
+# Repeatable, which the pairing above is not: it keeps only the last of them.
+added_dirs = [sys.argv[i + 1] for i in range(1, len(sys.argv) - 1)
+              if sys.argv[i] == "--add-dir"]
+
+
+def readable(path):
+    """Whether this worker may read `path`. Anywhere, unless `confine_reads` holds it to its
+    working directory and the directories its command added, as some runtimes are held."""
+    if not control.get("confine_reads"):
+        return True
+    target = os.path.realpath(path)
+    for root in [os.getcwd(), *added_dirs]:
+        root = os.path.realpath(root)
+        if target == root or target.startswith(root.rstrip(os.sep) + os.sep):
+            return True
+    return False
+
+
+def refuse(*lines):
+    """Explain in prose and exit 0 with no JSON, which is how a confined runtime that nobody
+    can approve a request for ends its turn."""
+    text = "\n".join(lines)
+    print(text, flush=True)
+    transcript.write_text(text + "\n", encoding="utf-8")
+    if control.get("trailer"):
+        # A streaming runtime's last line is its accounting, not its words.
+        print(json.dumps({"type": "result", "usage": {"tokens": "9" * 900}}), flush=True)
+    sys.exit(0)
+
+
+def refuse_the_read(path):
+    refuse(f"The file is outside the working directory ({os.getcwd()}), and because this "
+           f"session is non-interactive, nobody could approve the request.",
+           f"To unblock it, either allow reads of {os.path.dirname(path)} (for example, add "
+           f"it with `--add-dir`) or copy `{os.path.basename(path)}` into the working "
+           f"directory.")
+
+
+for path in (args["--payload"], args["--schema"]):
+    if not readable(path):
+        refuse_the_read(path)
+payload = pathlib.Path(args["--payload"]).read_text(encoding="utf-8")
+schema = json.loads(pathlib.Path(args["--schema"]).read_text(encoding="utf-8"))
+
+# The driver's smoke test, answered before anything a unit's test counts or records: what
+# this worker is told to do with a unit says nothing about whether its command can read and
+# write, so only the environment's controls reach it, and `smoke` overrides them.
+if set(schema.get("properties", {})) == {"ok", "nonce"}:
+    smoke = control.get("smoke", {})
+    outage = smoke.get("outage", control.get("outage"))
+    smoked = control_path.with_name("smoke-count.txt")
+    with open(smoked, "a", encoding="utf-8") as fh:
+        fh.write("x\n")
+    if outage and "outage_until" in smoke and \
+            len(smoked.read_text(encoding="utf-8").splitlines()) > int(smoke["outage_until"]):
+        outage = None
+    if outage:
+        print(json.dumps({"type": "turn.failed", "error": {"message": outage}}), flush=True)
+        sys.exit(0)
+    nonce_path = re.search(r"Read the file `([^`]+)`", payload).group(1)
+    if not readable(nonce_path):
+        refuse_the_read(nonce_path)
+    nonce = pathlib.Path(nonce_path).read_text(encoding="utf-8").strip()
+    asked = re.search(r"to the file `([^`]+)`", payload)
+    if asked:
+        if control.get("refuse_writes"):
+            refuse("This session may not write files, so the file was not written.")
+        pathlib.Path(asked.group(1)).write_text(nonce + "\n", encoding="utf-8")
+    reply = json.dumps({"ok": True, "nonce": smoke.get("nonce", nonce)})
+    if smoke.get("mode") == "no-object":
+        reply = "I read it."
+    transcript.write_text("Done.\n\n" + reply + "\n", encoding="utf-8")
+    if control.get("stream"):
+        # The same reply as a streaming runtime's events, for a mode whose supervisor reads
+        # the stream rather than the file.
+        print(json.dumps({"type": "item.completed", "item": {
+            "type": "agent_message", "text": "Done.\n\n" + reply}}), flush=True)
+        print(json.dumps({"type": "turn.completed"}), flush=True)
+    sys.exit(0)
 
 counter = control_path.with_name("stub-count.txt")
 with open(counter, "a", encoding="utf-8") as fh:
@@ -246,6 +323,9 @@ else:
 # on the order two lanes happened to be launched in. The schema is what says which kind this
 # unit is, and a reply the engine refuses is charged to the unit rather than to the provider.
 mode = control.get("mode")
+if control.get("modes"):
+    # One mode per launch on this control file, the last repeated: "answer" answers.
+    mode = control["modes"][min(n, len(control["modes"])) - 1]
 if set(schema.get("properties", {})) & set(control.get("refuse_for", ())):
     mode = "refused"
 
@@ -273,6 +353,12 @@ elif mode == "refused":
 else:
     body = answered
 transcript.write_text(body, encoding="utf-8")
+if control.get("trailer"):
+    print(json.dumps({"type": "result", "usage": {"tokens": "9" * 900}}), flush=True)
+if control.get("stream"):
+    print(json.dumps({"type": "item.completed", "item": {"type": "agent_message",
+                                                         "text": body}}), flush=True)
+    print(json.dumps({"type": "turn.completed"}), flush=True)
 # Replace a file once this worker has answered: how a test edits something the run reads
 # while the run is in progress.
 if control.get("rewrite"):
@@ -1013,6 +1099,40 @@ class ThePreviewOfAResumedRunCountsOnlyWhatIsLeft(_Case):
         self.assertNotIn("already landed", text)
 
 
+class AWriteCapableCommandMissingAReadOnlyMarkerIsWarnedAbout(_Case):
+    """A runtime that confines reads to the directories it is given cannot reach a payload
+    whose directory its command never names. The driver cannot tell from argv what a command
+    can read — a sandbox grants it without any flag — so a marker the read-only command uses
+    and the write-capable one does not is a warning, never a refusal."""
+
+    def preview(self):
+        return driver._preview(self.rundir, driver.load_adapter_config(self.adapter_path))
+
+    def test_the_documented_example_gives_each_write_capable_command_every_read_only_marker(self):
+        text = (_SKILL_DIR / "references" / "dispatch.md").read_text(encoding="utf-8")
+        blocks = [b for b in re.findall(r"```json\n(.*?)```", text, re.S) if '"lanes"' in b]
+        self.assertEqual(len(blocks), 1, "dispatch.md should hold one adapter example")
+        lanes = json.loads(blocks[0])["lanes"]
+        for lane, spec in sorted(lanes.items()):
+            self.assertEqual(driver.markers_missing_from_write_capable(
+                spec["read_only"]["command"], spec["write_capable"]["command"]), [],
+                f"lane {lane}'s write-capable example lacks a marker its read-only one uses")
+
+    def test_a_mismatched_lane_is_warned_about_and_the_run_still_plans(self):
+        mode = _stub_mode(self.stub, self.control)
+        read_only = dict(mode, command=mode["command"] + ["--input", "⟪input⟫"])
+        self.write_adapter(B={"read_only": read_only, "write_capable": mode})
+        self.plan_only()
+        text = self.preview()
+        self.assertIn("warning: lane B's write-capable command lacks ⟪input⟫, which its "
+                      "read-only command uses", text)
+        self.assertNotIn("lane A's write-capable command lacks", text)
+
+    def test_a_matched_adapter_prints_no_warning(self):
+        self.plan_only()
+        self.assertNotIn("write-capable command lacks", self.preview())
+
+
 class ATestPatchRunWithNoTestIsWarnedBeforeAnythingIsDispatched(_Case):
     """The driver prints its own preview and discards the engine's, and `--go` prints none,
     so the warning that the snapshot holds no test has to reach the owner on both paths."""
@@ -1499,6 +1619,446 @@ def status_text(run):
     return driver.status_report(run)
 
 
+class StatusOpensWithASummary(_Case):
+    """`status` opens with what an operator reads first: per kind and lane, how many units
+    landed, are running, are waiting and failed; and once `route` has planned verifiers, how
+    many there are and an estimate drawn from the ones that have landed."""
+
+    def listing(self, units, stage="verification"):
+        self.rundir.mkdir(parents=True, exist_ok=True)
+        review_panel.write_run_format(self.rundir)
+        (self.rundir / "units.json").write_text(json.dumps({
+            "stage": stage, "lanes": list(review_panel.LANES),
+            "units": [{"id": uid, "kind": kind, "lane": lane, "area": "area-01"}
+                      for uid, kind, lane in units]}), encoding="utf-8")
+        for uid, _kind, _lane in units:
+            (self.rundir / "units" / uid).mkdir(parents=True, exist_ok=True)
+
+    def land(self, unit, publication="result", elapsed=None):
+        status = {"status": "ok" if publication == "result" else "error"}
+        if elapsed is not None:
+            status["elapsed_s"] = elapsed
+        self.attempt(unit, 0, status=json.dumps(status),
+                     disposition={"attempt": "a0", "outcome": driver.ACCEPTED,
+                                  "intended_publication": publication})
+        name = "result.json" if publication == "result" else "error.txt"
+        (self.rundir / "units" / unit / name).write_text("{}", encoding="utf-8")
+        (self.rundir / "dispatch" / unit / "landed.json").write_text(
+            json.dumps({"publication": publication, "attempt": "a0"}), encoding="utf-8")
+
+    def text(self):
+        return " ".join(status_text(self.run_object()).split())
+
+    def test_counts_per_kind_and_lane_and_the_verifier_estimate(self):
+        self.listing([("r1", "reader", "A"), ("r2", "reader", "A"), ("r3", "reader", "B"),
+                      ("v1", "verifier", "A"), ("v2", "verifier", "B"),
+                      ("v3", "verifier", "B"), ("v4", "verifier", "A"),
+                      ("v5", "verifier", "A")])
+        self.land("r1")
+        self.land("r2", publication="error")
+        self.attempt("r3", 0)                      # spawned now, no status: running
+        self.land("v1", elapsed=60.0)
+        self.land("v2", elapsed=180.0)
+        self.land("v3", elapsed=600.0)
+        report = status_text(self.run_object())
+        flat = " ".join(report.split())
+        self.assertIn("reader A: 1 landed, 0 running, 0 waiting, 1 failed", flat)
+        self.assertIn("reader B: 0 landed, 1 running, 0 waiting, 0 failed", flat)
+        self.assertIn("verifier A: 1 landed, 0 running, 2 waiting, 0 failed", flat)
+        self.assertIn("verifier B: 2 landed, 0 running, 0 waiting, 0 failed", flat)
+        # Median of 60, 180 and 600 seconds is 3 minutes; two verifiers are still to land.
+        self.assertIn("verifiers: 5 planned, 3 landed, 2 still to land", flat)
+        self.assertIn("median of 3 landed verifier(s)", flat)
+        self.assertIn("about 6.0 min", flat)
+        self.assertIn("estimate", flat)
+        # The summary opens the report: it comes before the first per-unit line.
+        self.assertLess(report.index("reader A:"), report.index("  r1 [reader/A]"))
+
+    def test_no_verifier_landed_gives_no_estimate(self):
+        self.listing([("v1", "verifier", "A"), ("v2", "verifier", "B")])
+        self.attempt("v1", 0)
+        flat = self.text()
+        self.assertIn("verifiers: 2 planned, none landed yet, so there is no estimate", flat)
+        self.assertNotIn("about", flat)
+
+    def test_every_verifier_landed_gives_nothing_to_estimate(self):
+        self.listing([("v1", "verifier", "A")])
+        self.land("v1", elapsed=30.0)
+        flat = self.text()
+        self.assertIn("verifiers: 1 planned, 1 landed, 0 still to land, so there is "
+                      "nothing to estimate", flat)
+        self.assertNotIn("about", flat)
+
+    def test_before_route_the_verifiers_are_said_to_be_unknown(self):
+        self.listing([("r1", "reader", "A")], stage="reading")
+        flat = self.text()
+        self.assertIn("reader A: 0 landed, 0 running, 1 waiting, 0 failed", flat)
+        self.assertIn("verifiers: not planned until route runs, so there is no estimate",
+                      flat)
+
+    def test_an_unreadable_listing_still_prints_and_says_what_is_unknown(self):
+        self.rundir.mkdir(parents=True)
+        (self.rundir / "units.json").write_text("{ truncated", encoding="utf-8")
+        import io
+        run = driver.Run(self.rundir, driver._placeholder_lanes(), _SUPERVISOR,
+                         out=io.StringIO())
+        flat = " ".join(driver.status_report(run).split())
+        self.assertIn("run directory:", flat)
+        self.assertIn("unit counts are unknown", flat)
+
+    def test_an_ended_attempt_not_yet_judged_is_not_running(self):
+        self.listing([("r1", "reader", "A")])
+        self.attempt("r1", 0, status='{"status": "ok", "elapsed_s": 5.0}')
+        flat = self.text()
+        self.assertIn("reader A: 0 landed, 0 running, 0 waiting, 0 failed "
+                      "(1 ended, awaiting adjudication)", flat)
+
+    def test_the_estimate_says_verifiers_run_one_at_a_time(self):
+        self.listing([("v1", "verifier", "A"), ("v2", "verifier", "B")])
+        self.land("v1", elapsed=60.0)
+        flat = self.text()
+        self.assertIn("one at a time", flat)
+        self.assertNotIn("parallel", flat)
+
+    def test_the_estimate_is_bounded_by_a_lanes_slots_as_well(self):
+        """Four writers, but lane A takes one at a time and holds all eight verifiers
+        left: eight waves, not two, and the line says which capacities it assumed."""
+        self.listing([("v0", "verifier", "B")]
+                     + [(f"v{n}", "verifier", "A") for n in range(1, 9)])
+        self.land("v0", elapsed=60.0)
+        (self.rundir / "budget.json").write_text(json.dumps(
+            {"seconds": 0.0, "extended": 0.0, "writers": 4, "slots": {"A": 1, "B": 3}}),
+            encoding="utf-8")
+        import io
+        run = driver.Run(self.rundir, driver._placeholder_lanes(), _SUPERVISOR,
+                         out=io.StringIO())
+        flat = " ".join(status_text(run).split())
+        self.assertIn("about 8.0 min (8 x 1.0 min", flat)
+        self.assertIn("lane A up to 1 and lane B up to 3", flat)
+
+    def test_status_owes_room_to_running_writers_under_the_recorded_writers(self):
+        """`status` without `--adapter` checks disk headroom with the `writers` the run was
+        driven with, as the driver does, so it warns where the driver would hold back."""
+        self.listing([("v1", "verifier", "B")])
+        self.attempt("v1", 0, argv={"lane": "B", "kind": "verifier"})
+        (self.rundir / "budget.json").write_text(json.dumps(
+            {"seconds": 0.0, "extended": 0.0, "writers": 2, "slots": {"A": 2, "B": 2}}),
+            encoding="utf-8")
+        import io
+        run = driver.Run(self.rundir, driver._placeholder_lanes(self.rundir), _SUPERVISOR,
+                         out=io.StringIO())
+        self.assertEqual(driver.run_writers(run.lanes)[0], 2)
+        self.assertEqual(run.owed_to_running_writers()[1], 1)
+
+    def test_status_reads_the_writers_of_a_resynthesis_from_its_own_budget(self):
+        """A resynthesis runs after the run has finished, under its own budget file, so the
+        newest generation's `writers` is the one a running writer was claimed under."""
+        self.listing([("v1", "verifier", "B")])
+        (self.rundir / "budget.json").write_text(json.dumps(
+            {"seconds": 0.0, "extended": 0.0, "writers": 1}), encoding="utf-8")
+        (self.rundir / driver.generation_budget_name(2)).write_text(json.dumps(
+            {"seconds": 0.0, "extended": 0.0, "writers": 3}), encoding="utf-8")
+        self.assertEqual(driver.run_writers(driver._placeholder_lanes(self.rundir))[0], 3)
+
+    def test_the_estimate_divides_by_the_writers_the_run_was_driven_with(self):
+        """Read from the run's own budget record, because `status` is usually run without
+        the adapter; five verifiers at two at a time are three waves of the median."""
+        self.listing([("v0", "verifier", "A")]
+                     + [(f"v{n}", "verifier", "AB"[n % 2]) for n in range(1, 6)])
+        self.land("v0", elapsed=60.0)
+        (self.rundir / "budget.json").write_text(
+            json.dumps({"seconds": 0.0, "extended": 0.0, "writers": 2}), encoding="utf-8")
+        import io
+        run = driver.Run(self.rundir, driver._placeholder_lanes(), _SUPERVISOR,
+                         out=io.StringIO())
+        flat = " ".join(status_text(run).split())
+        self.assertIn("about 3.0 min", flat)
+        self.assertIn("up to 2 at a time across both lanes", flat)
+        self.assertNotIn("one at a time", flat)
+
+    # -- a record the host will not give up ------------------------------- #
+    def deny(self, path):
+        """Take every permission off ``path`` for the rest of the test, where that denies a
+        read: not as root and not on Windows, where a mode bit does not stop the owner."""
+        if os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0):
+            self.skipTest("a mode bit does not deny this process a read here")
+        os.chmod(path, 0)
+        self.addCleanup(os.chmod, path, 0o644)
+
+    def status_via_main(self):
+        import io
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = driver.main(["status", str(self.rundir)])
+        return code, " ".join(out.getvalue().split())
+
+    def test_an_unreadable_listing_prints_the_header_and_says_so(self):
+        self.listing([("r1", "reader", "A")])
+        self.deny(self.rundir / "units.json")
+        code, flat = self.status_via_main()
+        self.assertEqual(code, 0, flat)
+        self.assertIn("run directory:", flat)
+        self.assertIn("to stop a run in this directory", flat)
+        self.assertIn("could not be read", flat)
+
+    def test_an_unreadable_budget_still_prints_the_rest(self):
+        self.listing([("r1", "reader", "A")])
+        (self.rundir / "budget.json").write_text('{"seconds": 10}', encoding="utf-8")
+        self.deny(self.rundir / "budget.json")
+        code, flat = self.status_via_main()
+        self.assertEqual(code, 0, flat)
+        self.assertIn("budget spent: unknown", flat)
+        self.assertIn("reader A: 0 landed, 0 running, 1 waiting, 0 failed", flat)
+
+    def unreadable_attempt_record(self, name):
+        self.listing([("r1", "reader", "A"), ("r2", "reader", "B")])
+        self.land("r2")
+        path = self.attempt("r1", 0, status='{"status": "ok"}',
+                            disposition={"attempt": "a0", "outcome": driver.REFUSED,
+                                         "intended_publication": "none"})
+        self.deny(path / name)
+        code, flat = self.status_via_main()
+        self.assertEqual(code, 0, flat)
+        self.assertIn("reader A: 0 landed, 0 running, 0 waiting, 0 failed (1 unreadable)",
+                      flat)
+        self.assertIn("reader B: 1 landed", flat)
+        self.assertIn("r2 [reader/B] landed result from a0", flat)
+        self.assertIn("r1 [reader/A] could not be read", flat)
+        self.assertIn("provider pauses could not be read", flat)
+
+    def test_an_unreadable_argv_record_still_prints_the_rest(self):
+        self.unreadable_attempt_record("argv.json")
+
+    def test_an_unreadable_disposition_still_prints_the_rest(self):
+        self.unreadable_attempt_record("disposition.json")
+
+    def test_an_engine_refusal_in_one_section_still_prints_the_rest(self):
+        self.listing([("r1", "reader", "A")], stage=driver.REPORTED_STAGE)
+        self.land("r1")
+        with mock.patch.object(driver.engine, "published_generation",
+                               side_effect=review_panel.RunDirError("listing denied")):
+            code, flat = self.status_via_main()
+        self.assertEqual(code, 0, flat)
+        self.assertIn("listing denied", flat)
+        self.assertIn("reader A: 1 landed", flat)
+
+    def test_an_unreadable_verifier_withholds_the_conclusion(self):
+        self.listing([("v1", "verifier", "A"), ("v2", "verifier", "B")])
+        self.land("v1", elapsed=60.0)
+        path = self.attempt("v2", 0, status='{"status": "ok"}',
+                            disposition={"attempt": "a0", "outcome": driver.REFUSED,
+                                         "intended_publication": "none"})
+        self.deny(path / "argv.json")
+        code, flat = self.status_via_main()
+        self.assertEqual(code, 0, flat)
+        self.assertIn("1 could not be read", flat)
+        self.assertNotIn("nothing to estimate", flat)
+
+    def test_status_writes_nothing(self):
+        self.listing([("r1", "reader", "A"), ("v1", "verifier", "A")])
+        self.land("v1", elapsed=30.0)
+        before = sorted((str(p), p.stat().st_mtime_ns) for p in self.tmp.rglob("*"))
+        status_text(self.run_object())
+        after = sorted((str(p), p.stat().st_mtime_ns) for p in self.tmp.rglob("*"))
+        self.assertEqual(before, after, "status wrote to the run directory")
+
+
+class WritersBoundWriteCapableUnitsAcrossBothLanes(_Case):
+    """`writers` is how many write-capable units may run at once across both lanes: one
+    unless the operator says more, and each lane's `slots` still bounds that lane."""
+
+    def writer_units(self, *units):
+        self.fake_units(*units)
+        doc = json.loads((self.rundir / "units.json").read_text(encoding="utf-8"))
+        for unit in doc["units"]:
+            unit["kind"] = review_panel.VERIFIER_KIND
+        (self.rundir / "units.json").write_text(json.dumps(doc), encoding="utf-8")
+
+    def set_writers(self, writers):
+        raw = json.loads(self.adapter_path.read_text(encoding="utf-8"))
+        raw["writers"] = writers
+        self.adapter_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    def claim_pass(self, run):
+        """The units one pass of a round claims, in order, counted as the round counts."""
+        reserved, writers = run.reserving(), run.writers_running()
+        providers, probed, claims = run.providers(), set(), []
+        for unit in run.units():
+            claim, probe = run.claim_decision(unit, reserved, writers, providers, probed)
+            if not claim:
+                continue
+            claims.append((unit["id"], unit["lane"]))
+            if probe:
+                probed.add(run.lanes[unit["lane"]].account)
+            reserved[unit["lane"]] = reserved.get(unit["lane"], 0) + 1
+            if unit["kind"] in driver.WRITE_CAPABLE_KINDS:
+                writers += 1
+        return claims
+
+    FOUR = (("v1", "A"), ("v2", "A"), ("v3", "B"), ("v4", "B"))
+
+    def test_by_default_one_write_capable_unit_runs_across_both_lanes(self):
+        self.writer_units(*self.FOUR)
+        run = self.run_object()
+        self.assertEqual(self.claim_pass(run), [("v1", "A")],
+                         "two write-capable units ran at once at the default")
+        claim, _probe = run.claim_decision(run.unit_row("v3"), {}, 1, run.providers(), set())
+        self.assertFalse(claim, "a lane-B writer was claimed beside a running lane-A one")
+
+    def test_two_writers_run_at_once_across_the_lanes_within_each_lanes_slots(self):
+        self.writer_units(*self.FOUR)
+        self.set_slots(1)
+        self.set_writers(2)
+        claims = self.claim_pass(self.run_object())
+        self.assertEqual(claims, [("v1", "A"), ("v3", "B")])
+        # Room for three, and the lanes' own slots still decide each lane's share.
+        self.set_slots(2)
+        self.set_writers(3)
+        claims = self.claim_pass(self.run_object())
+        self.assertEqual(len(claims), 3, claims)
+        for lane in review_panel.LANES:
+            self.assertLessEqual(sum(1 for _u, where in claims if where == lane), 2, claims)
+
+    def test_a_writer_in_flight_counts_against_the_limit(self):
+        self.writer_units(*self.FOUR)
+        self.set_writers(2)
+        run = self.run_object()
+        claim, _probe = run.claim_decision(run.unit_row("v3"), {}, 1, run.providers(), set())
+        self.assertTrue(claim, "a second writer was held back under writers: 2")
+        claim, _probe = run.claim_decision(run.unit_row("v3"), {}, 2, run.providers(), set())
+        self.assertFalse(claim, "a third writer ran under writers: 2")
+
+    def test_writers_defaults_to_one_and_an_invalid_value_is_refused_at_parse_time(self):
+        lanes = driver.load_adapter_config(self.adapter_path)
+        self.assertEqual(driver.run_writers(lanes), (1, False))
+        self.set_writers(3)
+        self.assertEqual(driver.run_writers(driver.load_adapter_config(self.adapter_path)),
+                         (3, True))
+        raw = json.loads(self.adapter_path.read_text(encoding="utf-8"))
+        for bad in (0, -1, 1.5, True, "2", None):
+            with self.subTest(writers=bad):
+                with self.assertRaises(driver.DriverError) as ctx:
+                    driver.parse_adapter_config({**raw, "writers": bad})
+                self.assertIn("writers", str(ctx.exception))
+
+    def test_a_resume_may_change_writers(self):
+        """Like `slots`, it says how the run is paced and not who played, so it is not
+        pinned."""
+        self.plan_only()
+        self.set_writers(2)
+        self.drive()
+
+    def test_the_preview_prints_writers_and_whether_it_was_defaulted(self):
+        flat = " ".join(self.drive().stdout.split())
+        self.assertIn("run one at a time across both lanes (writers: 1, the default; set "
+                      "writers to change it)", flat)
+        self.set_writers(2)
+        flat = " ".join(self.drive().stdout.split())
+        self.assertIn("run up to 2 at a time across both lanes (writers: 2, as the adapter "
+                      "sets it)", flat)
+        self.assertIn("the operator's claim", flat)
+        self.assertNotIn("the default; set writers", flat)
+        self.assertNotIn("one at a time", flat)
+
+    def test_the_dispatch_record_carries_writers(self):
+        self.set_writers(2)
+        record = driver.dispatch_record(driver.load_adapter_config(self.adapter_path))
+        self.assertEqual(record["writers"], 2)
+
+    # -- the disk: every running writer's margin is still to come -------------- #
+    def running_writer(self, unit, copied):
+        """An attempt of ``unit`` still running, with its copy made or not yet made."""
+        path = self.attempt(unit, 0, argv={"kind": review_panel.VERIFIER_KIND,
+                                           "lane": "A"})
+        if copied:
+            (self.rundir / "work" / f"tok-{unit}-0").mkdir(parents=True)
+        return path
+
+    def headroom_with(self, free, writers):
+        self.set_writers(writers)
+        run = self.run_object(disk_floor=100, build_margin=1000)
+        run._snapshot_bytes = 10_000
+        with mock.patch.object(driver, "free_bytes", return_value=free):
+            return run.headroom()
+
+    def test_two_writers_on_a_volume_that_fits_one_do_not_both_start(self):
+        """The first writer's copy is made, but its build has not used its margin yet: a
+        second admitted against free space alone would share the room each was allowed."""
+        self.writer_units(*self.FOUR)
+        self.running_writer("v1", copied=True)
+        # Room for one copy and one margin beyond what the first copy already holds.
+        fits_one = 100 + 10_000 + 1000 + 500
+        self.assertIn("still running", self.headroom_with(fits_one, writers=2))
+        self.assertEqual(self.headroom_with(fits_one + 1000, writers=2), "",
+                         "room for both margins and the second copy was refused")
+
+    def test_a_running_writer_whose_copy_is_not_made_reserves_the_copy_too(self):
+        self.writer_units(*self.FOUR)
+        self.running_writer("v1", copied=False)
+        room = 100 + 2 * (10_000 + 1000)
+        self.assertNotEqual(self.headroom_with(room - 1, writers=2), "")
+        self.assertEqual(self.headroom_with(room, writers=2), "")
+
+    def test_one_writer_reserves_no_space_for_a_running_writer(self):
+        """With one writer the check is asked only when none is running, so a running
+        one adds nothing to it."""
+        self.writer_units(*self.FOUR)
+        self.running_writer("v1", copied=False)
+        self.assertEqual(self.headroom_with(100 + 10_000 + 1000, writers=1), "")
+        self.assertNotEqual(self.headroom_with(100 + 10_000 + 999, writers=1), "")
+
+    def test_the_budget_record_carries_the_writers_the_driver_ran_with(self):
+        """`status` is usually run without the adapter, so the run's own value is kept
+        where it can read it."""
+        self.writer_units(*self.FOUR)
+        self.set_writers(2)
+        self.set_slots(1)
+        self.run_object().save_budget(force=True)
+        budget = json.loads((self.rundir / "budget.json").read_text(encoding="utf-8"))
+        self.assertEqual(budget["writers"], 2)
+        self.assertEqual(budget["slots"], {"A": 1, "B": 1})
+
+
+class TheRefusalSaysHowToRemoveAReadOnlySnapshot(_Case):
+    """A directory with no `units.json` is refused by name. When it holds the snapshot this
+    program made read-only, the refusal says how to make it removable on each platform."""
+
+    def refusal(self):
+        with self.assertRaises(driver.DriverError) as caught:
+            driver.bootstrap(self.rundir, self.job_path)
+        return str(caught.exception)
+
+    def test_a_read_only_snapshot_names_chmod(self):
+        snapshot = self.rundir / "snapshot"
+        snapshot.mkdir(parents=True)
+        (snapshot / "a.py").write_text("x = 1\n", encoding="utf-8")
+        driver.harden_snapshot(snapshot)
+        text = self.refusal()
+        if os.name == "nt":
+            self.assertIn("attrib -r", text)
+        else:
+            self.assertIn("chmod -R u+w", text)
+        self.assertIn(str(self.rundir), text)
+        text.encode("ascii")                       # a console that takes only ASCII
+
+    def test_no_snapshot_names_no_chmod(self):
+        self.rundir.mkdir(parents=True)
+        text = self.refusal()
+        self.assertNotIn("chmod", text)
+        self.assertNotIn("attrib", text)
+        text.encode("ascii")
+
+    def test_each_platform_gets_its_own_command(self):
+        # Each platform's path type, so the text is the one that platform would print
+        # whichever host runs the test.
+        posix = driver.read_only_snapshot_text(PurePosixPath("/runs/r 1"), windows=False)
+        self.assertIn("chmod -R u+w '/runs/r 1'", posix)
+        windows = driver.read_only_snapshot_text(PureWindowsPath("C:/runs/r1"), windows=True)
+        self.assertIn("attrib -r /s /d", windows)
+        self.assertNotIn("chmod", windows)
+        (posix + windows).encode("ascii")
+
+
 class ReplayStableBudgets(_Case):
 
     def setUp(self):
@@ -1523,7 +2083,8 @@ class ReplayStableBudgets(_Case):
         self.assertTrue(self.run_object().eligible("u1"))
 
     def test_two_reply_charges_exhaust_it(self):
-        self.dispositions(driver.REFUSED, driver.NO_REPLY)
+        # Two refusals: a no-reply charges only once its lane has had an answer accepted.
+        self.dispositions(driver.REFUSED, driver.REFUSED)
         self.assertTrue(self.budget().exhausted)
         self.assertFalse(self.run_object().eligible("u1"))
 
@@ -3342,6 +3903,772 @@ class ADrainedProviderIsRetriedWhenTheRunIsStartedAgain(_Providers):
                          "the run started without closing the incident it stopped on")
 
 
+class ASmokeTestStopsABadCommandBeforeAnyUnit(_Case):
+    """Before the first unit of a `--go`, every lane and mode is asked to read a string the
+    driver wrote under its input directory and answer with it — and, write-capable, to write
+    it into its working directory. A command that cannot pauses the run having spent nothing.
+
+    Every lane and mode, not the ones the plan has units for: a fresh plan's only
+    write-capable unit is lane A's probe, so lane B's write-capable command is first launched
+    with the verifiers, after the whole reading round has been paid for."""
+
+    ACCOUNT = "one-account"
+
+    def confined_lane(self, write_capable_dirs):
+        """Lane B, held to its working directory and the directories its commands add — its
+        read-only command adds the input directory, its write-capable one ``write_capable_dirs``."""
+        where = self.tmp / "confined-lane"
+        where.mkdir(exist_ok=True)
+        control = where / "control.json"
+        control.write_text(json.dumps({"confine_reads": True}), encoding="utf-8")
+        read_only = _stub_mode(self.stub, control)
+        read_only["command"] += ["--add-dir", "⟪input⟫"]
+        write_capable = _stub_mode(self.stub, control)
+        for marker in write_capable_dirs:
+            write_capable["command"] += ["--add-dir", marker]
+        return {"read_only": read_only, "write_capable": write_capable}
+
+    def smoke_attempts(self):
+        return sorted(self.rundir.glob("dispatch/smoke/*/a*"), key=lambda p: p.as_posix())
+
+    def unit_attempts(self):
+        return list(self.rundir.glob("dispatch/*/a*/argv.json"))
+
+    def test_the_pause_quotes_the_refusal_not_the_last_line_of_the_log(self):
+        """A streaming runtime ends its log with an accounting record, so the end of the log
+        is numbers; the reply is what says why the command failed."""
+        lane = self.confined_lane(["⟪cwd⟫"])
+        control = self.tmp / "confined-lane" / "control.json"
+        control.write_text(json.dumps({"confine_reads": True, "trailer": True}),
+                           encoding="utf-8")
+        self.write_adapter(B=lane)
+        proc = self.drive("--go", expect=driver.EXIT_STOPPED)
+        said = " ".join(proc.stdout.split())
+        self.assertIn("Lane B's write_capable command failed its smoke test", said)
+        self.assertIn("nobody could approve the request", said)
+        self.assertNotIn("9999999999", said, "the quote is the log's accounting line")
+
+    def test_the_pause_reason_is_printed_once(self):
+        """The exit line says the run is resumable without repeating a reason the pause
+        already printed in full."""
+        self.write_adapter(B=self.confined_lane(["⟪cwd⟫"]))
+        proc = self.drive("--go", expect=driver.EXIT_STOPPED)
+        self.assertEqual(proc.stdout.count("failed its smoke test"), 1, proc.stdout)
+        self.assertIn("the run is resumable", proc.stdout)
+
+    def test_a_write_capable_command_missing_its_input_pauses_before_any_unit(self):
+        self.write_adapter(B=self.confined_lane(["⟪cwd⟫"]))
+        self.plan_only()
+        listing = json.loads((self.rundir / "units.json").read_text(encoding="utf-8"))
+        writers = {unit["lane"] for unit in listing["units"]
+                   if unit["kind"] in driver.WRITE_CAPABLE_KINDS}
+        self.assertEqual(writers, {"A"}, "the fixture plans a lane-B writer at --go, so it "
+                                         "proves nothing about a mode no unit uses yet")
+        proc = self.drive("--go", expect=driver.EXIT_STOPPED)
+        said = " ".join(proc.stdout.split())
+        self.assertIn("smoke test", said)
+        self.assertIn("Lane B's write_capable command failed its smoke test", said)
+        self.assertIn("nobody could approve the request", said)
+        self.assertIn("nothing was charged", said)
+        self.assertEqual(self.unit_attempts(), [], "a unit was launched past a failed smoke")
+        self.assertEqual(self.stub_invocations(), 0)
+        self.assertEqual(list(self.rundir.glob("units/*/error.txt")), [])
+        outcomes = {path.parent.name: json.loads(
+            (path / driver.DISPOSITION_NAME).read_text(encoding="utf-8"))
+            for path in self.smoke_attempts()}
+        self.assertEqual(sorted(outcomes), ["lane-A-read_only", "lane-A-write_capable",
+                                            "lane-B-read_only", "lane-B-write_capable"])
+        self.assertEqual({name: record["passed"] for name, record in outcomes.items()},
+                         {"lane-A-read_only": True, "lane-A-write_capable": True,
+                          "lane-B-read_only": True, "lane-B-write_capable": False})
+
+        # Corrected, a resume smokes again, passes, and the run is carried to its report.
+        self.write_adapter(B=self.confined_lane(["⟪input⟫", "⟪cwd⟫"]))
+        proc = self.drive("--go", timeout=600)
+        self.assertIn("reported:", proc.stdout, proc.stdout + proc.stderr)
+        self.assertTrue(self.unit_attempts())
+        again = [p for p in self.smoke_attempts() if p.parent.name == "lane-B-write_capable"]
+        self.assertEqual([p.name for p in again], ["a0", "a1"])
+        self.assertTrue(json.loads((again[-1] / driver.DISPOSITION_NAME)
+                                   .read_text(encoding="utf-8"))["passed"])
+        self.assertEqual(list(self.rundir.glob("units/*/error.txt")), [])
+        # Nothing the smoke made is left for the reclamation sweep to report as a leak.
+        self.assertNotIn("left behind", proc.stdout)
+
+    def test_a_read_only_smoke_never_asks_for_a_write(self):
+        where = self.tmp / "read-only-lane"
+        where.mkdir()
+        control = where / "control.json"
+        control.write_text(json.dumps({"refuse_writes": True}), encoding="utf-8")
+        self.write_adapter(**{lane: {"read_only": _stub_mode(self.stub, control)}
+                              for lane in review_panel.LANES})
+        self.plan_only()
+        run = self.run_object()
+        run.smoke_test(run.smoke_pairs())
+        self.assertEqual(run.pause_reason, "", run.out.getvalue())
+        records = [json.loads((path / driver.DISPOSITION_NAME).read_text(encoding="utf-8"))
+                   for path in self.smoke_attempts()]
+        self.assertEqual(len(records), 4)
+        self.assertTrue(all(record["passed"] for record in records), records)
+        # And the stub does refuse a write when one is asked of it, or this proves nothing.
+        self.write_adapter(**{lane: {"write_capable": _stub_mode(self.stub, control)}
+                              for lane in review_panel.LANES})
+        run = self.run_object()
+        run.smoke_test(run.smoke_pairs())
+        self.assertIn("write_capable command failed its smoke test", run.pause_reason)
+
+    def test_a_smoke_that_meets_an_outage_pauses_the_account_not_the_command(self):
+        self.write_adapter(
+            result_mode="stream-transcript",
+            A={"account": self.ACCOUNT, "provider_fault_patterns": ["usage limit"]},
+            B={"account": self.ACCOUNT, "provider_fault_patterns": ["usage limit"]})
+        self.write_control(smoke={"outage": "usage limit reached for this account"})
+        self.plan_only()
+        run = self.run_object(probe_backoff=10_000.0)
+        run.smoke_test(run.smoke_pairs())
+        self.assertEqual(run.pause_reason, "",
+                         "an outage was reported as the command's fault")
+        state = run.providers()[self.ACCOUNT]
+        self.assertIn("reported this provider unavailable", state.paused)
+        self.assertIn("is paused", run.out.getvalue())
+        self.assertNotIn("failed its smoke test", run.out.getvalue())
+        outcomes = {json.loads((path / driver.DISPOSITION_NAME).read_text(
+            encoding="utf-8"))["outcome"] for path in self.smoke_attempts()}
+        self.assertEqual(outcomes, {driver.PROVIDER_UNAVAILABLE})
+        self.assertEqual(self.unit_attempts(), [])
+
+    def test_a_lane_whose_smoke_met_an_outage_launches_no_unit_until_it_passes(self):
+        """The provider refusing a smoke says nothing about the command, so the pair is
+        smoked again once the provider is back — the first of them as the probe that asks
+        whether it is — and no unit of that lane goes out, as a probe or otherwise, until
+        its smokes have passed. The other lane is not held by the outage."""
+        where = self.tmp / "lane-b"
+        where.mkdir()
+        control = where / "control.json"
+        control.write_text(json.dumps({"stream": True, "smoke": {
+            "outage": "usage limit reached for this account", "outage_until": 2}}),
+            encoding="utf-8")
+        mode = _stub_mode(self.stub, control, result_mode="stream-transcript")
+        self.write_adapter(B={"account": "acct-B", "provider_fault_patterns": ["usage limit"],
+                              "read_only": mode, "write_capable": mode})
+        proc = self.drive("--go", "--probe-backoff", "0", timeout=600)
+        self.assertIn("reported:", proc.stdout, proc.stdout + proc.stderr)
+        passed_at = {}
+        for name in ("lane-B-read_only", "lane-B-write_capable"):
+            smokes = [p for p in self.smoke_attempts() if p.parent.name == name]
+            records = [json.loads((p / driver.DISPOSITION_NAME).read_text(encoding="utf-8"))
+                       for p in smokes]
+            self.assertEqual([r["outcome"] for r in records],
+                             [driver.PROVIDER_UNAVAILABLE, driver.ACCEPTED], name)
+            passed_at[name] = records[1]["judged_at"]
+        probes = [p for p in self.smoke_attempts()
+                  if json.loads((p / "argv.json").read_text(encoding="utf-8"))["probe"]]
+        self.assertEqual(len(probes), 1, "the recovered provider was not asked by a smoke")
+        b_passed = max(passed_at.values())
+        for path in self.unit_attempts():
+            record = json.loads(path.read_text(encoding="utf-8"))
+            self.assertFalse(record["probe"], f"{record['unit']} went out as the probe of a "
+                                              f"lane whose smoke had not passed")
+            if record["lane"] == "B":
+                self.assertGreaterEqual(record["spawn_time"], b_passed,
+                                        f"{record['unit']} launched on lane B before its "
+                                        f"smokes had passed")
+
+    def test_an_outage_on_one_lane_holds_only_that_lane(self):
+        """**A provider fault is not a broken command**, so it holds its own lane and no
+        other, as it does at any attempt: lane A's units launch and land while lane B's
+        account stays out, and the run does not drain over lane B's failed probe."""
+        where = self.tmp / "lane-b"
+        where.mkdir()
+        control = where / "control.json"
+        control.write_text(json.dumps({"stream": True, "smoke": {
+            "outage": "usage limit reached for this account"}}), encoding="utf-8")
+        mode = _stub_mode(self.stub, control, result_mode="stream-transcript")
+        self.write_adapter(B={"account": "acct-B", "provider_fault_patterns": ["usage limit"],
+                              "read_only": mode, "write_capable": mode})
+        self.fake_units(("u1", "A"))
+        (self.rundir / "snapshot").mkdir(exist_ok=True)
+        run = self.run_object(poll=0.05, probe_backoff=10_000.0)
+        run.dispatch_round(("reader",))
+        self.assertEqual(run.unfinished(("reader",)), [], run.out.getvalue())
+        self.assertTrue(run.attempts("u1"), run.out.getvalue())
+        self.assertNotIn("draining", run.out.getvalue())
+
+    def test_a_resume_probes_a_paused_account_only_for_a_unit_on_its_lane(self):
+        """Resumed with lane B's account already paused and its probe due, a round with only
+        lane A units does not probe B: a refused probe drains the run, and a round with no
+        unit on B has nothing to ask B for."""
+        where = self.tmp / "lane-b"
+        where.mkdir()
+        control = where / "control.json"
+        control.write_text(json.dumps({"stream": True, "smoke": {
+            "outage": "usage limit reached for this account"}}), encoding="utf-8")
+        mode = _stub_mode(self.stub, control, result_mode="stream-transcript")
+        self.write_adapter(B={"account": "acct-B", "provider_fault_patterns": ["usage limit"],
+                              "read_only": mode, "write_capable": mode})
+        self.fake_units(("u1", "A"))
+        (self.rundir / "snapshot").mkdir(exist_ok=True)
+        first = self.run_object(poll=0.05, probe_backoff=10_000.0)
+        first.dispatch_round(("reader",))
+        self.assertTrue(first.providers()["acct-B"].paused)
+        self.fake_units(("u1", "A"), ("u2", "A"))
+        again = self.run_object(poll=0.05, probe_backoff=0.0)
+        again.dispatch_round(("reader",))
+        said = again.out.getvalue()
+        self.assertTrue(again.attempts("u2"), said)
+        self.assertNotIn("draining", said)
+        probes = [p for p in self.smoke_attempts()
+                  if json.loads((p / "argv.json").read_text(encoding="utf-8"))["probe"]]
+        self.assertEqual(probes, [], "a round with no lane B unit probed lane B's account")
+
+    def test_a_broken_command_on_one_lane_still_holds_every_lane(self):
+        """The rule the outage case must not loosen: a command that fails its smoke pauses
+        the run before any unit of either lane is launched."""
+        where = self.tmp / "lane-b"
+        where.mkdir()
+        control = where / "control.json"
+        control.write_text(json.dumps({"smoke": {"nonce": "not-the-nonce"}}), encoding="utf-8")
+        self.write_adapter(B={"read_only": _stub_mode(self.stub, control),
+                              "write_capable": _stub_mode(self.stub, control)})
+        self.fake_units(("u1", "A"))
+        (self.rundir / "snapshot").mkdir(exist_ok=True)
+        run = self.run_object(poll=0.05)
+        run.dispatch_round(("reader",))
+        self.assertEqual(run.attempts("u1"), [], run.out.getvalue())
+        self.assertTrue(run.pause_reason, run.out.getvalue())
+
+    def test_a_smoke_never_starts_beside_a_surviving_worker_holding_the_slot(self):
+        self.plan_only()
+        self.set_slots(1)
+        listing = json.loads((self.rundir / "units.json").read_text(encoding="utf-8"))
+        unit = next(u["id"] for u in listing["units"] if u["lane"] == "A")
+        self.attempt(unit, 0, argv={"lane": "A", "kind": "reader"})
+        run = self.run_object()
+        run.smoke_test(run.smoke_pairs())
+        launched = {p.parent.name for p in self.smoke_attempts()}
+        self.assertEqual(launched, {"lane-B-read_only", "lane-B-write_capable"},
+                         "a smoke started beside the worker holding lane A's only slot")
+        self.assertEqual(run.pause_reason, "", run.out.getvalue())
+        self.assertNotIn(("A", driver.READ_ONLY), run.smoke_passed)
+
+    def test_a_smoke_a_killed_driver_left_is_judged_and_released_on_resume(self):
+        self.write_adapter(A={"account": self.ACCOUNT, "provider_fault_patterns": ["usage limit"]})
+        self.plan_only()
+        token = "0123456789abcdef"
+        inbox = self.rundir / "in" / token
+        inbox.mkdir(parents=True)
+        path = self.rundir / "dispatch" / "smoke" / "lane-A-read_only" / "a0"
+        path.mkdir(parents=True)
+        (path / "argv.json").write_text(json.dumps({
+            "argv": ["x"], "adapter": "stub", "lane": "A", "account": self.ACCOUNT,
+            "generation": 0, "permission": "none", "cwd": str(self.rundir / "snapshot"),
+            "kind": "smoke", "mode": driver.READ_ONLY, "smoke": True, "probe": False,
+            "spawn_time": time.time(), "deadline": 60.0, "token": token, "nonce": "n",
+            "transcript": str(path / "transcript.md"), "unit": "smoke/lane-A-read_only",
+            "attempt": "a0"}), encoding="utf-8")
+        (path / "status.txt").write_text(json.dumps({
+            "status": "error", "reason": "reviewer exited 1",
+            "terminal_detail": "usage limit reached", "terminal_detail_source": "message"}),
+            encoding="utf-8")
+        run = self.run_object(probe_backoff=10_000.0)
+        run.adopt()
+        record = json.loads((path / driver.DISPOSITION_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(record["outcome"], driver.PROVIDER_UNAVAILABLE)
+        self.assertTrue(record["interrupted"])
+        self.assertFalse(inbox.exists(), "an interrupted smoke's directory was never released")
+        self.assertIn("reported this provider unavailable",
+                      run.providers()[self.ACCOUNT].paused)
+        self.assertEqual(run.pause_reason, "")
+
+    def surviving_smoke(self, lane, mode, *, spawn_time, deadline=60.0, account="stub"):
+        """A smoke attempt a previous driver launched, with no status and no disposition."""
+        token = hashlib.sha256(f"{lane}{mode}{spawn_time}".encode()).hexdigest()[:16]
+        (self.rundir / "in" / token).mkdir(parents=True)
+        path = self.rundir / "dispatch" / "smoke" / f"lane-{lane}-{mode}" / "a0"
+        path.mkdir(parents=True)
+        (path / "argv.json").write_text(json.dumps({
+            "argv": ["x"], "adapter": "stub", "lane": lane, "account": account,
+            "generation": 0, "permission": "none", "cwd": str(self.rundir / "snapshot"),
+            "kind": "smoke", "mode": mode, "smoke": True, "probe": False,
+            "spawn_time": spawn_time, "deadline": deadline, "token": token, "nonce": "n",
+            "transcript": str(path / "transcript.md"), "unit": f"smoke/lane-{lane}-{mode}",
+            "attempt": "a0"}), encoding="utf-8")
+        return path
+
+    def test_a_smoke_whose_worker_may_still_run_holds_its_slot(self):
+        """The same rule a unit's attempt is held to: an execution nobody has shown ended
+        keeps its slot, against smokes and units alike."""
+        self.plan_only()
+        self.set_slots(1)
+        self.surviving_smoke("A", driver.READ_ONLY, spawn_time=time.time() - 10_000)
+        run = self.run_object()
+        self.assertEqual(run.smoke_attempts()[0].state, driver.UNCERTAIN)
+        self.assertEqual(run.reserving()["A"], 1,
+                         "a unit could be claimed beside a smoke that may still be running")
+        run.smoke_test(run.smoke_pairs())
+        launched = {p.parent.name for p in self.smoke_attempts()
+                    if (p / driver.DISPOSITION_NAME).exists()}
+        self.assertEqual(launched, {"lane-B-read_only", "lane-B-write_capable"})
+
+    def test_a_smoke_whose_supervisor_was_killed_holds_its_slot_and_its_directories(self):
+        self.plan_only()
+        self.set_slots(1)
+        path = self.surviving_smoke("A", driver.READ_ONLY, spawn_time=time.time())
+        (path / driver.STATUS_NAME).write_text("", encoding="utf-8")
+        token = json.loads((path / "argv.json").read_text(encoding="utf-8"))["token"]
+        run = self.run_object()
+        failures = []
+        run._finish_smoke({"lane": "A", "mode": driver.READ_ONLY, "path": path,
+                           "nonce": "n", "inbox": self.rundir / "in" / token, "work": None},
+                          -9, failures)
+        self.assertFalse((path / driver.DISPOSITION_NAME).exists(),
+                         "a disposition was written for a worker that may still be running")
+        self.assertTrue((self.rundir / "in" / token).exists())
+        self.assertTrue(failures)
+        run.invalidate()
+        self.assertEqual(run.reserving()["A"], 1)
+
+    @unittest.skipUnless(os.name == "posix", "elsewhere an exit code cannot show the worker "
+                                             "stopped, so the slot is kept by design")
+    def test_a_smoke_whose_supervisor_exited_without_a_status_releases_its_slot(self):
+        """An exit on the supervisor's own path ended its worker, so the status it never
+        wrote is written for it, as `reap_children` does for a unit. Kept only in memory,
+        a later driver reads the attempt as running and its slot is held for good, with
+        `resolve-attempt` refusing an attempt already judged."""
+        self.plan_only()
+        self.set_slots(1)
+        path = self.surviving_smoke("A", driver.READ_ONLY, spawn_time=time.time())
+        (path / driver.STATUS_NAME).write_text("", encoding="utf-8")
+        token = json.loads((path / "argv.json").read_text(encoding="utf-8"))["token"]
+        run = self.run_object()
+        failures = []
+        run._finish_smoke({"lane": "A", "mode": driver.READ_ONLY, "path": path,
+                           "nonce": "n", "inbox": self.rundir / "in" / token, "work": None},
+                          2, failures)
+        self.assertTrue((path / driver.DISPOSITION_NAME).exists())
+        status = driver.read_status(path / driver.STATUS_NAME)
+        self.assertIsNotNone(status, "the status was kept only in memory")
+        self.assertEqual(status["supervisor_exit"], 2)
+        self.assertEqual(self.run_object().reserving()["A"], 0,
+                         "a later driver still reads the ended smoke as holding its slot")
+
+    def test_a_surviving_smoke_that_finishes_mid_round_is_judged_by_the_scoped_pass(self):
+        self.write_adapter(A={"account": self.ACCOUNT, "provider_fault_patterns": ["usage limit"]})
+        self.plan_only()
+        path = self.surviving_smoke("A", driver.READ_ONLY, spawn_time=time.time(),
+                                    account=self.ACCOUNT)
+        run = self.run_object(probe_backoff=10_000.0)
+        run.adopt()
+        self.assertFalse((path / driver.DISPOSITION_NAME).exists())
+        (path / "status.txt").write_text(json.dumps({
+            "status": "error", "reason": "reviewer exited 1",
+            "terminal_detail": "usage limit reached", "terminal_detail_source": "message"}),
+            encoding="utf-8")
+        units = [u for u in run.units() if u["lane"] == "A"]
+        run.adopt(units)
+        record = json.loads((path / driver.DISPOSITION_NAME).read_text(encoding="utf-8"))
+        self.assertEqual(record["outcome"], driver.PROVIDER_UNAVAILABLE)
+        self.assertIn("reported this provider unavailable",
+                      run.providers()[self.ACCOUNT].paused)
+
+    def test_a_smoke_is_never_a_units_answer(self):
+        """Recorded apart from every unit: nothing lands from it, and nothing it did counts
+        toward a unit's allowances or toward what a lane executed."""
+        self.plan_only()
+        run = self.run_object()
+        run.smoke_test(run.smoke_pairs())
+        self.assertEqual(run.pause_reason, "", run.out.getvalue())
+        self.assertEqual(self.unit_attempts(), [])
+        self.assertEqual(list(self.rundir.glob("units/*/result.json")), [])
+        for lane, execution in driver.executed_provenance(run).items():
+            self.assertFalse(execution.landed, lane)
+        # Its worker directories are gone once it is judged; its record stays.
+        for area in ("in", "work"):
+            self.assertEqual(list((self.rundir / area).glob("*")), [], area)
+        self.assertEqual(len(self.smoke_attempts()), 4)
+
+
+class TwoRepliesWithNoAnswerPauseALaneAndChargeNothing(_Case):
+    """A lane and mode that has never had an answer accepted and ends two attempts with no
+    closing object is failing on every unit, so the command is at fault: it pauses, and the
+    attempts behind the pause charge nothing — derived on replay, so a restart agrees.
+
+    The smoke cannot catch every such command, so this is the rule that keeps one from
+    turning units into final errors one after another."""
+
+    SILENT = "I could not read the file I was given, so there is nothing to answer.\n"
+
+    def silent_lane_b(self):
+        """Lane B's write-capable command, answering every unit with prose and no object.
+        The smoke passes: it answers its own question whatever the units are told."""
+        self.write_adapter(B={"write_capable": self.failing_lane(mode="no-object")})
+
+    def verifiers(self, *units):
+        """A hand-built run whose units are lane B's verifiers, the write-capable kind."""
+        self.fake_units(*units)
+        doc = json.loads((self.rundir / "units.json").read_text(encoding="utf-8"))
+        for unit in doc["units"]:
+            unit["kind"] = review_panel.VERIFIER_KIND
+        (self.rundir / "units.json").write_text(json.dumps(doc), encoding="utf-8")
+
+    def replied(self, unit, index, text=SILENT, lane="B", **argv):
+        """One attempt whose worker exited cleanly and left ``text`` as its transcript and,
+        as a supervisor shows a worker's output, in its display log."""
+        path = self.attempt(unit, index, status='{"status": "ok"}', transcript=text,
+                            argv={"lane": lane, "kind": review_panel.VERIFIER_KIND, **argv})
+        (path / driver.DISPLAY_NAME).write_text(text, encoding="utf-8")
+        return path
+
+    def outcomes(self, unit):
+        return [json.loads((path / driver.DISPOSITION_NAME).read_text(encoding="utf-8"))
+                ["outcome"] for path in sorted(self.rundir.glob(f"dispatch/{unit}/a*"))
+                if (path / driver.DISPOSITION_NAME).exists()]
+
+    def lane_b_writers(self):
+        doc = json.loads((self.rundir / "units.json").read_text(encoding="utf-8"))
+        return [unit["id"] for unit in doc["units"] if unit["lane"] == "B"
+                and unit["kind"] in driver.WRITE_CAPABLE_KINDS]
+
+    def charges(self, run, unit):
+        return run.budget(unit).reply_charges
+
+    def test_two_units_with_no_reply_pause_the_lane_and_charge_nothing(self):
+        self.verifiers(("v1", "B"), ("v2", "B"))
+        self.replied("v1", 0)
+        self.replied("v2", 0)
+        run = self.run_object()
+        run.adopt()
+        self.assertEqual(self.outcomes("v1"), [driver.NO_REPLY])
+        self.assertEqual(self.outcomes("v2"), [driver.NO_REPLY])
+        said = " ".join(run.pause_reason.split())
+        self.assertIn("lane B's write_capable command", said)
+        self.assertIn("nothing to answer", said, "the pause does not quote the worker")
+        self.assertIn("charged nothing", said)
+        self.assertEqual(list(self.rundir.glob("units/*/error.txt")), [])
+        for unit in ("v1", "v2"):
+            self.assertEqual(self.charges(run, unit), 0, unit)
+            claim, _probe = run.claim_decision(run.unit_row(unit), {}, 0, {}, set())
+            self.assertFalse(claim, f"{unit} was claimable on a paused lane")
+        # Derived, never stored: a new process reads the same answer from disk.
+        again = self.run_object()
+        self.assertEqual([self.charges(again, unit) for unit in ("v1", "v2")], [0, 0])
+        # The pause closed its generation as it was committed: generation 0 is the silent
+        # one, and the restart opens generation 1.
+        self.assertEqual(again.silent().keys(), {("B", driver.WRITE_CAPABLE, 0)})
+        self.assertEqual(again.reply_generation("B", driver.WRITE_CAPABLE), 1)
+        self.assertIn("paused in reply generation 0", driver.status_report(again))
+
+    def test_status_stops_naming_a_pause_a_restart_has_launched_past(self):
+        """Once a restarted run has launched an attempt in the generation it reopened, the
+        pause is over, and `status` saying the lane is paused would send an operator to
+        stop a healthy run or change a command that is already right."""
+        self.verifiers(("v1", "B"), ("v2", "B"))
+        self.replied("v1", 0)
+        self.replied("v2", 0)
+        self.run_object().adopt()
+        self.attempt("v1", 1, argv={"lane": "B", "kind": review_panel.VERIFIER_KIND,
+                                    "reply_generation": 1})
+        self.assertNotIn("paused in reply generation", driver.status_report(self.run_object()))
+
+    def test_no_replies_charge_once_the_lane_has_an_accepted_answer(self):
+        self.verifiers(("v1", "B"), ("v2", "B"))
+        self.attempt("v1", 0, status='{"status": "ok"}',
+                     argv={"lane": "B", "kind": review_panel.VERIFIER_KIND},
+                     disposition={"attempt": "a0", "unit": "v1",
+                                  "outcome": driver.ACCEPTED, "intended_publication": "none"})
+        self.replied("v2", 0)
+        self.replied("v2", 1)
+        run = self.run_object()
+        run.adopt()
+        self.assertEqual(self.outcomes("v2"), [driver.NO_REPLY, driver.NO_REPLY])
+        self.assertEqual(run.pause_reason, "", "a lane that answers once was paused")
+        self.assertEqual(self.charges(run, "v2"), 2)
+        self.assertTrue((self.rundir / "units" / "v2" / "error.txt").exists(),
+                        "the unit's spent allowances did not publish its error")
+
+    def test_an_answer_accepted_while_the_pause_drains_charges_nothing(self):
+        """A worker still running when the lane paused answers while the driver drains. The
+        pause closed its generation when it was committed, so the paused attempts stay
+        uncharged, and a restart does not close a second one."""
+        self.verifiers(("v1", "B"), ("v2", "B"))
+        self.replied("v1", 0)
+        self.replied("v1", 1)
+        run = self.run_object()
+        run.adopt()
+        self.assertTrue(run.pause_reason)
+        self.assertEqual(run.reply_generation("B", driver.WRITE_CAPABLE), 1,
+                         "the pause did not close its generation when it was committed")
+        self.attempt("v2", 0, status='{"status": "ok"}',
+                     argv={"lane": "B", "kind": review_panel.VERIFIER_KIND},
+                     disposition={"attempt": "a0", "unit": "v2",
+                                  "outcome": driver.ACCEPTED, "intended_publication": "none"})
+        run.invalidate()
+        run.adopt()
+        self.assertEqual(run.budget("v1").reply_charges, 0)
+        self.assertIsNone(driver.landed(self.rundir, "v1"))
+        restarted = self.run_object()
+        restarted.reset_silent_lanes()
+        self.assertEqual(restarted.reply_generation("B", driver.WRITE_CAPABLE), 1)
+        self.assertTrue(restarted.eligible("v1"))
+
+    def test_an_answer_in_the_same_pass_publishes_the_error_it_spends(self):
+        """One adoption pass judges another unit's accepted answer after it has looked at
+        this unit: the no-reply that answer makes charge spends this unit, and its error is
+        published in that pass rather than the run stopping with no answer landed."""
+        self.plan_only()
+        unit, other = self.lane_b_readers()[:2]
+        self.replied(unit, 0, text=self.REFUSED_REPLY, kind=self.kind_of(unit))
+        self.replied(unit, 1, kind=self.kind_of(unit))
+        run = self.run_object()
+        run.adopt()
+        self.assertEqual(self.outcomes(unit), [driver.REFUSED, driver.NO_REPLY])
+        self.assertIsNone(driver.landed(self.rundir, unit))
+        self.replied(other, 0, text='{"findings": [], "summary": "read the area"}\n',
+                     kind=self.kind_of(other))
+        run.adopt()
+        self.assertEqual(self.outcomes(other), [driver.ACCEPTED])
+        self.assertEqual((driver.landed(self.rundir, unit) or {}).get("publication"), "error")
+
+    def refused_then_silent(self, unit):
+        """``unit``'s first attempt refused by the engine, its second ending with no
+        object: spent, if a no-reply charged before its lane had answered."""
+        self.attempt(unit, 0, status='{"status": "ok"}',
+                     argv={"lane": "B", "kind": review_panel.VERIFIER_KIND},
+                     disposition={"attempt": "a0", "unit": unit, "outcome": driver.REFUSED,
+                                  "intended_publication": "none"})
+        self.replied(unit, 1)
+
+    def test_a_refusal_and_a_no_reply_publish_nothing_while_the_lane_has_no_answer(self):
+        """Judged in one pass, the unit first: its no-reply charges nothing, so no error is
+        written, and the next unit's no-reply pauses the lane."""
+        self.verifiers(("v1", "B"), ("v2", "B"))
+        self.refused_then_silent("v1")
+        self.replied("v2", 0)
+        run = self.run_object()
+        run.adopt()
+        self.assertEqual(self.outcomes("v1"), [driver.REFUSED, driver.NO_REPLY])
+        self.assertTrue(run.pause_reason)
+        self.assertIsNone(driver.landed(self.rundir, "v1"), "an error was published")
+        self.assertFalse(run.budget("v1").exhausted)
+        # A new process replays the same answer from disk.
+        again = self.run_object()
+        again.adopt()
+        self.assertIsNone(driver.landed(self.rundir, "v1"))
+
+    def test_a_no_reply_charges_once_the_lane_has_had_an_answer_accepted(self):
+        """Until the lane and mode answers, a no-reply charges nothing, so it cannot spend a
+        unit's allowance. Its first accepted answer makes the open generation's no-replies
+        charge, and a unit that exhausts publishes its error then."""
+        self.verifiers(("v1", "B"), ("v3", "B"))
+        self.refused_then_silent("v1")
+        run = self.run_object()
+        run.adopt()
+        self.assertEqual(run.pause_reason, "")
+        self.assertEqual(run.budget("v1").reply_charges, 1)
+        self.assertIsNone(driver.landed(self.rundir, "v1"))
+        self.assertTrue(run.eligible("v1"))
+        self.attempt("v3", 0, status='{"status": "ok"}',
+                     argv={"lane": "B", "kind": review_panel.VERIFIER_KIND},
+                     disposition={"attempt": "a0", "unit": "v3",
+                                  "outcome": driver.ACCEPTED, "intended_publication": "none"})
+        later = self.run_object()
+        later.adopt()
+        self.assertEqual(later.budget("v1").reply_charges, 2)
+        self.assertEqual(driver.landed(self.rundir, "v1")["publication"], "error")
+
+    # The engine refuses this reply: `findings` is not a list.
+    REFUSED_REPLY = '{"findings": "not a list", "summary": "x"}\n'
+
+    def lane_b_readers(self):
+        """Lane B's read-only units, the reader first: the fixture plans one reader and
+        one auditor there."""
+        doc = json.loads((self.rundir / "units.json").read_text(encoding="utf-8"))
+        return sorted((unit["id"] for unit in doc["units"] if unit["lane"] == "B"
+                       and unit["kind"] not in driver.WRITE_CAPABLE_KINDS),
+                      key=lambda uid: not uid.startswith("area-"))
+
+    def kind_of(self, unit_id):
+        doc = json.loads((self.rundir / "units.json").read_text(encoding="utf-8"))
+        return next(unit["kind"] for unit in doc["units"] if unit["id"] == unit_id)
+
+    def test_a_no_reply_then_a_refusal_then_another_units_no_reply_publishes_nothing(self):
+        """Judged from disk on a planned run, then the driver restarted with a working
+        command: the unit the pause caught is retried and lands."""
+        self.plan_only()
+        unit, other = self.lane_b_readers()[:2]
+        self.replied(unit, 0, kind=self.kind_of(unit))
+        self.replied(unit, 1, text=self.REFUSED_REPLY, kind=self.kind_of(unit))
+        self.replied(other, 0, kind=self.kind_of(other))
+        run = self.run_object()
+        run.adopt()
+        self.assertEqual(self.outcomes(unit), [driver.NO_REPLY, driver.REFUSED])
+        self.assertIn("lane B's read_only command", " ".join(run.pause_reason.split()))
+        self.assertEqual(list(self.rundir.glob("units/*/error.txt")), [])
+        proc = self.drive("--go", timeout=600)  # a new driver process
+        self.assertIn("reported:", proc.stdout, proc.stdout + proc.stderr)
+        self.assertEqual(driver.landed(self.rundir, unit)["publication"], "result")
+        self.assertEqual(driver.landed(self.rundir, other)["publication"], "result")
+        self.assertEqual(list(self.rundir.glob("units/*/error.txt")), [])
+
+    def test_a_late_answer_in_a_paused_generation_charges_nothing(self):
+        """A worker of the generation the pause closed answers after the restart: that
+        generation stays uncharged, and the unit's replacement result stands."""
+        self.verifiers(("v1", "B"), ("v2", "B"), ("v3", "B"))
+        self.attempt("v1", 0, status='{"status": "ok"}',
+                     argv={"lane": "B", "kind": review_panel.VERIFIER_KIND},
+                     disposition={"attempt": "a0", "unit": "v1", "outcome": driver.REFUSED,
+                                  "intended_publication": "none"})
+        self.replied("v1", 1)
+        self.replied("v2", 0)
+        run = self.run_object()
+        run.adopt()
+        self.assertTrue(run.pause_reason)
+        restarted = self.run_object()
+        restarted.reset_silent_lanes()
+        self.assertEqual(restarted.reply_generation("B", driver.WRITE_CAPABLE), 1)
+        reply = self.rundir / "dispatch" / "v1" / "a2" / driver.REPLY_NAME
+        self.attempt("v1", 2, status='{"status": "ok"}',
+                     argv={"lane": "B", "kind": review_panel.VERIFIER_KIND,
+                           "reply_generation": 1},
+                     disposition={"attempt": "a2", "unit": "v1", "outcome": driver.ACCEPTED,
+                                  "intended_publication": "result",
+                                  "reply_path": "dispatch/v1/a2/reply.json", "rejected": []})
+        reply.write_text('{"verdicts": [], "summary": "x"}', encoding="utf-8")
+        self.attempt("v3", 0, status='{"status": "ok"}',
+                     argv={"lane": "B", "kind": review_panel.VERIFIER_KIND,
+                           "reply_generation": 0},
+                     disposition={"attempt": "a0", "unit": "v3",
+                                  "outcome": driver.ACCEPTED, "intended_publication": "none"})
+        late = self.run_object()
+        late.adopt()
+        self.assertEqual(driver.landed(self.rundir, "v1")["publication"], "result")
+        self.assertEqual(late.budget("v2").reply_charges, 0)
+        self.assertIsNone(driver.landed(self.rundir, "v2"))
+
+    def test_a_spent_time_budget_publishes_no_error_and_an_extension_resumes(self):
+        """The time budget runs out just after a unit's refusal and its no-reply. Nothing
+        it has is an error; a resume given more time retries it and lands it."""
+        where = self.tmp / "lane-b"
+        where.mkdir()
+        control = where / "control.json"
+        control.write_text(json.dumps({"modes": ["refused", "no-object", "answer"]}),
+                           encoding="utf-8")
+        self.write_adapter(B={"read_only": _stub_mode(self.stub, control)})
+        self.set_slots(1)
+        self.plan_only()
+        readers = self.lane_b_readers()
+
+        def spent(_run):
+            return any(self.outcomes(unit) == [driver.REFUSED, driver.NO_REPLY]
+                       for unit in readers)
+        run = self.run_object(poll=0.05, smoke_first=False)
+        with mock.patch.object(driver.Run, "over_budget", spent):
+            self.assertEqual(run.loop(), driver.EXIT_STOPPED, run.out.getvalue())
+        caught = [unit for unit in readers
+                  if self.outcomes(unit) == [driver.REFUSED, driver.NO_REPLY]]
+        self.assertEqual(len(caught), 1, run.out.getvalue())
+        self.assertEqual(list(self.rundir.glob("units/*/error.txt")), [])
+        self.drive("--go", "--max-hours", "1", "--extend", "1", timeout=600)
+        self.assertEqual(driver.landed(self.rundir, caught[0])["publication"], "result")
+        self.assertEqual(list(self.rundir.glob("units/*/error.txt")), [])
+
+    def test_a_refused_then_silent_unit_is_retried_and_lands_after_the_restart(self):
+        """Live: lane B's read-only command is refused once and then answers nothing. Its
+        first unit's no-reply charges nothing, so it is retried rather than spent, its second
+        no-reply pauses the lane, and the corrected command retries it and lands it."""
+        where = self.tmp / "lane-b"
+        where.mkdir()
+        control = where / "control.json"
+        control.write_text(json.dumps({"modes": ["refused", "no-object"]}), encoding="utf-8")
+        self.write_adapter(B={"read_only": _stub_mode(self.stub, control)})
+        self.set_slots(1)
+        self.plan_only()
+        run = self.run_object(poll=0.05, smoke_first=False)
+        self.assertEqual(run.loop(), driver.EXIT_STOPPED, run.out.getvalue())
+        self.assertIn("lane B's read_only command", " ".join(run.pause_reason.split()))
+        doc = json.loads((self.rundir / "units.json").read_text(encoding="utf-8"))
+        first = [unit["id"] for unit in doc["units"]
+                 if driver.REFUSED in self.outcomes(unit["id"])]
+        self.assertEqual(len(first), 1, first)
+        self.assertEqual(self.outcomes(first[0]),
+                         [driver.REFUSED, driver.NO_REPLY, driver.NO_REPLY])
+        self.assertEqual(list(self.rundir.glob("units/*/error.txt")), [])
+        self.write_adapter()
+        self.set_slots(1)
+        proc = self.drive("--go", timeout=600)  # a new driver process
+        self.assertIn("reported:", proc.stdout, proc.stdout + proc.stderr)
+        self.assertEqual(self.outcomes(first[0]),
+                         [driver.REFUSED, driver.NO_REPLY, driver.NO_REPLY, driver.ACCEPTED])
+        self.assertEqual(driver.landed(self.rundir, first[0])["publication"], "result")
+        self.assertEqual(list(self.rundir.glob("units/*/error.txt")), [])
+
+    def test_a_smoke_that_passed_is_not_an_accepted_answer(self):
+        """Smoke on, as an operator runs it: the smoke passes, the first real unit on the
+        lane ends twice with no object, and the lane pauses with nothing published."""
+        self.silent_lane_b()
+        self.set_slots(1)
+        proc = self.drive("--go", expect=driver.EXIT_STOPPED, timeout=600)
+        said = " ".join(proc.stdout.split())
+        self.assertIn("lane B's write_capable command", said, proc.stdout + proc.stderr)
+        smoke = self.rundir / "dispatch" / "smoke" / "lane-B-write_capable" / "a0"
+        self.assertTrue(json.loads((smoke / driver.DISPOSITION_NAME)
+                                   .read_text(encoding="utf-8"))["passed"])
+        self.assertEqual(list(self.rundir.glob("units/*/error.txt")), [])
+        tried = [unit for unit in self.lane_b_writers() if self.outcomes(unit)]
+        self.assertEqual(len(tried), 1, tried)
+        self.assertEqual(self.outcomes(tried[0]), [driver.NO_REPLY, driver.NO_REPLY])
+
+    def paused_on_one_units_retry(self):
+        """Smoke off, so nothing but this rule stands between the command and the units."""
+        self.silent_lane_b()
+        self.set_slots(1)
+        self.plan_only()
+        run = self.run_object(poll=0.05, smoke_first=False)
+        self.assertEqual(run.loop(), driver.EXIT_STOPPED, run.out.getvalue())
+        tried = [unit for unit in self.lane_b_writers() if self.outcomes(unit)]
+        self.assertEqual(len(tried), 1, f"the retry did not run first: {tried}")
+        self.assertEqual(self.outcomes(tried[0]), [driver.NO_REPLY, driver.NO_REPLY])
+        return run, tried[0]
+
+    def test_one_units_retry_with_no_reply_pauses_the_lane(self):
+        run, unit = self.paused_on_one_units_retry()
+        self.assertIn("lane B's write_capable command", " ".join(run.pause_reason.split()))
+        self.assertEqual(list(self.rundir.glob("units/*/error.txt")), [])
+        fresh = self.run_object()
+        self.assertFalse(fresh.budget(unit).exhausted, "the paused unit spent its allowance")
+        self.assertIsNone(driver.landed(self.rundir, unit))
+
+    def test_the_pause_quotes_the_reply_the_attempt_recorded(self):
+        """The reply is collected under the attempt's own token, not its dispatch directory,
+        and a streaming runtime's display log ends with numbers."""
+        self.write_adapter(B={"write_capable": self.failing_lane(mode="no-object",
+                                                                 trailer=True)})
+        self.set_slots(1)
+        self.plan_only()
+        run = self.run_object(poll=0.05, smoke_first=False)
+        self.assertEqual(run.loop(), driver.EXIT_STOPPED, run.out.getvalue())
+        said = " ".join(run.pause_reason.split())
+        self.assertIn("I could not answer this one", said)
+        self.assertNotIn("9999999999", said, "the quote is the log's accounting line")
+
+    def test_a_restart_with_the_command_corrected_lands_the_paused_units(self):
+        _run, unit = self.paused_on_one_units_retry()
+        self.write_adapter()
+        proc = self.drive("--go", timeout=600)  # a new driver process
+        self.assertIn("reported:", proc.stdout, proc.stdout + proc.stderr)
+        self.assertNotIn("paused:", proc.stdout)
+        self.assertEqual(self.outcomes(unit),
+                         [driver.NO_REPLY, driver.NO_REPLY, driver.ACCEPTED])
+        self.assertEqual(driver.landed(self.rundir, unit)["publication"], "result")
+        self.assertEqual(list(self.rundir.glob("units/*/error.txt")), [])
+        record = json.loads((self.rundir / "dispatch" / (
+            f"{driver.REPLY_GENERATIONS_PREFIX}B-{driver.WRITE_CAPABLE}.json"))
+            .read_text(encoding="utf-8"))
+        self.assertEqual(record["closed"], 1)
+        # The attempts behind the pause still charge nothing, replayed after the restart.
+        self.assertEqual(self.run_object().budget(unit).reply_charges, 0)
+
+
 class WhatTheSupervisorCouldNotHold(_Case):
     """`--max-capture-bytes` bounds what one attempt can make the supervisor keep, and the
     two ways that bound can bite are both infrastructure: they charge nothing and they are
@@ -3581,18 +4908,18 @@ class AnOutageInARealRound(_Case):
         # what makes the run resumable once the provider is back.
         self.assertEqual(list(self.rundir.glob("units/*/error.txt")), [],
                          "an outage was published as units that failed review")
-        outcomes = set()
-        for unit in json.loads(
-                (self.rundir / "units.json").read_text(encoding="utf-8"))["units"]:
-            for attempt in driver.read_attempts(self.rundir, unit["id"], grace=120.0):
-                if attempt.disposition:
-                    outcomes.add(attempt.disposition["outcome"])
+        # Every attempt, the smoke test's included: the outage meets the smoke first, and
+        # while no smoke has passed, the probe that asks whether the provider is back is a
+        # smoke too, so no unit need be launched at all.
+        attempts = [attempt for unit in driver._units(self.rundir)
+                    for attempt in driver.read_attempts(self.rundir, unit["id"], grace=120.0)]
+        attempts += self.run_object().smoke_attempts()
+        outcomes = {attempt.disposition["outcome"] for attempt in attempts
+                    if attempt.disposition}
         self.assertEqual(outcomes, {driver.PROVIDER_UNAVAILABLE},
                          f"an outage was adjudicated as something else: {outcomes}")
         # And a probe went out: one attempt, marked at spawn as the question being asked.
-        probes = [attempt for unit in driver._units(self.rundir)
-                  for attempt in driver.read_attempts(self.rundir, unit["id"], grace=120.0)
-                  if (attempt.argv or {}).get("probe")]
+        probes = [attempt for attempt in attempts if (attempt.argv or {}).get("probe")]
         self.assertTrue(probes, "a paused provider was never probed at all")
 
 
@@ -5437,6 +6764,33 @@ class ResynthesizeIsACommandOfItsOwn(_Resynthesis):
         self.assertFalse((self.rundir / "budget-g2.json").exists())
 
 
+class AResynthesisSmokesBeforeItsFirstUnit(_Resynthesis):
+    """`resynthesize` launches units of its own, so it smokes the lane and modes those can
+    run before the first of them, as a `--go` does."""
+
+    def test_the_smoke_comes_before_the_first_synthesis_unit(self):
+        self.reported_run()
+        before = set(self.rundir.glob("dispatch/smoke/*/a*"))
+        self.write_control(tier_per_batch=True)
+        self.resynth()
+        smoked = sorted(set(self.rundir.glob("dispatch/smoke/*/a*")) - before)
+        lanes = {u["lane"] for u in self.listing()["units"]
+                 if u["kind"] in review_panel.SYNTHESIS_KINDS}
+        self.assertEqual(sorted({p.parent.name for p in smoked}),
+                         sorted(f"lane-{lane}-{mode}" for lane in lanes
+                                for mode in driver.MODES))
+        first_smoke = min(json.loads((p / "argv.json").read_text(encoding="utf-8"))
+                          ["spawn_time"] for p in smoked)
+        last_smoke = max(json.loads((p / driver.DISPOSITION_NAME).read_text(
+            encoding="utf-8"))["judged_at"] for p in smoked)
+        spawned = [json.loads(p.read_text(encoding="utf-8"))["spawn_time"]
+                   for uid in self.batches(2)
+                   for p in self.rundir.glob(f"dispatch/{uid}/a*/argv.json")]
+        self.assertTrue(spawned)
+        self.assertLess(first_smoke, min(spawned))
+        self.assertLessEqual(last_smoke, min(spawned))
+
+
 class AResynthesisIsAttributedToItsOwnAdapter(_Resynthesis):
     """A generation may run on another adapter than the run was planned with. Its write-ups
     are attributed to the lanes it ran on, and every other stage to the run's lanes and
@@ -5465,6 +6819,21 @@ class AResynthesisIsAttributedToItsOwnAdapter(_Resynthesis):
         self.assertIn("lane A of synthesis generation 2", how)
         self.assertIn("recovery lane A (stub-C, stub-model-C)", how)
         self.assert_written_up(2)
+
+    def test_a_resynthesis_records_and_prints_its_own_writers(self):
+        """A generation run with another `writers` than the run's says so: the report's
+        run-wide line is the original driver's, and the generation's limit is its own."""
+        self.reported_run()
+        self.write_adapter()
+        raw = json.loads(self.adapter_path.read_text(encoding="utf-8"))
+        raw["writers"] = 2
+        self.adapter_path.write_text(json.dumps(raw), encoding="utf-8")
+        self.resynth()
+        record = json.loads((self.rundir / "dispatch-g2.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["writers"], 2)
+        how = " ".join(_report_section(self.rundir,
+                                       review_panel.SUBSECTION_HOW_IT_RAN).split())
+        self.assertIn("Write-capable units at once in synthesis generation 2: up to 2", how)
 
 
 def _report_section(rundir, heading):

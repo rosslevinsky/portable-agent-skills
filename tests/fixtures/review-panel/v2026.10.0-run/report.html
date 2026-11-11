@@ -419,11 +419,15 @@ Every file and directory this report names, under the short name the report uses
 <li>Lane A permission, as recorded by the dispatcher:
 <pre><code>read-only</code></pre>
 </li>
+<li>Lane A verdicts, by the evidence behind them: 0 executed, 0 documentary, 2 with no command evidence.
+</li>
 <li>Lane B adapter, as recorded by the dispatcher:
 <pre><code>runtime-two command line</code></pre>
 </li>
 <li>Lane B permission, as recorded by the dispatcher:
 <pre><code>read-only sandbox</code></pre>
+</li>
+<li>Lane B verdicts, by the evidence behind them: 1 executed, 0 documentary, 1 with no command evidence.
 </li>
 <li>Containment: the adapter and permission for each lane above are as the dispatcher recorded them, and the engine did not verify them. All the engine can state is that it spawned nothing and checked no sandbox, and that the files its payloads list are snapshot paths, none under the source root. It claims nothing stronger.
 </li>

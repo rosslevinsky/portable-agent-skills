@@ -28,7 +28,9 @@ portable-agent-skills/
 ├── install.py                       # The installer: Linux, macOS and Windows
 ├── plugin.json                      # Agent Plugins 1.0.0 manifest
 ├── PORTABILITY.md                   # Authoring contract — read this first
-└── .github/workflows/validate.yml
+├── .github/workflows/validate.yml
+└── .github/actions/kit/             # Vendored CI actions, checked against kit.lock on
+                                     # every run; replaced whole, never edited by hand
 ```
 
 ## Adding a skill

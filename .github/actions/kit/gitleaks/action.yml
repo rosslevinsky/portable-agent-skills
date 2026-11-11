@@ -1,0 +1,50 @@
+name: Pinned gitleaks
+description: >-
+  Checks out the repo, installs one pinned gitleaks release checked against its published
+  sha256, and scans either the full history (the default) or the current files only. Linux
+  x86_64 runners only.
+
+# This action runs only from a vendored copy, as a local action under .github/actions/kit/, which
+# the calling job checks out first. Its first step checks the copy against kit.lock.
+
+inputs:
+  mode:
+    description: >-
+      `history` scans every commit (the default; the checkout fetches the full history).
+      `files` scans the current files only.
+    required: false
+    default: history
+  config:
+    description: A gitleaks config path in the repo. Empty uses gitleaks' own lookup.
+    required: false
+    default: ""
+  ignore-gitleaks-allow:
+    description: >-
+      `true` (the default) ignores inline `gitleaks:allow` comments, so nothing scanned can
+      excuse itself. `false` honors them.
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Check the vendored copy against its lock
+      shell: bash
+      run: python3 "$GITHUB_ACTION_PATH/../check_copy.py"
+
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: ${{ inputs.mode == 'files' && 1 || 0 }}
+        persist-credentials: false
+
+    - name: Fetch the pinned gitleaks
+      shell: bash
+      run: python3 "$GITHUB_ACTION_PATH/gitleaks_step.py" install "$RUNNER_TEMP/pinned-gitleaks"
+
+    - name: No secrets
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        CONFIG: ${{ inputs.config }}
+        IGNORE_GITLEAKS_ALLOW: ${{ inputs.ignore-gitleaks-allow }}
+      run: python3 "$GITHUB_ACTION_PATH/gitleaks_step.py" scan

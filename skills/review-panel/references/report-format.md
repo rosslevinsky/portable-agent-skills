@@ -166,6 +166,10 @@ is refused by name, and nothing is defaulted:
   differ. `one-runtime` is checked no further, and a record
   naming it with two adapters is accepted: the engine renders what it is given and cannot
   know what ran. The report then claims only what that rung allows.
+- `writers`, optional, is how many write-capable units the driver let run at once across
+  both lanes: a whole number of at least 1, from the driver that wrote the record, which is
+  the one that finished the run. **How this ran** prints it beside the permissions, because
+  more than one is the operator's claim; a record without it prints no line.
 
 ## The job, in the appendix
 

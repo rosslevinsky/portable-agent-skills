@@ -7092,6 +7092,9 @@ RUNGS = (RUNG_TWO_RUNTIMES, RUNG_ONE_RUNTIME, RUNG_TWO_MODELS, RUNG_TWO_RUNTIMES
 # The rungs whose claim rests on what each lane's model is, so each lane must record one.
 RUNGS_NAMING_MODELS = (RUNG_TWO_MODELS, RUNG_TWO_RUNTIMES_ONE_MODEL)
 DISPATCH_KEYS = ("rung", "lanes")
+# Optional, so a record written before it existed still renders: how many write-capable
+# units the driver let run at once across both lanes. More than one is the operator's claim.
+DISPATCH_OPTIONAL_KEYS = ("writers",)
 # `model` is required for the rungs that are told apart by model and optional for the
 # others, so a run directory written before lane records carried one still re-renders.
 LANE_RECORD_KEYS = ("adapter", "permission", "model")
@@ -7117,6 +7120,7 @@ class LaneRecord:
 class DispatchRecord:
     rung: str
     lanes: dict[str, LaneRecord]
+    writers: int | None = None
 
 
 def parse_dispatch(obj: object) -> DispatchRecord:
@@ -7136,7 +7140,13 @@ def parse_dispatch(obj: object) -> DispatchRecord:
     """
     if not isinstance(obj, dict):
         raise DispatchError(f"the dispatch record must be a JSON object (found {type(obj).__name__})")
-    _check_keys(obj, "dispatch", frozenset(DISPATCH_KEYS), DISPATCH_KEYS, DispatchError)
+    _check_keys(obj, "dispatch", frozenset(DISPATCH_KEYS + DISPATCH_OPTIONAL_KEYS),
+                DISPATCH_KEYS, DispatchError)
+    writers = obj.get("writers")
+    if "writers" in obj and (not isinstance(writers, int) or isinstance(writers, bool)
+                             or writers < 1):
+        raise DispatchError(f"field 'writers' must be a whole number of at least 1 "
+                            f"(found {writers!r})")
     rung = obj["rung"]
     if not isinstance(rung, str) or rung not in RUNGS:
         raise DispatchError(f"field 'rung' must be one of: {', '.join(RUNGS)} (found {rung!r})")
@@ -7184,7 +7194,7 @@ def parse_dispatch(obj: object) -> DispatchRecord:
             f"rung {rung!r} claims one model, but the lanes record different models "
             f"({', '.join(repr(model) for model in models)}); record the rung that ran"
         )
-    return DispatchRecord(rung=rung, lanes=lanes)
+    return DispatchRecord(rung=rung, lanes=lanes, writers=writers)
 
 
 def load_dispatch(rundir: Path) -> DispatchRecord:
@@ -16403,6 +16413,35 @@ def _run_kinds(record: dict) -> str:
     return " — " + ", ".join(parts) if parts else ""
 
 
+def _lane_evidence_record(findings: Findings, lane: str) -> dict:
+    """One lane's verdicts counted by the kind of evidence behind them, in the order the
+    kinds are declared, every kind named even at zero.
+
+    A verdict is the lane's whose verifier issued it, and only an answered one counts: the
+    stand-in for a unit that never landed is the engine's, not the lane's. Evidence with no
+    ``run_kind`` still records a command, so it counts
+    as ``unstated``, as :func:`_run_kinds_record` counts it, and only a verdict with no
+    evidence counts as ``none``. The counts always sum to the verdicts the lane returned.
+    """
+    runs = [record["evidence"] for record in (*findings.candidates, *findings.coverage)
+            if record["answered"] and record["verified_by"]["lane"] == lane]
+    kinds = [evidence.get(RUN_KIND_KEY) for evidence in runs if evidence]
+    counted = sum(kinds.count(kind) for kind in RUN_KINDS)
+    return {"counts": [[kind, kinds.count(kind)] for kind in RUN_KINDS],
+            "unstated": len(kinds) - counted, "none": len(runs) - len(kinds)}
+
+
+def _lane_evidence(record: dict) -> str:
+    """The report's spelling of :func:`_lane_evidence_record`."""
+    unstated = record.get("unstated", 0)
+    if not record["none"] and not unstated and not any(c for _, c in record["counts"]):
+        return "none returned"
+    return ", ".join([*(f"{count} {kind}" for kind, count in record["counts"]),
+                      *([f"{unstated} of a kind the verdict did not state"] if unstated
+                        else []),
+                      f"{record['none']} with no command evidence"])
+
+
 def _executability_record(probe: dict, findings: Findings,
                           corrected: frozenset[str] = frozenset()) -> dict:
     """Executability, as three facts that are never inferred from one another.
@@ -17761,11 +17800,15 @@ def _how_it_ran_record(rundir: Path | None, dispatch: DispatchRecord, findings: 
     again = findings.synthesis.get("dispatch") if findings.synthesis else None
     return {"rundir": str(rundir) if rundir is not None else None,
             "lanes": [{"lane": lane, "adapter": dispatch.lanes[lane].adapter,
-                       "permission": dispatch.lanes[lane].permission} for lane in LANES],
+                       "permission": dispatch.lanes[lane].permission,
+                       "verdicts": _lane_evidence_record(findings, lane)} for lane in LANES],
+            "writers": dispatch.writers,
             "again": [{"lane": lane, "adapter": record["adapter"],
                        "permission": record["permission"]}
                       for lane, record in (again or {}).items()],
             "generation": findings.synthesis["generation"] if again else None,
+            "again_writers": (generation_writers(rundir, findings.synthesis["generation"])
+                              if again and rundir is not None else None),
             "files": len(inventory["files"]), "source": inventory["source"],
             "tree_sha256": inventory["tree_sha256"], "excluded": len(inventory["excluded"]),
             "skipped": len(inventory["skipped"]), "commit": findings.commit}
@@ -17794,12 +17837,29 @@ def _render_how_it_ran(record: dict) -> list[str]:
                          lane["adapter"])
         out += _recorded(f"- Lane {lane['lane']} permission, as recorded by the dispatcher:",
                          lane["permission"])
+        # Under the permission it tests: a lane whose permission could not run a command
+        # shows that here as verdicts with no command evidence, whatever the text claims.
+        out.append(f"- Lane {lane['lane']} verdicts, by the evidence behind them: "
+                   f"{_lane_evidence(lane['verdicts'])}.\n")
+    # Beside the permissions because it is the same kind of claim: the operator's word that
+    # write-capable units running at once do not collide, which nothing here can check.
+    writers = record.get("writers")
+    if writers is not None:
+        out.append(f"- Write-capable units at once, across both lanes: "
+                   + ("one at a time" if writers == 1 else f"up to {writers}")
+                   + " (writers, as set for the driver that finished the run).\n")
     for lane in record["again"]:
         where = f"lane {lane['lane']} of synthesis generation {record['generation']}"
         out += _recorded(f"- The {where} adapter, as recorded by the dispatcher:",
                          lane["adapter"])
         out += _recorded(f"- The {where} permission, as recorded by the dispatcher:",
                          lane["permission"])
+    if record["again"] and record.get("again_writers") is not None:
+        writers = record["again_writers"]
+        out.append(f"- Write-capable units at once in synthesis generation "
+                   f"{record['generation']}: "
+                   + ("one at a time" if writers == 1 else f"up to {writers}")
+                   + " (writers, as set for the driver that ran it).\n")
     out.append(f"- {CONTAINMENT_LINE}\n")
     out.append(f"- Read: {_plural(record['files'], 'file')} ({record['source']}), tree "
                f"sha256 {record['tree_sha256']}; {record['excluded']} excluded, "
@@ -19761,6 +19821,8 @@ STEP_REMOVE_STAGING = "remove-staging"
 STEP_STAMP = "stamp"
 PUBLICATION_RECORD_KEYS = ("generation", "generated", "resynthesized", "staging", "steps")
 GENERATION_DISPATCH_KEYS = ("generation", "lanes")
+# Optional, so a generation recorded before it existed still loads.
+GENERATION_DISPATCH_OPTIONAL_KEYS = ("writers",)
 
 
 def publication_steps() -> list[dict]:
@@ -19946,8 +20008,12 @@ def load_generation_dispatch(rundir: Path, generation: int,
         raise DispatchError(f"cannot read {path}: {exc}") from exc
     if not isinstance(obj, dict):
         raise DispatchError(f"{path} must be a JSON object (found {type(obj).__name__})")
-    _check_keys(obj, path.name, frozenset(GENERATION_DISPATCH_KEYS),
+    _check_keys(obj, path.name,
+                frozenset(GENERATION_DISPATCH_KEYS + GENERATION_DISPATCH_OPTIONAL_KEYS),
                 GENERATION_DISPATCH_KEYS, DispatchError)
+    if "writers" in obj and not _is_writers(obj["writers"]):
+        raise DispatchError(f"field 'writers' of {path} must be a whole number of at least "
+                            f"1 (found {obj['writers']!r})")
     if obj["generation"] != generation:
         raise DispatchError(f"{path} records generation {obj['generation']!r}, not "
                             f"{generation}")
@@ -19963,6 +20029,23 @@ def load_generation_dispatch(rundir: Path, generation: int,
             raise DispatchError(f"{unit['id']} came back from lane {unit.get('lane')} and "
                                 f"{path} records no such lane")
     return lanes
+
+
+def _is_writers(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+def generation_writers(rundir: Path, generation: int) -> int | None:
+    """The ``writers`` generation ``generation``'s driver ran with, or None where its record
+    predates the field. Read after :func:`load_generation_dispatch` has held the file to its
+    shape, so a value it would refuse never reaches the report."""
+    try:
+        obj = json.loads(generation_dispatch_path(rundir, generation).read_text(
+            encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError):
+        return None
+    value = obj.get("writers") if isinstance(obj, dict) else None
+    return value if _is_writers(value) else None
 
 
 def lane_records(lanes: Mapping[str, LaneRecord]) -> dict[str, dict]:

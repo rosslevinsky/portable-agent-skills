@@ -44,7 +44,7 @@ the records disagree with it. Three consequences settle nearly every placement q
 **The engine never learns how a unit is spawned**, and the clearest worked example is
 `WRITE_CAPABLE_KINDS` in the driver: the one enumeration of the unit kinds whose brief
 permits the worker to write. The working directory, which of a lane's two command lines is
-used, the run-wide serialization of reproductions, the disk reservation and a copy's
+used, the run-wide limit on reproductions at once, the disk reservation and a copy's
 retention are all read off that one set. Membership turns on whether the brief **permits**
 writing, not on whether the work is expected to produce anything worth keeping — the copy is
 containment. A read-only mode is not uniformly enforced everywhere, so a unit told to write
