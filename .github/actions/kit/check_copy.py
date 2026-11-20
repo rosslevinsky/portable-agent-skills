@@ -1,4 +1,4 @@
-"""Checks that this vendored copy of the kit's actions is the one its lock names.
+"""Checks that the action files in this folder match the hash recorded in kit.lock.
 
 Each action runs this as its first step, so an edited copy fails the job. What it checks is the
 committed copy: inside a git work tree it reads the folder it sits in, and kit.lock, from the
@@ -6,10 +6,11 @@ blobs at HEAD, so a checkout that converts line endings (core.autocrlf, or an eo
 .gitattributes) still passes a correct copy. A fresh CI checkout has no uncommitted edits, so
 there the commit is also what runs. Outside a git work tree it reads the working files instead.
 
-It hashes every file in the folder, leaving out kit.lock and bytecode caches, exactly as the
-kit's drift check hashes a copy, and compares the result with the hash in kit.lock. An edited,
-added or removed file, a symlink in the copy, a symlinked kit.lock, a copy reached through a
-symlink inside the repo, or a missing or malformed lock fails.
+It hashes every file in the folder, leaving out kit.lock and bytecode caches: the sha256 of
+each relative path and of its bytes, in sorted path order. It compares the result with the hash
+in kit.lock, which must hold exactly one well-formed hash line; any other line, such as a
+comment, is ignored. An edited, added or removed file, a symlink in the copy, a symlinked
+kit.lock, a copy reached through a symlink inside the repo, or a missing or malformed lock fails.
 
 Standard library only, with no TOML parser, so it runs on any runner's python3.
 """
@@ -24,11 +25,7 @@ from pathlib import Path
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOCK = "kit.lock"
 PLAIN = ("100644", "100755")
-LOCK_LINES = {
-    "tag": re.compile(r'^tag = "[A-Za-z0-9][A-Za-z0-9._+-]*"$', re.MULTILINE),
-    "commit": re.compile(r'^commit = "[0-9a-f]{40}"$', re.MULTILINE),
-    "hash": re.compile(r'^hash = "(sha256:[0-9a-f]{64})"$', re.MULTILINE),
-}
+HASH_LINE = re.compile(r'^hash = "(sha256:[0-9a-f]{64})"$', re.MULTILINE)
 
 
 class Failed(Exception):
@@ -156,13 +153,13 @@ def _blobs(top, shas):
 
 
 def locked_hash(text, where):
-    """The hash in a lock that holds exactly one well-formed tag, commit and hash line."""
+    """The hash in a lock that holds exactly one well-formed hash line. Other lines are not
+    read."""
     text = text.replace("\r\n", "\n")
-    for key, pattern in LOCK_LINES.items():
-        named = re.findall(rf"^{key}\s*=", text, re.MULTILINE)
-        if len(named) != 1 or len(pattern.findall(text)) != 1:
-            raise Failed(f"{where} must hold exactly one well-formed {key} line")
-    return LOCK_LINES["hash"].search(text).group(1)
+    named = re.findall(r"^hash\s*=", text, re.MULTILINE)
+    if len(named) != 1 or len(HASH_LINE.findall(text)) != 1:
+        raise Failed(f"{where} must hold exactly one well-formed hash line")
+    return HASH_LINE.search(text).group(1)
 
 
 def main():
@@ -189,8 +186,8 @@ def main():
         print(f"::error::{error}", file=sys.stderr)
         return 1
     if actual != locked:
-        print(f"::error::the vendored actions at {HERE} do not match {LOCK}: {actual}, locked "
-              f"{locked}. Move them only with the kit's sync, which rewrites the lock.",
+        print(f"::error::the files in {HERE} do not match the hash in {LOCK} ({actual}, locked "
+              f"{locked}): undo the edit, or change the files and {LOCK} together.",
               file=sys.stderr)
         return 1
     source = "working files" if committed is None else "committed copy"

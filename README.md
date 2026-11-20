@@ -9,7 +9,7 @@ A collection of portable, cross-runtime agent skills for [Claude Code](https://d
 
 AI coding agents benefit from reusable, well-shaped workflows — "write a failing test first, then implement," "audit this codebase for security issues," "break a large task into committable phases." This repository packages those workflows as plain-markdown `SKILL.md` files that both **Claude Code** (Anthropic) and **Codex CLI** (OpenAI) can invoke, with equivalent behavior enforced by an automated portability contract.
 
-One install command copies 19 skills to where both runtimes look for them. CI enforces a
+One install command copies 20 skills to where both runtimes look for them. CI enforces a
 contract that forbids runtime-specific tool names, requires a fallback wherever a skill depends
 on a companion skill, and flags private paths before they ship.
 
@@ -62,6 +62,17 @@ For work bigger than a one-shot edit, the intended flow is:
 /plan-init  →  /plan-phase  →  /plan-run
 ```
 
+**Or type one command: `/plan-and-do <task>`.** It runs those steps in order, with an `/xc`
+cross-check by a second model after each one: on the plan, on the proposed phase list, and on
+the phase files. It stops where you would want it to: for `/plan-init`'s questions, for your
+approval of the phase list, and at the end, so you can read the plan before anything is built.
+Add `--go` (`/plan-and-do --go <task>`) to continue straight into `/plan-run`. Run with no one
+to answer, each step follows its own rule for that case, so those stops can pass without you;
+the final report names any that did. Each step loads its own skill when it starts, so it
+follows the same instructions as if you had typed it.
+
+What each step does:
+
 - **`/plan-init <task>`** — interviews you, explores the codebase, and writes `plans/<slug>/plan.md`: goal, checkable success criteria, constraints, non-goals, affected files. It stamps the plan `Format: v2`, registers it in the `plans/README.md` index, and adds a visual-verification success criterion when UI is in scope. It does *not* break the work into phases.
 - **`/plan-phase <path>`** — reads the plan and proposes an ordered **phase list** for your approval. Where phases are genuinely independent it says so in prose and names the phase that reconciles them; everything else is simply sequential, which is the common case. It then writes one phase document per phase plus the `execution.md` tracker — a checkbox list, one box per phase. A phase document is Goal, Work, Tests, Verification, two gate boxes and a compact **evidence record** — under 350 words of structure — and each phase is independently committable.
 - **`/plan-run <path>`** — executes phases in order, resuming from the **first unticked
@@ -82,6 +93,8 @@ Insert `/cyw` freely between steps. Common spots: after `/plan-init` (sanity-che
 `/plan-init` and `/plan-phase` each end by asking whether to run **`/xc`** on what they just
 wrote: a different model's review of the plan or the breakdown before any work starts. It
 never runs unattended; see [Cross-model adversarial review](#cross-model-adversarial-review-a-second-cli-or-a-backend-on-another-model).
+`/plan-phase` also offers it on the proposed phase list, before any file is written.
+`/plan-and-do` runs all three without asking, because calling it is the request.
 
 Two of the skills the gate calls also stand on their own — **`/web-verify`** and
 **`/diff-review`** — and **`/demo-video`** takes over once the feature is finished. All three
@@ -329,6 +342,7 @@ runtimes.
 | `plan-init` | Interviews you and writes a `Format: v2` plan registered in `plans/README.md`. The start of any non-trivial feature or refactor | Full |
 | `plan-phase` | Breaks a plan into an ordered phase list plus the `execution.md` tracker. After `/plan-init` or `/plan-duel` | Full |
 | `plan-run` | Executes the phases in order with a per-phase gate, and writes `as-built.md` for a non-trivial plan. After `/plan-phase` | Full |
+| `plan-and-do` | Runs `/plan-init`, `/plan-phase` and three `/xc` cross-checks in one command — the plan, the proposed phase list, the phase files — then stops for you to look, or with `--go` continues into `/plan-run`. When you would otherwise type each step | Degraded |
 | `plan-duel` | Two models write competing plans and refine them against each other; needs Python 3.10+, the `diff-review` skill and, as shipped, **both** CLIs (or one CLI with a role on a backend running another model). In place of `/plan-init` when the plan itself is the risk | Degraded |
 | `diff-review` | Diff-first review by a second reviewer, as independent as the host allows and cross-model when a second CLI, or a backend running a different model, is available; never edits the tree. Before a merge, and inside the `/plan-run` gate | Degraded |
 | `xc` | Cross-checks a document — a plan, a phase breakdown, a design note — with a different model: a `cyw` pass, the other model's review, each disagreement settled once, only the survivors applied, and `cyw` again. After `/plan-init` or `/plan-phase`, or before acting on any document | Degraded |
@@ -782,7 +796,7 @@ and anything else in `~/.portable-agent-skills` are left in place.
 python3 install.py
 ```
 
-Installing 19 skills is a copy of about 80,000 words, fast enough to run after every edit.
+Installing 20 skills is a copy of about 80,000 words, fast enough to run after every edit.
 The runtimes read the installed copy, not this checkout, so an edit here changes nothing
 until it is reinstalled.
 
@@ -934,7 +948,8 @@ Quick version:
 All skills follow the [PORTABILITY.md](PORTABILITY.md) contract, and the validator enforces
 most of it — a PR fails on a branded tool name, a companion reference with no fallback, a
 missing classification or progress posture, a skill file reaching outside its own directory,
-or a private path.
+a private path in a file or its name, or a relative Markdown link to a file that isn't
+tracked.
 
 **Three rules it does not check**: hardcoded model names, an autonomous fallback on every
 user-prompting step, and naming both `CLAUDE.md` and `AGENTS.md` for project instruction

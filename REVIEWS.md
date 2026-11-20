@@ -118,7 +118,9 @@ written.
 way. What it adds is the round after the review: the author rejects a finding only with a
 concrete reason, the reviewer can answer once with new evidence, and anything still disputed
 comes to you unapplied. It will not review its own work: with no separate reviewer it stops
-and says so. `/plan-init` and `/plan-phase` offer it when they finish.
+and says so. `/plan-init` and `/plan-phase` offer it when they finish, and `/plan-phase`
+also offers it on the proposed phase list before it writes any file. `/plan-and-do` runs all
+three without asking.
 
 **`/review-panel` does two things nothing else here does.** First, it proves its coverage:
 every file is accounted for, and the run fails, naming the path, if anything was left

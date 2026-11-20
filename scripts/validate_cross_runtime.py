@@ -10,7 +10,10 @@ Checks:
 - Companion-skill references (backtick-quoted skill names like `cyw`) include fallback
   instructions nearby
 - PORTABILITY.md exists with required sections
-- Private paths and project-specific identifiers do not leak into skill files
+- Private paths and project-specific identifiers do not leak into any tracked file, in its
+  contents or in its name: a path is published along with the file
+- Every relative Markdown link names a path the tree carries — tracked, where git can say —
+  so no reader of a clone follows a link to nothing
 - plan-duel companion files (init.md, round.md, summary.md) AND the bundled plan_duel.py
   engine exist when plan-duel/SKILL.md is present
 - no bundled engine hardcodes a branded CLI name (claude/codex) as a subprocess
@@ -2500,7 +2503,16 @@ def sweep_content_hygiene(root: Path) -> list[str]:
     # was quietly different at every call site — `rglob` swallowed the OSError from an
     # unreadable directory, so a repository could sweep clean because a directory was
     # unreadable rather than because it held nothing.
-    for filepath, _rel, patterns, is_symlink in iter_hygiene_targets(root):
+    for filepath, rel, patterns, is_symlink in iter_hygiene_targets(root):
+        # The PATH is published as surely as the bytes: a directory named after a private
+        # repository ships its name with every file under it. A name has no line to carry
+        # an exemption marker, so no name is exempt.
+        for pattern in patterns:
+            if pattern.search(rel):
+                errors.append(
+                    f"  {filepath}: file name contains a private/project-specific "
+                    f"reference '{pattern.pattern}'"
+                )
         # A symlink's TARGET is content: git stores the target string in the object, so a
         # link pointing at an absolute home path publishes that path even though the link
         # may be dangling and `is_file()` therefore false. Read the target, not the file.
@@ -2540,6 +2552,102 @@ def sweep_content_hygiene(root: Path) -> list[str]:
             continue
         errors.extend(check_private_paths(filepath, patterns))
         errors.extend(check_hardcoded_attribution(filepath))
+    return errors
+
+
+# An inline link or image, `[text](target "title")`, with the target bare or in `<...>`.
+# A bare target may hold balanced parentheses, as `guide(v2).md` does.
+_MD_INLINE_LINK_RE = re.compile(
+    r"!?\[[^\[\]]*\]\(\s*(<[^>\n]*>|(?:[^\s()]|\([^\s()]*\))+)"
+    r"(?:\s+(?:\"[^\"]*\"|'[^']*'|\([^)]*\)))?\s*\)")
+# Blockquote markers, so a fence or a link inside a quote reads as it renders.
+_MD_QUOTE_RE = re.compile(r"^ {0,3}(?:> ?)+")
+# A link reference definition, `[label]: target`, at most three spaces in.
+_MD_LINK_DEFINITION_RE = re.compile(r"^ {0,3}\[[^\]]+\]:\s*(<[^>\n]*>|\S+)")
+# A code span: a run of backticks closed by a run of the same length.
+_MD_CODE_SPAN_RE = re.compile(r"(?<!`)(`+)(?!`).*?(?<!`)\1(?!`)")
+_URL_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+
+
+def markdown_link_targets(text: str) -> list[tuple[int, str]]:
+    """``(line, path)`` for every relative link a reader can follow in rendered Markdown.
+
+    Only what renders as a link counts: fenced code, code spans and HTML comments are
+    skipped. So are URLs with a scheme, links to an anchor in the same file, and template
+    placeholders — a target holding ``<...>``, ``⟪...⟫`` or a glob names a file the reader
+    fills in, not one the tree carries. The fragment and query are dropped and
+    percent-escapes decoded, so the path is the one a renderer opens.
+
+    Indentation is NOT read as code: four spaces is also how a nested list item is written,
+    and a link there is a link. Blockquote markers are removed first, so a fence inside a
+    quote is still a fence. A link wrapping an image, as a badge does, yields both targets.
+    """
+    quoted = [_MD_QUOTE_RE.sub("", line) for line in text.splitlines()]
+    lines, fenced = _strip_html_comments(quoted)
+    found: list[tuple[int, str]] = []
+    for number, (line, is_code) in enumerate(zip(lines, fenced), 1):
+        if is_code:
+            continue
+        line = _MD_CODE_SPAN_RE.sub("", line)
+        raw: list[str] = []
+        # Innermost first: each link found is replaced by plain text, so the link around
+        # it matches on the next pass.
+        while True:
+            matches = list(_MD_INLINE_LINK_RE.finditer(line))
+            if not matches:
+                break
+            raw.extend(m.group(1) for m in matches)
+            line = _MD_INLINE_LINK_RE.sub("x", line)
+        definition = _MD_LINK_DEFINITION_RE.match(line)
+        if definition:
+            raw.append(definition.group(1))
+        for target in raw:
+            if target.startswith("<") and target.endswith(">"):
+                target = target[1:-1]
+            elif any(c in target for c in "<>*\u27ea\u27eb"):
+                continue
+            if (not target or target.startswith(("#", "//"))
+                    or _URL_SCHEME_RE.match(target)):
+                continue
+            path = unquote(urlsplit(target).path)
+            if path:
+                found.append((number, path))
+    return found
+
+
+def check_markdown_links(root: Path) -> list[str]:
+    """Every relative link in a tracked Markdown file must name a path the tree carries.
+
+    A link out of the tree, or to a file that is not there, is a dead end for every reader
+    of every clone. Where git can answer, the target must be TRACKED as well: an untracked
+    file resolves on the machine that wrote the link and nowhere else. The files read are
+    the hygiene sweep's, from ``iter_hygiene_targets``, so the two cannot disagree about
+    which files are part of the project.
+    """
+    tracked = tracked_paths(root)
+    tracked_dirs: set[str] = set()
+    for path in tracked or ():
+        parts = path.split("/")[:-1]
+        tracked_dirs.update("/".join(parts[:i]) for i in range(1, len(parts) + 1))
+    errors = []
+    for filepath, rel, _patterns, is_symlink in iter_hygiene_targets(root):
+        if is_symlink or not rel.endswith(".md") or not _is_file(filepath):
+            continue
+        for number, target in markdown_link_targets(_read_text_lossy(filepath)):
+            joined = (target.lstrip("/") if target.startswith("/")
+                      else posixpath.join(posixpath.dirname(rel), target))
+            resolved = posixpath.normpath(joined)
+            if resolved == ".." or resolved.startswith("../"):
+                where = "outside this tree, so no clone carries it"
+            elif tracked is not None:
+                if resolved == "." or resolved in tracked or resolved in tracked_dirs:
+                    continue
+                where = "not tracked by git, so no clone carries it"
+            elif _present(root / resolved):
+                continue
+            else:
+                where = "not there"
+            errors.append(f"  {filepath}:{number}: link '{target}' points at a path that is {where}")
     return errors
 
 
@@ -2614,6 +2722,7 @@ def validate_skills(skills_dir: Path, repo_root: Path) -> list[str]:
     # skill-doc-prose rules to markdown only.
     # Universal content hygiene — EVERY file in the repository, not just skills/.
     all_errors.extend(sweep_content_hygiene(repo_root))
+    all_errors.extend(check_markdown_links(repo_root))
 
     for artifact in skill_artifacts:
         filepath = skills_dir / artifact

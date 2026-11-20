@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _git_env  # noqa: E402,F401  every git command a test starts runs under the suite's config
@@ -1329,6 +1330,126 @@ class PrivacyGuardCoversTheWholeRepository(unittest.TestCase):
             "a shipped skill turns the private-path guard off for a line. Skill prose must "
             f"be generic outright, so there is nothing here to exempt:\n  "
             + "\n  ".join(offenders))
+
+    def test_a_private_name_in_a_file_name_is_caught(self):
+        """A path is published as surely as the bytes inside it, so the name is read too."""
+        for rel in ("skills/demo/dotfiles-notes.md",  # hygiene-exempt: test data
+                    "docs/dotfiles/readme.md"):  # hygiene-exempt: test data
+            with self.subTest(path=rel):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    target = root / rel
+                    target.parent.mkdir(parents=True)
+                    target.write_text("nothing private in here\n", encoding="utf-8")
+                    found = self.vcr.sweep_content_hygiene(root)
+                self.assertTrue(
+                    any("name" in f and rel in f.replace(os.sep, "/") for f in found),
+                    f"a private name in the path {rel} was not reported: {found}")
+
+    def test_a_clean_file_name_is_not_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "skills" / "demo").mkdir(parents=True)
+            (root / "skills" / "demo" / "notes.md").write_text("plain\n", encoding="utf-8")
+            self.assertEqual(self.vcr.sweep_content_hygiene(root), [])
+
+
+class RelativeMarkdownLinksResolve(unittest.TestCase):
+    """Every relative link in a tracked Markdown file names a path the tree carries.
+
+    A link to a file that is not there is a dead end for the reader in every clone. Where git
+    can answer, the target must also be TRACKED: an untracked file resolves on the machine
+    that wrote the link and nowhere else.
+    """
+
+    def _write(self, root: Path, rel: str, text: str = "x\n"):
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    def test_only_relative_prose_links_are_read(self):
+        text = "\n".join([
+            "[a](docs/a.md) and ![img](img/b.png \"title\")",   # 1: two targets
+            "[ext](https://example.com/x) [mail](mailto:a@b.c) [top](#heading)",
+            "`[code](not/a/link.md)` and ``[also](not/this.md)``",
+            "```",
+            "[fenced](not/read.md)",
+            "```",
+            "",
+            "[tmpl](./phase-<NN>-<slug>.md) [angle](<with space.md>)",
+            "[frag](docs/c.md#part) [query](docs/d.md?plain=1)",
+            "[ref]: refs/e.md",
+            "<!-- [hidden](not/rendered.md) -->",
+        ])
+        self.assertEqual(
+            vcr.markdown_link_targets(text),
+            [(1, "docs/a.md"), (1, "img/b.png"), (8, "with space.md"),
+             (9, "docs/c.md"), (9, "docs/d.md"), (10, "refs/e.md")])
+
+    def test_the_shapes_a_renderer_follows_are_read(self):
+        text = "\n".join([
+            "[![badge](img/badge.svg)](docs/target.md)",       # 1: a linked image, both
+            "[guide](docs/guide(v2).md)",                         # 2: balanced parentheses
+            "- list",
+            "    - [nested](docs/nested.md)",                     # 4: a nested list item
+            "> ```markdown",
+            "> [example](not/a/file.md)",
+            "> ```",
+        ])
+        self.assertEqual(
+            vcr.markdown_link_targets(text),
+            [(1, "img/badge.svg"), (1, "docs/target.md"), (2, "docs/guide(v2).md"),
+             (4, "docs/nested.md")])
+
+    def test_a_link_to_a_missing_file_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write(root, "docs/here.md")
+            self._write(root, "README.md",
+                        "[ok](docs/here.md) [dir](docs/) [gone](docs/gone.md)\n")
+            found = vcr.check_markdown_links(root)
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("docs/gone.md", found[0])
+        self.assertIn("README.md:1", found[0].replace(os.sep, "/"))
+
+    def test_a_link_is_resolved_from_the_file_that_holds_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write(root, "skills/a/SKILL.md", "[ref](references/r.md) [up](../../README.md)\n")
+            self._write(root, "skills/a/references/r.md")
+            self._write(root, "README.md")
+            self.assertEqual(vcr.check_markdown_links(root), [])
+
+    def test_a_link_out_of_the_tree_is_reported_even_when_the_target_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outer = Path(tmp)
+            self._write(outer, "sibling.md")
+            root = outer / "repo"
+            self._write(root, "README.md", "[out](../sibling.md)\n")
+            found = vcr.check_markdown_links(root)
+        self.assertEqual(len(found), 1, found)
+
+    def test_an_untracked_target_is_reported_where_git_can_say(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-q", str(root)], check=True, capture_output=True)
+            self._write(root, "README.md", "[scratch](notes.md)\n")
+            self._write(root, "notes.md")
+            subprocess.run(["git", "-C", str(root), "add", "README.md"],
+                           check=True, capture_output=True)
+            found = vcr.check_markdown_links(root)
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("notes.md", found[0])
+
+    def test_the_validator_runs_the_link_check(self):
+        with unittest.mock.patch.object(vcr, "check_markdown_links",
+                                        return_value=["  sentinel"]) as spy:
+            errors = vcr.validate_skills(SKILLS, REPO_ROOT)
+        spy.assert_called_once_with(REPO_ROOT)
+        self.assertIn("  sentinel", errors)
+
+    def test_the_repository_has_no_dead_links_right_now(self):
+        self.assertEqual(vcr.check_markdown_links(REPO_ROOT), [])
 
 
 class ResumeReadsOnlyStateSomeStepWrites(unittest.TestCase):

@@ -9546,7 +9546,7 @@ class TheAdapterLinesRenderAlikeWhateverTheDispatcherTyped(_ReportCase):
 class TheReportPrintsWritersBesideThePermissions(_ReportCase):
     """`writers` is the operator's claim that write-capable units running at once do not
     collide, so the report prints it beside the permission text, as the dispatcher
-    recorded it. A record written before it existed prints no such line."""
+    recorded it. When the key is absent the report prints no writers line."""
 
     def how(self, **extra):
         self.setUp()

@@ -12,6 +12,12 @@ _Classification: Degraded — the reviewer has two rungs. Strongest is a **diffe
 
 _Progress: observable — rung 1's reviewer streams into the supervisor's append-only display log while it runs; rung 2 returns in one shot._
 
+**Each time a step below runs the `cyw` skill, load it fresh and follow its own
+instructions**, never a remembered version: a pass run from memory is shorter and looser.
+
+> **Claude adapter:** call the Skill tool with `cyw`.
+> **Codex adapter:** read `cyw`'s `SKILL.md` from its installed directory, beside this skill.
+
 ## Step 1 — Anchor and self-check
 
 1. Name the target files. With no argument, use the document this conversation just

@@ -7092,7 +7092,7 @@ RUNGS = (RUNG_TWO_RUNTIMES, RUNG_ONE_RUNTIME, RUNG_TWO_MODELS, RUNG_TWO_RUNTIMES
 # The rungs whose claim rests on what each lane's model is, so each lane must record one.
 RUNGS_NAMING_MODELS = (RUNG_TWO_MODELS, RUNG_TWO_RUNTIMES_ONE_MODEL)
 DISPATCH_KEYS = ("rung", "lanes")
-# Optional, so a record written before it existed still renders: how many write-capable
+# Optional: a dispatch record that lacks it is accepted. How many write-capable
 # units the driver let run at once across both lanes. More than one is the operator's claim.
 DISPATCH_OPTIONAL_KEYS = ("writers",)
 # `model` is required for the rungs that are told apart by model and optional for the
@@ -19821,7 +19821,7 @@ STEP_REMOVE_STAGING = "remove-staging"
 STEP_STAMP = "stamp"
 PUBLICATION_RECORD_KEYS = ("generation", "generated", "resynthesized", "staging", "steps")
 GENERATION_DISPATCH_KEYS = ("generation", "lanes")
-# Optional, so a generation recorded before it existed still loads.
+# Optional: a generation record that lacks it loads, and generation_writers returns None.
 GENERATION_DISPATCH_OPTIONAL_KEYS = ("writers",)
 
 
@@ -20036,8 +20036,8 @@ def _is_writers(value: object) -> bool:
 
 
 def generation_writers(rundir: Path, generation: int) -> int | None:
-    """The ``writers`` generation ``generation``'s driver ran with, or None where its record
-    predates the field. Read after :func:`load_generation_dispatch` has held the file to its
+    """The ``writers`` generation ``generation``'s driver ran with, or None when the record
+    lacks the field. Read after :func:`load_generation_dispatch` has held the file to its
     shape, so a value it would refuse never reaches the report."""
     try:
         obj = json.loads(generation_dispatch_path(rundir, generation).read_text(

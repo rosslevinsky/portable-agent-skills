@@ -120,6 +120,10 @@ no shared surface); which shared surfaces forced sequencing; and which phase rec
 each independent set. Invite the user to add, remove, merge, re-order, or re-scope
 phases, or to make an independent set strictly sequential.
 
+Also ask whether to run the `xc` skill on the list first, written to a file outside the
+repository, with `plan.md` as context. Autonomously, do not run it. If the `xc` skill is
+unavailable, make no offer.
+
 Wait for approval; revise and re-present until confirmed. If operating autonomously
 (no user available), proceed with the proposed graph and note that it was not
 user-reviewed.

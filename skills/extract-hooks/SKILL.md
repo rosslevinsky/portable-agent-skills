@@ -101,10 +101,14 @@ take a subset, or `none`, and a candidate they declined is a decision that was m
 gap to be closed. Review what was built; list what was declined once, without re-arguing it.
 If the answer was `none`, the run ended at Phase 3 and there is nothing here to do.
 
-Run the `cyw` skill to review the work. If the skill is unavailable, do a
+Run the `cyw` skill to review the work, loaded fresh and followed as written, never from
+memory. If the skill is unavailable, do a
 self-check: re-read each modified file, confirm no logic remains inline in
 `.tsx` files, confirm all tests/lint still pass, and list any assumptions or
 risks that could not be verified locally.
+
+> **Claude adapter:** call the Skill tool with `cyw`.
+> **Codex adapter:** read `cyw`'s `SKILL.md` from its installed directory, beside this skill.
 
 **Where no test exercises the logic that moved, report that hook as extracted but
 unverified, and name it.** This skill's promise is that behavior is preserved, and

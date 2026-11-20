@@ -29,8 +29,8 @@ portable-agent-skills/
 ├── plugin.json                      # Agent Plugins 1.0.0 manifest
 ├── PORTABILITY.md                   # Authoring contract — read this first
 ├── .github/workflows/validate.yml
-└── .github/actions/kit/             # Vendored CI actions, checked against kit.lock on
-                                     # every run; replaced whole, never edited by hand
+└── .github/actions/kit/             # CI actions, checked against kit.lock on every
+                                     # run; change the files and the lock together
 ```
 
 ## Adding a skill
@@ -110,6 +110,11 @@ before it becomes the instructions.
 `plan-init` / `plan-phase` / `plan-run` are the current suite. The superseded generation
 ships alongside as `plan-init-v1` / `plan-phase-v1` / `plan-run-v1`.
 
+`plan-and-do` runs the current suite in order, with `xc` between the steps. It holds only
+the order, the stops and its `--go` argument, and loads each skill when that step starts, so
+a change inside a planning skill needs no matching change there. Rename, remove or reorder a
+planning skill's stops, or its `xc` offers, and `plan-and-do` must change with it.
+
 They **coexist without collision**. The current skills act only on a `plan.md` stamped
 `| Format | v2 |` and use an `execution.md` tracker, never `phases.md`. The `-v1` skills
 track state in `phases.md` and never touch `execution.md`. There is no migration path. The
@@ -185,8 +190,9 @@ installed. **A fix to one side of a mirrored block is also made in its mirror, i
   `Last updated`. v2's `plans/README.md` index has no `Status` column. Do not restore mutable
   status fields to v2, and do not remove v1's.
 - **The `xc` offer is v2-only.** `plan-init` and `plan-phase` end by asking whether to run
-  the `xc` skill on what they wrote; `plan-init-v1` and `plan-phase-v1` do not. It is a
-  capability, not a fix, so it is not backported.
+  the `xc` skill on what they wrote, and `plan-phase` also asks before it writes, about the
+  proposed phase list; `plan-init-v1` and `plan-phase-v1` do not. It is a capability, not a
+  fix, so it is not backported.
 - **Delegation is v2-only.** v2's `plan-run` tags each transition worker-safe or
   orchestrator-only and ships `references/phase-worker-contract.md`. v1 has no worker concept.
   Do not backport it; it is a capability, not a fix.
@@ -266,7 +272,10 @@ Read `PORTABILITY.md` for the contract. The most common reasons a PR fails CI:
   fallback instruction, within about six lines
 - A Degraded or Runtime-limited skill with no `_Classification:` declaration
 - Codex install guidance pointing at `~/.codex/skills` instead of `$HOME/.agents/skills`
-- Private paths, project-specific identifiers, or vendor attribution emails in skill text
+- Private paths, project-specific identifiers, or vendor attribution emails in any tracked
+  file — in its name as well as its text
+- A relative Markdown link to a path that is not tracked, or that climbs out of the
+  repository
 
 **Three rules bind you that CI does not check** — hardcoded model names, autonomous
 fallbacks, and naming both `CLAUDE.md` and `AGENTS.md` — so review for them by hand.

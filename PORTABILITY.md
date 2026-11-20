@@ -65,6 +65,18 @@ describes what to do if the skill isn't installed or doesn't run. The
 manual-equivalent steps **are** the executed fallback when a companion is absent —
 keep them; they are functional, not boilerplate.
 
+**Where a skill runs a companion as a whole step, it says to load that skill fresh** and
+follow its own instructions, never a remembered version: a step run from memory comes out
+shorter and looser than the skill. State it once per skill, with an adapter note for each
+runtime's way of loading it:
+
+```markdown
+> **Claude adapter:** call the Skill tool with `cyw`.
+> **Codex adapter:** read `cyw`'s `SKILL.md` from its installed directory, beside this skill.
+```
+
+A skill that only mentions, offers or names a companion as optional needs no such note.
+
 ---
 
 ## Agent Instruction File References
@@ -475,7 +487,10 @@ Use generic language instead: "check `package.json` or project config for siblin
 repos" rather than naming specific frameworks or projects.
 
 The scan covers **every file in the repository**, not only `skills/` — installers,
-workflows, tests and scripts are where a real home path gets pasted. A handful of
+workflows, tests and scripts are where a real home path gets pasted. It reads each file's
+path as well as its contents, because a directory named after a private repository
+publishes that name with every file under it; a path has no line to carry the marker
+below, so no path is exempt. A handful of
 files legitimately carry a private-looking string because their job is to: the
 pattern definitions themselves, and fixture data proving the check fires. Those
 lines carry the marker `hygiene-exempt` in a trailing comment, and the scan skips
@@ -557,7 +572,8 @@ skills/` to check the pack.
 
 **What that run does and does not cover.** It enforces the mechanical rules above —
 banned phrases, companion fallbacks, classification declarations, progress postures,
-self-containment, private paths and the size ratchet. These are the rules in this document
+self-containment, private paths, relative Markdown links that name no tracked file, and the
+size ratchet. These are the rules in this document
 it does **not** check, and a green run says nothing about them. **The list is maintained by
 hand, so treat it as the known set rather than a proof**: adding a rule here without a
 `check_*` function to match means adding it to this list too.

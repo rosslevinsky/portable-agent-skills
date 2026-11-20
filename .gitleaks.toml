@@ -1,0 +1,20 @@
+# The secret scan's config, read by the `secrets` job in .github/workflows/validate.yml.
+#
+# gitleaks' own rules, plus an allowance for test values that look like keys and are not.
+# Each allowance is one exact value, so a real key anywhere, these test files included, is
+# still caught. A new key-shaped test value that trips the scan gets its own line here.
+#
+# Never allow by path. gitleaks skips a file whose path an allowlist names before it reads
+# a line of it, whatever `condition` says, so a path allowance stops the scan of that file.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Made-up tokens and keys in the review-panel and review-runner tests"
+regexes = [
+  '''^tok-verify-area-01-A-0$''',
+  '''^0123456789abcdef$''',
+  '''^sk-or-v1-PASTED-KEY-3b7d$''',
+  '''^fw_3ZfJpQ9xYk2LmN8aPASTED$''',
+]
