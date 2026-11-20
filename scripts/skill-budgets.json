@@ -4,15 +4,16 @@
   "cyw": 642,
   "demo-video": 1880,
   "diff-review": 3771,
-  "extract-hooks": 862,
+  "extract-hooks": 893,
   "handoff": 641,
+  "plan-and-do": 597,
   "plan-duel": 5223,
   "plan-init": 2359,
-  "plan-phase": 3313,
-  "plan-run": 9871,
+  "plan-phase": 3350,
+  "plan-run": 9924,
   "review-panel": 24468,
   "security-review-codebase": 5578,
   "tdd": 771,
   "web-verify": 1927,
-  "xc": 1122
+  "xc": 1174
 }

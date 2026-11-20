@@ -32,10 +32,10 @@ on:
 # release could reach is read access to content that is published anyway. Pinning would
 # also mean editing this file on every action bump, for no gain a read-only token can use.
 #
-# The local action under `.github/actions/kit/` is not one of them. It is a vendored copy that
-# must equal the hash in its `kit.lock`, it checks that itself each time it runs, and the
-# third-party actions inside it are pinned by full SHA there. Edit it only by vendoring a new
-# copy, never by hand.
+# The local action under `.github/actions/kit/` is not one of them. Its files must hash to the
+# value in its `kit.lock`, it checks that itself each time it runs, and the third-party actions
+# inside it are pinned by full SHA there. An edit to one file fails the job, so change the
+# files and the lock together.
 permissions:
   contents: read
 
@@ -333,6 +333,25 @@ jobs:
       - name: Run this shard of the test suite under a non-UTF-8 locale
         run: python scripts/shard_tests.py --index ${{ matrix.shard }} --total 4
 
+  secrets:
+    # Keys and tokens in the current files, by gitleaks' own rules and the allowances in
+    # `.gitleaks.toml`. No other check here looks for one. It runs on every event and never
+    # skips: a scan takes seconds, and a tree proved green before could still be one whose
+    # allowances were since widened. The vendored action pins gitleaks by version and checksum.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # The local action is read from the checkout; it then checks the copy against
+      # `kit.lock` and checks out the files it scans itself.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: No keys or tokens in the files
+        uses: ./.github/actions/kit/gitleaks
+        with:
+          mode: files
+          config: .gitleaks.toml
+
   gate:
     # ONE check for the branch ruleset to require, standing for every job above it.
     #
@@ -351,7 +370,7 @@ jobs:
     # was given.
     # `tested` is among these because its answer decides what a SKIP means here, and a gate
     # that could not tell a deliberate skip from a lost job would be the wrong gate.
-    needs: [tested, suite, non-utf8]
+    needs: [tested, suite, non-utf8, secrets]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -359,7 +378,7 @@ jobs:
       - name: Every job green, or skipped because this tree was already green
         run: |
           echo "tested=${{ needs.tested.outputs.already }} suite=${{ needs.suite.result }}" \
-               "non-utf8=${{ needs['non-utf8'].result }}"
+               "non-utf8=${{ needs['non-utf8'].result }} secrets=${{ needs.secrets.result }}"
           # **A skip counts as green ONLY where this workflow chose it.** With the tree already
           # proved by the run behind the merge, `skipped` is the expected result and `success`
           # would mean the skip did not happen. Every other skip — a cancelled dependency, a
@@ -375,3 +394,5 @@ jobs:
           fi
           [ "${{ needs.suite.result }}" = "$want" ] || exit 1
           [ "${{ needs['non-utf8'].result }}" = "$want" ] || exit 1
+          # The secret scan never skips, so it is held to success whatever `tested` said.
+          [ "${{ needs.secrets.result }}" = "success" ] || exit 1

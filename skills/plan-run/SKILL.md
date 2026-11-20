@@ -422,6 +422,12 @@ result, not the last piece's checks. Work produced in list order on one branch â
 
 Run each applicable axis; each must pass before the phase can complete.
 
+**Load each skill named below fresh when its axis runs, and follow its own instructions**,
+never a remembered version: an axis run from memory is shorter and looser.
+
+> **Claude adapter:** call the Skill tool with the skill's name.
+> **Codex adapter:** read that skill's `SKILL.md` from its installed directory, beside this skill.
+
 **Where a skill named below is unavailable, do the equivalent manual pass it bundles** â€”
 `web-verify`'s UI checklist across the mandatory viewports, `cyw`'s re-read of the modified
 files for correctness, completeness and consistency. That substitution holds for every named

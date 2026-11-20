@@ -225,7 +225,12 @@ grep -q '^WORK-EXIT rc=' /abs/path/work.log 2>/dev/null || { echo "timed out wai
 
 ### 3f — Check your work
 
-Run the `cyw` skill now. This performs a structured review of everything changed
+Run the `cyw` skill now, loaded fresh and followed as written, never from memory.
+
+> **Claude adapter:** call the Skill tool with `cyw`.
+> **Codex adapter:** read `cyw`'s `SKILL.md` from its installed directory, beside this skill.
+
+It performs a structured review of everything changed
 in this phase: correctness, completeness, consistency, integration, and test
 coverage. If the `cyw` skill is unavailable, perform the equivalent review
 manually: re-read all modified files, check correctness/completeness/consistency,

@@ -2817,8 +2817,8 @@ REPLY_GENERATIONS_PREFIX = "reply-generations-"
 
 
 def _mode_of(attempt: Attempt) -> str:
-    """The mode an attempt was launched in: recorded at spawn, or else read from its kind,
-    which is how a record written before the mode was recorded says it."""
+    """The mode an attempt was launched in: the `mode` recorded at spawn, or, when that key is
+    absent or invalid, the mode its kind implies."""
     argv = attempt.argv or {}
     if argv.get("mode") in MODES:
         return str(argv["mode"])
@@ -2826,7 +2826,7 @@ def _mode_of(attempt: Attempt) -> str:
 
 
 def _reply_generation_of(attempt: Attempt) -> int:
-    # Absent is 0: no reply generation was closed before attempts started carrying one.
+    # Absent is 0, the generation every run starts in, before any is closed.
     raw = (attempt.argv or {}).get("reply_generation")
     return raw if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0 else 0
 

@@ -8,6 +8,37 @@ Versions use [Calendar Versioning](https://calver.org/) in the form
 A MICRO bump in the same month indicates a follow-up release; a new month
 starts from `.0` again.
 
+## [2026.11.1] - 2026-11-20
+
+### Added
+
+- **`/plan-and-do` runs the whole planning cycle in one command.** It runs `/plan-init`, then
+  `/xc` on the plan, `/plan-phase` up to its proposed phase list, `/xc` on that list, the
+  phase files, and `/xc` on them. It stops for `/plan-init`'s questions, for your approval of
+  the phase list, and at the end, so you can read the plan before anything is built.
+  `/plan-and-do --go <task>` continues into `/plan-run`. Run with no one to answer, each step
+  follows its own rule for that case, so those stops can pass without you; the final report
+  names any that did. Each step loads its own skill, so it
+  follows the same instructions as if you had typed it. Without `/xc` installed it skips the
+  cross-checks and says so.
+- **`/plan-phase` offers `/xc` on the proposed phase list** before it writes any file, as
+  `/plan-init` and `/plan-phase` already do for what they write.
+
+### Changed
+
+- **A skill that runs another skill as a step now loads it fresh.** `/xc`, `/plan-run`,
+  `/plan-run-v1` and `/extract-hooks` load `cyw`, `diff-review` and `web-verify` when the step
+  starts and follow that skill's own instructions, rather than a remembered version of it,
+  which tends to be shorter and looser.
+- **`validate_cross_runtime.py` checks file names and links.** It now fails when a file's
+  path, not only its contents, holds a private path or name, including any names you have
+  listed for it as private. It also fails on a relative Markdown link to a file the
+  repository does not track.
+- **CI scans the files for keys and tokens.** `.github/workflows/validate.yml` has a new
+  `secrets` job that runs gitleaks with the rules in `.gitleaks.toml`, and the `gate` check
+  fails unless it passes. A test value shaped like a real key needs its own exact-value entry
+  in `.gitleaks.toml`; an entry by path would skip the whole file.
+
 ## [2026.11.0] - 2026-11-11
 
 ### Changed
@@ -1077,6 +1108,7 @@ release](README.md#installing-a-previous-release) to return to it.
 
 Initial release.
 
+[2026.11.1]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.11.1
 [2026.11.0]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.11.0
 [2026.10.3]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.10.3
 [2026.10.2]: https://github.com/rosslevinsky/portable-agent-skills/releases/tag/v2026.10.2
